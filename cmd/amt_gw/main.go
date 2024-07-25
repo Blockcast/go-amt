@@ -11,7 +11,6 @@ func main() {
 	source := "83.97.94.146"
 	group := "232.1.2.3"
 	dataChannel := make(chan []byte)
-
 	go amt.StartGateway(relay, source, group, dataChannel)
 
 	for data := range dataChannel {
