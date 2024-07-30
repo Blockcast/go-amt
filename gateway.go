@@ -7,7 +7,24 @@ import (
 	"time"
 
 	m "github.com/blockcast/go-amt/messages"
+	"github.com/google/gopacket"
 )
+
+type MessageBody interface {
+	MarshalBinary() (data []byte, err error)
+}
+
+var _ MessageBody = (*m.DiscoveryMessage)(nil)
+var _ MessageBody = (*m.RelayAdvertisementMessage)(nil)
+var _ MessageBody = (*m.MembershipQueryMessage)(nil)
+var _ MessageBody = (*m.MembershipUpdateMessage)(nil)
+var _ MessageBody = (*m.RequestMessage)(nil)
+
+type Message struct {
+	Version uint8
+	Type    m.MessageType
+	Body    MessageBody
+}
 
 func setupSocket(relay string) (*net.UDPConn, error) {
 	relayIP := relay
@@ -27,40 +44,102 @@ func setupSocket(relay string) (*net.UDPConn, error) {
 }
 
 func sendDiscovery(conn *net.UDPConn, nonce []byte) error {
-	discovery := m.DiscoveryMessage{
-		Header: m.Header{Version: m.Version, Type: m.RelayDiscoveryType},
-		Nonce:  [4]byte(nonce),
+	fmt.Print("Sending AMT relay discovery")
+	fmt.Println()
+
+	m := Message{
+		Version: m.Version,
+		Type:    m.RelayDiscoveryType,
+		Body:    &m.DiscoveryMessage{Nonce: [4]byte(nonce)},
 	}
-	// data, err := discovery.Encode()
-	data, err := discovery.Header.MarshalBinary()
+
+	data, err := m.Body.MarshalBinary()
+
 	if err != nil {
 		fmt.Println(err.Error())
 	}
 	_, err = conn.Write(data)
+
 	return err
 }
 
-func sendAdvertisement(conn *net.UDPConn, query *m.MembershipQueryMessage, relayIP string) error {
-	relayAdvertisement := m.RelayAdvertisementMessage{
-		Header:    m.Header{Version: m.Version, Type: m.RelayAdvertisementType},
-		Nonce:     query.Nonce,
-		RelayAddr: net.ParseIP(relayIP),
+func sendRequest(conn *net.UDPConn, nonce []byte, relayIP string) error {
+	fmt.Print("Sending AMT relay advertisement")
+	fmt.Println()
+
+	m := Message{
+		Version: m.Version,
+		Type:    m.RequestType,
+		Body:    &m.RequestMessage{Nonce: [4]byte(nonce), Reserved: uint16(0)},
 	}
-	data, err := relayAdvertisement.MarshalBinary()
+
+	data, err := m.Body.MarshalBinary()
 	if err != nil {
 		fmt.Println(err.Error())
 	}
+
 	_, err = conn.Write(data)
+
 	return err
 }
 
-func sendMembershipUpdate(conn *net.UDPConn, query *m.MembershipQueryMessage) {
-	update := m.MembershipUpdateMessage{
-		Header:      m.Header{Version: m.Version, Type: m.MembershipUpdateType},
-		ResponseMAC: query.ResponseMAC,
-		Nonce:       query.Nonce,
+func sendMembershipQuery(conn *net.UDPConn, nonce []byte, response m.RelayAdvertisementMessage) {
+
+	localAddr := conn.LocalAddr().String()
+
+	m := Message{
+		Version: m.Version,
+		Type:    m.RelayAdvertisementType,
+		Body: &m.MembershipQueryMessage{
+			LimitedMembership: true,
+			HasGatewayAddress: true,
+			ResponseMAC:       net.HardwareAddr("0"),
+
+			Nonce:       response.Nonce,
+			GatewayAddr: net.ParseIP(localAddr)},
 	}
-	data, err := update.Encode()
+
+	data, _ := m.Body.MarshalBinary()
+	conn.Write(data)
+}
+
+func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.MembershipQueryMessage, mult, sou string) {
+	// multicast := net.ParseIP(mult).To4()
+	// source := net.ParseIP(sou).To4()
+
+	// groupRecord := m.IGMPv3GroupRecord{
+	// 	RecordType: 4, // Change this based on the type of record you need (e.g., 1 for Mode Is Include)
+	// 	AuxDataLen: 0,
+	// 	NumSources: 1,
+	// 	Multicast:  [4]byte{multicast[0], multicast[1], multicast[2], multicast[3]},
+	// 	Sources:    [][4]byte{{source[0], source[1], source[2], source[3]}},
+	// }
+
+	// membershipReport := m.IGMPv3MembershipReport{
+	// 	Type:            m.IGMPv3TypeMembershipReport,
+	// 	Reserved1:       0,
+	// 	Checksum:        0,
+	// 	Reserved2:       0,
+	// 	NumGroupRecords: 1,
+	// 	GroupRecords:    []m.IGMPv3GroupRecord{groupRecord},
+	// }
+
+	// encapsulated, err := membershipReport.MarshalBinary()
+	encapsulated := createIGMPv3MembershipReport(mult, sou)
+
+	fmt.Println("membership query:")
+	fmt.Println(membershipQuery.EncapsulatedQuery)
+	m := Message{
+		Version: m.Version,
+		Type:    m.MembershipUpdateType,
+		Body: &m.MembershipUpdateMessage{
+			ResponseMAC:  membershipQuery.ResponseMAC,
+			Nonce:        [4]byte(nonce),
+			Encapsulated: encapsulated,
+		},
+	}
+
+	data, err := m.Body.MarshalBinary()
 	if err != nil {
 		fmt.Println(err.Error())
 	}
@@ -71,28 +150,29 @@ func sendMembershipUpdate(conn *net.UDPConn, query *m.MembershipQueryMessage) {
 
 }
 
-func readRelayAdvertisement(conn *net.UDPConn, nonce []byte) error {
-	buffer := make([]byte, 1024)
+func readRelayAdvertisement(conn *net.UDPConn, nonce []byte, responseChan chan []byte) error {
+	buffer := make([]byte, 1500)
+	fmt.Println("Local Address:", conn.LocalAddr())
+	fmt.Println("Remote Address:", conn.RemoteAddr())
 
-	// n, err := conn.Read(buffer)
-	_, err := conn.Read(buffer)
-	fmt.Println("paso")
+	n, err := conn.Read(buffer)
 
 	if err != nil {
-		// return nil, err
+		fmt.Println("Error reading from connection:", err)
 		return err
-
 	}
-	// return DecodeRelayAdvertisement(buffer[:n])
-	aux := m.RelayAdvertisementMessage{}
-	return aux.UnmarshalBinary(buffer)
+
+	fmt.Printf("Read %d bytes from connection\n", n)
+
+	responseChan <- buffer[:n]
+
+	return nil
 }
 
 func receiveAndForwardData(conn *net.UDPConn, dataChannel chan []byte) {
-	fmt.Sprintln("en receiveAndForwardData")
 
 	buffer := make([]byte, 1024)
-	timeout := 10 * time.Second
+	timeout := 30 * time.Second
 	for {
 		conn.SetReadDeadline(time.Now().Add(timeout))
 		n, err := conn.Read(buffer)
@@ -103,7 +183,8 @@ func receiveAndForwardData(conn *net.UDPConn, dataChannel chan []byte) {
 			fmt.Println("Error reading from connection:", err)
 			break
 		}
-		fmt.Println("Received data:", buffer[:n])
+		// fmt.Println("Received data:", buffer[:n])
+		dataChannel <- buffer[:n]
 	}
 
 }
@@ -117,7 +198,7 @@ func sendTeardown(conn *net.UDPConn, nonce []byte) {
 	conn.Write(data)
 }
 
-func StartGateway(relay, source, group string, dataChannel chan []byte) {
+func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
 
 	conn, err := setupSocket(relay)
 	if err != nil {
@@ -129,33 +210,97 @@ func StartGateway(relay, source, group string, dataChannel chan []byte) {
 	nonce := make([]byte, 4)
 	rand.Read(nonce)
 
+	relayResponseChan := make(chan []byte)
+	go readRelayAdvertisement(conn, nonce, relayResponseChan)
+
 	err = sendDiscovery(conn, nonce)
 	if err != nil {
 		fmt.Println("Error sending discovery:", err)
 		return
 	}
 
-	query := &m.MembershipQueryMessage{} // Simulate receiving a query
-	err = sendAdvertisement(conn, query, relay)
-	if err != nil {
-		fmt.Println("Error sending advertisement:", err)
-		return
+	for response := range relayResponseChan {
+		relayAdvertisement := &m.RelayAdvertisementMessage{}
+		err = relayAdvertisement.UnmarshalBinary(response)
+		err = sendRequest(conn, nonce, relay)
+		if err != nil {
+			fmt.Println("Error sending advertisement:", err)
+			return
+		}
+
+		go receiveAndForwardData(conn, dataChannel)
+
+		break
+
 	}
 
-	// Placeholder for receiving a membership query and sending a membership update
-	// This part is simplified for demonstration purposes
-	fmt.Sprintln("Waiting for 2 seconds")
-	time.Sleep(2 * time.Second) // Simulate waiting for a query
-	// query := &m.MembershipQueryMessage{} // Simulate receiving a query
-	sendMembershipUpdate(conn, query)
+	for response := range dataChannel {
+		membershipQuery, err := m.DecodeMembershipQueryMessage(response)
+		if err != nil {
+			fmt.Print("Error in DecodeMembershipQueryMessage", err)
+		}
+		sendMembershipUpdate(conn, nonce, *membershipQuery, multicast, source)
 
-	go receiveAndForwardData(conn, dataChannel)
+		receiveAndForwardData(conn, dataChannel)
 
-	// Placeholder for teardown logic
-	// In a real application, you might wait for a signal or a specific condition before tearing down
-	fmt.Sprintln("Waiting for 10 seconds")
-	time.Sleep(10 * time.Second) // Simulate operation
-	sendTeardown(conn, nonce)
+		break
 
-	// os.Exit(1)
+	}
+
+}
+
+func createIGMPv3MembershipReport(multicast, source string) []byte {
+	// Define the IGMPv3 header
+	multicastBytes := ipToBytes(net.ParseIP(multicast))
+	sourceBytes := ipToBytes(net.ParseIP(source))
+	igmpv3Header := gopacket.Payload([]byte{
+		0x11, // Type (Membership Report)
+		0x00, // Reserved
+		0x00, // Checksum (we'll calculate this later)
+		0x01, // Number of Group Records
+	})
+
+	// Define the IGMPv3 Group Record
+	groupRecord := gopacket.Payload([]byte{
+		0x01,              // Record Type (Mode is Include)
+		0x00,              // Auxiliary Data Length
+		0x01,              // Number of Sources
+		multicastBytes[0], // Multicast Address
+		multicastBytes[1],
+		multicastBytes[2],
+		multicastBytes[3],
+		sourceBytes[0], // Source Address
+		sourceBytes[1],
+		sourceBytes[2],
+		sourceBytes[3],
+	})
+
+	// Combine IGMPv3 header and Group Record
+	igmpv3Packet := append(igmpv3Header, groupRecord...)
+
+	// Calculate checksum
+	checksum := calculateChecksum(igmpv3Packet)
+	igmpv3Packet[2] = byte(checksum >> 8)
+	igmpv3Packet[3] = byte(checksum & 0xFF)
+	return igmpv3Packet
+}
+
+func ipToBytes(ip net.IP) []byte {
+	if ip.To4() != nil {
+		return ip.To4()
+	}
+	return ip.To16() // For IPv6
+}
+
+func calculateChecksum(data []byte) uint16 {
+	var sum uint32
+	for i := 0; i < len(data)-1; i += 2 {
+		sum += uint32(data[i])<<8 | uint32(data[i+1])
+	}
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
+	}
+	sum = (sum >> 16) + (sum & 0xFFFF)
+	sum += (sum >> 16)
+	return ^uint16(sum)
 }

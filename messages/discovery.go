@@ -16,3 +16,13 @@ type DiscoveryMessage struct {
 	Header
 	Nonce [4]byte
 }
+
+func (d *DiscoveryMessage) MarshalBinary() (data []byte, err error) {
+
+	var b byte
+	b |= (0 << 4) // Shift Version to the first nibble
+	b |= byte(1)  // Set Type in the next nibble
+	ret := []byte{b, 0, 0, 0}
+
+	return append(ret, d.Nonce[:]...), nil
+}
