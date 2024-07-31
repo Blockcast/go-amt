@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+"fmt"
 	"net"
 )
 
@@ -58,14 +59,18 @@ type IGMPv3MembershipReport struct {
 
 func (mum *MembershipUpdateMessage) MarshalBinary() (data []byte, err error) {
 
-	var b byte
-	b |= (0 << 4) // Shift Version to the first nibble
-	b |= byte(5)  // Set Type in the next nibble
-	ret := []byte{b, 0, 0, 0}
-	ret = append(ret, mum.ResponseMAC...)
-	ret = append(ret, mum.Nonce[:]...)
-	ret = append(ret, mum.Encapsulated[:]...)
-	return ret, nil
+	var myvar [2]byte
+
+	// Fill in the bit fields according to their sizes
+	myvar[0] = 0x05 // version + type
+	myvar[1] = 0x00 // rsvd1
+	result := append(myvar[:], mum.ResponseMAC[:]...)
+	result = append(result[:], mum.Nonce[:]...)
+	result = append(result[:], mum.Encapsulated[:]...)
+	
+	fmt.Println(" ------ Membership update message to send: ")
+	fmt.Printf("%x", result)
+	return result, nil
 }
 
 // MembershipUpdateMessage Encode and Decode
