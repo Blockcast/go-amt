@@ -51,7 +51,6 @@ type MembershipQueryMessage struct {
 	ResponseMAC       net.HardwareAddr
 	Nonce             [4]byte
 	// Encapsulated      []byte //IGMPv3 or MLDv2 packets are not directly represented
-	GatewayAddr net.IP
 
 	EncapsulatedQuery []byte
 	GatewayPortNumber uint16
@@ -79,14 +78,14 @@ func (mqm *MembershipQueryMessage) MarshalBinary() (data []byte, err error) {
 	ret = append(ret, mqm.Nonce[:]...)
 	ret = append(ret, mqm.EncapsulatedQuery[:]...)
 
-	switch len(mqm.GatewayAddr) {
+	switch len(mqm.GatewayIPAddress) {
 	case net.IPv4len:
-		ret = append(ret, mqm.GatewayAddr.To4()...)
+		ret = append(ret, mqm.GatewayIPAddress.To4()...)
 	case net.IPv6len:
-		ret = append(ret, mqm.GatewayAddr.To16()...)
+		ret = append(ret, mqm.GatewayIPAddress.To16()...)
 
 	default:
-		err = fmt.Errorf("invalid IP address length for RelayAdvertisementMessage: %d", len(mqm.GatewayAddr))
+		err = fmt.Errorf("invalid IP address length for RelayAdvertisementMessage: %d", len(mqm.GatewayIPAddress))
 	}
 
 	return ret, nil
@@ -164,8 +163,8 @@ func DecodeMembershipQueryMessage(data []byte) (*MembershipQueryMessage, error) 
 	// 	return nil, err
 	// }
 	// // Read Gateway IP Address
-	// mqm.GatewayAddr = make([]byte, buf.Len()) // Remaining bytes should be the IP
-	// if _, err := buf.Read(mqm.GatewayAddr); err != nil {
+	// mqm.GatewayIPAddress = make([]byte, buf.Len()) // Remaining bytes should be the IP
+	// if _, err := buf.Read(mqm.GatewayIPAddress); err != nil {
 	// 	return nil, err
 	// }
 
