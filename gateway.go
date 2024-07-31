@@ -133,8 +133,6 @@ func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.Mem
 
 	encapsulated = append(encapsulated, igmpv3...)
 
-	// fmt.Println("membership query:")
-	// fmt.Println(membershipQuery)
 	m := Message{
 		Version: m.Version,
 		Type:    m.MembershipUpdateType,
@@ -144,16 +142,6 @@ func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.Mem
 			Encapsulated: encapsulated,
 		},
 	}
-
-	// for _, b := range nonce {
-	// 	// Convert byte to binary string
-	// 	binaryStr := fmt.Sprintf("%08b", b)
-	// 	// Print each bit
-	// 	for i := 0; i < len(binaryStr); i++ {
-	// 		fmt.Print(string(binaryStr[i]), " ")
-	// 	}
-	// 	fmt.Print(" ") // Space between bytes
-	// }
 
 	data, err := m.Body.MarshalBinary()
 	if err != nil {
@@ -295,39 +283,6 @@ func createIPv4MembershipReport(multicast, source string) []byte {
 	// Get the serialized bytes
 	packetBytes := ipv4.Bytes()
 	return packetBytes
-	// // Define the IGMPv3 header
-	// multicastBytes := ipToBytes(net.ParseIP(multicast))
-	// sourceBytes := ipToBytes(net.ParseIP(source))
-	// igmpv3Header := gopacket.Payload([]byte{
-	// 	0x11, // Type (Membership Report)
-	// 	0x00, // Reserved
-	// 	0x00, // Checksum (we'll calculate this later)
-	// 	0x01, // Number of Group Records
-	// })
-
-	// // Define the IGMPv3 Group Record
-	// groupRecord := gopacket.Payload([]byte{
-	// 	0x01,              // Record Type (Mode is Include)
-	// 	0x00,              // Auxiliary Data Length
-	// 	0x01,              // Number of Sources
-	// 	multicastBytes[0], // Multicast Address
-	// 	multicastBytes[1],
-	// 	multicastBytes[2],
-	// 	multicastBytes[3],
-	// 	sourceBytes[0], // Source Address
-	// 	sourceBytes[1],
-	// 	sourceBytes[2],
-	// 	sourceBytes[3],
-	// })
-
-	// // Combine IGMPv3 header and Group Record
-	// igmpv3Packet := append(igmpv3Header, groupRecord...)
-
-	// // Calculate checksum
-	// checksum := calculateChecksum(igmpv3Packet)
-	// igmpv3Packet[2] = byte(checksum >> 8)
-	// igmpv3Packet[3] = byte(checksum & 0xFF)
-	// return igmpv3Packet
 }
 
 func ipToBytes(ip net.IP) []byte {
