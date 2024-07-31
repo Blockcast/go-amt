@@ -2,6 +2,7 @@ package amt
 
 import (
 	"crypto/rand"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"time"
@@ -295,6 +296,11 @@ func createIPv4MembershipReport(multicast, source string) []byte {
 	packetBytes = append(packetBytes, optionsarray)
 	packetBytes = append(packetBytes, optionsarray)
 	fmt.Println("packet bytes", packetBytes)
+
+	checksum := calculateChecksum(packetBytes)
+	fmt.Println("--- checksum", checksum)
+	binary.BigEndian.PutUint16(packetBytes[10:], checksum)
+
 	return packetBytes
 }
 
