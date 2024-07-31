@@ -32,7 +32,6 @@ import (
 	RFC7450 Figure 17: Membership Teardown Message Format
 */
 type MembershipTeardownMessage struct {
-	Header
 	ResponseMAC net.HardwareAddr
 	Nonce       [4]byte
 	GWPortNum   uint16
@@ -40,27 +39,16 @@ type MembershipTeardownMessage struct {
 }
 
 // MembershipTeardownMessage Encode and Decode
-func (mtm *MembershipTeardownMessage) Encode() ([]byte, error) {
-	buf := new(bytes.Buffer)
-	if err := binary.Write(buf, binary.BigEndian, mtm.Header.Version); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, mtm.Header.Type); err != nil {
-		return nil, err
-	}
-	if _, err := buf.Write(mtm.ResponseMAC); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, mtm.Nonce); err != nil {
-		return nil, err
-	}
-	if err := binary.Write(buf, binary.BigEndian, mtm.GWPortNum); err != nil {
-		return nil, err
-	}
-	if _, err := buf.Write(mtm.GWIPAddr.To16()); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+func (mtm *MembershipTeardownMessage) MarshalBinary() ([]byte, error) {
+	var b byte
+	b |= (0 << 4) // Shift Version to the first nibble
+	b |= byte(7)  // Set Type in the next nibble
+	ret := []byte{b, 0, 0, 0}
+	ret = append(ret, mtm.ResponseMAC...)
+	ret = append(ret, mtm.Nonce[:]...)
+	ret = append(ret, byte(mtm.GWPortNum))
+	ret = append(ret, mtm.GWIPAddr...)
+	return ret, nil
 }
 
 func DecodeMembershipTeardownMessage(data []byte) (*MembershipTeardownMessage, error) {
@@ -69,10 +57,10 @@ func DecodeMembershipTeardownMessage(data []byte) (*MembershipTeardownMessage, e
 	}
 	buf := bytes.NewReader(data)
 	mtm := &MembershipTeardownMessage{}
-	if err := binary.Read(buf, binary.BigEndian, &mtm.Header.Version); err != nil {
+	if err := binary.Read(buf, binary.BigEndian, 0); err != nil {
 		return nil, err
 	}
-	if err := binary.Read(buf, binary.BigEndian, &mtm.Header.Type); err != nil {
+	if err := binary.Read(buf, binary.BigEndian, 7); err != nil {
 		return nil, err
 	}
 	macBytes := make([]byte, 6)
