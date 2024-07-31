@@ -8,6 +8,7 @@ import (
 
 	m "github.com/blockcast/go-amt/messages"
 	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 )
 
 type MessageBody interface {
@@ -125,10 +126,15 @@ func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.Mem
 	// }
 
 	// encapsulated, err := membershipReport.MarshalBinary()
-	encapsulated := createIGMPv3MembershipReport(mult, sou)
+	encapsulated := createIPv4MembershipReport(mult, sou)
 
-	fmt.Println("membership query:")
-	fmt.Println(membershipQuery.EncapsulatedQuery)
+	igmpv3 := createIGMPv3Packet(mult, sou)
+	fmt.Println(igmpv3)
+
+	encapsulated = append(encapsulated, igmpv3...)
+
+	// fmt.Println("membership query:")
+	// fmt.Println(membershipQuery)
 	m := Message{
 		Version: m.Version,
 		Type:    m.MembershipUpdateType,
@@ -138,6 +144,16 @@ func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.Mem
 			Encapsulated: encapsulated,
 		},
 	}
+
+	// for _, b := range nonce {
+	// 	// Convert byte to binary string
+	// 	binaryStr := fmt.Sprintf("%08b", b)
+	// 	// Print each bit
+	// 	for i := 0; i < len(binaryStr); i++ {
+	// 		fmt.Print(string(binaryStr[i]), " ")
+	// 	}
+	// 	fmt.Print(" ") // Space between bytes
+	// }
 
 	data, err := m.Body.MarshalBinary()
 	if err != nil {
@@ -249,40 +265,69 @@ func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
 
 }
 
-func createIGMPv3MembershipReport(multicast, source string) []byte {
-	// Define the IGMPv3 header
-	multicastBytes := ipToBytes(net.ParseIP(multicast))
-	sourceBytes := ipToBytes(net.ParseIP(source))
-	igmpv3Header := gopacket.Payload([]byte{
-		0x11, // Type (Membership Report)
-		0x00, // Reserved
-		0x00, // Checksum (we'll calculate this later)
-		0x01, // Number of Group Records
-	})
+func createIPv4MembershipReport(multicast, source string) []byte {
+	srcIP := net.ParseIP(source)
+	dstIP := net.ParseIP(multicast)
+	// Create the IPv4 layer
+	ipv4 := gopacket.NewSerializeBuffer()
+	ipv4Layer := &layers.IPv4{
+		Version:    4,
+		IHL:        5,
+		TOS:        0,
+		Length:     20, // Header length only
+		Id:         0,
+		Flags:      0,
+		FragOffset: 0,
+		TTL:        64,                                               // Default TTL value
+		Protocol:   layers.IPProtocol(layers.IGMPMembershipReportV1), // TODO: see this
+		Checksum:   0,                                                // To be calculated
+		SrcIP:      srcIP,
+		DstIP:      dstIP,
+	}
 
-	// Define the IGMPv3 Group Record
-	groupRecord := gopacket.Payload([]byte{
-		0x01,              // Record Type (Mode is Include)
-		0x00,              // Auxiliary Data Length
-		0x01,              // Number of Sources
-		multicastBytes[0], // Multicast Address
-		multicastBytes[1],
-		multicastBytes[2],
-		multicastBytes[3],
-		sourceBytes[0], // Source Address
-		sourceBytes[1],
-		sourceBytes[2],
-		sourceBytes[3],
-	})
+	// Serialize IPv4 header
+	err := gopacket.SerializeLayers(ipv4, gopacket.SerializeOptions{}, ipv4Layer)
+	if err != nil {
+		fmt.Println("Error serializing IPv4 layer:", err)
+		return nil
+	}
 
-	// Combine IGMPv3 header and Group Record
-	igmpv3Packet := append(igmpv3Header, groupRecord...)
+	// Get the serialized bytes
+	packetBytes := ipv4.Bytes()
+	return packetBytes
+	// // Define the IGMPv3 header
+	// multicastBytes := ipToBytes(net.ParseIP(multicast))
+	// sourceBytes := ipToBytes(net.ParseIP(source))
+	// igmpv3Header := gopacket.Payload([]byte{
+	// 	0x11, // Type (Membership Report)
+	// 	0x00, // Reserved
+	// 	0x00, // Checksum (we'll calculate this later)
+	// 	0x01, // Number of Group Records
+	// })
 
-	// Calculate checksum
-	checksum := calculateChecksum(igmpv3Packet)
-	igmpv3Packet[2] = byte(checksum >> 8)
-	igmpv3Packet[3] = byte(checksum & 0xFF)
-	return igmpv3Packet
+	// // Define the IGMPv3 Group Record
+	// groupRecord := gopacket.Payload([]byte{
+	// 	0x01,              // Record Type (Mode is Include)
+	// 	0x00,              // Auxiliary Data Length
+	// 	0x01,              // Number of Sources
+	// 	multicastBytes[0], // Multicast Address
+	// 	multicastBytes[1],
+	// 	multicastBytes[2],
+	// 	multicastBytes[3],
+	// 	sourceBytes[0], // Source Address
+	// 	sourceBytes[1],
+	// 	sourceBytes[2],
+	// 	sourceBytes[3],
+	// })
+
+	// // Combine IGMPv3 header and Group Record
+	// igmpv3Packet := append(igmpv3Header, groupRecord...)
+
+	// // Calculate checksum
+	// checksum := calculateChecksum(igmpv3Packet)
+	// igmpv3Packet[2] = byte(checksum >> 8)
+	// igmpv3Packet[3] = byte(checksum & 0xFF)
+	// return igmpv3Packet
 }
 
 func ipToBytes(ip net.IP) []byte {
@@ -303,4 +348,37 @@ func calculateChecksum(data []byte) uint16 {
 	sum = (sum >> 16) + (sum & 0xFFFF)
 	sum += (sum >> 16)
 	return ^uint16(sum)
+}
+
+func createIGMPv3Packet(multicast, source string) []byte {
+	srcIP := net.ParseIP(source)
+	dstIP := net.ParseIP(multicast)
+	// igmpv3 := gopacket.NewSerializeBuffer()
+
+	// Create the IGMPv3 layer
+	igmpv3Layer := &layers.IGMP{
+		Type: layers.IGMPMembershipReportV3,
+		GroupRecords: []layers.IGMPv3GroupRecord{
+			{
+				Type:             layers.IGMPv3GroupRecordType(layers.IGMPMembershipReportV1),
+				AuxDataLen:       0,
+				MulticastAddress: dstIP,
+				SourceAddresses:  []net.IP{srcIP},
+			},
+		},
+	}
+
+	fmt.Println(igmpv3Layer)
+
+	// // Serialize IPv4 header
+	// err := gopacket.SerializeLayers(igmpv3, gopacket.SerializeOptions{}, igmpv3Layer)
+	// if err != nil {
+	// 	fmt.Println("Error serializing IPv4 layer:", err)
+	// 	return nil
+	// }
+
+	// Get the serialized bytes
+	packetBytes := igmpv3Layer.LayerPayload()
+	return packetBytes
+
 }
