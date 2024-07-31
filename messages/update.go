@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-"fmt"
 	"net"
 )
 
@@ -67,9 +66,7 @@ func (mum *MembershipUpdateMessage) MarshalBinary() (data []byte, err error) {
 	result := append(myvar[:], mum.ResponseMAC[:]...)
 	result = append(result[:], mum.Nonce[:]...)
 	result = append(result[:], mum.Encapsulated[:]...)
-	
-	fmt.Println(" ------ Membership update message to send: ")
-	fmt.Printf("%x", result)
+
 	return result, nil
 }
 

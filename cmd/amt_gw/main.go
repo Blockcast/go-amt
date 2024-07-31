@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"net"
 
 	"github.com/blockcast/go-amt"
 )
@@ -17,10 +16,6 @@ func main() {
 	multicast := "232.162.250.140" // group
 	source := "162.250.138.201"
 
-	fmt.Println(relay, "is", checkIPVersion(relay))
-	fmt.Println(multicast, "is", checkIPVersion(multicast))
-	fmt.Println(source, "is", checkIPVersion(source))
-
 	dataChannel := make(chan []byte)
 	amt.StartGateway(relay, source, multicast, dataChannel)
 
@@ -28,18 +23,4 @@ func main() {
 		fmt.Println("Received data:", data)
 	}
 
-}
-
-func checkIPVersion(ipStr string) string {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return "an invalid IP"
-	}
-	if ip.To4() != nil {
-		return "an IPv4 address"
-	}
-	if ip.To16() != nil {
-		return "an IPv6 address"
-	}
-	return "an unknown IP"
 }

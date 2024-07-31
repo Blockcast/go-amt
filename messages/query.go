@@ -150,7 +150,6 @@ func DecodeMembershipQueryMessage(data []byte) (*MembershipQueryMessage, error) 
 	if err := binary.Read(buf, binary.BigEndian, &mqm.Nonce); err != nil {
 		return nil, err
 	}
-	fmt.Println(mqm.Nonce)
 
 	encapsulatedLength := buf.Len() // - 8 // 8 bytes for Gateway Port and IP
 	if encapsulatedLength > 0 {
@@ -159,9 +158,6 @@ func DecodeMembershipQueryMessage(data []byte) (*MembershipQueryMessage, error) 
 			return nil, err
 		}
 	}
-
-	fmt.Println("encapsulated query")
-	fmt.Println(mqm.EncapsulatedQuery)
 
 	// // Read Gateway Port Number
 	// if err := binary.Read(buf, binary.BigEndian, &mqm.GatewayPortNumber); err != nil {

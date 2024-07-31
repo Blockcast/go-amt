@@ -46,7 +46,7 @@ func setupSocket(relay string) (*net.UDPConn, error) {
 }
 
 func sendDiscovery(conn *net.UDPConn, nonce []byte) error {
-	fmt.Print("Sending AMT relay discovery")
+	fmt.Print("Sending AMT Relay Discovery")
 	fmt.Println()
 
 	m := Message{
@@ -66,8 +66,7 @@ func sendDiscovery(conn *net.UDPConn, nonce []byte) error {
 }
 
 func sendRequest(conn *net.UDPConn, nonce []byte, relayIP string) error {
-	fmt.Print("Sending AMT relay advertisement")
-	fmt.Println()
+	fmt.Println("Sending AMT Request")
 
 	m := Message{
 		Version: m.Version,
@@ -106,6 +105,7 @@ func sendMembershipQuery(conn *net.UDPConn, nonce []byte, response m.RelayAdvert
 }
 
 func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.MembershipQueryMessage, mult, sou string) {
+	fmt.Println("Sending AMT Membership Update")
 	multicast := net.ParseIP(mult).To4()
 	source := net.ParseIP(sou).To4()
 
@@ -126,17 +126,11 @@ func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.Mem
 		GroupRecords:    []m.IGMPv3GroupRecord{groupRecord},
 	}
 
-	// encapsulated, err := membershipReport.MarshalBinary()
 	encapsulated := createIPv4MembershipReport(mult, sou)
 
 	membershipReportBinary, err := membershipReport.MarshalBinary()
-	fmt.Println("----membershipReportBinary", membershipReportBinary)
-
-	// groupRecordBinary, err := groupRecord.MarshalBinary()
-	// fmt.Println("----groupRecordBinary", groupRecordBinary)
 
 	encapsulated = append(encapsulated, membershipReportBinary...)
-	//encapsulated = append(encapsulated, groupRecordBinary...)
 
 	m := Message{
 		Version: m.Version,
@@ -161,8 +155,6 @@ func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.Mem
 
 func readRelayAdvertisement(conn *net.UDPConn, nonce []byte, responseChan chan []byte) error {
 	buffer := make([]byte, 1500)
-	fmt.Println("Local Address:", conn.LocalAddr())
-	fmt.Println("Remote Address:", conn.RemoteAddr())
 
 	n, err := conn.Read(buffer)
 
@@ -171,7 +163,7 @@ func readRelayAdvertisement(conn *net.UDPConn, nonce []byte, responseChan chan [
 		return err
 	}
 
-	fmt.Printf("Read %d bytes from connection\n", n)
+	// fmt.Printf("Read %d bytes from connection\n", n)
 
 	responseChan <- buffer[:n]
 
@@ -193,6 +185,7 @@ func receiveAndForwardData(conn *net.UDPConn, dataChannel chan []byte) {
 			break
 		}
 		// fmt.Println("Received data:", buffer[:n])
+		fmt.Println("Receiving data..")
 		dataChannel <- buffer[:n]
 	}
 
@@ -229,6 +222,7 @@ func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
 	}
 
 	for response := range relayResponseChan {
+		fmt.Println("Received AMT Relay Advertisement")
 		relayAdvertisement := &m.RelayAdvertisementMessage{}
 		err = relayAdvertisement.UnmarshalBinary(response)
 		err = sendRequest(conn, nonce, relay)
@@ -244,6 +238,7 @@ func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
 	}
 
 	for response := range dataChannel {
+		fmt.Println("Received AMT Membership Query")
 		membershipQuery, err := m.DecodeMembershipQueryMessage(response)
 		if err != nil {
 			fmt.Print("Error in DecodeMembershipQueryMessage", err)
@@ -288,17 +283,14 @@ func createIPv4MembershipReport(multicast, source string) []byte {
 
 	// Get the serialized bytes
 	packetBytes := ipv4.Bytes()
-	fmt.Println("packet bytes", packetBytes)
 	var optionsarray byte
 
 	packetBytes = append(packetBytes, optionsarray)
 	packetBytes = append(packetBytes, optionsarray)
 	packetBytes = append(packetBytes, optionsarray)
 	packetBytes = append(packetBytes, optionsarray)
-	fmt.Println("packet bytes", packetBytes)
 
 	checksum := calculateChecksum(packetBytes)
-	fmt.Println("--- checksum", checksum)
 	binary.BigEndian.PutUint16(packetBytes[10:], checksum)
 
 	return packetBytes
@@ -321,9 +313,6 @@ func createIGMPv3Packet(multicast, source string) []byte {
 			},
 		},
 	}
-
-	fmt.Println()
-	fmt.Println("---- igmpv3Layer", igmpv3Layer)
 
 	// // Serialize IPv4 header
 	// err := gopacket.SerializeLayers(igmpv3, gopacket.SerializeOptions{}, igmpv3Layer)
