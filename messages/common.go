@@ -14,7 +14,7 @@ const (
 	RequestType
 	MembershipQueryType
 	MembershipUpdateType
-	DataType
+	MulticastDataType
 	TeardownType
 )
 
