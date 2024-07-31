@@ -47,14 +47,14 @@ func (rm *RequestMessage) MarshalBinary() ([]byte, error) {
 
 	// Fill in the bit fields according to their sizes
 	myvar[0] = 0x03 // version + type
-	myvar[1] = 0x01 // rsvd1 + p_flag
+	myvar[1] = 0x00 // rsvd1 + p_flag
 	myvar[2] = 0x00 // rsvd2 (high byte)
 	myvar[3] = 0x00 // rsvd2 (low byte)
 
 	// Append the nonce (4 bytes)
-	nonce := []byte{0x12, 0x34, 0x56, 0x78} // Example nonce value
+	//nonce := []byte{0x12, 0x34, 0x56, 0x78} // Example nonce value
 	// Combine bit fields and nonce
-	result := append(myvar[:], nonce...)
+	result := append(myvar[:], rm.Nonce[:]...)
 
 	return result, nil
 	// var b byte
