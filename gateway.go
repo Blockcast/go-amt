@@ -158,9 +158,9 @@ func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.Mem
 
 }
 
-func readRelayAdvertisement(conn *net.UDPConn, responseChan chan AMTresponse) error {
+func readRelayAdvertisement(conn *net.UDPConn, amtResponseChan chan AMTresponse) error {
 
-	// defer close(responseChan)
+	// defer close(amtResponseChan)
 	buffer := make([]byte, 1500)
 
 	for {
@@ -172,9 +172,9 @@ func readRelayAdvertisement(conn *net.UDPConn, responseChan chan AMTresponse) er
 		}
 		amtMessageType := determineAMTmessageType(buffer[:])
 		amtResponse := AMTresponse{amtMessageType, buffer[:n]}
-		responseChan <- amtResponse
+		amtResponseChan <- amtResponse
 
-		// responseChan <- buffer[:n]
+		// amtResponseChan <- buffer[:n]
 
 	}
 }
@@ -201,8 +201,13 @@ func receiveAndForwardData(conn *net.UDPConn, dataChannel chan []byte) {
 
 }
 
-func sendTeardown(conn *net.UDPConn, membershipQuery m.MembershipQueryMessage) {
+func sendTeardown(conn *net.UDPConn, membershipQuery m.MembershipQueryMessage, multicast string) {
 	fmt.Println("Sending AMT Teardown")
+	localPort := conn.LocalAddr().(*net.UDPAddr).Port
+	ip := net.ParseIP(multicast).To4()
+
+	ipv6 := make([]byte, 16) // ip must be IPv6 or IPv4 prefixed with 96 bits set to zero (see [RFC4291])
+	copy(ipv6[12:], ip)
 
 	m := Message{
 		Version: m.Version,
@@ -210,8 +215,8 @@ func sendTeardown(conn *net.UDPConn, membershipQuery m.MembershipQueryMessage) {
 		Body: &m.MembershipTeardownMessage{
 			ResponseMAC: membershipQuery.ResponseMAC,
 			Nonce:       membershipQuery.Nonce,
-			GWPortNum:   membershipQuery.GatewayPortNumber,
-			GWIPAddr:    membershipQuery.GatewayIPAddress,
+			GWPortNum:   uint16(localPort),
+			GWIPAddr:    ipv6,
 		},
 	}
 
@@ -231,10 +236,8 @@ func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
 	nonce := make([]byte, 4)
 	rand.Read(nonce)
 
-	relayResponseChan := make(chan AMTresponse)
-	go readRelayAdvertisement(conn, relayResponseChan)
-
-	// go receiveAndForwardData(conn, dataChannel)
+	amtResponseChan := make(chan AMTresponse)
+	go readRelayAdvertisement(conn, amtResponseChan)
 
 	err = sendDiscovery(conn, nonce)
 	if err != nil {
@@ -242,9 +245,7 @@ func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
 		return
 	}
 
-	var membershipQuery *m.MembershipQueryMessage //TODO: see if necessary to be pointer
-
-	for response := range relayResponseChan {
+	for response := range amtResponseChan {
 		switch response.AMTmessageType {
 		case m.RelayAdvertisementType:
 			fmt.Println("Received AMT Relay Advertisement")
@@ -257,16 +258,17 @@ func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
 			}
 		case m.MembershipQueryType:
 			fmt.Println("Received AMT Membership Query")
-			membershipQuery, err = m.DecodeMembershipQueryMessage(response.Data)
+			membershipQuery, err := m.DecodeMembershipQueryMessage(response.Data)
 			fmt.Println("port", membershipQuery.GatewayPortNumber)
 			fmt.Println("ip", membershipQuery.GatewayIPAddress)
 
 			if err != nil {
 				fmt.Print("Error in DecodeMembershipQueryMessage", err)
 			}
-			// sendMembershipUpdate(conn, nonce, *membershipQuery, multicast, source)
+			sendMembershipUpdate(conn, nonce, *membershipQuery, multicast, source)
 
-			go timer(conn, membershipQuery)
+			// Simulate timeout
+			go timer(conn, membershipQuery, multicast)
 
 		case m.MulticastDataType:
 			fmt.Println("Receiving data..")
@@ -377,8 +379,8 @@ func determineAMTmessageType(data []byte) m.MessageType {
 	return m.MessageType(data[0])
 }
 
-func timer(conn *net.UDPConn, membershipQuery *m.MembershipQueryMessage) {
+func timer(conn *net.UDPConn, membershipQuery *m.MembershipQueryMessage, multicast string) {
 	time.Sleep(3 * time.Second)
-	sendTeardown(conn, *membershipQuery)
+	sendTeardown(conn, *membershipQuery, multicast)
 
 }

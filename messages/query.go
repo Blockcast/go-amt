@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
-	"fmt"
-	"net"
 )
 
 /*
@@ -48,13 +46,13 @@ type MembershipQueryMessage struct {
 	Rsvd1             uint8
 	LimitedMembership bool
 	HasGatewayAddress bool
-	ResponseMAC       net.HardwareAddr
+	ResponseMAC       []byte
 	Nonce             [4]byte
 	// Encapsulated      []byte //IGMPv3 or MLDv2 packets are not directly represented
 
 	EncapsulatedQuery []byte
 	GatewayPortNumber uint16
-	GatewayIPAddress  net.IP
+	GatewayIPAddress  []byte
 }
 
 func (mqm *MembershipQueryMessage) MarshalBinary() (data []byte, err error) {
@@ -73,23 +71,11 @@ func (mqm *MembershipQueryMessage) MarshalBinary() (data []byte, err error) {
 	}
 	ret = append(ret, flags)
 	ret = append(ret, mqm.ResponseMAC...)
-	// ret = append(ret, binary.BigEndian)
 
 	ret = append(ret, mqm.Nonce[:]...)
 	ret = append(ret, mqm.EncapsulatedQuery[:]...)
-
-	switch len(mqm.GatewayIPAddress) {
-	case net.IPv4len:
-		ret = append(ret, mqm.GatewayIPAddress.To4()...)
-	case net.IPv6len:
-		ret = append(ret, mqm.GatewayIPAddress.To16()...)
-
-	default:
-		err = fmt.Errorf("invalid IP address length for RelayAdvertisementMessage: %d", len(mqm.GatewayIPAddress))
-	}
-
+	ret = append(ret, mqm.GatewayIPAddress...)
 	return ret, nil
-
 }
 
 // MembershipQueryMessage Encode and Decode
@@ -127,12 +113,14 @@ func DecodeMembershipQueryMessage(data []byte) (*MembershipQueryMessage, error) 
 	}
 	buf := bytes.NewReader(data)
 	mqm := &MembershipQueryMessage{}
-	// if err := binary.Read(buf, binary.BigEndian, &mqm.Header.Version); err != nil {
-	// 	return nil, err
-	// }
-	// if err := binary.Read(buf, binary.BigEndian, &mqm.Header.Type); err != nil {
-	// 	return nil, err
-	// }
+	var aux1 []byte
+	if err := binary.Read(buf, binary.BigEndian, aux1); err != nil {
+		return nil, err
+	}
+	var aux2 []byte
+	if err := binary.Read(buf, binary.BigEndian, aux2); err != nil {
+		return nil, err
+	}
 	flags := uint16(0)
 	if err := binary.Read(buf, binary.BigEndian, &flags); err != nil {
 		return nil, err
@@ -144,11 +132,18 @@ func DecodeMembershipQueryMessage(data []byte) (*MembershipQueryMessage, error) 
 	if err := binary.Read(buf, binary.LittleEndian, &macBytes); err != nil {
 		return nil, err
 	}
-	mqm.ResponseMAC = net.HardwareAddr(macBytes)
+	// mqm.ResponseMAC = net.HardwareAddr(macBytes)
+	mqm.ResponseMAC = macBytes
 
-	if err := binary.Read(buf, binary.BigEndian, &mqm.Nonce); err != nil {
+	// if err := binary.Read(buf, binary.BigEndian, &mqm.Nonce); err != nil {
+	// 	return nil, err
+	// }
+
+	nonce := make([]byte, 4)
+	if err := binary.Read(buf, binary.LittleEndian, &nonce); err != nil {
 		return nil, err
 	}
+	mqm.Nonce = [4]byte(nonce)
 
 	// Read Gateway Port Number
 	if err := binary.Read(buf, binary.BigEndian, &mqm.GatewayPortNumber); err != nil {
