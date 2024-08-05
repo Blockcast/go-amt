@@ -14,7 +14,6 @@ func main() {
 	dataChannel := make(chan []byte)
 	amt.StartGateway(relay, source, multicast, dataChannel)
 	for data := range dataChannel {
-		fmt.Println("!!!!!")
 		fmt.Println("Received data:", data)
 	}
 }

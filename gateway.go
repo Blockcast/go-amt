@@ -52,8 +52,7 @@ func setupSocket(relay string) (*net.UDPConn, error) {
 }
 
 func sendDiscovery(conn *net.UDPConn, nonce []byte) error {
-	fmt.Print("Sending AMT Relay Discovery")
-	fmt.Println()
+	fmt.Println("Sending AMT Relay Discovery")
 
 	m := Message{
 		Version: m.Version,
@@ -237,7 +236,12 @@ func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
 	rand.Read(nonce)
 
 	amtResponseChan := make(chan AMTresponse)
-	go readRelayAdvertisement(conn, amtResponseChan)
+	go func() {
+		err := readRelayAdvertisement(conn, amtResponseChan)
+		if err != nil {
+			fmt.Println("Error reading advertisement:", err)
+		}
+	}()
 
 	err = sendDiscovery(conn, nonce)
 	if err != nil {
@@ -259,12 +263,13 @@ func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
 		case m.MembershipQueryType:
 			fmt.Println("Received AMT Membership Query")
 			membershipQuery, err := m.DecodeMembershipQueryMessage(response.Data)
+			if err != nil {
+				fmt.Print("Error in DecodeMembershipQueryMessage", err)
+				return
+			}
 			fmt.Println("port", membershipQuery.GatewayPortNumber)
 			fmt.Println("ip", membershipQuery.GatewayIPAddress)
 
-			if err != nil {
-				fmt.Print("Error in DecodeMembershipQueryMessage", err)
-			}
 			sendMembershipUpdate(conn, nonce, *membershipQuery, multicast, source)
 
 			// Simulate timeout
