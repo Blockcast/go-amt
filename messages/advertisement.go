@@ -24,53 +24,64 @@ import (
 	RFC7450 Figure 12: Relay Advertisement Message Format
 */
 type RelayAdvertisementMessage struct {
-	Header
+	// Header
 	Nonce     [4]byte
 	RelayAddr net.IP
 }
 
 func (ram *RelayAdvertisementMessage) MarshalBinary() (data []byte, err error) {
 	buf := new(bytes.Buffer)
-	if ram.Type != RelayAdvertisementType {
-		return nil, fmt.Errorf("invalid message type for RelayAdvertisementMessage: %d", ram.Type)
-	}
+	// fmt.Print(ram.Type)
+	// if ram.Type != RelayAdvertisementType {
+	// 	return nil, fmt.Errorf("invalid message type for RelayAdvertisementMessage: %d", ram.Type)
+	// }
 
-	hdr, err := ram.Header.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	if _, err = buf.Write(hdr); err != nil {
-		return nil, err
-	}
+	// hdr, err := ram.Header.MarshalBinary()
+	// if err != nil {
+	// 	return nil, err
+	// }
+	// if _, err = buf.Write(hdr); err != nil {
+	// 	return nil, err
+	// }
 
-	// Skip reserved 3 bytes
-	if _, err = buf.Write(advReserved[:]); err != nil {
-		return nil, err
-	}
+	var b byte
+	b |= (0 << 4) // Shift Version to the first nibble
+	b |= byte(2)  // Set Type in the next nibble
+	ret := []byte{b, 0, 0, 0}
+	ret = append(ret, ram.Nonce[:]...)
+
+	// // Skip reserved 3 bytes
+	// if _, err = buf.Write(advReserved[:]); err != nil {
+	// 	return nil, err
+	// }
 
 	if err = binary.Write(buf, binary.BigEndian, ram.Nonce); err != nil {
 		return nil, err
 	}
-
 	switch len(ram.RelayAddr) {
 	case net.IPv4len:
-		_, err = buf.Write(ram.RelayAddr.To4())
+		// _, err = buf.Write(ram.RelayAddr.To4())
+		ret = append(ret, ram.RelayAddr.To4()...)
 	case net.IPv6len:
-		_, err = buf.Write(ram.RelayAddr.To16())
+		// _, err = buf.Write(ram.RelayAddr.To16())
+		ret = append(ret, ram.RelayAddr.To16()...)
+
 	default:
 		err = fmt.Errorf("invalid IP address length for RelayAdvertisementMessage: %d", len(ram.RelayAddr))
 	}
 
-	return buf.Bytes(), err
+	// return buf.Bytes(), err
+	return ret, nil
+
 }
 
 func (ram *RelayAdvertisementMessage) UnmarshalBinary(data []byte) error {
 	if len(data) < 8 { // Header (1 bytes) + Reserved (3 bytes) + Nonce (4 bytes)
 		return fmt.Errorf("data too short for RelayAdvertisementMessage: %d", len(data))
 	}
-	if err := ram.Header.UnmarshalBinary(data); err != nil {
-		return err
-	}
+	// if err := ram.Header.UnmarshalBinary(data); err != nil {
+	// 	return err
+	// }
 
 	if data[1] != 0 || data[2] != 0 || data[3] != 0 {
 		return fmt.Errorf("invalid reserved bytes for RelayAdvertisementMessage: %v", data[1:4])

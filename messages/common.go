@@ -14,7 +14,7 @@ const (
 	RequestType
 	MembershipQueryType
 	MembershipUpdateType
-	DataType
+	MulticastDataType
 	TeardownType
 )
 
@@ -25,8 +25,9 @@ const DefaultPort = 2268
 const Version = 0
 
 type Header struct {
-	Version uint8
-	Type    MessageType
+	Version  uint8
+	Type     MessageType
+	Reserved [3]byte
 }
 
 // EncodeHeader encodes the Header into a single byte.
@@ -42,7 +43,7 @@ func (h *Header) MarshalBinary() (data []byte, err error) {
 	var b byte
 	b |= (h.Version << 4) // Shift Version to the first nibble
 	b |= byte(h.Type)     // Set Type in the next nibble
-	return []byte{b}, nil
+	return []byte{b, 0, 0, 0}, nil
 }
 
 // DecodeHeader decodes a single byte into a Header.

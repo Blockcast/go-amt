@@ -2,17 +2,17 @@ package main
 
 import (
 	"fmt"
+
 	"github.com/blockcast/go-amt"
 )
 
 func main() {
 	relay := "162.250.137.254"
-	source := "83.97.94.146"
-	group := "232.1.2.3"
+	multicast := "232.162.250.140"
+	source := "162.250.138.201"
+
 	dataChannel := make(chan []byte)
-
-	go amt.StartGateway(relay, source, group, dataChannel)
-
+	amt.StartGateway(relay, source, multicast, dataChannel)
 	for data := range dataChannel {
 		fmt.Println("Received data:", data)
 	}
