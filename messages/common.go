@@ -65,3 +65,25 @@ func (header *Header) UnmarshalBinary(b []byte) error {
 
 	return nil
 }
+
+type MessageBody interface {
+	MarshalBinary() (data []byte, err error)
+}
+
+type Message struct {
+	Version uint8
+	Type    MessageType
+	Body    MessageBody
+}
+
+type AMTresponse struct {
+	AMTmessageType MessageType
+	Data           []byte
+}
+
+var _ MessageBody = (*DiscoveryMessage)(nil)
+var _ MessageBody = (*RelayAdvertisementMessage)(nil)
+var _ MessageBody = (*MembershipQueryMessage)(nil)
+var _ MessageBody = (*MembershipUpdateMessage)(nil)
+var _ MessageBody = (*RequestMessage)(nil)
+var _ MessageBody = (*MembershipTeardownMessage)(nil)

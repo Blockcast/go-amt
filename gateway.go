@@ -4,292 +4,315 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"net"
-	"time"
-
 	m "github.com/blockcast/go-amt/messages"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"golang.org/x/net/ipv4"
+	"net"
+	"os"
+	"syscall"
 )
 
-type MessageBody interface {
-	MarshalBinary() (data []byte, err error)
+type Gateway struct {
+	conn       *ipv4.PacketConn
+	nonce      []byte
+	RelayAddr  net.Addr
+	cm         *ipv4.ControlMessage
+	leave      bool
+	SourceAddr net.IP
+	GroupAddr  net.IP
+	MTU        int
 }
 
-var _ MessageBody = (*m.DiscoveryMessage)(nil)
-var _ MessageBody = (*m.RelayAdvertisementMessage)(nil)
-var _ MessageBody = (*m.MembershipQueryMessage)(nil)
-var _ MessageBody = (*m.MembershipUpdateMessage)(nil)
-var _ MessageBody = (*m.RequestMessage)(nil)
-var _ MessageBody = (*m.MembershipTeardownMessage)(nil)
-
-type Message struct {
-	Version uint8
-	Type    m.MessageType
-	Body    MessageBody
-}
-
-type AMTresponse struct {
-	AMTmessageType m.MessageType
-	Data           []byte
-}
-
-func setupSocket(relay string) (*net.UDPConn, error) {
-	relayIP := relay
-	relayPort := m.DefaultPort
-
-	relayAddr := &net.UDPAddr{
-		IP:   net.ParseIP(relayIP),
-		Port: relayPort,
+func (g *Gateway) setupSocket() (*ipv4.PacketConn, error) {
+	if len(g.SourceAddr) == 0 {
+		g.SourceAddr = net.IPv4zero
 	}
-
-	conn, err := net.DialUDP("udp", nil, relayAddr)
+	// Create socket
+	sock, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
 	if err != nil {
-		fmt.Println("Error connecting to relay:", err)
-		return nil, nil
+		return nil, fmt.Errorf("could not get socket: %w", err)
 	}
-	return conn, nil
+
+	if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_TIMESTAMP, 1); err != nil {
+		return nil, fmt.Errorf("could not set socket timestamp: %w", err)
+	}
+
+	// Turn the socket file descriptor into an *os.File
+	file := os.NewFile(uintptr(sock), "")
+
+	// Turn it into a net.PacketConn
+	conn, err := net.FilePacketConn(file)
+	if err != nil {
+		return nil, err
+	}
+
+	// We no longer need the file
+	if err = file.Close(); err != nil {
+		return nil, err
+	}
+
+	return ipv4.NewPacketConn(conn), nil
 }
 
-func sendDiscovery(conn *net.UDPConn, nonce []byte) error {
-	fmt.Print("Sending AMT Relay Discovery")
-	fmt.Println()
-
-	m := Message{
+func (g *Gateway) sendDiscovery() error {
+	msg := m.Message{
 		Version: m.Version,
 		Type:    m.RelayDiscoveryType,
-		Body:    &m.DiscoveryMessage{Nonce: [4]byte(nonce)},
+		Body:    &m.DiscoveryMessage{Nonce: [4]byte(g.nonce)},
 	}
 
-	data, err := m.Body.MarshalBinary()
-
+	data, err := msg.Body.MarshalBinary()
 	if err != nil {
-		fmt.Println(err.Error())
+		return err
 	}
-	_, err = conn.Write(data)
-
+	_, err = g.conn.WriteTo(data, g.cm, g.RelayAddr)
 	return err
 }
 
-func sendRequest(conn *net.UDPConn, nonce []byte, relayIP string) error {
-	fmt.Println("Sending AMT Request")
-
-	m := Message{
+func (g *Gateway) sendRequest() error {
+	msg := m.Message{
 		Version: m.Version,
 		Type:    m.RequestType,
-		Body:    &m.RequestMessage{Nonce: [4]byte(nonce), Reserved: uint16(0)},
+		Body:    &m.RequestMessage{Nonce: [4]byte(g.nonce), Reserved: uint16(0)},
 	}
 
-	data, err := m.Body.MarshalBinary()
+	data, err := msg.Body.MarshalBinary()
 	if err != nil {
-		fmt.Println(err.Error())
+		return err
 	}
 
-	_, err = conn.Write(data)
+	_, err = g.conn.WriteTo(data, g.cm, g.RelayAddr)
 	return err
 }
 
-func sendMembershipQuery(conn *net.UDPConn, nonce []byte, response m.RelayAdvertisementMessage) {
-
-	localAddr := conn.LocalAddr().String()
-
-	m := Message{
-		Version: m.Version,
-		Type:    m.RelayAdvertisementType,
-		Body: &m.MembershipQueryMessage{
-			LimitedMembership: true,
-			HasGatewayAddress: true,
-			ResponseMAC:       net.HardwareAddr("0"),
-
-			Nonce:            response.Nonce,
-			GatewayIPAddress: net.ParseIP(localAddr)},
-	}
-
-	data, _ := m.Body.MarshalBinary()
-	conn.Write(data)
-}
-
-func sendMembershipUpdate(conn *net.UDPConn, nonce []byte, membershipQuery m.MembershipQueryMessage, mult, sou string) {
-	fmt.Println("Sending AMT Membership Update")
-	multicast := net.ParseIP(mult).To4()
-	source := net.ParseIP(sou).To4()
-
+func (g *Gateway) sendMembershipUpdate(membershipQuery m.MembershipQueryMessage) error {
+	multicast := g.GroupAddr.To4()
+	var encapsulated []byte
+	var err error
+	//if g.SourceAddr.IsUnspecified() {
+	//	membershipReport := m.IGMPv2Message{
+	//		Type:        m.IGMPv2TypeMembershipReport,
+	//		MaxRespTime: 10,
+	//		GroupAddr:   [4]byte{multicast[0], multicast[1], multicast[2], multicast[3]},
+	//	}
+	//	encapsulated, err = createIPv4MembershipReport(g.GroupAddr, g.SourceAddr, 32)
+	//	if err != nil {
+	//		return err
+	//	}
+	//	membershipReportBinary, err := membershipReport.MarshalBinary()
+	//	if err != nil {
+	//		return err
+	//	}
+	//
+	//	encapsulated = append(encapsulated, membershipReportBinary...)
+	//} else {
+	var length uint16 = 40
+	srcAddr := g.SourceAddr
 	groupRecord := m.IGMPv3GroupRecord{
-		RecordType: 1, // Change this based on the type of record you need (e.g., 1 for Mode Is Include)
+		RecordType: m.IGMPv3ModeIsExclude, // Change this based on the type of record you need (e.g., 1 for Mode Is Include)
 		AuxDataLen: 0,
-		NumSources: 1,
 		Multicast:  [4]byte{multicast[0], multicast[1], multicast[2], multicast[3]},
-		Sources:    [][4]byte{{source[0], source[1], source[2], source[3]}},
+	}
+	if !g.SourceAddr.IsUnspecified() {
+		source := srcAddr.To4()
+		groupRecord.Sources = [][4]byte{{source[0], source[1], source[2], source[3]}}
+		groupRecord.NumSources = 1
+		groupRecord.RecordType = m.IGMPv3ModeIsInclude
+		length += 4
 	}
 
 	membershipReport := m.IGMPv3MembershipReport{
 		Type:            m.IGMPv3TypeMembershipReport,
-		Reserved1:       0,
-		Checksum:        0,
-		Reserved2:       0,
 		NumGroupRecords: 1,
 		GroupRecords:    []m.IGMPv3GroupRecord{groupRecord},
 	}
 
-	encapsulated := createIPv4MembershipReport(mult, sou)
-
+	encapsulated, err = createIPv4MembershipReport(g.GroupAddr, srcAddr, length)
+	if err != nil {
+		return err
+	}
 	membershipReportBinary, err := membershipReport.MarshalBinary()
+	if err != nil {
+		return err
+	}
 
 	encapsulated = append(encapsulated, membershipReportBinary...)
+	//}
 
-	m := Message{
+	msg := m.Message{
 		Version: m.Version,
 		Type:    m.MembershipUpdateType,
 		Body: &m.MembershipUpdateMessage{
 			ResponseMAC:  membershipQuery.ResponseMAC,
-			Nonce:        [4]byte(nonce),
+			Nonce:        [4]byte(g.nonce),
 			Encapsulated: encapsulated,
 		},
 	}
 
-	data, err := m.Body.MarshalBinary()
+	data, err := msg.Body.MarshalBinary()
 	if err != nil {
-		fmt.Println(err.Error())
+		return err
 	}
-	_, err = conn.Write(data)
+	_, err = g.conn.WriteTo(data, g.cm, g.RelayAddr)
+	return err
+}
+
+func (g *Gateway) sendMembershipLeave(membershipQuery m.MembershipQueryMessage) error {
+	var encapsulated []byte
+	var err error
+	multicast := g.GroupAddr.To4()
+	srcAddr := g.SourceAddr
+
+	//	membershipReport := m.IGMPv2Message{
+	//		Type:        m.IGMPv2TypeLeaveGroup,
+	//		MaxRespTime: 10,
+	//		GroupAddr:   [4]byte{multicast[0], multicast[1], multicast[2], multicast[3]},
+	//	}
+	//	encapsulated, err = createIPv4MembershipReport(g.GroupAddr, g.SourceAddr, 32)
+	//	if err != nil {
+	//		return err
+	//	}
+	//	membershipReportBinary, err := membershipReport.MarshalBinary()
+	//	if err != nil {
+	//		return err
+	//	}
+	//
+	//	encapsulated = append(encapsulated, membershipReportBinary...)
+	//} else {
+	groupRecord := m.IGMPv3GroupRecord{
+		RecordType: m.IGMPv3ChangeToIncludeMode, // Change this based on the type of record you need (e.g., 1 for Mode Is Include)
+		AuxDataLen: 0,
+		NumSources: 0,
+		Multicast:  [4]byte{multicast[0], multicast[1], multicast[2], multicast[3]},
+		Sources:    [][4]byte{},
+	}
+
+	membershipReport := m.IGMPv3MembershipReport{
+		Type:            m.IGMPv3TypeMembershipReport,
+		NumGroupRecords: 1,
+		GroupRecords:    []m.IGMPv3GroupRecord{groupRecord},
+	}
+
+	encapsulated, err = createIPv4MembershipReport(g.GroupAddr, srcAddr, 40)
 	if err != nil {
-		fmt.Println(err.Error())
+		return err
+	}
+	membershipReportBinary, err := membershipReport.MarshalBinary()
+	if err != nil {
+		return err
 	}
 
-}
+	encapsulated = append(encapsulated, membershipReportBinary...)
+	//}
 
-func readRelayAdvertisement(conn *net.UDPConn, amtResponseChan chan AMTresponse) error {
-
-	// defer close(amtResponseChan)
-	buffer := make([]byte, 1500)
-
-	for {
-		n, err := conn.Read(buffer)
-
-		if err != nil {
-			fmt.Println("Error reading from connection:", err)
-			return err
-		}
-		amtMessageType := determineAMTmessageType(buffer[:])
-		amtResponse := AMTresponse{amtMessageType, buffer[:n]}
-		amtResponseChan <- amtResponse
-
-		// amtResponseChan <- buffer[:n]
-
-	}
-}
-
-func receiveAndForwardData(conn *net.UDPConn, dataChannel chan []byte) {
-
-	buffer := make([]byte, 1024)
-	timeout := 30 * time.Second
-	for {
-		conn.SetReadDeadline(time.Now().Add(timeout))
-		n, err := conn.Read(buffer)
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			fmt.Println("Read timeout, no data received")
-			break
-		} else if err != nil {
-			fmt.Println("Error reading from connection:", err)
-			break
-		}
-		// fmt.Println("Received data:", buffer[:n])
-		fmt.Println("Receiving data..")
-
-		dataChannel <- buffer[:n]
+	msg := m.Message{
+		Version: m.Version,
+		Type:    m.MembershipUpdateType,
+		Body: &m.MembershipUpdateMessage{
+			ResponseMAC:  membershipQuery.ResponseMAC,
+			Nonce:        [4]byte(g.nonce),
+			Encapsulated: encapsulated,
+		},
 	}
 
+	data, err := msg.Body.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	_, err = g.conn.WriteTo(data, g.cm, g.RelayAddr)
+	fmt.Println("Sent membership leave")
+	return err
 }
 
-func sendTeardown(conn *net.UDPConn, membershipQuery m.MembershipQueryMessage, multicast string) {
-	fmt.Println("Sending AMT Teardown")
-	localPort := conn.LocalAddr().(*net.UDPAddr).Port
-	ip := net.ParseIP(multicast).To4()
+func (g *Gateway) sendTeardown(membershipQuery m.MembershipQueryMessage) error {
+	var ipv6 = make([]byte, 16)
+	if membershipQuery.HasGatewayAddress {
+		copy(ipv6[12:], membershipQuery.GatewayIPAddress)
+	}
 
-	ipv6 := make([]byte, 16) // ip must be IPv6 or IPv4 prefixed with 96 bits set to zero (see [RFC4291])
-	copy(ipv6[12:], ip)
-
-	m := Message{
+	msg := m.Message{
 		Version: m.Version,
 		Type:    m.TeardownType,
 		Body: &m.MembershipTeardownMessage{
 			ResponseMAC: membershipQuery.ResponseMAC,
 			Nonce:       membershipQuery.Nonce,
-			GWPortNum:   uint16(localPort),
+			GWPortNum:   membershipQuery.GatewayPortNumber,
 			GWIPAddr:    ipv6,
 		},
 	}
 
-	data, _ := m.Body.MarshalBinary()
-	conn.Write(data)
+	data, _ := msg.Body.MarshalBinary()
+	_, err := g.conn.WriteTo(data, g.cm, g.RelayAddr)
+	fmt.Println("Sent teardown")
+	return err
 }
 
-func StartGateway(relay, source, multicast string, dataChannel chan []byte) {
-
-	conn, err := setupSocket(relay)
+func (g *Gateway) Open() (err error) {
+	g.cm = &ipv4.ControlMessage{}
+	g.conn, err = g.setupSocket()
 	if err != nil {
-		fmt.Println("Error setting up socket:", err)
-		return
+		return fmt.Errorf("Error setting up socket: %w", err)
 	}
-	defer conn.Close()
 
-	nonce := make([]byte, 4)
-	rand.Read(nonce)
-
-	amtResponseChan := make(chan AMTresponse)
-	go readRelayAdvertisement(conn, amtResponseChan)
-
-	err = sendDiscovery(conn, nonce)
+	g.nonce = make([]byte, 4)
+	_, err = rand.Read(g.nonce)
 	if err != nil {
-		fmt.Println("Error sending discovery:", err)
-		return
+		return err
 	}
 
-	for response := range amtResponseChan {
-		switch response.AMTmessageType {
-		case m.RelayAdvertisementType:
-			fmt.Println("Received AMT Relay Advertisement")
-			relayAdvertisement := &m.RelayAdvertisementMessage{}
-			err := relayAdvertisement.UnmarshalBinary(response.Data)
-			err = sendRequest(conn, nonce, relay)
-			if err != nil {
-				fmt.Println("Error sending advertisement:", err)
-				return
-			}
-		case m.MembershipQueryType:
-			fmt.Println("Received AMT Membership Query")
-			membershipQuery, err := m.DecodeMembershipQueryMessage(response.Data)
-			fmt.Println("port", membershipQuery.GatewayPortNumber)
-			fmt.Println("ip", membershipQuery.GatewayIPAddress)
+	err = g.sendDiscovery()
+	if err != nil {
+		return fmt.Errorf("Error sending discovery: %w", err)
+	}
+	buffer := make([]byte, g.MTU)
+	n, _, _, err := g.conn.ReadFrom(buffer)
+	if err != nil {
+		return fmt.Errorf("Error reading from connection: %w", err)
+	}
+	if amtMessageType := determineAMTmessageType(buffer[:]); amtMessageType != m.RelayAdvertisementType {
+		return fmt.Errorf("Expected relay advertisement after discovery")
+	}
+	data := buffer[:n]
 
-			if err != nil {
-				fmt.Print("Error in DecodeMembershipQueryMessage", err)
-			}
-			sendMembershipUpdate(conn, nonce, *membershipQuery, multicast, source)
-
-			// Simulate timeout
-			go timer(conn, membershipQuery, multicast)
-
-		case m.MulticastDataType:
-			fmt.Println("Receiving data..")
-		default:
-			fmt.Println("Unknown data type") // TODO: see how to handle
-			break
-		}
+	relayAdvertisement := &m.RelayAdvertisementMessage{}
+	err = relayAdvertisement.UnmarshalBinary(data)
+	if err != nil {
+		return fmt.Errorf("Failed to read advertisemnt: %w", err)
 	}
 
+	err = g.sendRequest()
+	if err != nil {
+		return fmt.Errorf("Error sending advertisement: %w", err)
+	}
+
+	n, _, _, err = g.conn.ReadFrom(buffer)
+	if err != nil {
+		return fmt.Errorf("Error reading from connection: %w", err)
+	}
+	if amtMessageType := determineAMTmessageType(buffer[:]); amtMessageType != m.MembershipQueryType {
+		return fmt.Errorf("Expected membership query after request")
+	}
+	data = buffer[:n]
+	membershipQuery, err := m.DecodeMembershipQueryMessage(data)
+	if err != nil {
+		return fmt.Errorf("Error in DecodeMembershipQueryMessage", err)
+	}
+	err = g.sendMembershipUpdate(*membershipQuery)
+	if err != nil {
+		return fmt.Errorf("Error in sendMembershipUpdate: %w", err)
+	}
+	return nil
 }
 
-func createIPv4MembershipReport(multicast, source string) []byte {
-	srcIP := net.ParseIP("0.0.0.0")
-	dstIP := net.ParseIP("224.0.0.22")
+func createIPv4MembershipReport(dstIP, srcIP net.IP, length uint16) ([]byte, error) {
 	// Create the IPv4 layer
-	ipv4 := gopacket.NewSerializeBuffer()
+	packet := gopacket.NewSerializeBuffer()
 	ipv4Layer := &layers.IPv4{
 		Version:    4,
 		IHL:        6,
 		TOS:        0xc0,
-		Length:     44, // Header length only
+		Length:     length, // Header length only
 		Id:         1,
 		Flags:      0,
 		FragOffset: 0,
@@ -302,14 +325,13 @@ func createIPv4MembershipReport(multicast, source string) []byte {
 	}
 
 	// Serialize IPv4 header
-	err := gopacket.SerializeLayers(ipv4, gopacket.SerializeOptions{}, ipv4Layer)
+	err := gopacket.SerializeLayers(packet, gopacket.SerializeOptions{}, ipv4Layer)
 	if err != nil {
-		fmt.Println("Error serializing IPv4 layer:", err)
-		return nil
+		return nil, fmt.Errorf("Error serializing IPv4 layer: %w", err)
 	}
 
 	// Get the serialized bytes
-	packetBytes := ipv4.Bytes()
+	packetBytes := packet.Bytes()
 	var optionsarray byte
 
 	packetBytes = append(packetBytes, optionsarray)
@@ -320,46 +342,7 @@ func createIPv4MembershipReport(multicast, source string) []byte {
 	checksum := calculateChecksum(packetBytes)
 	binary.BigEndian.PutUint16(packetBytes[10:], checksum)
 
-	return packetBytes
-}
-
-func createIGMPv3Packet(multicast, source string) []byte {
-	srcIP := net.ParseIP(source)
-	dstIP := net.ParseIP(multicast)
-	//igmpv3 := gopacket.NewSerializeBuffer()
-
-	// Create the IGMPv3 layer
-	igmpv3Layer := &layers.IGMP{
-		Type: layers.IGMPMembershipReportV3,
-		GroupRecords: []layers.IGMPv3GroupRecord{
-			{
-				Type:             layers.IGMPv3GroupRecordType(layers.IGMPMembershipReportV1),
-				AuxDataLen:       0,
-				MulticastAddress: dstIP,
-				SourceAddresses:  []net.IP{srcIP},
-			},
-		},
-	}
-
-	// // Serialize IPv4 header
-	// err := gopacket.SerializeLayers(igmpv3, gopacket.SerializeOptions{}, igmpv3Layer)
-	// if err != nil {
-	// 	fmt.Println("Error serializing IPv4 layer:", err)
-	// 	return nil
-	// }
-
-	// Get the serialized bytes
-	packetBytes := igmpv3Layer.LayerContents()
-	fmt.Println(packetBytes)
-	return packetBytes
-
-}
-
-func ipToBytes(ip net.IP) []byte {
-	if ip.To4() != nil {
-		return ip.To4()
-	}
-	return ip.To16() // For IPv6
+	return packetBytes, err
 }
 
 func calculateChecksum(data []byte) uint16 {
@@ -379,8 +362,43 @@ func determineAMTmessageType(data []byte) m.MessageType {
 	return m.MessageType(data[0])
 }
 
-func timer(conn *net.UDPConn, membershipQuery *m.MembershipQueryMessage, multicast string) {
-	time.Sleep(3 * time.Second)
-	sendTeardown(conn, *membershipQuery, multicast)
-
+func (g *Gateway) handleMembershipQuery(data []byte) error {
+	membershipQuery, err := m.DecodeMembershipQueryMessage(data)
+	if err != nil {
+		return fmt.Errorf("Error in DecodeMembershipQueryMessage: %w", err)
+	}
+	if g.leave {
+		err = g.sendTeardown(*membershipQuery)
+		if err != nil {
+			return fmt.Errorf("Error in sendTeardown: %w", err)
+		}
+		err = g.sendMembershipLeave(*membershipQuery)
+		if err != nil {
+			return fmt.Errorf("Error in sendMembershipUpdate: %w", err)
+		}
+		return g.conn.Close()
+	} else {
+		err = g.sendMembershipUpdate(*membershipQuery)
+		if err != nil {
+			return fmt.Errorf("Error in sendMembershipUpdate: %w", err)
+		}
+	}
+	return nil
+}
+func (g *Gateway) Close() error {
+	g.leave = true
+	if err := g.sendRequest(); err != nil {
+		return fmt.Errorf("failed to send request: %w", err)
+	}
+	buffer := make([]byte, g.MTU)
+	for {
+		n, _, _, err := g.conn.ReadFrom(buffer)
+		if err != nil {
+			return fmt.Errorf("Error reading from connection: %w", err)
+		}
+		amtMessageType := determineAMTmessageType(buffer[:])
+		if amtMessageType == m.MembershipQueryType {
+			return g.handleMembershipQuery(buffer[:n])
+		}
+	}
 }

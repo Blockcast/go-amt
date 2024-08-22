@@ -37,6 +37,18 @@ type MembershipUpdateMessage struct {
 
 const (
 	IGMPv3TypeMembershipReport = 0x22
+	IGMPv2TypeMembershipReport = 0x16
+	IGMPv2TypeLeaveGroup       = 0x17
+)
+
+const (
+	_ uint8 = iota
+	IGMPv3ModeIsInclude
+	IGMPv3ModeIsExclude
+	IGMPv3ChangeToIncludeMode
+	IGMPv3ChangeToExcludeMode
+	IGMPv3AllowNewSources
+	IGMPv3BlockOldSources
 )
 
 type IGMPv3GroupRecord struct {
@@ -47,6 +59,21 @@ type IGMPv3GroupRecord struct {
 	Sources    [][4]byte
 }
 
+/*
+	0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
+
++---------------------------------------------------------------
+|      Type     | Max Resp Time |           Checksum            |
++---------------------------------------------------------------
+|                         Group Address                         |
++---------------------------------------------------------------
+*/
+type IGMPv2Message struct {
+	Type        uint8
+	MaxRespTime uint8
+	Checksum    uint16
+	GroupAddr   [4]byte
+}
 type IGMPv3MembershipReport struct {
 	Type            uint8
 	Reserved1       uint8
@@ -111,6 +138,18 @@ func DecodeMembershipUpdateMessage(data []byte) (*MembershipUpdateMessage, error
 	}
 	// Note: Encapsulated IGMPv3 or MLDv2 packets are not directly represented
 	return mum, nil
+}
+
+func (report *IGMPv2Message) MarshalBinary() ([]byte, error) {
+	buffer := new(bytes.Buffer)
+	if err := binary.Write(buffer, binary.BigEndian, report); err != nil {
+		return nil, err
+	}
+	b := buffer.Bytes()
+	// Compute and set checksum
+	checksum := calculateChecksum(b)
+	binary.BigEndian.PutUint16(b[2:], checksum)
+	return b, nil
 }
 
 func (report *IGMPv3MembershipReport) MarshalBinary() ([]byte, error) {
