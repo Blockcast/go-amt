@@ -133,7 +133,6 @@ func (mc *MutlicastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			i++
 		case m.MembershipQueryType:
 			err = mc.amtGw.handleMembershipQuery(data)
-			fallthrough
 		default:
 			ms = append(ms[:i], ms[i+1:]...)
 			N--

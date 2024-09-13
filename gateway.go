@@ -11,17 +11,19 @@ import (
 	"net"
 	"os"
 	"syscall"
+	"time"
 )
 
 type Gateway struct {
-	conn       *ipv4.PacketConn
-	nonce      []byte
-	RelayAddr  net.Addr
-	cm         *ipv4.ControlMessage
-	leave      bool
-	SourceAddr net.IP
-	GroupAddr  net.IP
-	MTU        int
+	conn         *ipv4.PacketConn
+	nonce        []byte
+	RelayAddr    net.Addr
+	cm           *ipv4.ControlMessage
+	leave        bool
+	SourceAddr   net.IP
+	GroupAddr    net.IP
+	MTU          int
+	intervalTime time.Duration
 }
 
 func (g *Gateway) setupSocket() (*ipv4.PacketConn, error) {
@@ -221,7 +223,6 @@ func (g *Gateway) sendMembershipLeave(membershipQuery m.MembershipQueryMessage) 
 		return err
 	}
 	_, err = g.conn.WriteTo(data, g.cm, g.RelayAddr)
-	fmt.Println("Sent membership leave")
 	return err
 }
 
@@ -244,7 +245,6 @@ func (g *Gateway) sendTeardown(membershipQuery m.MembershipQueryMessage) error {
 
 	data, _ := msg.Body.MarshalBinary()
 	_, err := g.conn.WriteTo(data, g.cm, g.RelayAddr)
-	fmt.Println("Sent teardown")
 	return err
 }
 
@@ -254,7 +254,7 @@ func (g *Gateway) Open() (err error) {
 	if err != nil {
 		return fmt.Errorf("Error setting up socket: %w", err)
 	}
-
+	g.intervalTime = 125 * time.Second
 	g.nonce = make([]byte, 4)
 	_, err = rand.Read(g.nonce)
 	if err != nil {
@@ -294,14 +294,22 @@ func (g *Gateway) Open() (err error) {
 		return fmt.Errorf("Expected membership query after request")
 	}
 	data = buffer[:n]
-	membershipQuery, err := m.DecodeMembershipQueryMessage(data)
-	if err != nil {
-		return fmt.Errorf("Error in DecodeMembershipQueryMessage", err)
+	if err = g.handleMembershipQuery(data); err != nil {
+		return err
 	}
-	err = g.sendMembershipUpdate(*membershipQuery)
-	if err != nil {
-		return fmt.Errorf("Error in sendMembershipUpdate: %w", err)
-	}
+	go func() {
+		for {
+			if g.leave {
+				return
+			}
+			err = g.sendRequest()
+			if err != nil {
+				return
+			}
+			time.Sleep(time.Duration(float64(g.intervalTime) * 0.8))
+		}
+	}()
+
 	return nil
 }
 
@@ -366,6 +374,19 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 	membershipQuery, err := m.DecodeMembershipQueryMessage(data)
 	if err != nil {
 		return fmt.Errorf("Error in DecodeMembershipQueryMessage: %w", err)
+	}
+	if membershipQuery.EncapsulatedQuery[0]>>4 == 4 {
+		p := gopacket.NewPacket(membershipQuery.EncapsulatedQuery, layers.LayerTypeIPv4, gopacket.NoCopy)
+		igmp, ok := p.Layer(layers.LayerTypeIGMP).(*layers.IGMP)
+		if !ok {
+			return fmt.Errorf("Invalid IGMP")
+		}
+		switch igmp.Type {
+		case layers.IGMPMembershipQuery:
+			g.intervalTime = igmp.IntervalTime
+		default:
+			return fmt.Errorf("Unexpected IGMP Type %v", igmp)
+		}
 	}
 	if g.leave {
 		err = g.sendTeardown(*membershipQuery)

@@ -145,22 +145,23 @@ func DecodeMembershipQueryMessage(data []byte) (*MembershipQueryMessage, error) 
 	}
 	mqm.Nonce = [4]byte(nonce)
 
-	// Read Gateway Port Number
-	if err := binary.Read(buf, binary.BigEndian, &mqm.GatewayPortNumber); err != nil {
-		return nil, err
-	}
-	// Read Gateway IP Address
-	if mqm.HasGatewayAddress {
-		mqm.GatewayIPAddress = make([]byte, buf.Len()) // Remaining bytes should be the IP
-		if _, err := buf.Read(mqm.GatewayIPAddress); err != nil {
-			return nil, err
-		}
-	}
-
 	encapsulatedLength := buf.Len() // - 8 // 8 bytes for Gateway Port and IP
+	if mqm.HasGatewayAddress {
+		encapsulatedLength -= 18 // 16-bit gateway port and 128 bit ipv6 or compatible ipv4
+	}
 	if encapsulatedLength > 0 {
 		mqm.EncapsulatedQuery = make([]byte, encapsulatedLength)
 		if _, err := buf.Read(mqm.EncapsulatedQuery); err != nil {
+			return nil, err
+		}
+	}
+	// Read Gateway IP Address and port
+	if mqm.HasGatewayAddress {
+		if err := binary.Read(buf, binary.BigEndian, &mqm.GatewayPortNumber); err != nil {
+			return nil, err
+		}
+		mqm.GatewayIPAddress = make([]byte, buf.Len()) // Remaining bytes should be the IP
+		if _, err := buf.Read(mqm.GatewayIPAddress); err != nil {
 			return nil, err
 		}
 	}
