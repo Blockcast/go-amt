@@ -414,7 +414,7 @@ func (g *Gateway) Close() error {
 		return fmt.Errorf("failed to send request: %w", err)
 	}
 	buffer := make([]byte, g.MTU)
-	for {
+	for range 100 {
 		n, _, _, err := g.conn.ReadFrom(buffer)
 		if err != nil {
 			return fmt.Errorf("Error reading from connection: %w", err)
@@ -424,4 +424,5 @@ func (g *Gateway) Close() error {
 			return g.handleMembershipQuery(buffer[:n])
 		}
 	}
+	return g.conn.Close()
 }
