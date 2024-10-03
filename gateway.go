@@ -410,18 +410,32 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 }
 func (g *Gateway) Close() error {
 	g.leave = true
-	if err := g.sendRequest(); err != nil {
-		return fmt.Errorf("failed to send request: %w", err)
-	}
 	buffer := make([]byte, g.MTU)
-	for {
-		n, _, _, err := g.conn.ReadFrom(buffer)
-		if err != nil {
-			return fmt.Errorf("Error reading from connection: %w", err)
+	errc := make(chan error)
+	go func() {
+		defer close(errc)
+		for {
+			if err := g.sendRequest(); err != nil {
+				errc <- fmt.Errorf("failed to send request: %w", err)
+				return
+			}
+			n, _, _, err := g.conn.ReadFrom(buffer)
+			if err != nil {
+				errc <- fmt.Errorf("Error reading from connection: %w", err)
+				return
+			}
+			amtMessageType := determineAMTmessageType(buffer[:])
+			if amtMessageType == m.MembershipQueryType {
+				errc <- g.handleMembershipQuery(buffer[:n])
+				return
+			}
 		}
-		amtMessageType := determineAMTmessageType(buffer[:])
-		if amtMessageType == m.MembershipQueryType {
-			return g.handleMembershipQuery(buffer[:n])
-		}
+	}()
+	select {
+	case <-time.After(5 * time.Second):
+	case err := <-errc:
+		g.conn.Close()
+		return err
 	}
+	return g.conn.Close()
 }
