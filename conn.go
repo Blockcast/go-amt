@@ -32,18 +32,18 @@ func (mc *MutlicastConn) Open() error {
 	var prog []bpf.RawInstruction
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
-	srcAddr := &net.IPAddr{
-		IP:   mc.SrcAddr.AsSlice(),
-		Zone: mc.SrcAddr.Zone(),
-	}
 	conn, err := ListenMulticastUDP4("udp4", mc.IFace, dstAddr, prog, mc.Timestamp)
 	if _, ok := conn.(net.Conn); !ok || err != nil {
-		err = fmt.Errorf("failed to create conn %s on %s: %s, %w", addr.String(), mc.IFace.Name, conn, err)
+		return fmt.Errorf("failed to create conn %s on %s: %s, %w", addr.String(), mc.IFace.Name, conn, err)
 	}
 	mc.conn4 = ipv4.NewPacketConn(conn)
 	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
 	if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
 		flags4 |= ipv4.FlagSrc
+		srcAddr := &net.IPAddr{
+			IP:   mc.SrcAddr.AsSlice(),
+			Zone: mc.SrcAddr.Zone(),
+		}
 		if err := mc.conn4.JoinSourceSpecificGroup(mc.IFace, dstAddr, srcAddr); err != nil {
 			return fmt.Errorf("join ssg: %w", err)
 		}
@@ -82,10 +82,12 @@ func (mc *MutlicastConn) Open() error {
 				return err
 			}
 			mc.amtGw = &Gateway{
-				RelayAddr:  &mc.RelayAddr,
-				SourceAddr: srcAddr.IP,
-				GroupAddr:  dstAddr.IP,
-				MTU:        mc.IFace.MTU,
+				RelayAddr: &mc.RelayAddr,
+				GroupAddr: dstAddr.IP,
+				MTU:       mc.IFace.MTU,
+			}
+			if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
+				mc.amtGw.SourceAddr = mc.SrcAddr.AsSlice()
 			}
 			if err := mc.amtGw.Open(); err != nil {
 				return fmt.Errorf("Error setting up socket: %w", err)
@@ -120,19 +122,28 @@ func (mc *MutlicastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			p := gopacket.NewPacket(data[m.DataMsgHdrLen:], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)
 			udpHdr, ok := p.TransportLayer().(*layers.UDP)
-			if !ok || (mc.GroupPort > 0 && uint16(udpHdr.DstPort) != mc.GroupPort) {
+			if !ok || uint16(udpHdr.DstPort) != mc.GroupPort ||
+				!ipHdr.DstIP.Equal(mc.GroupAddr.AsSlice()) {
 				ms = append(ms[:i], ms[i+1:]...)
 				N--
 				break
 			}
-			srcIp := make([]byte, 4)
-			copy(srcIp, ipHdr.SrcIP)
-			ms[i].Addr = &net.UDPAddr{IP: srcIp, Port: int(udpHdr.DstPort)}
-			ms[i].N -= m.UDPHeaderLen
-			copy(ms[i].Buffers[0], ms[i].Buffers[0][m.UDPHeaderLen:])
+			stream := p.ApplicationLayer()
+			var srcAddr []byte
+			if n+4 < cap(ms[i].Buffers[0]) {
+				copy(ms[i].Buffers[0][n:n+4], ipHdr.SrcIP)
+				srcAddr = ms[i].Buffers[0][n : n+4]
+			} else {
+				srcAddr = make([]byte, 4)
+				copy(srcAddr, ipHdr.SrcIP)
+			}
+			ms[i].Addr = &net.UDPAddr{IP: srcAddr, Port: int(udpHdr.DstPort)}
+			ms[i].N = copy(ms[i].Buffers[0][:], stream.Payload())
 			i++
 		case m.MembershipQueryType:
 			err = mc.amtGw.handleMembershipQuery(data)
+			ms = append(ms[:i], ms[i+1:]...)
+			N--
 		default:
 			ms = append(ms[:i], ms[i+1:]...)
 			N--
@@ -151,30 +162,41 @@ func (mc *MutlicastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.ReadFrom(buf)
 	}
-	n, cm, src, err = mc.amtGw.conn.ReadFrom(buf)
-	if n == 0 || err != nil {
-		return
-	}
-	amtMessageType := determineAMTmessageType(buf[:])
-	data := buf[:n]
-	switch amtMessageType {
-	case m.MembershipQueryType:
-		err = mc.amtGw.handleMembershipQuery(data)
-	case m.MulticastDataType:
-		p := gopacket.NewPacket(data[m.DataMsgHdrLen:], layers.LayerTypeIPv4, gopacket.NoCopy)
-		ipHdr := p.NetworkLayer().(*layers.IPv4)
-		udpHdr, ok := p.TransportLayer().(*layers.UDP)
-		if !ok || (mc.GroupPort > 0 && uint16(udpHdr.DstPort) != mc.GroupPort) {
-			break
+	for {
+		n, cm, src, err = mc.amtGw.conn.ReadFrom(buf)
+		if n == 0 || err != nil {
+			return
 		}
-		srcIp := make([]byte, 4)
-		copy(srcIp, ipHdr.SrcIP)
-		src = &net.UDPAddr{IP: srcIp, Port: int(udpHdr.DstPort)}
-		n = copy(buf, data[m.UDPHeaderLen:])
-	default:
-		return 0, cm, nil, fmt.Errorf("unknown data type %d", n)
+		amtMessageType := determineAMTmessageType(buf[:])
+		data := buf[:n]
+		switch amtMessageType {
+		case m.MembershipQueryType:
+			err = mc.amtGw.handleMembershipQuery(data)
+			n = 0
+		case m.MulticastDataType:
+			p := gopacket.NewPacket(data[m.DataMsgHdrLen:], layers.LayerTypeIPv4, gopacket.NoCopy)
+			ipHdr := p.NetworkLayer().(*layers.IPv4)
+			udpHdr, ok := p.TransportLayer().(*layers.UDP)
+			if !ok || (mc.GroupPort > 0 && uint16(udpHdr.DstPort) != mc.GroupPort) ||
+				!ipHdr.DstIP.Equal(mc.GroupAddr.AsSlice()) {
+				break
+			}
+			stream := p.ApplicationLayer()
+			var srcAddr []byte
+			if n+4 < cap(data) {
+				copy(data[n:n+4], ipHdr.SrcIP)
+				srcAddr = data[n : n+4]
+			} else {
+				srcAddr = make([]byte, 4)
+				copy(srcAddr, ipHdr.SrcIP)
+			}
+			src = &net.UDPAddr{IP: srcAddr, Port: int(udpHdr.DstPort)}
+			n = copy(buf, stream.Payload())
+			return
+		default:
+			return 0, cm, nil, fmt.Errorf("unknown data type %d", n)
+		}
 	}
-	return
 }
 
 func (mc *MutlicastConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
@@ -190,10 +212,13 @@ func (mc *MutlicastConn) WriteToWithControlMessage(b []byte, cm *ipv4.ControlMes
 }
 
 func (mc *MutlicastConn) Close() error {
-	if !mc.IsUsingTunnel() {
+	if !mc.IsUsingTunnel() && mc.conn4 != nil {
 		return mc.conn4.Close()
 	}
-	return mc.amtGw.Close()
+	if mc.amtGw != nil {
+		return mc.amtGw.Close()
+	}
+	return nil
 }
 
 func (mc *MutlicastConn) LocalAddr() net.Addr {

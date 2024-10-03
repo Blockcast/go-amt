@@ -383,7 +383,9 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 		}
 		switch igmp.Type {
 		case layers.IGMPMembershipQuery:
-			g.intervalTime = igmp.IntervalTime
+			if igmp.IntervalTime > 0 {
+				g.intervalTime = igmp.IntervalTime
+			}
 		default:
 			return fmt.Errorf("Unexpected IGMP Type %v", igmp)
 		}
