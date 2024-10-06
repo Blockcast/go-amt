@@ -7,6 +7,7 @@ import (
 	m "github.com/blockcast/go-amt/messages"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"go.uber.org/atomic"
 	"golang.org/x/net/ipv4"
 	"net"
 	"os"
@@ -24,6 +25,8 @@ type Gateway struct {
 	GroupAddr    net.IP
 	MTU          int
 	intervalTime time.Duration
+	lastData     atomic.Time
+	loopErr      atomic.Error
 }
 
 func (g *Gateway) setupSocket() (*ipv4.PacketConn, error) {
@@ -254,47 +257,13 @@ func (g *Gateway) Open() (err error) {
 	if err != nil {
 		return fmt.Errorf("Error setting up socket: %w", err)
 	}
-	g.intervalTime = 125 * time.Second
+	g.intervalTime = time.Second * 10
 	g.nonce = make([]byte, 4)
-	_, err = rand.Read(g.nonce)
-	if err != nil {
+	g.lastData.Store(time.Now())
+	if _, err = rand.Read(g.nonce); err != nil {
 		return err
 	}
-
-	err = g.sendDiscovery()
-	if err != nil {
-		return fmt.Errorf("Error sending discovery: %w", err)
-	}
-	buffer := make([]byte, g.MTU)
-	n, _, _, err := g.conn.ReadFrom(buffer)
-	if err != nil {
-		return fmt.Errorf("Error reading from connection: %w", err)
-	}
-	if amtMessageType := determineAMTmessageType(buffer[:]); amtMessageType != m.RelayAdvertisementType {
-		return fmt.Errorf("Expected relay advertisement after discovery")
-	}
-	data := buffer[:n]
-
-	relayAdvertisement := &m.RelayAdvertisementMessage{}
-	err = relayAdvertisement.UnmarshalBinary(data)
-	if err != nil {
-		return fmt.Errorf("Failed to read advertisemnt: %w", err)
-	}
-
-	err = g.sendRequest()
-	if err != nil {
-		return fmt.Errorf("Error sending advertisement: %w", err)
-	}
-
-	n, _, _, err = g.conn.ReadFrom(buffer)
-	if err != nil {
-		return fmt.Errorf("Error reading from connection: %w", err)
-	}
-	if amtMessageType := determineAMTmessageType(buffer[:]); amtMessageType != m.MembershipQueryType {
-		return fmt.Errorf("Expected membership query after request")
-	}
-	data = buffer[:n]
-	if err = g.handleMembershipQuery(data); err != nil {
+	if err = g.sendDiscovery(); err != nil {
 		return err
 	}
 	go func() {
@@ -302,15 +271,34 @@ func (g *Gateway) Open() (err error) {
 			if g.leave {
 				return
 			}
-			err = g.sendRequest()
-			if err != nil {
-				return
+			if time.Since(g.lastData.Load()) > g.intervalTime {
+				err = g.sendDiscovery()
+			} else {
+				err = g.sendRequest()
 			}
-			time.Sleep(time.Duration(float64(g.intervalTime) * 0.8))
+			if err != nil {
+				g.loopErr.Store(err)
+			}
+			time.Sleep(g.intervalTime)
+
 		}
 	}()
-
-	return nil
+	buffer := make([]byte, g.MTU)
+	for {
+		_, _, _, err = g.conn.ReadFrom(buffer)
+		if err != nil {
+			return fmt.Errorf("Error reading from connection: %w", err)
+		}
+		amtMessageType := determineAMTmessageType(buffer[:])
+		switch amtMessageType {
+		case m.RelayAdvertisementType:
+			err = g.handleRelayAdvertisement(buffer[:])
+		case m.MembershipQueryType:
+			return g.handleMembershipQuery(buffer[:])
+		default:
+			return fmt.Errorf("invalid response: %s", amtMessageType)
+		}
+	}
 }
 
 func createIPv4MembershipReport(dstIP, srcIP net.IP, length uint16) ([]byte, error) {
@@ -431,11 +419,23 @@ func (g *Gateway) Close() error {
 			}
 		}
 	}()
+	var err error
 	select {
 	case <-time.After(5 * time.Second):
-	case err := <-errc:
-		g.conn.Close()
-		return err
+	case err = <-errc:
 	}
-	return g.conn.Close()
+	errClose := g.conn.Close()
+	if err == nil {
+		err = errClose
+	}
+	return err
+}
+
+func (g *Gateway) handleRelayAdvertisement(data []byte) error {
+	relayAdvertisement := &m.RelayAdvertisementMessage{}
+	err := relayAdvertisement.UnmarshalBinary(data)
+	if err != nil {
+		return fmt.Errorf("Failed to read advertisemnt: %w", err)
+	}
+	return g.sendRequest()
 }

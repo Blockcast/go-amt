@@ -108,50 +108,69 @@ func (mc *MutlicastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.ReadBatch(ms, flags)
 	}
+	if err := mc.amtGw.loopErr.Swap(nil); err != nil {
+		return 0, err
+	}
 	N, err := mc.amtGw.conn.ReadBatch(ms, flags)
 	if err != nil {
 		return 0, fmt.Errorf("error reading from connection: %w", err)
 	}
-	var i int
-	for i = 0; i < N; {
-		n := ms[i].N
-		data := ms[i].Buffers[0][:n]
-		amtMessageType := determineAMTmessageType(data)
+	var i, bad int
+	for i = 0; i < N && N > bad; i++ {
+		cur := ms[i]
+		n := cur.N
+		amtMessageType := determineAMTmessageType(cur.Buffers[0])
 		switch amtMessageType {
 		case m.MulticastDataType:
-			p := gopacket.NewPacket(data[m.DataMsgHdrLen:], layers.LayerTypeIPv4, gopacket.NoCopy)
+			mc.amtGw.lastData.Store(time.Now())
+			p := gopacket.NewPacket(cur.Buffers[0][m.DataMsgHdrLen:n], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)
 			udpHdr, ok := p.TransportLayer().(*layers.UDP)
-			if !ok || uint16(udpHdr.DstPort) != mc.GroupPort ||
-				!ipHdr.DstIP.Equal(mc.GroupAddr.AsSlice()) {
-				ms = append(ms[:i], ms[i+1:]...)
-				N--
+			if p.ErrorLayer() != nil {
+				remainLayer := p.ErrorLayer()
+				return i, remainLayer.Error()
+			}
+			if !ok || !ipHdr.DstIP.Equal(mc.GroupAddr.AsSlice()) {
+				bad++
+				cur = ms[N-bad]
+				ms[N-bad] = cur
+				i--
 				break
 			}
-			stream := p.ApplicationLayer()
 			var srcAddr []byte
-			if n+4 < cap(ms[i].Buffers[0]) {
-				copy(ms[i].Buffers[0][n:n+4], ipHdr.SrcIP)
-				srcAddr = ms[i].Buffers[0][n : n+4]
+			if n+4 < cap(cur.Buffers[0]) {
+				copy(cur.Buffers[0][n:n+4], ipHdr.SrcIP)
+				srcAddr = cur.Buffers[0][n : n+4]
 			} else {
 				srcAddr = make([]byte, 4)
 				copy(srcAddr, ipHdr.SrcIP)
 			}
+			stream := p.ApplicationLayer()
 			ms[i].Addr = &net.UDPAddr{IP: srcAddr, Port: int(udpHdr.DstPort)}
-			ms[i].N = copy(ms[i].Buffers[0][:], stream.Payload())
-			i++
+			ms[i].N = len(stream.Payload())
+			ms[i].Buffers[0] = stream.Payload()
 		case m.MembershipQueryType:
-			err = mc.amtGw.handleMembershipQuery(data)
-			ms = append(ms[:i], ms[i+1:]...)
-			N--
+			err = mc.amtGw.handleMembershipQuery(cur.Buffers[0])
+			bad++
+			cur = ms[N-bad]
+			ms[N-bad] = cur
+			i--
+		case m.RelayAdvertisementType:
+			err = mc.amtGw.handleRelayAdvertisement(cur.Buffers[0])
+			bad++
+			cur = ms[N-bad]
+			ms[N-bad] = cur
+			i--
 		default:
-			ms = append(ms[:i], ms[i+1:]...)
-			N--
+			bad++
+			cur = ms[N-bad]
+			ms[N-bad] = cur
+			i--
 			err = fmt.Errorf("unknown data type: %d", amtMessageType) // TODO: see how to handle
 			break
 		}
 	}
-	return i, err
+	return N - bad, err
 }
 
 func (mc *MutlicastConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
@@ -162,6 +181,9 @@ func (mc *MutlicastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.ReadFrom(buf)
 	}
+	if err := mc.amtGw.loopErr.Swap(nil); err != nil {
+		return 0, nil, nil, err
+	}
 	for {
 		n, cm, src, err = mc.amtGw.conn.ReadFrom(buf)
 		if n == 0 || err != nil {
@@ -170,15 +192,18 @@ func (mc *MutlicastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 		amtMessageType := determineAMTmessageType(buf[:])
 		data := buf[:n]
 		switch amtMessageType {
+		case m.RelayAdvertisementType:
+			err = mc.amtGw.handleRelayAdvertisement(data)
+			n = 0
 		case m.MembershipQueryType:
 			err = mc.amtGw.handleMembershipQuery(data)
 			n = 0
 		case m.MulticastDataType:
+			mc.amtGw.lastData.Store(time.Now())
 			p := gopacket.NewPacket(data[m.DataMsgHdrLen:], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)
 			udpHdr, ok := p.TransportLayer().(*layers.UDP)
-			if !ok || (mc.GroupPort > 0 && uint16(udpHdr.DstPort) != mc.GroupPort) ||
-				!ipHdr.DstIP.Equal(mc.GroupAddr.AsSlice()) {
+			if !ok || !ipHdr.DstIP.Equal(mc.GroupAddr.AsSlice()) {
 				break
 			}
 			stream := p.ApplicationLayer()

@@ -40,19 +40,25 @@ func main() {
 	}
 	fmt.Printf("read n=%d, src=%s\n", n, src)
 
-	ms := []ipv4.Message{
-		{
-			Buffers: [][]byte{make([]byte, 1500)},
-			OOB:     make([]byte, 1500),
-		},
-		{
-			Buffers: [][]byte{make([]byte, 1500)},
-			OOB:     make([]byte, 1500),
-		},
+	bufs := [][]byte{
+		make([]byte, 1500),
+		make([]byte, 1500),
+		make([]byte, 1500),
+		make([]byte, 1500),
 	}
 
 	count := 0
 	for count < 1000 {
+		ms := []ipv4.Message{
+			{
+				Buffers: [][]byte{bufs[0]},
+				OOB:     bufs[1],
+			},
+			{
+				Buffers: [][]byte{bufs[2]},
+				OOB:     bufs[3],
+			},
+		}
 		N, err := g.ReadBatch(ms, 0)
 		if err != nil {
 			fmt.Println(err)
