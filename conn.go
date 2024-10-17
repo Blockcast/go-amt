@@ -32,43 +32,12 @@ func (mc *MutlicastConn) Open() error {
 	var prog []bpf.RawInstruction
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
-	conn, err := ListenMulticastUDP4("udp4", mc.IFace, dstAddr, prog, mc.Timestamp)
-	if _, ok := conn.(net.Conn); !ok || err != nil {
+	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
+	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4)
+	if err != nil {
 		return fmt.Errorf("failed to create conn %s on %s: %s, %w", addr.String(), mc.IFace.Name, conn, err)
 	}
-	mc.conn4 = ipv4.NewPacketConn(conn)
-	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
-	if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
-		flags4 |= ipv4.FlagSrc
-		srcAddr := &net.IPAddr{
-			IP:   mc.SrcAddr.AsSlice(),
-			Zone: mc.SrcAddr.Zone(),
-		}
-		if err := mc.conn4.JoinSourceSpecificGroup(mc.IFace, dstAddr, srcAddr); err != nil {
-			return fmt.Errorf("join ssg: %w", err)
-		}
-	} else {
-		err := mc.conn4.JoinGroup(mc.IFace, dstAddr)
-		if err != nil {
-			return fmt.Errorf("join group: %w", err)
-		}
-	}
-
-	if err := mc.conn4.SetMulticastInterface(mc.IFace); err != nil {
-		return err
-	}
-	//if err := mc.conn4.SetMulticastLoopback(true); err != nil {
-	//	return err
-	//}
-	if err := mc.conn4.SetMulticastTTL(mc.TTL); err != nil {
-		return err
-	}
-	if err := mc.conn4.SetTTL(mc.TTL); err != nil {
-		return err
-	}
-	if err := mc.conn4.SetControlMessage(flags4, true); err != nil {
-		return err
-	}
+	mc.conn4 = conn
 
 	if len(mc.RelayAddr.IP) > 0 {
 		if err = mc.conn4.SetReadDeadline(time.Now().Add(mc.Timeout)); err != nil {
