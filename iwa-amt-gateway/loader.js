@@ -1,0 +1,25 @@
+// Module loader for Trusted Types compatibility
+// This replaces the inline script in index.html
+
+if (window.trustedTypes && window.trustedTypes.createPolicy) {
+    try {
+        // Create the default policy first (needed for service worker and other scripts)
+        const defaultPolicy = window.trustedTypes.createPolicy('default', {
+            createHTML: (string) => string,
+            createScript: (string) => string,
+            createScriptURL: (url) => url
+        });
+        
+        // Now create app-module policy
+        const appPolicy = window.trustedTypes.createPolicy('app-module', {
+            createScriptURL: (url) => url
+        });
+        
+        // Webpack bundles app.js as main.js
+        // Don't load anything - webpack already injected scripts
+        console.log('[Loader] Webpack scripts already loaded');
+    } catch (error) {
+        console.warn('Trusted Types policy creation failed:', error);
+    }
+}
+
