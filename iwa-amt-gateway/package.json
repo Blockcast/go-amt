@@ -1,0 +1,44 @@
+{
+  "name": "amt-gateway-iwa",
+  "version": "1.0.64",
+  "description": "Blockcast AMT Gateway - Isolated Web App (Cross-platform: macOS/Linux)",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/blockcast/go-amt"
+  },
+  "dependencies": {
+    "mpegts.js": "^1.8.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.22.0",
+    "@babel/preset-env": "^7.22.0",
+    "@playwright/test": "^1.56.1",
+    "babel-loader": "^9.1.2",
+    "clean-webpack-plugin": "^4.0.0",
+    "copy-webpack-plugin": "^11.0.0",
+    "css-loader": "^6.7.1",
+    "dotenv": "^16.0.3",
+    "html-webpack-plugin": "^5.5.0",
+    "playwright": "^1.56.1",
+    "wbn-sign": "^0.2.0",
+    "webbundle-webpack-plugin": "^0.2.0",
+    "webpack": "^5.94.0",
+    "webpack-cli": "^4.9.2",
+    "webpack-merge": "^5.8.0"
+  },
+  "scripts": {
+    "setup": "./setup.sh",
+    "test": "./test.sh",
+    "test:auto": "node auto-test.js",
+    "test:e2e": "node test-e2e-full.js",
+    "test:manual": "node test-manual-stream.js",
+    "install-iwa": "./install.sh",
+    "clean": "./clean.sh",
+    "clean:dist": "rm -rf dist/ && mkdir dist",
+    "build": "cd ../ && GOOS=js GOARCH=wasm go build -o iwa-amt-gateway/amt-client.wasm ./cmd/wasm-client && cd iwa-amt-gateway && webpack --config webpack.wbn.js",
+    "build:clean": "npm run clean:dist && npm run build",
+    "build:bundle-only": "webpack --config webpack.wbn.js",
+    "build:dev": "cd ../ && GOOS=js GOARCH=wasm go build -o iwa-amt-gateway/amt-client.wasm ./cmd/wasm-client && cd iwa-amt-gateway && webpack --config webpack.dev.js"
+  }
+}

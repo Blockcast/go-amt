@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Blockcast AMT Gateway</title>
+    <link rel="manifest" href="manifest.webmanifest">
+    <link rel="serviceworker" href="/service-worker-minimal.js">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .subtitle {
+            opacity: 0.9;
+            font-size: 1.1em;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .section {
+            margin-bottom: 30px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 8px;
+        }
+        
+        h2 {
+            color: #333;
+            margin-bottom: 15px;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 600;
+            color: #555;
+        }
+        
+        input {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+            margin-bottom: 15px;
+        }
+        
+        button {
+            padding: 12px 30px;
+            font-size: 16px;
+            font-weight: 600;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.3s;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin-right: 10px;
+        }
+        
+        button:hover:not(:disabled) {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(102, 126, 234, 0.4);
+        }
+        
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .stat-card {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 5px;
+        }
+        
+        .stat-label {
+            color: #666;
+            font-size: 0.9em;
+        }
+        
+        .relay-list, .group-list {
+            margin-top: 15px;
+        }
+        
+        .relay-item, .group-item {
+            background: white;
+            padding: 15px;
+            margin-bottom: 10px;
+            border-radius: 6px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .status {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 12px;
+            font-size: 0.8em;
+            font-weight: 600;
+            margin-left: 10px;
+        }
+        
+        .status.active {
+            background: #4caf50;
+            color: white;
+        }
+        
+        .status.connecting {
+            background: #ff9800;
+            color: white;
+        }
+        
+        .status.error {
+            background: #f44336;
+            color: white;
+        }
+        
+        .empty-state {
+            text-align: center;
+            color: #999;
+            padding: 40px;
+        }
+        
+        .info-banner {
+            background: #e3f2fd;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border-left: 4px solid #2196f3;
+        }
+        
+        .warning-banner {
+            background: #fff3e0;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+            border-left: 4px solid #ff9800;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Blockcast AMT Gateway</h1>
+            <p class="subtitle">Isolated Web App with Direct Sockets API</p>
+        </div>
+        
+        <div class="content">
+            <div id="direct-sockets-warning" class="warning-banner" style="display: none;">
+                <strong>⚠️ Direct Sockets API not available</strong><br>
+                Enable it in Chrome flags: <code>chrome://flags/#enable-experimental-web-platform-features</code>
+            </div>
+            
+            <div class="info-banner">
+                <strong>ℹ️ Using Direct Sockets API</strong><br>
+                This Isolated Web App uses the new Direct Sockets API for real UDP communication.
+            </div>
+            
+            <div class="section">
+                <h2>Connect to AMT Relay</h2>
+                <label for="amt-url">AMT URL</label>
+                <input type="text" id="amt-url" 
+                       placeholder="amt://source@group:port@relay:port"
+                       value="amt://83.97.94.146@232.1.2.3:1234@162.250.137.254:2268">
+                
+                <label for="relay-name">Relay Name (optional)</label>
+                <input type="text" id="relay-name" 
+                       placeholder="e.g., geant-relay">
+                
+                <button id="connect-btn">Connect & Join</button>
+                <button id="disconnect-all-btn">Disconnect All</button>
+            </div>
+            
+            <div class="section">
+                <h2>Statistics</h2>
+                <div class="stats">
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-packets">0</div>
+                        <div class="stat-label">Packets</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-bytes">0 B</div>
+                        <div class="stat-label">Bytes</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-streams">0</div>
+                        <div class="stat-label">Streams</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-value" id="stat-rate">0 Mbps</div>
+                        <div class="stat-label">Bitrate</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2>Active Relays</h2>
+                <div id="relay-list" class="relay-list">
+                    <p class="empty-state">No active relays</p>
+                </div>
+            </div>
+            
+            <div class="section">
+                <h2>Subscribed Groups</h2>
+                <div id="group-list" class="group-list">
+                    <p class="empty-state">No subscribed groups</p>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="loader.js"></script>
+</body>
+</html>
+
