@@ -1,0 +1,9 @@
+{
+  "versions": [
+    {
+      "version": "1.0.39",
+      "src": "https://localhost:4321/amt-gateway.swbn"
+    }
+  ]
+}
+
