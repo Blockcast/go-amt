@@ -1,3 +1,5 @@
+//go:build (linux || darwin) && cgo
+
 package amt
 
 import (
@@ -17,6 +19,12 @@ const (
 )
 
 func TestE2E_ReceiveMulticastData(t *testing.T) {
+	// Skip if CGO is not available (this test requires the Rust-backed MutlicastConn)
+	caps := GetPlatformCapabilities()
+	if !caps.SupportsCGO {
+		t.Skip("Skipping E2E test: CGO not available (Rust backend required)")
+	}
+
 	t.Log("Testing AMT gateway with Rust backend")
 	t.Logf("Relay: %s:%d", testRelayAddr, testRelayPort)
 	t.Logf("Source: %s, Group: %s:%d", testSource, testGroup, testGroupPort)

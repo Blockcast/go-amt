@@ -9,7 +9,6 @@ import (
 
 func TestEncodeRelayAdvertisementMessageIPv4(t *testing.T) {
 	message := messages.RelayAdvertisementMessage{
-		Header:    messages.Header{Version: messages.Version, Type: messages.RelayAdvertisementType},
 		Nonce:     [4]byte{0, 0, 0, 1},
 		RelayAddr: net.IPv4(192, 168, 1, 1)[12:],
 	}
@@ -24,7 +23,6 @@ func TestEncodeRelayAdvertisementMessageIPv4(t *testing.T) {
 
 func TestEncodeRelayAdvertisementMessageIPv6(t *testing.T) {
 	message := messages.RelayAdvertisementMessage{
-		Header:    messages.Header{Version: messages.Version, Type: messages.RelayAdvertisementType},
 		Nonce:     [4]byte{0, 0, 0, 1},
 		RelayAddr: net.ParseIP("2001:db8::1"),
 	}
@@ -39,7 +37,6 @@ func TestEncodeRelayAdvertisementMessageIPv6(t *testing.T) {
 
 func TestDecodeRelayAdvertisementMessageIPv4(t *testing.T) {
 	expected := messages.RelayAdvertisementMessage{
-		Header:    messages.Header{Version: messages.Version, Type: messages.RelayAdvertisementType},
 		Nonce:     [4]byte{0, 0, 0, 1},
 		RelayAddr: net.IPv4(192, 168, 1, 1)[12:],
 	}
@@ -55,7 +52,6 @@ func TestDecodeRelayAdvertisementMessageIPv4(t *testing.T) {
 
 func TestDecodeRelayAdvertisementMessageIPv6(t *testing.T) {
 	expected := messages.RelayAdvertisementMessage{
-		Header:    messages.Header{Version: messages.Version, Type: messages.RelayAdvertisementType},
 		Nonce:     [4]byte{0, 0, 0, 1},
 		RelayAddr: net.ParseIP("2001:db8::1"),
 	}

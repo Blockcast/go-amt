@@ -1,3 +1,5 @@
+//go:build (linux || darwin) && !ios && !android && cgo
+
 package amt
 
 import (
