@@ -35,7 +35,7 @@ func (mc *MutlicastConn) Open() error {
 	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
 	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4)
 	if err != nil {
-		return fmt.Errorf("failed to create conn %s on %s: %s, %w", addr.String(), mc.IFace.Name, conn, err)
+		return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 	}
 	mc.conn4 = conn
 
