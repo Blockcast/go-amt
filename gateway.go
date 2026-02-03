@@ -3,7 +3,7 @@
 package amt
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/include
+#cgo CFLAGS: -I${SRCDIR}/amt-protocol/include
 #cgo LDFLAGS: -lamt_protocol -ldl -lm -lpthread
 
 #include <stdlib.h>
