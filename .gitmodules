@@ -1,0 +1,3 @@
+[submodule "amt-protocol"]
+	path = amt-protocol
+	url = https://github.com/Blockcast/amt-protocol.git
