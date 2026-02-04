@@ -1,0 +1,373 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 1000" font-family="Arial, sans-serif">
+  <defs>
+    <marker id="arr" markerWidth="6" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#666"/>
+    </marker>
+    <marker id="arr-g" markerWidth="6" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#27ae60"/>
+    </marker>
+    <marker id="arr-p" markerWidth="6" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#8e44ad"/>
+    </marker>
+    <marker id="arr-b" markerWidth="6" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#2980b9"/>
+    </marker>
+    <marker id="arr-r" markerWidth="6" markerHeight="5" refX="6" refY="2.5" orient="auto">
+      <polygon points="0 0, 6 2.5, 0 5" fill="#c0392b"/>
+    </marker>
+  </defs>
+
+  <rect width="1400" height="1000" fill="#f8f9fa"/>
+  <text x="700" y="30" text-anchor="middle" font-size="20" font-weight="bold" fill="#2c3e50">CDN Gateway Architecture</text>
+
+  <!-- ========== ACTORS ========== -->
+  <rect x="20" y="55" width="90" height="60" rx="5" fill="#9b59b6"/>
+  <text x="65" y="78" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">Content</text>
+  <text x="65" y="92" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">Provider</text>
+  <text x="65" y="106" text-anchor="middle" font-size="7" fill="#fff">uCDN Customer</text>
+
+  <!-- User Client with PIM SDK -->
+  <rect x="20" y="850" width="100" height="130" rx="5" fill="#3498db" stroke="#2980b9" stroke-width="2"/>
+  <text x="70" y="872" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">User Client</text>
+  <text x="70" y="888" text-anchor="middle" font-size="7" fill="#fff">Mobile / Browser</text>
+  <rect x="30" y="898" width="80" height="35" rx="3" fill="#2980b9"/>
+  <text x="70" y="914" text-anchor="middle" font-size="7" font-weight="bold" fill="#fff">PIM Multicast</text>
+  <text x="70" y="926" text-anchor="middle" font-size="6" fill="#fff">SDK + IWA</text>
+  <rect x="30" y="938" width="80" height="35" rx="3" fill="#1a5276"/>
+  <text x="70" y="952" text-anchor="middle" font-size="6" font-weight="bold" fill="#fff">Non-IWA: mDNS</text>
+  <text x="70" y="964" text-anchor="middle" font-size="6" fill="#fff">Personal WebTransport GW</text>
+
+  <!-- ========== CLOUD ========== -->
+  <rect x="130" y="55" width="1250" height="85" rx="6" fill="#2c3e50"/>
+  <text x="150" y="78" font-size="12" font-weight="bold" fill="#fff">CLOUD</text>
+
+  <rect x="145" y="88" width="120" height="45" rx="4" fill="#34495e"/>
+  <text x="205" y="106" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">Orc8r</text>
+  <text x="205" y="120" text-anchor="middle" font-size="6" fill="#aaa">CDN | Streamer | Certifier | Dispatcher</text>
+
+  <rect x="275" y="88" width="100" height="45" rx="4" fill="#9b59b6"/>
+  <text x="325" y="106" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">CDNi</text>
+  <text x="325" y="120" text-anchor="middle" font-size="6" fill="#fff">FCI | CI | RRI | Trigger | LOI</text>
+
+  <rect x="385" y="88" width="120" height="45" rx="4" fill="#34495e"/>
+  <text x="445" y="106" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">Traffic Ops</text>
+  <text x="445" y="120" text-anchor="middle" font-size="6" fill="#aaa">cr-config | Snapshot | 302 DS</text>
+
+  <rect x="515" y="88" width="80" height="45" rx="4" fill="#1a5276"/>
+  <text x="555" y="106" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">Origin</text>
+  <text x="555" y="120" text-anchor="middle" font-size="6" fill="#fff">HTTP | MoQ | WARP</text>
+
+  <rect x="605" y="88" width="80" height="45" rx="4" fill="#1abc9c"/>
+  <text x="645" y="106" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">RKS</text>
+  <text x="645" y="120" text-anchor="middle" font-size="6" fill="#fff">Remote Key Server</text>
+
+  <rect x="695" y="88" width="100" height="45" rx="4" fill="#2980b9"/>
+  <text x="745" y="106" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">Azure TM</text>
+  <text x="745" y="120" text-anchor="middle" font-size="6" fill="#fff">External DNS | TR export</text>
+
+  <rect x="805" y="88" width="100" height="45" rx="4" fill="#8e44ad"/>
+  <text x="855" y="106" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">CDNi Log Svc</text>
+  <text x="855" y="120" text-anchor="middle" font-size="6" fill="#fff">Analytics | Compliance</text>
+
+  <rect x="915" y="88" width="125" height="45" rx="4" fill="#d35400"/>
+  <text x="977" y="106" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">DRIAD DNS</text>
+  <text x="977" y="120" text-anchor="middle" font-size="6" fill="#fff">ARIN 69.25.95.0/24 rDNS</text>
+
+  <!-- ========== GATEWAY ========== -->
+  <rect x="130" y="155" width="1250" height="680" rx="6" fill="#27ae60"/>
+  <text x="150" y="180" font-size="14" font-weight="bold" fill="#fff">GATEWAY (RELAY Edge + CAST Origin)</text>
+
+  <!-- Magma Core -->
+  <rect x="145" y="195" width="1220" height="70" rx="5" fill="rgba(255,255,255,0.15)"/>
+  <text x="160" y="218" font-size="11" font-weight="bold" fill="#fff">Magma Gateway Core</text>
+  
+  <rect x="160" y="228" width="110" height="32" rx="4" fill="#1e8449"/>
+  <text x="215" y="245" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">blockcastd</text>
+  <text x="215" y="256" text-anchor="middle" font-size="6" fill="#fff">orchestrator</text>
+
+  <rect x="285" y="228" width="220" height="32" rx="4" fill="#196f3d"/>
+  <text x="395" y="245" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">control-proxy</text>
+  <text x="395" y="256" text-anchor="middle" font-size="6" fill="#fff">persistent bidirectional gRPC (IPv4/6) | SyncRPC</text>
+
+  <rect x="520" y="228" width="90" height="32" rx="4" fill="#1e8449"/>
+  <text x="565" y="245" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">beacond</text>
+  <text x="565" y="256" text-anchor="middle" font-size="6" fill="#fff">location</text>
+
+  <rect x="625" y="228" width="90" height="32" rx="4" fill="#1e8449"/>
+  <text x="670" y="245" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">service303</text>
+  <text x="670" y="256" text-anchor="middle" font-size="6" fill="#fff">gRPC health</text>
+
+  <rect x="730" y="228" width="200" height="32" rx="4" fill="#117864"/>
+  <text x="830" y="245" text-anchor="middle" font-size="8" font-weight="bold" fill="#fff">Registered Gateway gRPC</text>
+  <text x="830" y="256" text-anchor="middle" font-size="6" fill="#fff">CDNGatewayService | IngressCacheService</text>
+
+  <!-- Dynamic Services -->
+  <rect x="145" y="275" width="1220" height="545" rx="5" fill="rgba(52,152,219,0.2)"/>
+  <text x="160" y="298" font-size="11" font-weight="bold" fill="#fff">Dynamic Services</text>
+
+  <!-- ROW 1: Ingress Controllers -->
+  <rect x="160" y="310" width="580" height="70" rx="4" fill="#16a085"/>
+  <text x="450" y="330" text-anchor="middle" font-size="11" font-weight="bold" fill="#fff">Ingress Controllers (ALPN / SNI / mTLS) - First Contact</text>
+  
+  <rect x="175" y="345" width="130" height="30" rx="3" fill="#148f77"/>
+  <text x="240" y="360" text-anchor="middle" font-size="8" font-weight="bold" fill="#fff">Caddy config</text>
+  <text x="240" y="370" text-anchor="middle" font-size="6" fill="#fff">ALPN: H3/MoQ | SNI: TR 302</text>
+
+  <rect x="315" y="345" width="130" height="30" rx="3" fill="#148f77"/>
+  <text x="380" y="360" text-anchor="middle" font-size="8" font-weight="bold" fill="#fff">ts-ingress-ctrl</text>
+  <text x="380" y="370" text-anchor="middle" font-size="6" fill="#fff">ATS remap + t3c</text>
+
+  <rect x="455" y="345" width="130" height="30" rx="3" fill="#148f77"/>
+  <text x="520" y="360" text-anchor="middle" font-size="8" font-weight="bold" fill="#fff">vingress</text>
+  <text x="520" y="370" text-anchor="middle" font-size="6" fill="#fff">Varnish VCL + t3c</text>
+
+  <rect x="595" y="345" width="130" height="30" rx="3" fill="#1abc9c"/>
+  <text x="660" y="360" text-anchor="middle" font-size="8" font-weight="bold" fill="#fff">RKS Client</text>
+  <text x="660" y="370" text-anchor="middle" font-size="6" fill="#fff">Token/mTLS | memguard</text>
+
+  <!-- Ingress Controller with PostgreSQL -->
+  <rect x="760" y="310" width="230" height="70" rx="4" fill="#2e86c1"/>
+  <text x="875" y="330" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">Ingress Controller</text>
+  <rect x="775" y="345" width="80" height="28" rx="3" fill="#1a5276"/>
+  <text x="815" y="360" text-anchor="middle" font-size="7" font-weight="bold" fill="#fff">PostgreSQL</text>
+  <text x="815" y="370" text-anchor="middle" font-size="5" fill="#fff">route storage</text>
+  <rect x="865" y="345" width="110" height="28" rx="3" fill="#1a5276"/>
+  <text x="920" y="360" text-anchor="middle" font-size="7" font-weight="bold" fill="#fff">Routes Export</text>
+  <text x="920" y="370" text-anchor="middle" font-size="5" fill="#fff">Lua/VCL/routes.json</text>
+
+  <!-- DNS Forwarder + LUKS cache-init -->
+  <rect x="1010" y="310" width="100" height="30" rx="3" fill="#5d6d7e"/>
+  <text x="1060" y="328" text-anchor="middle" font-size="7" font-weight="bold" fill="#fff">DNS Forwarder</text>
+  <text x="1060" y="338" text-anchor="middle" font-size="5" fill="#fff">CoreDNS to TR</text>
+  
+  <rect x="1120" y="310" width="100" height="30" rx="3" fill="#7d3c98"/>
+  <text x="1170" y="328" text-anchor="middle" font-size="7" font-weight="bold" fill="#fff">cache-init</text>
+  <text x="1170" y="338" text-anchor="middle" font-size="5" fill="#fff">LUKS2 init container</text>
+
+  <!-- ROW 2: TR + TM + Cache + t3c -->
+  <rect x="160" y="395" width="130" height="70" rx="4" fill="#2980b9"/>
+  <text x="225" y="418" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">Traffic Router</text>
+  <text x="225" y="433" text-anchor="middle" font-size="7" fill="#fff">DNS :53 | HTTP 302</text>
+  <rect x="172" y="444" width="45" height="14" rx="2" fill="#1abc9c"/>
+  <text x="194" y="454" text-anchor="middle" font-size="6" fill="#fff">RKS</text>
+  <rect x="225" y="444" width="55" height="14" rx="2" fill="#e74c3c"/>
+  <text x="252" y="454" text-anchor="middle" font-size="6" fill="#fff">crstats</text>
+
+  <rect x="300" y="395" width="130" height="70" rx="4" fill="#2980b9"/>
+  <text x="365" y="418" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">Traffic Monitor</text>
+  <text x="365" y="433" text-anchor="middle" font-size="7" fill="#fff">Health poll | CrStates</text>
+  <rect x="312" y="444" width="100" height="14" rx="2" fill="#e74c3c"/>
+  <text x="362" y="454" text-anchor="middle" font-size="6" fill="#fff">mTLS (all)</text>
+
+  <rect x="440" y="395" width="290" height="70" rx="4" fill="#1abc9c"/>
+  <text x="585" y="418" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">Cache Backends</text>
+  <rect x="455" y="430" width="80" height="28" rx="3" fill="#17a589"/>
+  <text x="495" y="447" text-anchor="middle" font-size="8" fill="#fff">ATS10</text>
+  <text x="495" y="457" text-anchor="middle" font-size="6" fill="#fff">LUKS</text>
+  <rect x="545" y="430" width="80" height="28" rx="3" fill="#17a589"/>
+  <text x="585" y="447" text-anchor="middle" font-size="8" fill="#fff">Varnish</text>
+  <text x="585" y="457" text-anchor="middle" font-size="6" fill="#fff">LUKS</text>
+  <rect x="635" y="430" width="80" height="28" rx="3" fill="#17a589"/>
+  <text x="675" y="447" text-anchor="middle" font-size="8" fill="#fff">Caddy</text>
+  <text x="675" y="457" text-anchor="middle" font-size="6" fill="#fff">cdni_log handler</text>
+
+  <rect x="740" y="395" width="110" height="70" rx="4" fill="#5d6d7e"/>
+  <text x="795" y="418" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">astats</text>
+  <text x="795" y="433" text-anchor="middle" font-size="7" fill="#fff">linux-amt</text>
+  <rect x="752" y="444" width="85" height="14" rx="2" fill="#e74c3c"/>
+  <text x="795" y="454" text-anchor="middle" font-size="6" fill="#fff">_astats mTLS</text>
+
+  <rect x="860" y="395" width="130" height="70" rx="4" fill="#2e86c1"/>
+  <text x="925" y="415" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">t3c-daemon</text>
+  <text x="925" y="430" text-anchor="middle" font-size="7" fill="#fff">config sync + CDNi Log</text>
+  <text x="925" y="445" text-anchor="middle" font-size="6" fill="#fff">LogForwarder: tail access.log</text>
+  <rect x="875" y="452" width="100" height="10" rx="2" fill="#8e44ad"/>
+  <text x="925" y="460" text-anchor="middle" font-size="5" fill="#fff">gRPC cdni_log.proto</text>
+
+  <!-- ROW 3: MAHP above MoQ -->
+  <text x="350" y="495" text-anchor="middle" font-size="12" font-weight="bold" fill="#fff">RELAY (Edge)</text>
+  <text x="870" y="495" text-anchor="middle" font-size="12" font-weight="bold" fill="#fff">CAST (Origin)</text>
+
+  <!-- RELAY: MAHP Receiver above MoQ Relay -->
+  <rect x="160" y="510" width="280" height="90" rx="4" fill="#8e44ad"/>
+  <text x="300" y="532" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">MAHP Receiver (@blockcast/ plugin)</text>
+  <text x="300" y="548" text-anchor="middle" font-size="7" fill="#fff">multicast_receiver | cache miss parent backend</text>
+  <text x="300" y="562" text-anchor="middle" font-size="7" fill="#fff">L7 health (@blockcast/health/l7.go)</text>
+  <text x="300" y="576" text-anchor="middle" font-size="7" fill="#fff">GET adapt + PUSH preposition (same bandwidth)</text>
+  <text x="300" y="590" text-anchor="middle" font-size="7" fill="#fff">FEC decode | AMT Gateway</text>
+
+  <rect x="160" y="610" width="280" height="55" rx="4" fill="#e74c3c"/>
+  <text x="300" y="635" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">MoQ Relay (dual-stack-relay)</text>
+  <text x="300" y="655" text-anchor="middle" font-size="7" fill="#fff">QUIC/WebTransport H3 | Multicast to PIM SDK</text>
+
+  <!-- CAST: MAHP Sender above MoQ Server -->
+  <rect x="760" y="510" width="280" height="90" rx="4" fill="#8e44ad"/>
+  <text x="900" y="532" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">MAHP Sender (@blockcast/ plugin)</text>
+  <text x="900" y="548" text-anchor="middle" font-size="7" fill="#fff">multiservice origin | @blockcast/config/trafficops.go</text>
+  <text x="900" y="562" text-anchor="middle" font-size="7" fill="#fff">L7 health (@blockcast/health/l7.go)</text>
+  <text x="900" y="576" text-anchor="middle" font-size="7" fill="#fff">Multicast TX | FEC encode | Manifest</text>
+  <text x="900" y="590" text-anchor="middle" font-size="7" fill="#fff">AMT Relay source | PUSH to preposition</text>
+
+  <rect x="760" y="610" width="280" height="55" rx="4" fill="#c0392b"/>
+  <text x="900" y="635" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">MoQ Server (CAST origin)</text>
+  <text x="900" y="655" text-anchor="middle" font-size="7" fill="#fff">moq-pub | WARP | publish</text>
+
+  <!-- AMTR center - Unified AMT Service -->
+  <rect x="470" y="520" width="260" height="150" rx="4" fill="#9b59b6"/>
+  <text x="600" y="540" text-anchor="middle" font-size="11" font-weight="bold" fill="#fff">amtr (Unified AMT)</text>
+  <text x="600" y="555" text-anchor="middle" font-size="7" fill="#fff">DRIAD (RFC 8777) | linux-amt | go-amt</text>
+  <rect x="490" y="562" width="75" height="24" rx="3" fill="#7d3c98"/>
+  <text x="527" y="578" text-anchor="middle" font-size="7" fill="#fff">AMT GW</text>
+  <rect x="575" y="562" width="75" height="24" rx="3" fill="#7d3c98"/>
+  <text x="612" y="578" text-anchor="middle" font-size="7" fill="#fff">AMT Relay</text>
+  <rect x="660" y="562" width="55" height="24" rx="3" fill="#e74c3c"/>
+  <text x="687" y="578" text-anchor="middle" font-size="6" fill="#fff">/_astats</text>
+  <rect x="490" y="592" width="75" height="22" rx="3" fill="#1a5276"/>
+  <text x="527" y="606" text-anchor="middle" font-size="6" fill="#fff">eBPF track</text>
+  <rect x="575" y="592" width="75" height="22" rx="3" fill="#8e44ad"/>
+  <text x="612" y="606" text-anchor="middle" font-size="6" fill="#fff">CDNi log</text>
+  <rect x="660" y="592" width="55" height="22" rx="3" fill="#2e86c1"/>
+  <text x="687" y="606" text-anchor="middle" font-size="5" fill="#fff">svc303</text>
+  <text x="600" y="632" text-anchor="middle" font-size="7" fill="#fff">mcast tunnel (same bandwidth)</text>
+  <text x="600" y="645" text-anchor="middle" font-size="6" fill="#fff">svc acquisition + forward</text>
+  <text x="600" y="660" text-anchor="middle" font-size="6" fill="#d35400">69.25.95.0/24 rDNS -&gt; TR -&gt; amtr</text>
+
+  <!-- @blockcast/ plugin layer -->
+  <rect x="1050" y="510" width="205" height="155" rx="4" fill="#1a5276" fill-opacity="0.8"/>
+  <text x="1152" y="535" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">@blockcast/ Plugin Layer</text>
+  <text x="1152" y="555" text-anchor="middle" font-size="7" fill="#fff">config/trafficops.go</text>
+  <text x="1152" y="570" text-anchor="middle" font-size="7" fill="#fff">health/l7.go</text>
+  <text x="1152" y="585" text-anchor="middle" font-size="7" fill="#fff">multicast_receiver</text>
+  <text x="1152" y="605" text-anchor="middle" font-size="7" fill="#fff">------------------------</text>
+  <text x="1152" y="620" text-anchor="middle" font-size="7" fill="#fff">Cache miss = parent backend</text>
+  <text x="1152" y="635" text-anchor="middle" font-size="7" fill="#fff">GET adapt to PUSH</text>
+  <text x="1152" y="650" text-anchor="middle" font-size="7" fill="#fff">Preposition online caches</text>
+
+  <!-- Security row -->
+  <rect x="160" y="680" width="250" height="28" rx="4" fill="#566573"/>
+  <text x="285" y="700" text-anchor="middle" font-size="8" fill="#fff">LUKS disk encryption | TPM/vault</text>
+
+  <!-- CDNi Log flow box -->
+  <rect x="430" y="680" width="320" height="55" rx="4" fill="#8e44ad" fill-opacity="0.8"/>
+  <text x="590" y="700" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">CDNi Log Generation Flow</text>
+  <text x="590" y="715" text-anchor="middle" font-size="7" fill="#fff">Cache (ATS/Varnish) access.log → t3c-daemon LogForwarder</text>
+  <text x="590" y="728" text-anchor="middle" font-size="7" fill="#fff">Caddy cdni_log handler → gRPC cdni_log.proto → blockcastd → Cloud</text>
+
+  <!-- Protocol migration note -->
+  <rect x="1050" y="680" width="205" height="50" rx="4" fill="#34495e"/>
+  <text x="1152" y="700" text-anchor="middle" font-size="9" font-weight="bold" fill="#fff">Protocol Migration</text>
+  <text x="1152" y="715" text-anchor="middle" font-size="7" fill="#fff">Current: mTLS (_astats, crstats)</text>
+  <text x="1152" y="730" text-anchor="middle" font-size="7" fill="#fff">Future: all protobuf/gRPC</text>
+
+  <!-- ========== DATA FLOWS ========== -->
+  
+  <!-- Content Provider to CDNi -->
+  <line x1="110" y1="85" x2="275" y2="85" stroke="#9b59b6" stroke-width="2" marker-end="url(#arr-p)"/>
+  
+  <!-- Cloud to control-proxy -->
+  <path d="M 205 133 L 205 150 L 395 150 L 395 228" stroke="#666" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+  <text x="300" y="148" font-size="7" fill="#666">mconfig (SyncRPC)</text>
+
+  <!-- RKS to ingress -->
+  <path d="M 645 133 L 645 150 L 660 150 L 660 345" stroke="#1abc9c" stroke-width="1.5" fill="none" marker-end="url(#arr)"/>
+
+  <!-- TO cr-config to TR -->
+  <path d="M 445 133 L 445 150 L 225 150 L 225 395" stroke="#c0392b" stroke-width="1.5" fill="none" marker-end="url(#arr-r)"/>
+
+  <!-- CDNi Log from t3c-daemon to Cloud -->
+  <path d="M 925 395 L 925 380 L 855 380 L 855 133" stroke="#8e44ad" stroke-width="2" fill="none" marker-end="url(#arr-p)"/>
+  <text x="880" y="255" font-size="7" fill="#8e44ad" font-weight="bold" transform="rotate(-90,880,255)">CDNi Log gRPC</text>
+
+  <!-- MAHP to cache (parent backend) -->
+  <path d="M 300 510 L 300 480 L 585 480 L 585 465" stroke="#8e44ad" stroke-width="2" fill="none" marker-end="url(#arr-p)"/>
+  <text x="450" y="478" font-size="7" fill="#8e44ad" font-weight="bold">cache miss parent</text>
+
+  <!-- AMT multicast tunnel -->
+  <path d="M 760 555 L 730 555" stroke="#8e44ad" stroke-width="2.5" fill="none" marker-end="url(#arr-p)"/>
+  <path d="M 470 555 L 440 555" stroke="#8e44ad" stroke-width="2.5" fill="none" marker-end="url(#arr-p)"/>
+  <text x="600" y="745" text-anchor="middle" font-size="9" fill="#8e44ad" font-weight="bold">AMT Multicast Tunnel (DRIAD) - same bandwidth</text>
+
+  <!-- User flows to Ingress (PIM SDK in client) -->
+  <path d="M 70 850 L 70 340 L 160 340" stroke="#27ae60" stroke-width="2.5" fill="none" marker-end="url(#arr-g)"/>
+  <text x="95" y="530" font-size="9" fill="#27ae60" font-weight="bold" transform="rotate(-90,95,530)">HTTPS/H3/MoQ</text>
+
+  <path d="M 90 850 L 90 420 L 160 420" stroke="#2980b9" stroke-width="2" fill="none" marker-end="url(#arr-b)"/>
+  <text x="110" y="600" font-size="9" fill="#2980b9" font-weight="bold" transform="rotate(-90,110,600)">DNS</text>
+
+  <!-- PIM SDK multicast to MoQ Relay -->
+  <path d="M 120 915 L 140 915 L 140 635 L 160 635" stroke="#e74c3c" stroke-width="2" stroke-dasharray="5,2" fill="none" marker-end="url(#arr-r)"/>
+  <text x="155" y="770" font-size="7" fill="#e74c3c" font-weight="bold" transform="rotate(-90,155,770)">Multicast (PIM SDK)</text>
+
+  <!-- ========== LEGEND ========== -->
+  <rect x="1050" y="755" width="230" height="240" rx="5" fill="#fff" stroke="#ccc"/>
+  <text x="1165" y="773" text-anchor="middle" font-size="11" font-weight="bold">Legend</text>
+  
+  <rect x="1065" y="785" width="14" height="10" fill="#9b59b6"/>
+  <text x="1088" y="794" font-size="6">Content Provider</text>
+  
+  <rect x="1065" y="798" width="14" height="10" fill="#2c3e50"/>
+  <text x="1088" y="807" font-size="6">Cloud Control Plane</text>
+  
+  <rect x="1065" y="811" width="14" height="10" fill="#27ae60"/>
+  <text x="1088" y="820" font-size="6">Gateway (RELAY+CAST)</text>
+  
+  <rect x="1065" y="824" width="14" height="10" fill="#16a085"/>
+  <text x="1088" y="833" font-size="6">Ingress Controllers</text>
+  
+  <rect x="1065" y="837" width="14" height="10" fill="#2e86c1"/>
+  <text x="1088" y="846" font-size="6">Ingress Ctrl + PostgreSQL</text>
+  
+  <rect x="1065" y="850" width="14" height="10" fill="#8e44ad"/>
+  <text x="1088" y="859" font-size="6">MAHP (@blockcast/ plugin)</text>
+  
+  <rect x="1065" y="863" width="14" height="10" fill="#9b59b6"/>
+  <text x="1088" y="872" font-size="6">amtr (unified AMT)</text>
+  
+  <rect x="1065" y="876" width="14" height="10" fill="#e74c3c"/>
+  <text x="1088" y="885" font-size="6">mTLS endpoint (/_astats)</text>
+  
+  <rect x="1065" y="889" width="14" height="10" fill="#7d3c98"/>
+  <text x="1088" y="898" font-size="6">LUKS cache-init</text>
+  
+  <rect x="1065" y="902" width="14" height="10" fill="#1abc9c"/>
+  <text x="1088" y="911" font-size="6">RKS (Token/mTLS)</text>
+  
+  <rect x="1065" y="915" width="14" height="10" fill="#d35400"/>
+  <text x="1088" y="924" font-size="6">DRIAD DNS (69.25.95.0/24)</text>
+  
+  <rect x="1065" y="928" width="14" height="10" fill="#3498db"/>
+  <text x="1088" y="937" font-size="6">User Client (PIM SDK)</text>
+  
+  <rect x="1065" y="941" width="14" height="10" fill="#d35400" fill-opacity="0.9"/>
+  <text x="1088" y="950" font-size="6">External: pim-multicast-gateway</text>
+
+  <rect x="1065" y="954" width="14" height="10" fill="#c0392b" fill-opacity="0.9"/>
+  <text x="1088" y="963" font-size="6">External: AMT Protocol Stack</text>
+
+  <rect x="1065" y="967" width="14" height="10" fill="#5d6d7e"/>
+  <text x="1088" y="976" font-size="6">DNS Forwarder (CoreDNS)</text>
+
+  <!-- ========== EXTERNAL SYSTEMS ========== -->
+  <rect x="140" y="755" width="280" height="85" rx="5" fill="#d35400" fill-opacity="0.9"/>
+  <text x="280" y="775" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">External: pim-multicast-gateway</text>
+  <text x="280" y="790" text-anchor="middle" font-size="7" fill="#fff">IWA Browser | Mobile SDKs (Android/iOS)</text>
+  <text x="280" y="805" text-anchor="middle" font-size="7" fill="#fff">dual-stack-relay (MoQ) | ssm-transport (DRIAD)</text>
+  <text x="280" y="820" text-anchor="middle" font-size="6" fill="#fff">Chromium IWA integration in progress</text>
+  <text x="280" y="835" text-anchor="middle" font-size="6" fill="#fff">~/src/pim-multicast-gateway/packages/</text>
+
+  <rect x="440" y="755" width="280" height="85" rx="5" fill="#c0392b" fill-opacity="0.9"/>
+  <text x="580" y="775" text-anchor="middle" font-size="10" font-weight="bold" fill="#fff">External: AMT Protocol Stack</text>
+  <text x="580" y="790" text-anchor="middle" font-size="7" fill="#fff">amt-protocol (Rust) - FFI/WASM/JNI</text>
+  <text x="580" y="805" text-anchor="middle" font-size="7" fill="#fff">go-amt (Go) - gateway.go, driad.go</text>
+  <text x="580" y="820" text-anchor="middle" font-size="7" fill="#fff">linux-amt - kernel + amt-astats</text>
+  <text x="580" y="835" text-anchor="middle" font-size="6" fill="#fff">~/src/go-amt | ~/src/linux-amt</text>
+
+  <!-- DRIAD Discovery Flow Arrow -->
+  <path d="M 977 133 L 977 160 L 225 160 L 225 200" stroke="#d35400" stroke-width="2" stroke-dasharray="5,3" fill="none" marker-end="url(#arr)"/>
+  <text x="600" y="175" text-anchor="middle" font-size="7" fill="#d35400" font-weight="bold">DRIAD: source rDNS query -&gt; TR balancer -&gt; amtr address</text>
+
+  <!-- Footer notes -->
+  <text x="550" y="865" text-anchor="middle" font-size="8" fill="#7f8c8d">Multi-repo: trafficcontrol + pim-multicast-gateway + go-amt + linux-amt. Integration via AMT, DRIAD (RFC 8777), MoQ.</text>
+  <text x="550" y="880" text-anchor="middle" font-size="8" fill="#7f8c8d">LUKS cache-init: Encrypted cache with K8s Secret. RKS mTLS: Token (group-&gt;node, 10min TTL) or cert (DNS-SD SAN) auth with memguard.</text>
+</svg>
