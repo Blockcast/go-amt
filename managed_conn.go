@@ -16,14 +16,14 @@ import (
 var _ net.PacketConn = (*ManagedConn)(nil)
 
 // ManagedConn provides a backward-compatible wrapper around RelayManager subscriptions.
-// It implements net.PacketConn and can be used as a drop-in replacement for MutlicastConn.
+// It implements net.PacketConn and can be used as a drop-in replacement for MulticastConn.
 //
-// Key differences from MutlicastConn:
+// Key differences from MulticastConn:
 // - Shares a single socket per relay across multiple (S,G) subscriptions
 // - Automatic reconnection with exponential backoff
 // - Supports DRIAD discovery (RFC 8777) when EnableDRIAD is true
 type ManagedConn struct {
-	// Configuration (same fields as MutlicastConn for compatibility)
+	// Configuration (same fields as MulticastConn for compatibility)
 	RelayAddr net.UDPAddr
 	SrcAddr   netip.Addr
 	GroupAddr netip.Addr

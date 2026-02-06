@@ -14,9 +14,9 @@ import (
 	"time"
 )
 
-var _ net.PacketConn = (*MutlicastConn)(nil)
+var _ net.PacketConn = (*MulticastConn)(nil)
 
-type MutlicastConn struct {
+type MulticastConn struct {
 	RelayAddr net.UDPAddr
 	SrcAddr   netip.Addr
 	GroupAddr netip.Addr
@@ -30,7 +30,7 @@ type MutlicastConn struct {
 	amtGw *Gateway
 }
 
-func (mc *MutlicastConn) Open() error {
+func (mc *MulticastConn) Open() error {
 	var prog []bpf.RawInstruction
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
@@ -72,10 +72,10 @@ func (mc *MutlicastConn) Open() error {
 	return nil
 }
 
-func (mc *MutlicastConn) IsUsingTunnel() bool {
+func (mc *MulticastConn) IsUsingTunnel() bool {
 	return mc.amtGw != nil
 }
-func (mc *MutlicastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
+func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.ReadBatch(ms, flags)
 	}
@@ -144,11 +144,11 @@ func (mc *MutlicastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	return N - bad, err
 }
 
-func (mc *MutlicastConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+func (mc *MulticastConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	n, _, src, err := mc.ReadFromWithControlMessage(p)
 	return n, src, err
 }
-func (mc *MutlicastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.ControlMessage, src net.Addr, err error) {
+func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.ControlMessage, src net.Addr, err error) {
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.ReadFrom(buf)
 	}
@@ -195,19 +195,19 @@ func (mc *MutlicastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 	}
 }
 
-func (mc *MutlicastConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+func (mc *MulticastConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	cm := new(ipv4.ControlMessage)
 	return mc.WriteToWithControlMessage(p, cm, addr)
 }
 
-func (mc *MutlicastConn) WriteToWithControlMessage(b []byte, cm *ipv4.ControlMessage, dst net.Addr) (n int, err error) {
+func (mc *MulticastConn) WriteToWithControlMessage(b []byte, cm *ipv4.ControlMessage, dst net.Addr) (n int, err error) {
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.WriteTo(b, cm, dst)
 	}
 	return 0, fmt.Errorf("write not implemented for amt gatway")
 }
 
-func (mc *MutlicastConn) Close() error {
+func (mc *MulticastConn) Close() error {
 	if !mc.IsUsingTunnel() && mc.conn4 != nil {
 		return mc.conn4.Close()
 	}
@@ -217,35 +217,35 @@ func (mc *MutlicastConn) Close() error {
 	return nil
 }
 
-func (mc *MutlicastConn) LocalAddr() net.Addr {
+func (mc *MulticastConn) LocalAddr() net.Addr {
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.LocalAddr()
 	}
 	return mc.amtGw.conn.LocalAddr()
 }
 
-func (mc *MutlicastConn) SetDeadline(t time.Time) error {
+func (mc *MulticastConn) SetDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.SetDeadline(t)
 	}
 	return mc.amtGw.conn.SetDeadline(t)
 }
 
-func (mc *MutlicastConn) SetReadDeadline(t time.Time) error {
+func (mc *MulticastConn) SetReadDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.SetReadDeadline(t)
 	}
 	return mc.amtGw.conn.SetReadDeadline(t)
 }
 
-func (mc *MutlicastConn) SetWriteDeadline(t time.Time) error {
+func (mc *MulticastConn) SetWriteDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.SetWriteDeadline(t)
 	}
 	return mc.amtGw.conn.SetWriteDeadline(t)
 }
 
-func (mc *MutlicastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {
+func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {
 	if !mc.IsUsingTunnel() {
 		return mc.conn4.WriteBatch(msg, i)
 	}

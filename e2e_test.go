@@ -19,7 +19,7 @@ const (
 )
 
 func TestE2E_ReceiveMulticastData(t *testing.T) {
-	// Skip if CGO is not available (this test requires the Rust-backed MutlicastConn)
+	// Skip if CGO is not available (this test requires the Rust-backed MulticastConn)
 	caps := GetPlatformCapabilities()
 	if !caps.SupportsCGO {
 		t.Skip("Skipping E2E test: CGO not available (Rust backend required)")
@@ -47,7 +47,7 @@ func TestE2E_ReceiveMulticastData(t *testing.T) {
 	t.Logf("Using interface: %s (MTU: %d)", iface.Name, iface.MTU)
 
 	// Create multicast connection with AMT relay
-	mc := &MutlicastConn{
+	mc := &MulticastConn{
 		RelayAddr: net.UDPAddr{
 			IP:   net.ParseIP(testRelayAddr),
 			Port: testRelayPort,

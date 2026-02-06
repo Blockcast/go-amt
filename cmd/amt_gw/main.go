@@ -19,7 +19,7 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	g := amt.MutlicastConn{
+	g := amt.MulticastConn{
 		RelayAddr: net.UDPAddr{
 			IP:   net.ParseIP("162.250.137.254"),
 			Port: m.DefaultPort,
