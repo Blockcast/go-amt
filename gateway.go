@@ -29,13 +29,17 @@ import (
 // Public fields maintain compatibility with conn.go.
 type Gateway struct {
 	// Public fields for conn.go compatibility
-	conn         *ipv4.PacketConn
-	RelayAddr    net.Addr
-	SourceAddr   net.IP
-	GroupAddr    net.IP
-	MTU          int
-	lastData     atomic.Time
-	loopErr      atomic.Error
+	conn        *ipv4.PacketConn
+	RelayAddr   net.Addr
+	SourceAddr  net.IP
+	GroupAddr   net.IP
+	MTU         int
+	// RcvBufBytes and SndBufBytes are forwarded to the AMT relay UDP socket;
+	// see MulticastConn for semantics.
+	RcvBufBytes int
+	SndBufBytes int
+	lastData    atomic.Time
+	loopErr     atomic.Error
 
 	// Internal fields
 	handle       C.amt_gateway_handle_t
@@ -63,6 +67,11 @@ func (g *Gateway) setupSocket() (*ipv4.PacketConn, error) {
 
 	if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_TIMESTAMP, 1); err != nil {
 		return nil, fmt.Errorf("could not set socket timestamp: %w", err)
+	}
+
+	if err := applyForcedBuffers(sock, g.RcvBufBytes, g.SndBufBytes); err != nil {
+		_ = syscall.Close(sock)
+		return nil, err
 	}
 
 	// Turn the socket file descriptor into an *os.File

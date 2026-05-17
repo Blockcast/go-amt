@@ -33,6 +33,11 @@ type ManagedConn struct {
 	Timeout   time.Duration
 	Timestamp bool
 
+	// RcvBufBytes and SndBufBytes are forwarded to the native multicast
+	// socket; see MulticastConn for semantics.
+	RcvBufBytes int
+	SndBufBytes int
+
 	// DRIAD discovery configuration (RFC 8777)
 	// When EnableDRIAD is true and RelayAddr is empty, discovers relay via DNS
 	EnableDRIAD bool
@@ -157,7 +162,7 @@ func (mc *ManagedConn) tryNativeMulticast() error {
 	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
 
 	var prog []bpf.RawInstruction
-	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4)
+	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
 	if err != nil {
 		return err
 	}
