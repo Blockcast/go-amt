@@ -19,7 +19,7 @@ import (
 // regardless of the address you tell it to listen on. The network and address gaddr parameters
 // work like any others and if ifname is not specified it lets the OS decide
 // which interface to listen on.
-func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, gaddr *net.UDPAddr, f []bpf.RawInstruction, timestamp bool, ttl int, flags4 ipv4.ControlFlags) (*ipv4.PacketConn, error) {
+func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, gaddr *net.UDPAddr, f []bpf.RawInstruction, timestamp bool, ttl int, flags4 ipv4.ControlFlags, rcvBufBytes int, sndBufBytes int) (*ipv4.PacketConn, error) {
 
 	if gaddr == nil || gaddr.IP.To4() == nil {
 		return nil, errors.New("invalid ipv4 address")
@@ -40,6 +40,11 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 	const SO_REUSEPORT = 0x0200
 	if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, SO_REUSEPORT, 1); err != nil {
 		return nil, fmt.Errorf("could not set socket reuseport: %w", err)
+	}
+
+	if err := applyForcedBuffers(sock, rcvBufBytes, sndBufBytes); err != nil {
+		_ = syscall.Close(sock)
+		return nil, err
 	}
 
 	if timestamp {

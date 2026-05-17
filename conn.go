@@ -26,6 +26,14 @@ type MulticastConn struct {
 	Timeout   time.Duration
 	Timestamp bool
 
+	// RcvBufBytes, if > 0, requests this size on the underlying UDP socket via
+	// SetForcedReceiveBuffer (SO_RCVBUFFORCE on Linux, SO_RCVBUF on Darwin).
+	// SO_RCVBUFFORCE requires CAP_NET_ADMIN; on EPERM it falls back to
+	// SO_RCVBUF, which is capped at 2*net.core.rmem_max.
+	RcvBufBytes int
+	// SndBufBytes is the send-side counterpart of RcvBufBytes.
+	SndBufBytes int
+
 	conn4 *ipv4.PacketConn
 	amtGw *Gateway
 }
@@ -35,7 +43,7 @@ func (mc *MulticastConn) Open() error {
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
 	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
-	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4)
+	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
 	if err != nil {
 		return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 	}
@@ -53,9 +61,11 @@ func (mc *MulticastConn) Open() error {
 				return err
 			}
 			mc.amtGw = &Gateway{
-				RelayAddr: &mc.RelayAddr,
-				GroupAddr: dstAddr.IP,
-				MTU:       mc.IFace.MTU,
+				RelayAddr:   &mc.RelayAddr,
+				GroupAddr:   dstAddr.IP,
+				MTU:         mc.IFace.MTU,
+				RcvBufBytes: mc.RcvBufBytes,
+				SndBufBytes: mc.SndBufBytes,
 			}
 			if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
 				mc.amtGw.SourceAddr = mc.SrcAddr.AsSlice()

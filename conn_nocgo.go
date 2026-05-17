@@ -16,14 +16,16 @@ import (
 // This stub allows packages that reference the type to compile without CGO,
 // but all methods return errors indicating CGO is required.
 type MulticastConn struct {
-	RelayAddr net.UDPAddr
-	SrcAddr   netip.Addr
-	GroupAddr netip.Addr
-	GroupPort uint16
-	TTL       int
-	IFace     *net.Interface
-	Timeout   time.Duration
-	Timestamp bool
+	RelayAddr   net.UDPAddr
+	SrcAddr     netip.Addr
+	GroupAddr   netip.Addr
+	GroupPort   uint16
+	TTL         int
+	IFace       *net.Interface
+	Timeout     time.Duration
+	Timestamp   bool
+	RcvBufBytes int
+	SndBufBytes int
 }
 
 var errNoCGO = fmt.Errorf("multicast connections require CGO; rebuild with CGO_ENABLED=1")
