@@ -1,0 +1,71 @@
+// go-amt LikeC4 model
+// Go AMT library with optional CGO binding to amt-protocol
+// Repo: https://github.com/Blockcast/go-amt
+
+specification {
+  element softwareSystem
+  element service
+  element component
+  element library
+
+  relationship sync
+  relationship uses
+
+  tag external
+  tag amt
+  tag driad
+  tag go
+  tag rust
+}
+
+model {
+  goAmtSystem = softwareSystem 'go-amt' {
+    #external #amt #go
+    description 'Go AMT library. Pure Go or CGO with amt-protocol FFI.'
+
+    gateway = library 'gateway.go' {
+      #amt #go
+      technology 'Go'
+      description 'AMT gateway implementation. Handles AMT protocol messaging.'
+    }
+
+    driadGo = library 'driad.go' {
+      #driad #go
+      technology 'Go, DNS'
+      description 'DRIAD discovery (RFC 8777). Builds query, parses AMTRELAY records.'
+    }
+
+    relayManager = library 'relay_manager.go' {
+      #amt #go
+      technology 'Go'
+      description 'Manages multiple AMT relay connections.'
+    }
+
+    cgoBinding = component 'CGO Binding' {
+      #amt #go #rust
+      technology 'CGO, libamt_protocol.so'
+      description 'Optional CGO binding to amt-protocol Rust FFI.'
+    }
+
+    // Internal relationships
+    gateway -[uses]-> driadGo
+    gateway -[uses]-> relayManager
+    gateway -[uses]-> cgoBinding
+  }
+}
+
+views {
+  view goAmtOverview {
+    title 'go-amt Overview'
+    description 'Go AMT library with gateway, DRIAD, relay manager'
+    include goAmtSystem
+    include goAmtSystem.*
+  }
+
+  view driadFlow {
+    title 'DRIAD Discovery in Go'
+    description 'driad.go builds DNS queries and parses AMTRELAY records'
+    include goAmtSystem.gateway
+    include goAmtSystem.driadGo
+  }
+}
