@@ -58,6 +58,12 @@ type TransportConfig struct {
 
 	// MTU is the maximum transmission unit
 	MTU int
+
+	// RcvBufBytes and SndBufBytes, if > 0, are applied to the relay UDP socket
+	// via applyForcedBuffers (SO_RCVBUFFORCE/SO_SNDBUFFORCE on Linux,
+	// SO_RCVBUF/SO_SNDBUF on Darwin); see MulticastConn / Gateway for semantics.
+	RcvBufBytes int
+	SndBufBytes int
 }
 
 // DefaultTransportConfig returns a config with sensible defaults

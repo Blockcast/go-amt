@@ -86,6 +86,8 @@ func (mc *ManagedConn) Open() error {
 		Timeout:         mc.Timeout,
 		EnableTimestamp: mc.Timestamp,
 		MTU:             1500,
+		RcvBufBytes:     mc.RcvBufBytes,
+		SndBufBytes:     mc.SndBufBytes,
 	}
 	if mc.IFace != nil {
 		transportCfg.MTU = mc.IFace.MTU

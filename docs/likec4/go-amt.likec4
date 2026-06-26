@@ -50,7 +50,7 @@ model {
     // Internal relationships
     gateway -[uses]-> driadGo
     gateway -[uses]-> relayManager
-    gateway -[uses]-> cgoBinding
+    gateway -[uses]-> cgoBinding // optional: CGO_ENABLED=1 builds only
   }
 }
 
