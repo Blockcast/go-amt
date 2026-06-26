@@ -9,12 +9,24 @@ import (
 	"github.com/google/gopacket/layers"
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	"net"
 	"net/netip"
 	"time"
 )
 
 var _ net.PacketConn = (*MulticastConn)(nil)
+
+// nativeConn is the subset of methods shared by *ipv4.PacketConn and
+// *ipv6.PacketConn that the non-data-plane bookkeeping (Close, deadlines,
+// local address) needs, independent of the IP version's control-message type.
+type nativeConn interface {
+	Close() error
+	LocalAddr() net.Addr
+	SetDeadline(t time.Time) error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+}
 
 type MulticastConn struct {
 	RelayAddr net.UDPAddr
@@ -35,13 +47,60 @@ type MulticastConn struct {
 	SndBufBytes int
 
 	conn4 *ipv4.PacketConn
+	conn6 *ipv6.PacketConn
 	amtGw *Gateway
+}
+
+// activeConn returns the version-agnostic view of whichever native PacketConn
+// is currently open (v4 or v6), or nil when neither is set (e.g. AMT tunnel).
+func (mc *MulticastConn) activeConn() nativeConn {
+	if mc.conn4 != nil {
+		return mc.conn4
+	}
+	if mc.conn6 != nil {
+		return mc.conn6
+	}
+	return nil
 }
 
 func (mc *MulticastConn) Open() error {
 	var prog []bpf.RawInstruction
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
+
+	if mc.GroupAddr.Is6() {
+		flags6 := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit
+		conn, err := ListenMulticastUDP6("udp6", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags6, mc.RcvBufBytes, mc.SndBufBytes)
+		if err != nil {
+			return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
+		}
+		mc.conn6 = conn
+
+		if len(mc.RelayAddr.IP) > 0 {
+			if err = mc.conn6.SetReadDeadline(time.Now().Add(mc.Timeout)); err != nil {
+				return err
+			}
+			discard := make([]byte, mc.IFace.MTU)
+			n, _, _, err := mc.conn6.ReadFrom(discard)
+			_ = n
+			if err, ok := err.(net.Error); ok && err.Timeout() {
+				if err := mc.conn6.Close(); err != nil {
+					return err
+				}
+				mc.conn6 = nil
+				// Native v6 join produced no traffic and a relay is configured,
+				// but the AMT tunnel data plane is v4-only. Surface a clear error
+				// rather than silently falling back to an unsupported path.
+				return fmt.Errorf("v6 AMT tunnel fallback not yet supported")
+			} else if err != nil {
+				return err
+			} else {
+				return mc.conn6.SetReadDeadline(time.Time{})
+			}
+		}
+		return nil
+	}
+
 	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
 	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
 	if err != nil {
@@ -87,6 +146,10 @@ func (mc *MulticastConn) IsUsingTunnel() bool {
 }
 func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	if !mc.IsUsingTunnel() {
+		if mc.conn6 != nil {
+			// ipv6.Message and ipv4.Message are both aliases for socket.Message.
+			return mc.conn6.ReadBatch(ms, flags)
+		}
 		return mc.conn4.ReadBatch(ms, flags)
 	}
 	if err := mc.amtGw.loopErr.Swap(nil); err != nil {
@@ -160,6 +223,12 @@ func (mc *MulticastConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 }
 func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.ControlMessage, src net.Addr, err error) {
 	if !mc.IsUsingTunnel() {
+		if mc.conn6 != nil {
+			// Native v6 receive: the v6 control message has a different type, so
+			// it is dropped here. Callers only consume cm on the v4 path.
+			n, _, src, err = mc.conn6.ReadFrom(buf)
+			return n, nil, src, err
+		}
 		return mc.conn4.ReadFrom(buf)
 	}
 	if err := mc.amtGw.loopErr.Swap(nil); err != nil {
@@ -212,14 +281,20 @@ func (mc *MulticastConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 func (mc *MulticastConn) WriteToWithControlMessage(b []byte, cm *ipv4.ControlMessage, dst net.Addr) (n int, err error) {
 	if !mc.IsUsingTunnel() {
+		if mc.conn6 != nil {
+			// The v4 control message does not apply to the v6 socket.
+			return mc.conn6.WriteTo(b, nil, dst)
+		}
 		return mc.conn4.WriteTo(b, cm, dst)
 	}
 	return 0, fmt.Errorf("write not implemented for amt gatway")
 }
 
 func (mc *MulticastConn) Close() error {
-	if !mc.IsUsingTunnel() && mc.conn4 != nil {
-		return mc.conn4.Close()
+	if !mc.IsUsingTunnel() {
+		if c := mc.activeConn(); c != nil {
+			return c.Close()
+		}
 	}
 	if mc.amtGw != nil {
 		return mc.amtGw.Close()
@@ -229,34 +304,38 @@ func (mc *MulticastConn) Close() error {
 
 func (mc *MulticastConn) LocalAddr() net.Addr {
 	if !mc.IsUsingTunnel() {
-		return mc.conn4.LocalAddr()
+		return mc.activeConn().LocalAddr()
 	}
 	return mc.amtGw.conn.LocalAddr()
 }
 
 func (mc *MulticastConn) SetDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
-		return mc.conn4.SetDeadline(t)
+		return mc.activeConn().SetDeadline(t)
 	}
 	return mc.amtGw.conn.SetDeadline(t)
 }
 
 func (mc *MulticastConn) SetReadDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
-		return mc.conn4.SetReadDeadline(t)
+		return mc.activeConn().SetReadDeadline(t)
 	}
 	return mc.amtGw.conn.SetReadDeadline(t)
 }
 
 func (mc *MulticastConn) SetWriteDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
-		return mc.conn4.SetWriteDeadline(t)
+		return mc.activeConn().SetWriteDeadline(t)
 	}
 	return mc.amtGw.conn.SetWriteDeadline(t)
 }
 
 func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {
 	if !mc.IsUsingTunnel() {
+		if mc.conn6 != nil {
+			// ipv6.Message and ipv4.Message are both aliases for socket.Message.
+			return mc.conn6.WriteBatch(msg, i)
+		}
 		return mc.conn4.WriteBatch(msg, i)
 	}
 	return 0, fmt.Errorf("writebatch not implemented for amt gatway")
