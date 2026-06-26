@@ -50,6 +50,17 @@ func (t *UDPTransport) Open(ctx context.Context) error {
 		_ = syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_TIMESTAMP, 1)
 	}
 
+	// Apply forced socket buffers (mirrors Gateway.setupSocket); clamps are
+	// logged + counted as non-fatal, real syscall errors abort setup.
+	if err := applyForcedBuffers(sock, t.cfg.RcvBufBytes, t.cfg.SndBufBytes); err != nil {
+		_ = syscall.Close(sock)
+		return &TransportError{
+			Type:    TransportTypeUDP,
+			Message: "failed to apply socket buffers",
+			Cause:   err,
+		}
+	}
+
 	// Convert socket to PacketConn
 	file := os.NewFile(uintptr(sock), "")
 	conn, err := net.FilePacketConn(file)
