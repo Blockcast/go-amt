@@ -64,15 +64,18 @@ func (mc *ManagedConn) Open() error {
 		return fmt.Errorf("connection already closed")
 	}
 
+	hasRelay := len(mc.RelayAddr.IP) > 0
+	useDRIAD := mc.EnableDRIAD && !hasRelay
+
 	// Try native multicast first (if relay timeout is configured)
-	if len(mc.RelayAddr.IP) > 0 && mc.Timeout > 0 {
+	if hasRelay && mc.Timeout > 0 {
 		if err := mc.tryNativeMulticast(); err == nil {
 			mc.usingTunnel = false
 			return nil
 		}
 		// Native multicast failed or timed out, use AMT relay
-	} else if len(mc.RelayAddr.IP) == 0 {
-		// No relay configured, use native multicast only
+	} else if !hasRelay && !useDRIAD {
+		// No relay or DRIAD discovery configured, use native multicast only.
 		return mc.tryNativeMulticast()
 	}
 
@@ -94,7 +97,7 @@ func (mc *ManagedConn) Open() error {
 
 	// Get or create RelayManager for this relay
 	var config RelayManagerConfig
-	if mc.EnableDRIAD && len(mc.RelayAddr.IP) == 0 {
+	if useDRIAD {
 		// Use DRIAD discovery
 		config = DefaultRelayManagerConfigWithDRIAD(mc.SrcAddr)
 		config.DNSServers = mc.DNSServers
@@ -105,7 +108,7 @@ func (mc *ManagedConn) Open() error {
 
 	// For DRIAD, use source address as registry key since relay is unknown
 	registryKey := mc.RelayAddr
-	if mc.EnableDRIAD && len(mc.RelayAddr.IP) == 0 {
+	if useDRIAD {
 		// Use a placeholder key based on source address for DRIAD
 		registryKey = net.UDPAddr{
 			IP:   mc.SrcAddr.AsSlice(),
