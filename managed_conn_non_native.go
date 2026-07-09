@@ -1,4 +1,4 @@
-//go:build (!linux && !darwin) || ios || android
+//go:build !linux && !darwin
 
 package amt
 

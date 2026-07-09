@@ -283,6 +283,22 @@ func (mc *ManagedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	return 0, fmt.Errorf("write not supported for AMT tunnel")
 }
 
+// WriteToWithControlMessage writes a packet with an IPv4 control message.
+func (mc *ManagedConn) WriteToWithControlMessage(p []byte, cm *ipv4.ControlMessage, addr net.Addr) (n int, err error) {
+	mc.mu.RLock()
+	defer mc.mu.RUnlock()
+
+	if mc.closed {
+		return 0, fmt.Errorf("connection closed")
+	}
+
+	if !mc.usingTunnel && mc.nativeConn != nil {
+		return mc.nativeConn.WriteTo(p, cm, addr)
+	}
+
+	return 0, fmt.Errorf("write not supported for AMT tunnel")
+}
+
 // WriteBatch writes multiple packets (not supported for AMT tunnel)
 func (mc *ManagedConn) WriteBatch(msg []ipv4.Message, flags int) (int, error) {
 	mc.mu.RLock()
