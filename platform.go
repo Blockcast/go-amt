@@ -29,13 +29,13 @@ type PlatformCapabilities struct {
 // DetectPlatform returns the current runtime platform
 func DetectPlatform() Platform {
 	switch runtime.GOOS {
+	case "android":
+		return PlatformAndroid
+	case "ios":
+		return PlatformIOS
 	case "linux":
-		// Could be regular Linux or Android
-		// Android detection would require checking build tags
 		return PlatformLinux
 	case "darwin":
-		// Could be macOS or iOS
-		// iOS detection would require checking build tags
 		return PlatformDarwin
 	case "windows":
 		return PlatformWindows
@@ -61,6 +61,12 @@ func GetPlatformCapabilities() PlatformCapabilities {
 		caps.SupportsUDP = PlatformUDPAvailable()
 		caps.SupportsCGO = IsCGOAvailable()
 		caps.SupportsBPF = false // macOS has different BPF semantics
+		caps.SupportsTimestamp = true
+
+	case PlatformAndroid, PlatformIOS:
+		caps.SupportsUDP = PlatformUDPAvailable()
+		caps.SupportsCGO = IsCGOAvailable()
+		caps.SupportsBPF = false
 		caps.SupportsTimestamp = true
 
 	case PlatformWindows:

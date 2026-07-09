@@ -1,4 +1,4 @@
-//go:build !cgo || ios || android || js || wasm
+//go:build (!cgo && !android && !ios) || js || wasm
 
 package amt
 
