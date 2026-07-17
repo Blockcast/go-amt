@@ -63,6 +63,14 @@ func main() {
 	if err != nil {
 		log.Fatalf("-relay port: %v", err)
 	}
+	// net.ParseIP returns nil for a hostname or malformed value; without this
+	// guard a bad -relay host yields a nil RelayAddr.IP and the AMT membership
+	// datagrams are sent to an invalid destination — a silent post-discovery
+	// stall. DRIAD/relay discovery hands out literal IPs, so require one here.
+	relayIP := net.ParseIP(relayHost)
+	if relayIP == nil {
+		log.Fatalf("-relay host %q is not a valid IP address", relayHost)
+	}
 	ifi, err := net.InterfaceByName(*ifaceName)
 	if err != nil {
 		log.Fatalf("-iface %q: %v", *ifaceName, err)
@@ -83,7 +91,7 @@ func main() {
 	defer outConn.Close()
 
 	mc := amt.MulticastConn{
-		RelayAddr:   net.UDPAddr{IP: net.ParseIP(relayHost), Port: relayPort},
+		RelayAddr:   net.UDPAddr{IP: relayIP, Port: relayPort},
 		SrcAddr:     srcAddr,
 		GroupAddr:   grpAddr,
 		GroupPort:   uint16(*port),
