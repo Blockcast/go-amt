@@ -1,10 +1,13 @@
-//go:build (linux || darwin) && !ios && !android && cgo
+//go:build (linux || darwin) && !ios && !android
 
 package amt
 
 import (
+	"context"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -19,15 +22,34 @@ const (
 )
 
 func TestE2E_ReceiveMulticastData(t *testing.T) {
-	// Skip if CGO is not available (this test requires the Rust-backed MulticastConn)
-	caps := GetPlatformCapabilities()
-	if !caps.SupportsCGO {
-		t.Skip("Skipping E2E test: CGO not available (Rust backend required)")
+	if os.Getenv("AMT_E2E") == "" {
+		t.Skip("set AMT_E2E=1 to run the live AMT test")
 	}
 
-	t.Log("Testing AMT gateway with Rust backend")
-	t.Logf("Relay: %s:%d", testRelayAddr, testRelayPort)
-	t.Logf("Source: %s, Group: %s:%d", testSource, testGroup, testGroupPort)
+	relayAddr := testRelayAddr
+	if override := os.Getenv("AMT_TEST_RELAY"); override != "" {
+		relayAddr = override
+	}
+	sourceAddr := testSource
+	if override := os.Getenv("AMT_TEST_SOURCE"); override != "" {
+		sourceAddr = override
+	}
+	groupAddr := testGroup
+	if override := os.Getenv("AMT_TEST_GROUP"); override != "" {
+		groupAddr = override
+	}
+	groupPort := uint16(testGroupPort)
+	if override := os.Getenv("AMT_TEST_PORT"); override != "" {
+		port, err := strconv.ParseUint(override, 10, 16)
+		if err != nil || port == 0 {
+			t.Fatalf("AMT_TEST_PORT = %q, want 1..65535", override)
+		}
+		groupPort = uint16(port)
+	}
+
+	t.Log("Testing AMT gateway through RelayManager")
+	t.Logf("Relay: %s:%d", relayAddr, testRelayPort)
+	t.Logf("Source: %s, Group: %s:%d", sourceAddr, groupAddr, groupPort)
 
 	// Get default interface
 	iface, err := net.InterfaceByName("eth0")
@@ -46,65 +68,46 @@ func TestE2E_ReceiveMulticastData(t *testing.T) {
 	}
 	t.Logf("Using interface: %s (MTU: %d)", iface.Name, iface.MTU)
 
-	// Create multicast connection with AMT relay
-	mc := &MulticastConn{
-		RelayAddr: net.UDPAddr{
-			IP:   net.ParseIP(testRelayAddr),
-			Port: testRelayPort,
-		},
-		SrcAddr:   netip.MustParseAddr(testSource),
-		GroupAddr: netip.MustParseAddr(testGroup),
-		GroupPort: testGroupPort,
-		IFace:     iface,
-		Timeout:   5 * time.Second,
-		TTL:       255,
+	config := DefaultRelayManagerConfig(net.UDPAddr{
+		IP:   net.ParseIP(relayAddr),
+		Port: testRelayPort,
+	})
+	manager := NewRelayManager(config)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Open(ctx); err != nil {
+		t.Fatalf("Failed to open relay manager: %v", err)
+	}
+	defer manager.Close()
+
+	if _, ok := manager.protocol.(*PureGoProtocol); !ok {
+		t.Fatalf("Protocol = %T, want *PureGoProtocol; run with CGO_ENABLED=0", manager.protocol)
 	}
 
-	// Open connection (will use AMT tunnel)
-	if err := mc.Open(); err != nil {
-		t.Fatalf("Failed to open connection: %v", err)
-	}
-	defer mc.Close()
-
-	if !mc.IsUsingTunnel() {
-		t.Log("Warning: Not using AMT tunnel (native multicast available)")
-	} else {
-		t.Log("Using AMT tunnel as expected")
+	subscription, err := manager.Subscribe(SubscriptionKey{
+		Source: netip.MustParseAddr(sourceAddr),
+		Group:  netip.MustParseAddr(groupAddr),
+		Port:   groupPort,
+	}, SubscriptionCallbacks{})
+	if err != nil {
+		t.Fatalf("Failed to subscribe: %v", err)
 	}
 
-	// Try to receive data
-	buf := make([]byte, iface.MTU)
-	packetsReceived := 0
-
-	// Set read deadline
-	if err := mc.SetReadDeadline(time.Now().Add(testDataTimeout)); err != nil {
-		t.Fatalf("Failed to set read deadline: %v", err)
-	}
-
-	for i := 0; i < 5; i++ {
-		n, addr, err := mc.ReadFrom(buf)
-		if err != nil {
-			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				t.Log("Read timeout - no more data")
-				break
-			}
-			t.Fatalf("Read error: %v", err)
+	started := time.Now()
+	dataTimeout := time.NewTimer(testDataTimeout)
+	defer dataTimeout.Stop()
+	for packetsReceived := 0; packetsReceived < 5; {
+		select {
+		case packet := <-subscription.DataChan():
+			packetsReceived++
+			t.Logf("Received packet %d: %d bytes from %v", packetsReceived, len(packet.Data), packet.Source)
+		case <-dataTimeout.C:
+			stats := subscription.Stats()
+			t.Fatalf("Data timeout after %s: state=%s packets=%d bytes=%d", time.Since(started), stats.State, stats.PacketsReceived, stats.BytesReceived)
 		}
-		packetsReceived++
-		t.Logf("Received packet %d: %d bytes from %v", packetsReceived, n, addr)
 	}
 
-	if packetsReceived == 0 {
-		t.Error("No multicast packets received")
-	} else {
-		t.Logf("Successfully received %d multicast packets via AMT", packetsReceived)
-	}
-}
-
-func TestVersion(t *testing.T) {
-	v := Version()
-	if v == "" {
-		t.Error("Version() returned empty string")
-	}
-	t.Logf("AMT Protocol Library Version: %s", v)
+	stats := subscription.Stats()
+	elapsed := time.Since(started)
+	t.Logf("AMT data pass: packets=%d bytes=%d elapsed=%s packet_rate=%.2f/s", stats.PacketsReceived, stats.BytesReceived, elapsed, float64(stats.PacketsReceived)/elapsed.Seconds())
 }

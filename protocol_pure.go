@@ -221,23 +221,27 @@ func (p *PureGoProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []n
 
 // buildIPHeader creates an IPv4 header for IGMP
 func (p *PureGoProtocol) buildIPHeader(payload []byte) []byte {
-	totalLen := 20 + len(payload) // IP header + payload
+	const headerLen = 24
+	totalLen := headerLen + len(payload)
 
-	header := make([]byte, 20)
-	header[0] = 0x45                                        // Version (4) + IHL (5)
-	header[1] = 0xc0                                        // DSCP + ECN (0xc0 for IGMP)
+	header := make([]byte, headerLen)
+	header[0] = 0x46 // Version (4) + IHL (6)
+	header[1] = 0xc0 // DSCP + ECN (0xc0 for IGMP)
 	binary.BigEndian.PutUint16(header[2:4], uint16(totalLen))
-	binary.BigEndian.PutUint16(header[4:6], 0)              // Identification
-	binary.BigEndian.PutUint16(header[6:8], 0)              // Flags + Fragment Offset
-	header[8] = 1                                           // TTL = 1 for IGMP
-	header[9] = 2                                           // Protocol = IGMP
-	binary.BigEndian.PutUint16(header[10:12], 0)            // Checksum (calculated below)
+	binary.BigEndian.PutUint16(header[4:6], 0)   // Identification
+	binary.BigEndian.PutUint16(header[6:8], 0)   // Flags + Fragment Offset
+	header[8] = 1                                // TTL = 1 for IGMP
+	header[9] = 2                                // Protocol = IGMP
+	binary.BigEndian.PutUint16(header[10:12], 0) // Checksum (calculated below)
 
 	// Source: 0.0.0.0 (will be filled by kernel/relay)
 	copy(header[12:16], net.IPv4zero.To4())
 
 	// Destination: 224.0.0.22 (IGMP report address)
 	copy(header[16:20], net.ParseIP("224.0.0.22").To4())
+
+	// RFC 3376 requires every IGMPv3 message to carry Router Alert.
+	copy(header[20:24], []byte{0x94, 0x04, 0x00, 0x00})
 
 	// Calculate IP header checksum
 	checksum := p.calculateIPChecksum(header)
