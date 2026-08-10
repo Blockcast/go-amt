@@ -46,6 +46,7 @@ type ManagedConn struct {
 	rm          *RelayManager
 	sub         *Subscription
 	readBuffer  chan *DataPacket
+	done        chan struct{}
 	mu          sync.RWMutex
 	closed      bool
 	usingTunnel bool
@@ -63,6 +64,7 @@ func (mc *ManagedConn) Open() error {
 	if mc.closed {
 		return fmt.Errorf("connection already closed")
 	}
+	mc.done = make(chan struct{})
 	if !mc.SrcAddr.Is4() {
 		return fmt.Errorf("AMT source address must be IPv4: %s", mc.SrcAddr)
 	}
@@ -140,6 +142,8 @@ func (mc *ManagedConn) Open() error {
 	sub, err := rm.Subscribe(key, SubscriptionCallbacks{
 		OnPacket: func(data []byte, src net.Addr) error {
 			select {
+			case <-mc.done:
+				return nil
 			case mc.readBuffer <- &DataPacket{
 				Data:      data,
 				Source:    src,
@@ -175,20 +179,26 @@ func (mc *ManagedConn) IsUsingTunnel() bool {
 // ReadFrom reads a packet from the connection
 func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-
 	if mc.closed {
+		mc.mu.RUnlock()
 		return 0, nil, fmt.Errorf("connection closed")
 	}
+	usingTunnel := mc.usingTunnel
+	nativeConn := mc.nativeConn
+	readBuffer := mc.readBuffer
+	done := mc.done
+	mc.mu.RUnlock()
 
-	if !mc.usingTunnel && mc.nativeConn != nil {
-		n, _, src, err := mc.nativeConn.ReadFrom(p)
+	if !usingTunnel && nativeConn != nil {
+		n, _, src, err := nativeConn.ReadFrom(p)
 		return n, src, err
 	}
 
 	// Read from subscription channel
 	select {
-	case pkt, ok := <-mc.readBuffer:
+	case <-done:
+		return 0, nil, fmt.Errorf("connection closed")
+	case pkt, ok := <-readBuffer:
 		if !ok {
 			return 0, nil, fmt.Errorf("connection closed")
 		}
@@ -200,19 +210,25 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 // ReadFromWithControlMessage reads a packet with control message
 func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.ControlMessage, src net.Addr, err error) {
 	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-
 	if mc.closed {
+		mc.mu.RUnlock()
 		return 0, nil, nil, fmt.Errorf("connection closed")
 	}
+	usingTunnel := mc.usingTunnel
+	nativeConn := mc.nativeConn
+	readBuffer := mc.readBuffer
+	done := mc.done
+	mc.mu.RUnlock()
 
-	if !mc.usingTunnel && mc.nativeConn != nil {
-		return mc.nativeConn.ReadFrom(buf)
+	if !usingTunnel && nativeConn != nil {
+		return nativeConn.ReadFrom(buf)
 	}
 
 	// Read from subscription channel (no control message available for AMT)
 	select {
-	case pkt, ok := <-mc.readBuffer:
+	case <-done:
+		return 0, nil, nil, fmt.Errorf("connection closed")
+	case pkt, ok := <-readBuffer:
 		if !ok {
 			return 0, nil, nil, fmt.Errorf("connection closed")
 		}
@@ -224,21 +240,30 @@ func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.C
 // ReadBatch reads multiple packets efficiently
 func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	mc.mu.RLock()
-	defer mc.mu.RUnlock()
-
 	if mc.closed {
+		mc.mu.RUnlock()
 		return 0, fmt.Errorf("connection closed")
 	}
+	usingTunnel := mc.usingTunnel
+	nativeConn := mc.nativeConn
+	readBuffer := mc.readBuffer
+	done := mc.done
+	mc.mu.RUnlock()
 
-	if !mc.usingTunnel && mc.nativeConn != nil {
-		return mc.nativeConn.ReadBatch(ms, flags)
+	if !usingTunnel && nativeConn != nil {
+		return nativeConn.ReadBatch(ms, flags)
 	}
 
 	// Read from subscription channel
 	count := 0
 	for i := range ms {
 		select {
-		case pkt, ok := <-mc.readBuffer:
+		case <-done:
+			if count > 0 {
+				return count, nil
+			}
+			return 0, fmt.Errorf("connection closed")
+		case pkt, ok := <-readBuffer:
 			if !ok {
 				if count > 0 {
 					return count, nil
@@ -257,14 +282,18 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 				return count, nil
 			}
 			// Block for at least one packet
-			pkt, ok := <-mc.readBuffer
-			if !ok {
+			select {
+			case <-done:
 				return 0, fmt.Errorf("connection closed")
-			}
-			if len(ms[i].Buffers) > 0 && len(ms[i].Buffers[0]) > 0 {
-				ms[i].N = copy(ms[i].Buffers[0], pkt.Data)
-				ms[i].Addr = pkt.Source
-				count++
+			case pkt, ok := <-readBuffer:
+				if !ok {
+					return 0, fmt.Errorf("connection closed")
+				}
+				if len(ms[i].Buffers) > 0 && len(ms[i].Buffers[0]) > 0 {
+					ms[i].N = copy(ms[i].Buffers[0], pkt.Data)
+					ms[i].Addr = pkt.Source
+					count++
+				}
 			}
 			return count, nil
 		}
@@ -324,24 +353,27 @@ func (mc *ManagedConn) WriteBatch(msg []ipv4.Message, flags int) (int, error) {
 // Close closes the connection
 func (mc *ManagedConn) Close() error {
 	mc.mu.Lock()
-	defer mc.mu.Unlock()
-
 	if mc.closed {
+		mc.mu.Unlock()
 		return nil
 	}
 	mc.closed = true
+	if mc.done != nil {
+		close(mc.done)
+	}
+	usingTunnel := mc.usingTunnel
+	nativeConn := mc.nativeConn
+	rm := mc.rm
+	sub := mc.sub
+	mc.mu.Unlock()
 
-	if !mc.usingTunnel && mc.nativeConn != nil {
-		return mc.nativeConn.Close()
+	if !usingTunnel && nativeConn != nil {
+		return nativeConn.Close()
 	}
 
 	// Unsubscribe from RelayManager
-	if mc.rm != nil && mc.sub != nil {
-		return mc.rm.Unsubscribe(mc.sub.Key())
-	}
-
-	if mc.readBuffer != nil {
-		close(mc.readBuffer)
+	if rm != nil && sub != nil {
+		return rm.Unsubscribe(sub.Key())
 	}
 
 	return nil
