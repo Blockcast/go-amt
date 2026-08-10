@@ -11,6 +11,7 @@ import (
 	m "github.com/blockcast/go-amt/messages"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
+	"golang.org/x/net/ipv4"
 )
 
 func multicastDataPacket(t *testing.T, payload []byte) []byte {
@@ -168,6 +169,80 @@ func TestManagedConnOpenRejectsNonIPv4Subscription(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("Open() error = %q, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestManagedConnCloseUnblocksTunnelReads(t *testing.T) {
+	tests := []struct {
+		name string
+		read func(*ManagedConn) error
+	}{
+		{
+			name: "ReadFrom",
+			read: func(mc *ManagedConn) error {
+				_, _, err := mc.ReadFrom(make([]byte, 1500))
+				return err
+			},
+		},
+		{
+			name: "ReadFromWithControlMessage",
+			read: func(mc *ManagedConn) error {
+				_, _, _, err := mc.ReadFromWithControlMessage(make([]byte, 1500))
+				return err
+			},
+		},
+		{
+			name: "ReadBatch",
+			read: func(mc *ManagedConn) error {
+				messages := []ipv4.Message{{Buffers: [][]byte{make([]byte, 1500)}}}
+				_, err := mc.ReadBatch(messages, 0)
+				return err
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mc := &ManagedConn{
+				usingTunnel: true,
+				readBuffer:  make(chan *DataPacket),
+				done:        make(chan struct{}),
+			}
+
+			readResult := make(chan error, 1)
+			go func() {
+				readResult <- tt.read(mc)
+			}()
+
+			select {
+			case err := <-readResult:
+				t.Fatalf("read returned before Close: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+
+			closeResult := make(chan error, 1)
+			go func() {
+				closeResult <- mc.Close()
+			}()
+
+			select {
+			case err := <-closeResult:
+				if err != nil {
+					t.Fatalf("Close() error = %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("Close blocked behind an idle read")
+			}
+
+			select {
+			case err := <-readResult:
+				if err == nil || !strings.Contains(err.Error(), "connection closed") {
+					t.Fatalf("read error = %v, want connection closed", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("read did not unblock after Close")
 			}
 		})
 	}
