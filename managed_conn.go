@@ -63,6 +63,12 @@ func (mc *ManagedConn) Open() error {
 	if mc.closed {
 		return fmt.Errorf("connection already closed")
 	}
+	if !mc.SrcAddr.Is4() {
+		return fmt.Errorf("AMT source address must be IPv4: %s", mc.SrcAddr)
+	}
+	if !mc.GroupAddr.Is4() {
+		return fmt.Errorf("AMT group address must be IPv4: %s", mc.GroupAddr)
+	}
 
 	hasRelay := len(mc.RelayAddr.IP) > 0
 	useDRIAD := mc.EnableDRIAD && !hasRelay
