@@ -714,15 +714,16 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 		return
 	}
 
-	// Extract payload
+	// Extract and own the payload before the read loop reuses its receive buffer.
 	payload := pkt.ApplicationLayer()
 	if payload == nil {
 		return
 	}
+	payloadData := append([]byte(nil), payload.Payload()...)
 
 	// Update stats
 	sub.packetsReceived.Add(1)
-	sub.bytesReceived.Add(uint64(len(payload.Payload())))
+	sub.bytesReceived.Add(uint64(len(payloadData)))
 	sub.lastPacketTime.Store(time.Now())
 
 	// Send to callback or channel
@@ -731,7 +732,7 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 			IP:   ip.SrcIP,
 			Port: int(udp.SrcPort),
 		}
-		if err := sub.callbacks.OnPacket(payload.Payload(), srcUDP); err != nil {
+		if err := sub.callbacks.OnPacket(payloadData, srcUDP); err != nil {
 			if sub.callbacks.OnError != nil {
 				sub.callbacks.OnError(err)
 			}
@@ -741,7 +742,7 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 	// Also send to channel (non-blocking)
 	select {
 	case sub.dataChan <- &DataPacket{
-		Data:      payload.Payload(),
+		Data:      payloadData,
 		Source:    &net.UDPAddr{IP: ip.SrcIP, Port: int(udp.SrcPort)},
 		Timestamp: time.Now(),
 	}:
