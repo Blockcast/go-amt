@@ -21,11 +21,12 @@ func TestHealthFreshness(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Unix(100, 0)
+	health.now = func() time.Time { return now.Add(-5 * time.Second) }
 
 	if health.HealthyAt(now) {
 		t.Fatal("zero-state health is healthy")
 	}
-	health.MarkReceived(now.Add(-5 * time.Second))
+	health.MarkReceived()
 	if !health.HealthyAt(now) {
 		t.Fatal("packet at freshness limit is unhealthy")
 	}
@@ -40,25 +41,27 @@ func TestHealthKeepsNewestPacketTimestamp(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Unix(100, 0)
-	health.MarkReceived(now)
-	health.MarkReceived(now.Add(-time.Hour))
+	health.now = func() time.Time { return now }
+	health.MarkReceived()
+	health.now = func() time.Time { return now.Add(time.Second) }
+	health.MarkReceived()
 
-	if !health.HealthyAt(now.Add(time.Second)) {
-		t.Fatal("late timestamp replaced the newest packet timestamp")
+	if !health.HealthyAt(now.Add(2 * time.Second)) {
+		t.Fatal("latest local receipt timestamp was not retained")
 	}
 }
 
-func TestHealthRejectsFuturePacketTimestamp(t *testing.T) {
+func TestHealthTreatsClockRegressionAsFresh(t *testing.T) {
 	now := time.Unix(100, 0)
 	health, err := NewHealth(time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
 	health.now = func() time.Time { return now }
-	health.MarkReceived(now.Add(time.Hour))
+	health.MarkReceived()
 
-	if health.HealthyAt(now) {
-		t.Fatal("future packet timestamp made health healthy")
+	if !health.HealthyAt(now.Add(-time.Hour)) {
+		t.Fatal("local clock regression made a fresh receipt unhealthy")
 	}
 }
 
@@ -73,7 +76,7 @@ func TestHealthConcurrentAccess(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 100; i++ {
-			health.MarkReceived(now)
+			health.MarkReceived()
 		}
 	}()
 	for i := 0; i < 100; i++ {
@@ -91,7 +94,7 @@ func TestHealthHandler(t *testing.T) {
 	health.now = func() time.Time { return now }
 
 	assertHealthResponse(t, health, http.StatusServiceUnavailable, "{\"status\":\"unhealthy\"}\n")
-	health.MarkReceived(now)
+	health.MarkReceived()
 	assertHealthResponse(t, health, http.StatusOK, "{\"status\":\"ok\"}\n")
 	now = now.Add(time.Hour + time.Nanosecond)
 	assertHealthResponse(t, health, http.StatusServiceUnavailable, "{\"status\":\"unhealthy\"}\n")

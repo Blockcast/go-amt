@@ -24,17 +24,12 @@ func NewHealth(maxPacketAge time.Duration) (*Health, error) {
 	return &Health{maxPacketAge: maxPacketAge, now: time.Now}, nil
 }
 
-// MarkReceived records a successfully received ingress packet. Older
-// timestamps cannot move health backwards when concurrent feeds report late.
-func (h *Health) MarkReceived(receivedAt time.Time) {
+// MarkReceived records a successfully received ingress packet using the local
+// monotonic clock.
+func (h *Health) MarkReceived() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if receivedAt.After(h.now()) {
-		return
-	}
-	if receivedAt.After(h.lastPacketAt) {
-		h.lastPacketAt = receivedAt
-	}
+	h.lastPacketAt = h.now()
 }
 
 // HealthyAt reports whether a packet has arrived within the freshness limit.
@@ -43,7 +38,7 @@ func (h *Health) HealthyAt(now time.Time) bool {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	age := now.Sub(h.lastPacketAt)
-	return !h.lastPacketAt.IsZero() && age >= 0 && age <= h.maxPacketAge
+	return !h.lastPacketAt.IsZero() && age <= h.maxPacketAge
 }
 
 // ServeHTTP exposes ingress freshness as a JSON health check.
