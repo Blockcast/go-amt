@@ -8,9 +8,10 @@ import (
 )
 
 const (
-	commonHeaderSize = 83
-	codingHeaderSize = 6
-	shredsPerFECSet  = 64
+	commonHeaderSize    = 83
+	codingHeaderSize    = 6
+	dataShredsPerFECSet = 32
+	shredsPerFECSet     = 64
 )
 
 var (
@@ -59,7 +60,7 @@ func ParseHeader(packet []byte) (Header, error) {
 			return Header{}, fmt.Errorf("%w: data index %d precedes FEC set %d", ErrInvalidIndex, header.Index, header.FECSetIndex)
 		}
 		index := header.Index - header.FECSetIndex
-		if index >= shredsPerFECSet {
+		if index >= dataShredsPerFECSet {
 			return Header{}, fmt.Errorf("%w: data position %d is outside FEC set", ErrInvalidIndex, index)
 		}
 		header.IndexWithinSet = uint8(index)

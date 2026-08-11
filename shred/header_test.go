@@ -46,7 +46,7 @@ func TestParseHeader(t *testing.T) {
 		{name: "legacy data is rejected", packet: testPacket(0xa5, 1, 1, 0, 0, 0, 0), wantErr: ErrInvalidVariant},
 		{name: "unknown variant", packet: testPacket(0x10, 1, 1, 0, 0, 0, 0), wantErr: ErrInvalidVariant},
 		{name: "data before FEC set", packet: testPacket(0x96, 1, 31, 32, 0, 0, 0), wantErr: ErrInvalidIndex},
-		{name: "data outside FEC set", packet: testPacket(0x96, 1, 96, 32, 0, 0, 0), wantErr: ErrInvalidIndex},
+		{name: "data at coding boundary", packet: testPacket(0x96, 1, 64, 32, 0, 0, 0), wantErr: ErrInvalidIndex},
 		{name: "zero data coding set", packet: testPacket(0x66, 1, 1, 0, 0, 32, 0), wantErr: ErrInvalidIndex},
 		{name: "zero coding shreds", packet: testPacket(0x66, 1, 1, 0, 32, 0, 0), wantErr: ErrInvalidIndex},
 		{name: "coding position outside coding count", packet: testPacket(0x66, 1, 1, 0, 32, 16, 16), wantErr: ErrInvalidIndex},
