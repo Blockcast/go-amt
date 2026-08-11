@@ -9,12 +9,32 @@ import (
 	"github.com/blockcast/go-amt/shred"
 )
 
-const shredsPerSet = 64
+const (
+	shredsPerSet    = 64
+	reportingWindow = 30 * time.Second
+	peakRateBucket  = 100 * time.Millisecond
+	reportSchema    = 1
+)
 
-// Window is the scored FEC-set portion of one reporting window.
+// GapHistogram contains the fixed v1 consecutive-arrival gap buckets.
+type GapHistogram struct {
+	LT1        uint64 `json:"<1"`
+	From1To2_4 uint64 `json:"1-2.4"`
+	From2_4To7 uint64 `json:"2.4-7"`
+	From7To32  uint64 `json:"7-32"`
+	GTE32      uint64 `json:">=32"`
+}
+
+// Window is one schema-1 receiver delivery report.
 type Window struct {
-	SetsTotal  uint64
-	SetsErased uint64
+	SetsTotal       uint64       `json:"sets_total"`
+	SetsErased      uint64       `json:"sets_erased"`
+	ErasureFraction float64      `json:"erasure_fraction"`
+	RMean           float64      `json:"r_mean"`
+	RPeak100MS      float64      `json:"r_peak_100ms"`
+	GapMSHist       GapHistogram `json:"gap_ms_hist"`
+	GraceMS         int64        `json:"grace_ms"`
+	Schema          uint8        `json:"schema"`
 }
 
 // Stats describes the currently retained scoring state.
@@ -45,6 +65,10 @@ type Tracker struct {
 	boundaries  map[uint64]time.Time
 	slots       map[uint64]*slotState
 	window      Window
+	shreds      uint64
+	peakCount   uint64
+	rateBuckets map[int64]uint64
+	lastArrival time.Time
 }
 
 // NewTracker constructs a tracker. A zero grace scores at the slot boundary.
@@ -53,14 +77,16 @@ func NewTracker(grace time.Duration) (*Tracker, error) {
 		return nil, errors.New("erasure grace must not be negative")
 	}
 	return &Tracker{
-		grace:      grace,
-		boundaries: make(map[uint64]time.Time),
-		slots:      make(map[uint64]*slotState),
+		grace:       grace,
+		boundaries:  make(map[uint64]time.Time),
+		slots:       make(map[uint64]*slotState),
+		rateBuckets: make(map[int64]uint64),
 	}, nil
 }
 
-// Observe records one parsed shred. It returns false for duplicate, stale,
-// invalid, or already-scored observations.
+// Observe records one parsed shred. receivedAt must be monotonic for consecutive
+// gap reporting, as it is on the receiver's serial UDP read path. It returns
+// false for duplicate, stale, invalid, or already-scored observations.
 func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -109,6 +135,7 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 		return false
 	}
 	state.sets[key] |= bit
+	t.observeDelivery(receivedAt)
 	return true
 }
 
@@ -120,12 +147,22 @@ func (t *Tracker) Advance(now time.Time) {
 	t.reclaimOldSlots()
 }
 
-// DrainWindow returns and resets the scored window counters.
+// DrainWindow returns and resets one fixed 30-second report. The broker
+// heartbeat scheduler must call it once per reporting interval.
 func (t *Tracker) DrainWindow() Window {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	window := t.window
+	window.ErasureFraction = fraction(window.SetsErased, window.SetsTotal)
+	window.RMean = float64(t.shreds) / reportingWindow.Seconds()
+	window.RPeak100MS = float64(t.peakCount) / peakRateBucket.Seconds()
+	window.GraceMS = t.grace.Milliseconds()
+	window.Schema = reportSchema
 	t.window = Window{}
+	t.shreds = 0
+	t.peakCount = 0
+	clear(t.rateBuckets)
+	t.lastArrival = time.Time{}
 	return window
 }
 
@@ -154,6 +191,44 @@ func (t *Tracker) scoreDue(now time.Time) {
 		}
 		state.scored = true
 	}
+}
+
+func (t *Tracker) observeDelivery(receivedAt time.Time) {
+	t.shreds++
+	bucket := receivedAt.UnixNano() / peakRateBucket.Nanoseconds()
+	t.rateBuckets[bucket]++
+	if t.rateBuckets[bucket] > t.peakCount {
+		t.peakCount = t.rateBuckets[bucket]
+	}
+
+	if !t.lastArrival.IsZero() && !receivedAt.Before(t.lastArrival) {
+		t.window.GapMSHist.observe(receivedAt.Sub(t.lastArrival))
+	}
+	if t.lastArrival.IsZero() || receivedAt.After(t.lastArrival) {
+		t.lastArrival = receivedAt
+	}
+}
+
+func (h *GapHistogram) observe(gap time.Duration) {
+	switch {
+	case gap < time.Millisecond:
+		h.LT1++
+	case gap < 2400*time.Microsecond:
+		h.From1To2_4++
+	case gap < 7*time.Millisecond:
+		h.From2_4To7++
+	case gap < 32*time.Millisecond:
+		h.From7To32++
+	default:
+		h.GTE32++
+	}
+}
+
+func fraction(numerator, denominator uint64) float64 {
+	if denominator == 0 {
+		return 0
+	}
+	return float64(numerator) / float64(denominator)
 }
 
 func (t *Tracker) reclaimOldSlots() {
