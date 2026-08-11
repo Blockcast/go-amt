@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -15,6 +16,7 @@ const (
 	DefaultBindAddress  = "0.0.0.0:0"
 	DefaultRcvBufBytes  = 16 << 20
 	DefaultErasureGrace = 400 * time.Millisecond
+	maxDurationMillis   = (1<<63 - 1) / int64(time.Millisecond)
 )
 
 // Config contains the transport-independent v1 receiver configuration. The
@@ -72,6 +74,10 @@ func Parse(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("parse --bind-address: %w", err)
 	}
+	bindAddress = netip.AddrPortFrom(bindAddress.Addr().Unmap(), bindAddress.Port())
+	if bindAddress.Addr().IsMulticast() {
+		return Config{}, errors.New("--bind-address must not be multicast")
+	}
 	destinations, err := parseDestinations(raw.destinations)
 	if err != nil {
 		return Config{}, err
@@ -81,6 +87,9 @@ func Parse(args []string) (Config, error) {
 	}
 	if raw.graceMS <= 0 {
 		return Config{}, errors.New("--erasure-grace-ms must be positive")
+	}
+	if int64(raw.graceMS) > maxDurationMillis {
+		return Config{}, errors.New("--erasure-grace-ms exceeds the maximum supported duration")
 	}
 	if strings.TrimSpace(raw.certificate) == "" {
 		return Config{}, errors.New("--cert is required")
@@ -92,8 +101,14 @@ func Parse(args []string) (Config, error) {
 	if err != nil {
 		return Config{}, fmt.Errorf("parse --broker-url: %w", err)
 	}
-	if brokerURL.Scheme != "https" || brokerURL.Host == "" || brokerURL.User != nil {
+	if !strings.EqualFold(brokerURL.Scheme, "https") || brokerURL.Hostname() == "" || brokerURL.User != nil {
 		return Config{}, errors.New("--broker-url must be an HTTPS URL without user information")
+	}
+	if port := brokerURL.Port(); port != "" {
+		portNumber, err := strconv.ParseUint(port, 10, 16)
+		if err != nil || portNumber == 0 {
+			return Config{}, errors.New("--broker-url port must be between 1 and 65535")
+		}
 	}
 
 	return Config{
@@ -115,14 +130,20 @@ func parseDestinations(value string) ([]netip.AddrPort, error) {
 		return nil, err
 	}
 	destinations := make([]netip.AddrPort, 0, len(items))
+	seen := make(map[netip.AddrPort]struct{}, len(items))
 	for _, item := range items {
 		destination, err := netip.ParseAddrPort(item)
 		if err != nil {
 			return nil, fmt.Errorf("parse destination %q: %w", item, err)
 		}
-		if destination.Addr().IsUnspecified() || destination.Addr().IsMulticast() || destination.Port() == 0 {
+		destination = netip.AddrPortFrom(destination.Addr().Unmap(), destination.Port())
+		if (!destination.Addr().IsGlobalUnicast() && !destination.Addr().IsLoopback()) || destination.Port() == 0 {
 			return nil, fmt.Errorf("destination %q must be a unicast IP with a non-zero port", item)
 		}
+		if _, exists := seen[destination]; exists {
+			return nil, fmt.Errorf("destination %q resolves to a duplicate address", item)
+		}
+		seen[destination] = struct{}{}
 		destinations = append(destinations, destination)
 	}
 	return destinations, nil
