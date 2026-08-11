@@ -10,11 +10,12 @@ import (
 )
 
 const (
-	shredsPerSet    = 64
-	reportingWindow = 30 * time.Second
-	peakRateBucket  = 100 * time.Millisecond
-	reportSchema    = 1
+	shredsPerSet   = 64
+	peakRateBucket = 100 * time.Millisecond
+	reportSchema   = 1
 )
+
+var ErrInvalidWindowCutoff = errors.New("report cutoff must follow window start")
 
 // GapHistogram contains the fixed v1 consecutive-arrival gap buckets.
 type GapHistogram struct {
@@ -54,6 +55,11 @@ type slotState struct {
 	scored   bool
 }
 
+type scoreEvent struct {
+	at     time.Time
+	erased bool
+}
+
 // Tracker deduplicates shred positions and scores observed FEC sets once their
 // slot boundary plus the configured grace has elapsed.
 type Tracker struct {
@@ -64,23 +70,25 @@ type Tracker struct {
 	newestSlot  uint64
 	boundaries  map[uint64]time.Time
 	slots       map[uint64]*slotState
-	window      Window
-	shreds      uint64
-	peakCount   uint64
-	rateBuckets map[int64]uint64
-	lastArrival time.Time
+	windowStart time.Time
+	arrivals    []time.Time
+	scores      []scoreEvent
 }
 
-// NewTracker constructs a tracker. A zero grace scores at the slot boundary.
-func NewTracker(grace time.Duration) (*Tracker, error) {
+// NewTracker constructs a tracker whose first report begins at windowStart. A
+// zero grace scores at the slot boundary.
+func NewTracker(grace time.Duration, windowStart time.Time) (*Tracker, error) {
 	if grace < 0 {
 		return nil, errors.New("erasure grace must not be negative")
+	}
+	if windowStart.IsZero() {
+		return nil, errors.New("report window start must be set")
 	}
 	return &Tracker{
 		grace:       grace,
 		boundaries:  make(map[uint64]time.Time),
 		slots:       make(map[uint64]*slotState),
-		rateBuckets: make(map[int64]uint64),
+		windowStart: windowStart,
 	}, nil
 }
 
@@ -92,6 +100,9 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 	defer t.mu.Unlock()
 
 	if header.IndexWithinSet >= shredsPerSet {
+		return false
+	}
+	if receivedAt.Before(t.windowStart) {
 		return false
 	}
 	if !t.initialized {
@@ -147,23 +158,55 @@ func (t *Tracker) Advance(now time.Time) {
 	t.reclaimOldSlots()
 }
 
-// DrainWindow returns and resets one fixed 30-second report. The broker
-// heartbeat scheduler must call it once per reporting interval.
-func (t *Tracker) DrainWindow() Window {
+// DrainWindow scores through cutoff, returns one report, and resets its
+// counters. The broker normally calls it every 30 seconds; delayed calls use
+// their actual elapsed interval so the mean rate is not silently distorted.
+func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	window := t.window
+	if !cutoff.After(t.windowStart) {
+		return Window{}, ErrInvalidWindowCutoff
+	}
+	t.scoreDue(cutoff)
+	window := Window{GraceMS: t.grace.Milliseconds(), Schema: reportSchema}
+
+	retainedScores := t.scores[:0]
+	for _, event := range t.scores {
+		if event.at.Before(cutoff) {
+			window.SetsTotal++
+			if event.erased {
+				window.SetsErased++
+			}
+			continue
+		}
+		retainedScores = append(retainedScores, event)
+	}
+	t.scores = retainedScores
 	window.ErasureFraction = fraction(window.SetsErased, window.SetsTotal)
-	window.RMean = float64(t.shreds) / reportingWindow.Seconds()
-	window.RPeak100MS = float64(t.peakCount) / peakRateBucket.Seconds()
-	window.GraceMS = t.grace.Milliseconds()
-	window.Schema = reportSchema
-	t.window = Window{}
-	t.shreds = 0
-	t.peakCount = 0
-	clear(t.rateBuckets)
-	t.lastArrival = time.Time{}
-	return window
+
+	retainedArrivals := t.arrivals[:0]
+	rateBuckets := make(map[int64]uint64)
+	var lastArrival time.Time
+	for _, arrival := range t.arrivals {
+		if !arrival.Before(cutoff) {
+			retainedArrivals = append(retainedArrivals, arrival)
+			continue
+		}
+		window.RMean++
+		bucket := arrival.UnixNano() / peakRateBucket.Nanoseconds()
+		rateBuckets[bucket]++
+		if rate := float64(rateBuckets[bucket]) / peakRateBucket.Seconds(); rate > window.RPeak100MS {
+			window.RPeak100MS = rate
+		}
+		if !lastArrival.IsZero() {
+			window.GapMSHist.observe(arrival.Sub(lastArrival))
+		}
+		lastArrival = arrival
+	}
+	t.arrivals = retainedArrivals
+	window.RMean /= cutoff.Sub(t.windowStart).Seconds()
+	t.windowStart = cutoff
+	return window, nil
 }
 
 // Stats returns the size of retained state for observability and tests.
@@ -184,29 +227,17 @@ func (t *Tracker) scoreDue(now time.Time) {
 			continue
 		}
 		for _, bitmap := range state.sets {
-			t.window.SetsTotal++
-			if bitsSet(bitmap) < 32 {
-				t.window.SetsErased++
-			}
+			t.scores = append(t.scores, scoreEvent{
+				at:     state.boundary.Add(t.grace),
+				erased: bitsSet(bitmap) < 32,
+			})
 		}
 		state.scored = true
 	}
 }
 
 func (t *Tracker) observeDelivery(receivedAt time.Time) {
-	t.shreds++
-	bucket := receivedAt.UnixNano() / peakRateBucket.Nanoseconds()
-	t.rateBuckets[bucket]++
-	if t.rateBuckets[bucket] > t.peakCount {
-		t.peakCount = t.rateBuckets[bucket]
-	}
-
-	if !t.lastArrival.IsZero() && !receivedAt.Before(t.lastArrival) {
-		t.window.GapMSHist.observe(receivedAt.Sub(t.lastArrival))
-	}
-	if t.lastArrival.IsZero() || receivedAt.After(t.lastArrival) {
-		t.lastArrival = receivedAt
-	}
+	t.arrivals = append(t.arrivals, receivedAt)
 }
 
 func (h *GapHistogram) observe(gap time.Duration) {
