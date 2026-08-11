@@ -43,6 +43,11 @@ func NewFanout(writers []io.WriteCloser, queueCapacity int) (*Fanout, error) {
 	if len(writers) == 0 {
 		return nil, errors.New("fan-out requires at least one destination")
 	}
+	for i, writer := range writers {
+		if writer == nil {
+			return nil, fmt.Errorf("fan-out destination %d is nil", i)
+		}
+	}
 	if queueCapacity <= 0 {
 		return nil, errors.New("fan-out queue capacity must be positive")
 	}

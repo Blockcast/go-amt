@@ -112,6 +112,9 @@ func TestNewFanoutValidatesConfiguration(t *testing.T) {
 	if _, err := NewFanout(nil, 1); err == nil {
 		t.Fatal("NewFanout() accepted no destinations")
 	}
+	if _, err := NewFanout([]io.WriteCloser{nil}, 1); err == nil {
+		t.Fatal("NewFanout() accepted a nil destination")
+	}
 	if _, err := NewFanout([]io.WriteCloser{&recordingWriter{}}, 0); err == nil {
 		t.Fatal("NewFanout() accepted zero queue capacity")
 	}
