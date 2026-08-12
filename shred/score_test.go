@@ -8,41 +8,91 @@ import (
 )
 
 func TestScorerCountsCompleteErasedAndPaddedSets(t *testing.T) {
-	scorer := NewScorer()
-	started := time.Unix(1, 0)
-	for i := uint32(0); i < 32; i++ {
-		observeTestPacket(t, scorer, dataPacket(10, 0, i), started.Add(time.Duration(i)*time.Millisecond))
+	tests := []struct {
+		name        string
+		observe     func(*testing.T, *Scorer, time.Time)
+		total       int
+		erased      int
+		erasureRate float64
+	}{
+		{
+			name: "erased below 32 of 64",
+			observe: func(t *testing.T, scorer *Scorer, started time.Time) {
+				for i := uint32(0); i < 31; i++ {
+					observeTestPacket(t, scorer, dataPacket(10, 0, i), started.Add(time.Duration(i)*time.Millisecond))
+				}
+			},
+			total: 1, erased: 1, erasureRate: 1,
+		},
+		{
+			name: "padded final set remains consensus 32 plus 32",
+			observe: func(t *testing.T, scorer *Scorer, started time.Time) {
+				for i := uint32(0); i < 32; i++ {
+					observeTestPacket(t, scorer, codingPacket(11, 0, i), started.Add(time.Duration(i)*time.Millisecond))
+				}
+			},
+			total: 1, erased: 0, erasureRate: 0,
+		},
 	}
-	for i := uint32(0); i < 31; i++ {
-		observeTestPacket(t, scorer, dataPacket(10, 32, 32+i), started.Add(40*time.Millisecond+time.Duration(i)*time.Millisecond))
-	}
-	for i := uint32(0); i < 32; i++ {
-		observeTestPacket(t, scorer, codingPacket(11, 0, i), started.Add(80*time.Millisecond+time.Duration(i)*time.Millisecond))
-	}
-
-	receipt := scorer.Receipt()
-	if receipt.SetsTotal != 3 || receipt.SetsErased != 1 || receipt.ErasureFraction != 1.0/3.0 {
-		t.Fatalf("receipt = %+v", receipt)
-	}
-	if receipt.CompletionP50 != 31*time.Millisecond || receipt.CompletionP99 != 31*time.Millisecond {
-		t.Fatalf("completion latency = p50 %s p99 %s", receipt.CompletionP50, receipt.CompletionP99)
-	}
-	if !strings.HasPrefix(receipt.String(), "time_to_32nd_shred") {
-		t.Fatalf("receipt does not lead with latency: %q", receipt.String())
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scorer := NewScorer()
+			test.observe(t, scorer, time.Unix(1, 0))
+			receipt := scorer.Receipt()
+			if receipt.SetsTotal != test.total || receipt.SetsErased != test.erased || receipt.ErasureFraction != test.erasureRate {
+				t.Fatalf("receipt = %+v", receipt)
+			}
+		})
 	}
 }
 
-func TestScorerDeduplicatesAcrossFeeds(t *testing.T) {
+func TestCompletionPercentilesKnownFixture(t *testing.T) {
+	tests := []struct {
+		name       string
+		latencies  []time.Duration
+		p50, p95   time.Duration
+		p99        time.Duration
+	}{
+		{name: "single set", latencies: []time.Duration{31 * time.Millisecond}, p50: 31 * time.Millisecond, p95: 31 * time.Millisecond, p99: 31 * time.Millisecond},
+		{name: "nearest rank", latencies: []time.Duration{40 * time.Millisecond, 10 * time.Millisecond, 30 * time.Millisecond, 20 * time.Millisecond}, p50: 20 * time.Millisecond, p95: 40 * time.Millisecond, p99: 40 * time.Millisecond},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			values := append([]time.Duration(nil), test.latencies...)
+			sortDurations(values)
+			if got := percentile(values, 50); got != test.p50 {
+				t.Fatalf("p50 = %s, want %s", got, test.p50)
+			}
+			if got := percentile(values, 95); got != test.p95 {
+				t.Fatalf("p95 = %s, want %s", got, test.p95)
+			}
+			if got := percentile(values, 99); got != test.p99 {
+				t.Fatalf("p99 = %s, want %s", got, test.p99)
+			}
+		})
+	}
+}
+
+func TestScorerDeduplicatesFirstArrivalAcrossTwoFeeds(t *testing.T) {
 	scorer := NewScorer()
-	packet := dataPacket(20, 0, 0)
-	if accepted, err := scorer.Observe(packet, time.Unix(2, 0)); err != nil || !accepted {
-		t.Fatalf("first arrival = %v, %v", accepted, err)
+	started := time.Unix(2, 0)
+	for i := uint32(0); i < 32; i++ {
+		packet := dataPacket(20, 0, i)
+		// Feed A reaches the shared scorer first.
+		if accepted, err := scorer.Observe(packet, started.Add(time.Duration(i)*time.Millisecond)); err != nil || !accepted {
+			t.Fatalf("feed A shred %d = %v, %v", i, accepted, err)
+		}
+		// Feed B carries the same UDP payload later and must not change metrics.
+		if accepted, err := scorer.Observe(packet, started.Add(time.Second+time.Duration(i)*time.Millisecond)); err != nil || accepted {
+			t.Fatalf("feed B duplicate %d = %v, %v", i, accepted, err)
+		}
 	}
-	if accepted, err := scorer.Observe(packet, time.Unix(2, 1)); err != nil || accepted {
-		t.Fatalf("duplicate arrival = %v, %v", accepted, err)
+	got := scorer.Receipt()
+	if got.SetsTotal != 1 || got.CompletionP50 != 31*time.Millisecond || got.Gaps.From1To2_4 != 31 {
+		t.Fatalf("duplicates changed first-arrival receipt: %+v", got)
 	}
-	if got := scorer.Receipt(); got.SetsTotal != 1 || got.Gaps != (GapHistogram{}) {
-		t.Fatalf("duplicate affected receipt: %+v", got)
+	if !strings.HasPrefix(got.String(), "time_to_32nd_shred") {
+		t.Fatalf("receipt does not lead with latency: %q", got.String())
 	}
 }
 
@@ -51,6 +101,14 @@ func TestParseHeaderRejectsNonConsensusCodingShape(t *testing.T) {
 	binary.LittleEndian.PutUint16(packet[83:85], 31)
 	if _, err := ParseHeader(packet); err == nil {
 		t.Fatal("31+32 coding header accepted")
+	}
+}
+
+func sortDurations(values []time.Duration) {
+	for i := 1; i < len(values); i++ {
+		for j := i; j > 0 && values[j] < values[j-1]; j-- {
+			values[j], values[j-1] = values[j-1], values[j]
+		}
 	}
 }
 
