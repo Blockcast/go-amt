@@ -5,6 +5,7 @@ package amt
 import (
 	"net"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
 )
@@ -23,6 +24,20 @@ func TestE2E_ReceiveMulticastData(t *testing.T) {
 	caps := GetPlatformCapabilities()
 	if !caps.SupportsCGO {
 		t.Skip("Skipping E2E test: CGO not available (Rust backend required)")
+	}
+
+	// This is a live test against real AMT infrastructure: it joins
+	// (testSource, testGroup) through an AMT relay and expects actual multicast
+	// traffic to arrive. On any host without that fabric it can only fail, so it
+	// is opt-in rather than a default red. Set AMT_E2E_RELAY to the relay
+	// address to run it (AMT_E2E_RELAY=<addr>, or "1" for the default relay).
+	relayAddr := testRelayAddr
+	switch env := os.Getenv("AMT_E2E_RELAY"); env {
+	case "":
+		t.Skip("Skipping live AMT E2E test: set AMT_E2E_RELAY=<relay-addr> (or 1) to run it")
+	case "1":
+	default:
+		relayAddr = env
 	}
 
 	t.Log("Testing AMT gateway with Rust backend")
@@ -49,7 +64,7 @@ func TestE2E_ReceiveMulticastData(t *testing.T) {
 	// Create multicast connection with AMT relay
 	mc := &MulticastConn{
 		RelayAddr: net.UDPAddr{
-			IP:   net.ParseIP(testRelayAddr),
+			IP:   net.ParseIP(relayAddr),
 			Port: testRelayPort,
 		},
 		SrcAddr:   netip.MustParseAddr(testSource),
