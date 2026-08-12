@@ -11,7 +11,9 @@ go get github.com/blockcast/go-amt
 
 ## Usage
 
-By default, go-amt uses a **pure-Go implementation** that works everywhere without any dependencies.
+The library has a pure-Go protocol path, but the legacy `amt_gw` and
+`amt_bridge` example commands require CGO. The `blockcast-shreds` demo command
+is pure Go and builds as a static binary with `CGO_ENABLED=0`.
 
 ### With CGO (optional, for Rust library performance)
 
@@ -50,6 +52,16 @@ CGO_ENABLED=1 go build
 | `CGO_ENABLED=0`        | Pure Go        | None                          |
 | `CGO_ENABLED=1` (no lib) | Pure Go      | None (CGO files won't compile without library) |
 | `CGO_ENABLED=1` + lib  | Rust FFI       | libamt_protocol installed     |
+
+### Shred delivery demo
+
+```bash
+CGO_ENABLED=0 go build -o blockcast-shreds ./cmd/blockcast-shreds
+./blockcast-shreds selftest --fixture
+```
+
+Run `./blockcast-shreds --help` for demo-mode unicast listen, repeatable feed,
+and Jito-proxy-compatible `--dest-ip-ports` forwarding flags.
 
 ## License
 
