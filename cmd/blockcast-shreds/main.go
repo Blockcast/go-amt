@@ -28,6 +28,11 @@ repeatable for first-arrival-wins scoring across multiple unicast UDP feeds.`
 
 type feeds []string
 
+type feed struct {
+	name    string
+	address string
+}
+
 func (f *feeds) String() string { return strings.Join(*f, ",") }
 func (f *feeds) Set(value string) error {
 	*f = append(*f, value)
@@ -62,18 +67,23 @@ func run(args []string) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	addresses := []string{listen}
+	configured := []feed{{name: "default", address: listen}}
 	if len(configuredFeeds) != 0 {
-		addresses = addresses[:0]
-		for _, feed := range configuredFeeds {
-			_, address, ok := strings.Cut(feed, "=")
-			if !ok || address == "" {
-				return fmt.Errorf("--feed %q must be NAME=IP:PORT", feed)
+		configured = configured[:0]
+		seen := make(map[string]struct{}, len(configuredFeeds))
+		for _, value := range configuredFeeds {
+			name, address, ok := strings.Cut(value, "=")
+			if !ok || name == "" || address == "" {
+				return fmt.Errorf("--feed %q must be NAME=IP:PORT", value)
 			}
-			addresses = append(addresses, address)
+			if _, exists := seen[name]; exists {
+				return fmt.Errorf("duplicate --feed name %q", name)
+			}
+			seen[name] = struct{}{}
+			configured = append(configured, feed{name: name, address: address})
 		}
 	}
-	return listenAndScore(addresses, splitNonempty(destinations))
+	return listenAndScore(configured, splitNonempty(destinations))
 }
 
 func selftest(args []string) error {
@@ -94,7 +104,7 @@ func selftest(args []string) error {
 	return nil
 }
 
-func listenAndScore(addresses, destinations []string) error {
+func listenAndScore(feeds []feed, destinations []string) error {
 	var fanout *receiver.Fanout
 	var err error
 	if len(destinations) != 0 {
@@ -105,24 +115,28 @@ func listenAndScore(addresses, destinations []string) error {
 		defer fanout.Close()
 	}
 
-	scorer := shred.NewScorer()
+	names := make([]string, 0, len(feeds))
+	for _, feed := range feeds {
+		names = append(names, feed.name)
+	}
+	scorer := shred.NewFeedScorer(names)
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(stop)
-	errCh := make(chan error, len(addresses))
+	errCh := make(chan error, len(feeds))
 	var sockets []*net.UDPConn
 	var mu sync.Mutex
-	for _, address := range addresses {
-		udpAddress, err := net.ResolveUDPAddr("udp", address)
+	for _, feed := range feeds {
+		udpAddress, err := net.ResolveUDPAddr("udp", feed.address)
 		if err != nil {
-			return fmt.Errorf("resolve --listen %q: %w", address, err)
+			return fmt.Errorf("resolve feed %q: %w", feed.name, err)
 		}
 		conn, err := net.ListenUDP("udp", udpAddress)
 		if err != nil {
-			return fmt.Errorf("listen %q: %w", address, err)
+			return fmt.Errorf("listen feed %q at %q: %w", feed.name, feed.address, err)
 		}
 		sockets = append(sockets, conn)
-		go func(conn *net.UDPConn) {
+		go func(feedName string, conn *net.UDPConn) {
 			packet := make([]byte, 2048)
 			for {
 				n, _, err := conn.ReadFromUDP(packet)
@@ -131,7 +145,7 @@ func listenAndScore(addresses, destinations []string) error {
 					return
 				}
 				mu.Lock()
-				accepted, parseErr := scorer.Observe(packet[:n], time.Now())
+				accepted, parseErr := scorer.Observe(feedName, packet[:n], time.Now())
 				mu.Unlock()
 				if parseErr != nil {
 					continue
@@ -140,7 +154,7 @@ func listenAndScore(addresses, destinations []string) error {
 					fanout.Enqueue(packet[:n])
 				}
 			}
-		}(conn)
+		}(feed.name, conn)
 	}
 
 	select {

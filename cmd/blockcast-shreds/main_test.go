@@ -35,3 +35,10 @@ func TestSelftestRequiresFixture(t *testing.T) {
 		t.Fatal("selftest without --fixture succeeded")
 	}
 }
+
+func TestRunRejectsDuplicateFeedNames(t *testing.T) {
+	err := run([]string{"--feed", "same=127.0.0.1:20001", "--feed", "same=127.0.0.1:20002"})
+	if err == nil || !strings.Contains(err.Error(), "duplicate --feed name") {
+		t.Fatalf("run() error = %v", err)
+	}
+}
