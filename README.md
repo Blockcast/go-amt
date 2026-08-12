@@ -63,6 +63,20 @@ CGO_ENABLED=0 go build -o blockcast-shreds ./cmd/blockcast-shreds
 Run `./blockcast-shreds --help` for demo-mode unicast listen, repeatable feed,
 and Jito-proxy-compatible `--dest-ip-ports` forwarding flags.
 
+To measure the value of a second feed, bind one socket per named input:
+
+```bash
+./blockcast-shreds \
+  --feed blockcast=0.0.0.0:20000 \
+  --feed existing=0.0.0.0:20001
+```
+
+The receipt reports each feed's erasure fraction, the first-arrival-wins union
+fraction, and the gap the second feed closes relative to the first feed. This
+measures what the observed second input added during the run. It does not prove
+the feeds are independently operated or path-decorrelated; state their actual
+origins when presenting the result.
+
 ## License
 
 MIT

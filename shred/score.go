@@ -3,6 +3,7 @@ package shred
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -40,6 +41,59 @@ type Scorer struct {
 	sets        map[SetKey]*setScore
 	lastArrival time.Time
 	gaps        GapHistogram
+}
+
+type FeedReceipt struct {
+	Name    string
+	Receipt Receipt
+}
+
+type UnionReceipt struct {
+	Feeds     []FeedReceipt
+	Union     Receipt
+	GapClosed float64
+}
+
+// FeedScorer keeps each feed's loss accounting separate while applying
+// first-arrival-wins deduplication to the union.
+type FeedScorer struct {
+	names []string
+	feeds map[string]*Scorer
+	union *Scorer
+}
+
+func NewFeedScorer(names []string) *FeedScorer {
+	feeds := make(map[string]*Scorer, len(names))
+	for _, name := range names {
+		feeds[name] = NewScorer()
+	}
+	return &FeedScorer{names: append([]string(nil), names...), feeds: feeds, union: NewScorer()}
+}
+
+func (s *FeedScorer) Observe(feed string, packet []byte, receivedAt time.Time) (bool, error) {
+	scorer := s.feeds[feed]
+	if scorer == nil {
+		return false, fmt.Errorf("unknown feed %q", feed)
+	}
+	if _, err := scorer.Observe(packet, receivedAt); err != nil {
+		return false, err
+	}
+	return s.union.Observe(packet, receivedAt)
+}
+
+func (s *FeedScorer) Receipt() UnionReceipt {
+	keys := make([]SetKey, 0, len(s.union.sets))
+	for key := range s.union.sets {
+		keys = append(keys, key)
+	}
+	receipt := UnionReceipt{Feeds: make([]FeedReceipt, 0, len(s.names)), Union: s.union.receiptFor(keys)}
+	for _, name := range s.names {
+		receipt.Feeds = append(receipt.Feeds, FeedReceipt{Name: name, Receipt: s.feeds[name].receiptFor(keys)})
+	}
+	if len(receipt.Feeds) > 1 {
+		receipt.GapClosed = receipt.Feeds[0].Receipt.ErasureFraction - receipt.Union.ErasureFraction
+	}
+	return receipt
 }
 
 func NewScorer() *Scorer {
@@ -80,10 +134,19 @@ func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
 }
 
 func (s *Scorer) Receipt() Receipt {
-	receipt := Receipt{SetsTotal: len(s.sets), Gaps: s.gaps}
-	latencies := make([]time.Duration, 0, len(s.sets))
-	for _, set := range s.sets {
-		if set.completed == 0 {
+	keys := make([]SetKey, 0, len(s.sets))
+	for key := range s.sets {
+		keys = append(keys, key)
+	}
+	return s.receiptFor(keys)
+}
+
+func (s *Scorer) receiptFor(keys []SetKey) Receipt {
+	receipt := Receipt{SetsTotal: len(keys), Gaps: s.gaps}
+	latencies := make([]time.Duration, 0, len(keys))
+	for _, key := range keys {
+		set := s.sets[key]
+		if set == nil || set.completed == 0 {
 			receipt.SetsErased++
 			continue
 		}
@@ -97,6 +160,21 @@ func (s *Scorer) Receipt() Receipt {
 	receipt.CompletionP95 = percentile(latencies, 95)
 	receipt.CompletionP99 = percentile(latencies, 99)
 	return receipt
+}
+
+func (r UnionReceipt) String() string {
+	var output strings.Builder
+	fmt.Fprintf(&output, "time_to_32nd_shred union p50=%s p95=%s p99=%s\n", r.Union.CompletionP50, r.Union.CompletionP95, r.Union.CompletionP99)
+	fmt.Fprintf(&output, "union erasure sets=%d erased=%d fraction=%.6f\n", r.Union.SetsTotal, r.Union.SetsErased, r.Union.ErasureFraction)
+	fmt.Fprintf(&output, "gap_ms union <1=%d 1-2.4=%d 2.4-7=%d 7-32=%d >=32=%d\n",
+		r.Union.Gaps.LT1, r.Union.Gaps.From1To2_4, r.Union.Gaps.From2_4To7, r.Union.Gaps.From7To32, r.Union.Gaps.GTE32)
+	for _, feed := range r.Feeds {
+		fmt.Fprintf(&output, "feed name=%s erasure sets=%d erased=%d fraction=%.6f\n", feed.Name, feed.Receipt.SetsTotal, feed.Receipt.SetsErased, feed.Receipt.ErasureFraction)
+	}
+	if len(r.Feeds) > 1 {
+		fmt.Fprintf(&output, "second_feed_gap_closed baseline=%s fraction=%.6f", r.Feeds[0].Name, r.GapClosed)
+	}
+	return strings.TrimSuffix(output.String(), "\n")
 }
 
 func (r Receipt) String() string {
