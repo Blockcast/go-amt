@@ -29,17 +29,23 @@ import (
 // Public fields maintain compatibility with conn.go.
 type Gateway struct {
 	// Public fields for conn.go compatibility
-	conn        *ipv4.PacketConn
-	RelayAddr   net.Addr
-	SourceAddr  net.IP
-	GroupAddr   net.IP
-	MTU         int
+	conn       *ipv4.PacketConn
+	RelayAddr  net.Addr
+	SourceAddr net.IP
+	GroupAddr  net.IP
+	MTU        int
 	// RcvBufBytes and SndBufBytes are forwarded to the AMT relay UDP socket;
 	// see MulticastConn for semantics.
 	RcvBufBytes int
 	SndBufBytes int
-	lastData    atomic.Time
-	loopErr     atomic.Error
+	// Timeout bounds the relay handshake in Open: discovery is sent, then the
+	// relay advertisement and membership query must arrive within it. Zero
+	// selects DefaultOpenTimeout. Without a bound, a relay that never answers
+	// blocks Open forever — the caller has no way to recover, because the
+	// blocking read is internal to it.
+	Timeout  time.Duration
+	lastData atomic.Time
+	loopErr  atomic.Error
 
 	// Internal fields
 	handle       C.amt_gateway_handle_t
@@ -228,36 +234,52 @@ func (g *Gateway) Open() (err error) {
 	g.intervalTime = time.Second * 10
 	g.lastData.Store(time.Now())
 
+	openTimeout := g.Timeout
+	if openTimeout <= 0 {
+		openTimeout = DefaultOpenTimeout
+	}
+
 	// Send discovery
 	if err = g.sendDiscovery(); err != nil {
 		return err
 	}
 
-	// Start keepalive goroutine
+	// Start keepalive goroutine. `loopErr` is deliberately local: the outer
+	// `err` is written concurrently by the read loop below, so assigning to it
+	// from here is a data race.
 	go func() {
 		for {
 			if g.leave {
 				return
 			}
+			var loopErr error
 			if time.Since(g.lastData.Load()) > g.intervalTime {
 				// Reset and rediscover
 				C.amt_gateway_reset(g.handle)
-				err = g.sendDiscovery()
+				loopErr = g.sendDiscovery()
 			} else {
-				err = g.sendRequest()
+				loopErr = g.sendRequest()
 			}
-			if err != nil {
-				g.loopErr.Store(err)
+			if loopErr != nil {
+				g.loopErr.Store(loopErr)
 			}
 			time.Sleep(g.intervalTime)
 		}
 	}()
+
+	// Bound the handshake. Without this the read below blocks forever against a
+	// relay that never answers, and the keepalive goroutine spins behind it.
+	if err = g.conn.SetReadDeadline(time.Now().Add(openTimeout)); err != nil {
+		g.stopKeepalive()
+		return fmt.Errorf("error setting handshake deadline: %w", err)
+	}
 
 	// Wait for advertisement and query
 	buffer := make([]byte, g.MTU)
 	for {
 		_, _, _, err = g.conn.ReadFrom(buffer)
 		if err != nil {
+			g.stopKeepalive()
 			return fmt.Errorf("error reading from connection: %w", err)
 		}
 		amtMessageType := determineAMTmessageType(buffer[:])
@@ -265,11 +287,32 @@ func (g *Gateway) Open() (err error) {
 		case m.RelayAdvertisementType:
 			err = g.handleRelayAdvertisement(buffer[:])
 		case m.MembershipQueryType:
-			return g.handleMembershipQuery(buffer[:])
+			// Handshake done: clear the deadline so steady-state reads are not
+			// bounded by the Open timeout.
+			if deadlineErr := g.conn.SetReadDeadline(time.Time{}); deadlineErr != nil {
+				g.stopKeepalive()
+				return fmt.Errorf("error clearing handshake deadline: %w", deadlineErr)
+			}
+			if queryErr := g.handleMembershipQuery(buffer[:]); queryErr != nil {
+				g.stopKeepalive()
+				return queryErr
+			}
+			return nil
 		default:
+			g.stopKeepalive()
 			return fmt.Errorf("invalid response: %d", amtMessageType)
 		}
 	}
+}
+
+// DefaultOpenTimeout bounds the relay handshake when Gateway.Timeout is unset.
+const DefaultOpenTimeout = 10 * time.Second
+
+// stopKeepalive signals the keepalive goroutine to exit. Called on every Open
+// failure path so a failed Open does not leak a goroutine that reconnects to a
+// relay nobody is listening to.
+func (g *Gateway) stopKeepalive() {
+	g.leave = true
 }
 
 // handleRelayAdvertisement processes AMT Relay Advertisement.
