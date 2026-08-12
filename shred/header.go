@@ -33,6 +33,10 @@ type Header struct {
 	Kind           Kind
 	Index          uint32
 	IndexWithinSet uint8
+	// SendTimeMicros is the sender-side send timestamp carried by the
+	// shred-forwarder framing (microseconds since the Unix epoch). Zero when the
+	// datagram was parsed as a canonical Agave shred, which has no such field.
+	SendTimeMicros uint64
 }
 
 // ParseHeader parses only the stable Solana shred wire header. It intentionally

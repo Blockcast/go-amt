@@ -36,7 +36,7 @@ func TestScorerCountsCompleteErasedAndPaddedSets(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			scorer := NewScorer()
+			scorer := NewScorerWithFormat(FormatAgave)
 			test.observe(t, scorer, time.Unix(1, 0))
 			receipt := scorer.Receipt()
 			if receipt.SetsTotal != test.total || receipt.SetsErased != test.erased || receipt.ErasureFraction != test.erasureRate {
@@ -74,7 +74,7 @@ func TestCompletionPercentilesKnownFixture(t *testing.T) {
 }
 
 func TestScorerDeduplicatesFirstArrivalAcrossTwoFeeds(t *testing.T) {
-	scorer := NewScorer()
+	scorer := NewScorerWithFormat(FormatAgave)
 	started := time.Unix(2, 0)
 	for i := uint32(0); i < 32; i++ {
 		packet := dataPacket(20, 0, i)
@@ -97,7 +97,7 @@ func TestScorerDeduplicatesFirstArrivalAcrossTwoFeeds(t *testing.T) {
 }
 
 func TestFeedScorerReportsPerFeedAndUnionBenefit(t *testing.T) {
-	scorer := NewFeedScorer([]string{"blockcast", "external"})
+	scorer := NewFeedScorerWithFormat(FormatAgave, []string{"blockcast", "external"})
 	started := time.Unix(3, 0)
 	for i := uint32(0); i < 31; i++ {
 		if _, err := scorer.Observe("blockcast", dataPacket(30, 0, i), started.Add(time.Duration(i)*time.Millisecond)); err != nil {
@@ -124,7 +124,7 @@ func TestFeedScorerReportsPerFeedAndUnionBenefit(t *testing.T) {
 }
 
 func TestFeedScorerDeduplicatesUnionFirstArrival(t *testing.T) {
-	scorer := NewFeedScorer([]string{"first", "second"})
+	scorer := NewFeedScorerWithFormat(FormatAgave, []string{"first", "second"})
 	packet := dataPacket(31, 0, 0)
 	if accepted, err := scorer.Observe("second", packet, time.Unix(4, 0)); err != nil || !accepted {
 		t.Fatalf("first union arrival = %v, %v", accepted, err)
