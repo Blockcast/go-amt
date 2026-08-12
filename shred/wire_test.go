@@ -39,6 +39,28 @@ func TestParseWireHeaderReadsForwarderFraming(t *testing.T) {
 	}
 }
 
+func TestParseWireHeaderRejectsInconsistentKindAndGeometry(t *testing.T) {
+	tests := []struct {
+		name   string
+		packet []byte
+	}{
+		{name: "data index in coding range", packet: forwarderPacket(3, 1, 0, 32, false, 0)},
+		{name: "coding index in data range", packet: forwarderPacket(3, 1, 0, 0, true, 0)},
+		{name: "non-32-plus-32 geometry", packet: func() []byte {
+			p := forwarderPacket(3, 1, 0, 32, true, 0)
+			p[18], p[19] = 31, 33
+			return p
+		}()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := ParseWireHeader(tt.packet); err == nil {
+				t.Fatal("malformed forwarder header should be rejected")
+			}
+		})
+	}
+}
+
 // The parser must not be pointed at Agave bytes: an Agave shred starts with a
 // signature, so its leading byte is arbitrary and the fields would be garbage.
 func TestParseWireHeaderRejectsNonForwarderVersions(t *testing.T) {
@@ -55,7 +77,7 @@ func TestParseWireHeaderRejectsShortAndOutOfRange(t *testing.T) {
 	if _, err := ParseWireHeader(make([]byte, WireHeaderSize-1)); err == nil {
 		t.Fatal("short datagram should be rejected")
 	}
-	p := forwarderPacket(4, 1, 0, 64, false, 0) // 64 is outside a 32+32 set
+	p := forwarderPacket(4, 1, 0, 64, true, 0) // 64 is outside a 32+32 set
 	if _, err := ParseWireHeader(p); err == nil {
 		t.Fatal("local index 64 should be rejected")
 	}
