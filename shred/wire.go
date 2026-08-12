@@ -15,8 +15,8 @@ import (
 //	[9:13]   fec_set_index u32 LE
 //	[13:17]  local_index   u32 LE   data: 0..num_data; coding: num_data+position
 //	[17]     flags         u8       bit0 DATA_COMPLETE, bit1 IS_CODING_SHRED
-//	[18]     num_data      u8       set on coding shreds only; 0 on data
-//	[19]     num_coding    u8       set on coding shreds only; 0 on data
+//	[18]     num_data      u8        set on coding shreds only; 0 on data
+//	[19]     num_coding    u8        set on coding shreds only; 0 on data
 //	[20:28]  send_ts_us    u64 LE   sender-side send time, microseconds
 //	[28:]    body
 //
@@ -65,14 +65,26 @@ func ParseWireHeader(packet []byte) (Header, error) {
 	}
 
 	localIndex := binary.LittleEndian.Uint32(packet[13:17])
-	if localIndex >= shredsPerFECSet {
-		return Header{}, fmt.Errorf("%w: local index %d outside FEC set", ErrInvalidIndex, localIndex)
-	}
-
 	flags := packet[17]
 	kind := KindData
 	if flags&wireFlagCoding != 0 {
 		kind = KindCoding
+	}
+	numData, numCoding := packet[18], packet[19]
+	if kind == KindData {
+		if numData != 0 || numCoding != 0 {
+			return Header{}, fmt.Errorf("%w: data advertises geometry %d+%d", ErrInvalidIndex, numData, numCoding)
+		}
+		if localIndex >= dataShredsPerFECSet {
+			return Header{}, fmt.Errorf("%w: data local index %d outside %d data shreds", ErrInvalidIndex, localIndex, dataShredsPerFECSet)
+		}
+	} else {
+		if numData != dataShredsPerFECSet || numCoding != dataShredsPerFECSet {
+			return Header{}, fmt.Errorf("%w: coding advertises unsupported geometry %d+%d", ErrInvalidIndex, numData, numCoding)
+		}
+		if localIndex < dataShredsPerFECSet || localIndex >= shredsPerFECSet {
+			return Header{}, fmt.Errorf("%w: coding local index %d outside %d..%d", ErrInvalidIndex, localIndex, dataShredsPerFECSet, shredsPerFECSet-1)
+		}
 	}
 
 	header := Header{
