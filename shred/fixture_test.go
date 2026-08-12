@@ -41,7 +41,7 @@ func TestReplayPCAPParsesForwarderUDPPayloadWithoutReframing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	scorer := NewScorer()
+	scorer := NewScorerWithFormat(FormatAgave)
 	if err := ReplayPCAP(&fixture, scorer); err != nil {
 		t.Fatal(err)
 	}

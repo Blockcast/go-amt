@@ -29,15 +29,21 @@ type Receipt struct {
 }
 
 type setScore struct {
-	seen      uint64
-	first     time.Time
+	seen  uint64
+	first time.Time
+	// completed is only meaningful when complete is true. A duration of zero is
+	// a legitimate value — a set whose 32nd distinct shred lands in the same
+	// clock tick as its first — so completion must not be inferred from
+	// completed != 0, which would misreport such a set as erased.
+	complete  bool
 	completed time.Duration
 }
 
 // Scorer applies first-arrival-wins deduplication across feeds and scores each
 // consensus 32+32 FEC set when its 32nd distinct shred arrives.
 type Scorer struct {
-	dedup       map[[2]uint64]struct{}
+	format      Format
+	dedup       map[dedupKey]struct{}
 	sets        map[SetKey]*setScore
 	lastArrival time.Time
 	gaps        GapHistogram
@@ -62,12 +68,21 @@ type FeedScorer struct {
 	union *Scorer
 }
 
+// NewFeedScorer scores the shred-forwarder wire format on every feed.
 func NewFeedScorer(names []string) *FeedScorer {
+	return NewFeedScorerWithFormat(FormatForwarder, names)
+}
+
+func NewFeedScorerWithFormat(format Format, names []string) *FeedScorer {
 	feeds := make(map[string]*Scorer, len(names))
 	for _, name := range names {
-		feeds[name] = NewScorer()
+		feeds[name] = NewScorerWithFormat(format)
 	}
-	return &FeedScorer{names: append([]string(nil), names...), feeds: feeds, union: NewScorer()}
+	return &FeedScorer{
+		names: append([]string(nil), names...),
+		feeds: feeds,
+		union: NewScorerWithFormat(format),
+	}
 }
 
 func (s *FeedScorer) Observe(feed string, packet []byte, receivedAt time.Time) (bool, error) {
@@ -96,38 +111,66 @@ func (s *FeedScorer) Receipt() UnionReceipt {
 	return receipt
 }
 
+// dedupKey identifies one shred for first-arrival-wins deduplication.
+//
+// It must include FECSetIndex and the kind-bearing in-set index: Header.Index is
+// an absolute index whose space differs between data and coding shreds, so
+// keying on (Slot, Index) alone collides a data shred with a coding shred of the
+// same index in the same slot and silently discards the second one — which
+// reads downstream as packet loss.
+type dedupKey struct {
+	slot           uint64
+	fecSetIndex    uint32
+	indexWithinSet uint8
+}
+
+// NewScorer scores the shred-forwarder wire format, which is what the SSM group
+// and the demo tap carry. Use NewScorerWithFormat for canonical Agave shreds.
 func NewScorer() *Scorer {
-	return &Scorer{dedup: make(map[[2]uint64]struct{}), sets: make(map[SetKey]*setScore)}
+	return NewScorerWithFormat(FormatForwarder)
+}
+
+func NewScorerWithFormat(format Format) *Scorer {
+	return &Scorer{
+		format: format,
+		dedup:  make(map[dedupKey]struct{}),
+		sets:   make(map[SetKey]*setScore),
+	}
 }
 
 func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
-	header, err := ParseHeader(packet)
+	header, err := Parse(packet, s.format)
 	if err != nil {
 		return false, err
 	}
-	dedupKey := [2]uint64{header.Slot, uint64(header.Index)}
-	if _, exists := s.dedup[dedupKey]; exists {
+	key := dedupKey{
+		slot:           header.Slot,
+		fecSetIndex:    header.FECSetIndex,
+		indexWithinSet: header.IndexWithinSet,
+	}
+	if _, exists := s.dedup[key]; exists {
 		return false, nil
 	}
-	s.dedup[dedupKey] = struct{}{}
+	s.dedup[key] = struct{}{}
 
 	if !s.lastArrival.IsZero() {
 		s.gaps.observe(receivedAt.Sub(s.lastArrival))
 	}
 	s.lastArrival = receivedAt
 
-	key := SetKey{Slot: header.Slot, FECSetIndex: header.FECSetIndex}
-	set := s.sets[key]
+	setKey := SetKey{Slot: header.Slot, FECSetIndex: header.FECSetIndex}
+	set := s.sets[setKey]
 	if set == nil {
 		set = &setScore{first: receivedAt}
-		s.sets[key] = set
+		s.sets[setKey] = set
 	}
 	bit := uint64(1) << header.IndexWithinSet
 	if set.seen&bit != 0 {
 		return false, nil
 	}
 	set.seen |= bit
-	if set.completed == 0 && bitsSet64(set.seen) == completionThreshold {
+	if !set.complete && bitsSet64(set.seen) == completionThreshold {
+		set.complete = true
 		set.completed = receivedAt.Sub(set.first)
 	}
 	return true, nil
@@ -146,7 +189,7 @@ func (s *Scorer) receiptFor(keys []SetKey) Receipt {
 	latencies := make([]time.Duration, 0, len(keys))
 	for _, key := range keys {
 		set := s.sets[key]
-		if set == nil || set.completed == 0 {
+		if set == nil || !set.complete {
 			receipt.SetsErased++
 			continue
 		}
