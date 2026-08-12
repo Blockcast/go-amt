@@ -72,7 +72,7 @@ func ParseHeader(packet []byte) (Header, error) {
 		numCoding := uint32(binary.LittleEndian.Uint16(packet[85:87]))
 		position := uint32(binary.LittleEndian.Uint16(packet[87:89]))
 		index := numData + position
-		if numData == 0 || numCoding == 0 || numData+numCoding > shredsPerFECSet || position >= numCoding {
+		if numData != dataShredsPerFECSet || numCoding != dataShredsPerFECSet || position >= numCoding {
 			return Header{}, fmt.Errorf("%w: coding position %d with %d data and %d coding shreds is outside FEC set", ErrInvalidIndex, position, numData, numCoding)
 		}
 		header.IndexWithinSet = uint8(index)
