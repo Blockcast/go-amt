@@ -86,6 +86,11 @@ type UnionReceipt struct {
 	// UniqueShreds is the number of distinct shreds seen across all feeds.
 	UniqueShreds uint64           `json:"unique_shreds_total"`
 	SecondFeed   *SecondFeedWorth `json:"second_feed,omitempty"`
+	// GapClosed is the baseline feed's erasure fraction minus the union's.
+	//
+	// Deprecated: kept for source compatibility with pre-SecondFeed consumers.
+	// Use SecondFeed for per-set rescue accounting.
+	GapClosed float64 `json:"gap_closed,omitempty"`
 }
 
 // FeedScorer keeps each feed's loss accounting separate while applying
@@ -149,6 +154,7 @@ func (s *FeedScorer) Receipt() UnionReceipt {
 	}
 	if len(receipt.Feeds) > 1 {
 		receipt.SecondFeed = s.secondFeedWorth(keys)
+		receipt.GapClosed = receipt.Feeds[0].Receipt.ErasureFraction - receipt.Union.ErasureFraction
 	}
 	return receipt
 }

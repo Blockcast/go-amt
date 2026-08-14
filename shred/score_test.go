@@ -120,6 +120,9 @@ func TestFeedScorerReportsPerFeedAndUnionBenefit(t *testing.T) {
 	if got.SecondFeed == nil || got.SecondFeed.RescuedSets != 1 || got.SecondFeed.GapClosed != 1 || got.SecondFeed.Baseline != "blockcast" {
 		t.Fatalf("second-feed worth = %+v", got.SecondFeed)
 	}
+	if got.GapClosed != 1 {
+		t.Fatalf("deprecated GapClosed = %v, want baseline minus union erasure = 1", got.GapClosed)
+	}
 	if got.SecondFeed.Label != "measured worth of a second feed" {
 		t.Fatalf("second-feed label = %q", got.SecondFeed.Label)
 	}
