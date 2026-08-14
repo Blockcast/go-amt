@@ -2,10 +2,27 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/blockcast/go-amt/receiver"
+	"github.com/blockcast/go-amt/shred"
+	"github.com/prometheus/client_golang/prometheus"
 )
+
+type captureWriter struct {
+	packets chan []byte
+}
+
+func (w *captureWriter) Write(packet []byte) (int, error) {
+	w.packets <- append([]byte(nil), packet...)
+	return len(packet), nil
+}
+
+func (w *captureWriter) Close() error { return nil }
 
 func TestSelftestFixturePrintsOrderedReceipt(t *testing.T) {
 	read, write, err := os.Pipe()
@@ -40,5 +57,36 @@ func TestRunRejectsDuplicateFeedNames(t *testing.T) {
 	err := run([]string{"--feed", "same=127.0.0.1:20001", "--feed", "same=127.0.0.1:20002"})
 	if err == nil || !strings.Contains(err.Error(), "duplicate --feed name") {
 		t.Fatalf("run() error = %v", err)
+	}
+}
+
+func TestPacketDeliveryDoesNotDependOnScoring(t *testing.T) {
+	writer := &captureWriter{packets: make(chan []byte, 2)}
+	fanout, err := receiver.NewFanout([]io.WriteCloser{writer}, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+	registry := prometheus.NewRegistry()
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	scorer := shred.NewFeedScorer([]string{"feed"})
+	packet := []byte{0x01, 0x02, 0x03}
+
+	for range 2 {
+		processPacket("feed", packet, time.Now(), scorer, fanout, metrics)
+	}
+
+	for range 2 {
+		select {
+		case got := <-writer.packets:
+			if !bytes.Equal(got, packet) {
+				t.Fatalf("forwarded packet = %x, want %x", got, packet)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for forwarded packet")
+		}
 	}
 }
