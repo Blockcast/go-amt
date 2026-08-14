@@ -261,6 +261,10 @@ type RelayManager struct {
 	ctx             context.Context
 	cancel          context.CancelFunc
 	mu              sync.RWMutex
+	handshakeMu     sync.Mutex
+	loopsMu         sync.Mutex
+	loopsCancel     context.CancelFunc
+	loopGeneration  uint64
 	intervalTime    time.Duration
 	lastAnyMessage  atomic.Time
 	lastDataMessage atomic.Time
@@ -357,11 +361,8 @@ func (rm *RelayManager) Open(ctx context.Context) error {
 	rm.lastAnyMessage.Store(now)
 	rm.lastDataMessage.Store(now)
 
-	// Start read loop
-	go rm.readLoop()
-
-	// Start keepalive loop
-	go rm.keepaliveLoop()
+	// Start exactly one read/keepalive pair for the initial generation.
+	rm.startLoops()
 
 	return nil
 }
@@ -374,6 +375,7 @@ func (rm *RelayManager) Close() error {
 	if rm.cancel != nil {
 		rm.cancel()
 	}
+	rm.stopLoops()
 
 	rm.state.Store(RelayStateClosed)
 
@@ -495,6 +497,9 @@ func (rm *RelayManager) Stats() RelayManagerStats {
 
 // performHandshake performs the AMT discovery handshake
 func (rm *RelayManager) performHandshake() error {
+	rm.handshakeMu.Lock()
+	defer rm.handshakeMu.Unlock()
+
 	rm.state.Store(RelayStateDiscovering)
 
 	// Send discovery
@@ -625,20 +630,55 @@ func (rm *RelayManager) sendBatchedMembershipUpdate() error {
 	return nil
 }
 
+// startLoops launches one read/keepalive pair and records its generation.
+func (rm *RelayManager) startLoops() {
+	rm.loopsMu.Lock()
+	defer rm.loopsMu.Unlock()
+	if rm.loopsCancel != nil {
+		return
+	}
+	loopCtx, cancel := context.WithCancel(rm.ctx)
+	rm.loopsCancel = cancel
+	rm.loopGeneration++
+	generation := rm.loopGeneration
+	go rm.readLoop(loopCtx, generation)
+	go rm.keepaliveLoop(loopCtx, generation)
+}
+
+// stopLoops cancels the current generation. Transport closure during reconnect
+// releases any receive blocked by the old generation.
+func (rm *RelayManager) stopLoops() {
+	rm.loopsMu.Lock()
+	defer rm.loopsMu.Unlock()
+	if rm.loopsCancel != nil {
+		rm.loopsCancel()
+		rm.loopsCancel = nil
+	}
+}
+
+func (rm *RelayManager) generationActive(generation uint64) bool {
+	rm.loopsMu.Lock()
+	defer rm.loopsMu.Unlock()
+	return rm.loopGeneration == generation && rm.loopsCancel != nil
+}
+
 // readLoop continuously reads from the transport
-func (rm *RelayManager) readLoop() {
+func (rm *RelayManager) readLoop(ctx context.Context, generation uint64) {
 	buffer := make([]byte, rm.config.MTU)
 
 	for {
+		if !rm.generationActive(generation) {
+			return
+		}
 		select {
-		case <-rm.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
 
 		n, _, err := rm.transport.Receive(buffer)
 		if err != nil {
-			if rm.ctx.Err() != nil {
+			if ctx.Err() != nil || rm.ctx.Err() != nil {
 				return // Context cancelled
 			}
 			// Trigger reconnection
@@ -756,13 +796,16 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 }
 
 // keepaliveLoop sends periodic keepalive requests
-func (rm *RelayManager) keepaliveLoop() {
+func (rm *RelayManager) keepaliveLoop(ctx context.Context, generation uint64) {
 	ticker := time.NewTicker(rm.intervalTime)
 	defer ticker.Stop()
 
 	for {
+		if !rm.generationActive(generation) {
+			return
+		}
 		select {
-		case <-rm.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if rm.State() != RelayStateActive {
@@ -799,6 +842,7 @@ func (rm *RelayManager) reconnectWithBackoff() {
 	}
 	rm.state.Store(RelayStateReconnecting)
 	rm.mu.Unlock()
+	rm.stopLoops()
 
 	// Suspend all subscriptions
 	rm.subscriptions.Range(func(key SubscriptionKey, sub *Subscription) bool {
@@ -856,6 +900,7 @@ func (rm *RelayManager) reconnectWithBackoff() {
 
 	rm.state.Store(RelayStateActive)
 	rm.lastAnyMessage.Store(time.Now())
+	rm.startLoops()
 
 	// Restore all subscriptions
 	rm.subscriptions.Range(func(key SubscriptionKey, sub *Subscription) bool {
