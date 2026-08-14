@@ -35,14 +35,20 @@ func TestUDPFanoutWritesByteIdenticalPacketsToEveryDestination(t *testing.T) {
 	}
 	packet[0] = 0
 
-	for _, listener := range listeners {
+	var sourcePort int
+	for i, listener := range listeners {
 		if err := listener.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 			t.Fatal(err)
 		}
 		got := make([]byte, 64)
-		n, _, err := listener.ReadFromUDP(got)
+		n, source, err := listener.ReadFromUDP(got)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if i == 0 {
+			sourcePort = source.Port
+		} else if source.Port != sourcePort {
+			t.Fatalf("destination %d saw source port %d, want shared source port %d", i, source.Port, sourcePort)
 		}
 		if want := []byte{0xde, 0xad, 0xbe, 0xef}; !bytes.Equal(got[:n], want) {
 			t.Fatalf("received %x, want %x", got[:n], want)
