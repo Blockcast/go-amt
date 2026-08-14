@@ -168,17 +168,8 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string) err
 				receivedAt := time.Now()
 				health.MarkReceived(receivedAt)
 				_ = metrics.IncIngress(feedName)
-				accepted, parseErr := scorer.Observe(feedName, packet[:n], receivedAt)
+				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics)
 				mu.Unlock()
-				if parseErr != nil {
-					_ = metrics.IncUnparsed(feedName)
-					continue
-				}
-				if accepted && fanout != nil {
-					if !fanout.Enqueue(packet[:n]) {
-						_ = metrics.IncFanoutDrop(feedName)
-					}
-				}
 			}
 		}(feed.name, conn)
 	}
@@ -198,6 +189,18 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string) err
 	fmt.Println(scorer.Receipt())
 	mu.Unlock()
 	return nil
+}
+
+func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer *shred.FeedScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics) {
+	_, parseErr := scorer.Observe(feedName, packet, receivedAt)
+	// Delivery is independent of scoring: malformed and duplicate packets must
+	// still reach every configured validator destination unchanged.
+	if fanout != nil && !fanout.Enqueue(packet) {
+		_ = metrics.IncFanoutDrop(feedName)
+	}
+	if parseErr != nil {
+		_ = metrics.IncUnparsed(feedName)
+	}
 }
 
 func startHTTP(address string, registry *prometheus.Registry, health http.Handler) (*http.Server, error) {
