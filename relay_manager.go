@@ -239,14 +239,14 @@ func DefaultRelayManagerConfigWithDRIAD(sourceAddr netip.Addr) RelayManagerConfi
 
 // RelayManagerStats contains relay manager statistics
 type RelayManagerStats struct {
-	State              RelayState
-	SubscriptionCount  int
-	TotalPackets       uint64
-	TotalBytes         uint64
-	ReconnectCount     uint64
-	LastReconnectTime  time.Time
-	TransportType      TransportType
-	ProtocolType       ProtocolType
+	State             RelayState
+	SubscriptionCount int
+	TotalPackets      uint64
+	TotalBytes        uint64
+	ReconnectCount    uint64
+	LastReconnectTime time.Time
+	TransportType     TransportType
+	ProtocolType      ProtocolType
 }
 
 // RelayManager manages a shared AMT relay connection for multiple subscriptions
@@ -258,12 +258,13 @@ type RelayManager struct {
 	subscriptions *xsync.MapOf[SubscriptionKey, *Subscription]
 	pendingJoins  *xsync.MapOf[SubscriptionKey, *Subscription]
 
-	ctx           context.Context
-	cancel        context.CancelFunc
-	mu            sync.RWMutex
-	intervalTime  time.Duration
-	lastData      atomic.Time
-	reconnectCount atomic.Uint64
+	ctx             context.Context
+	cancel          context.CancelFunc
+	mu              sync.RWMutex
+	intervalTime    time.Duration
+	lastAnyMessage  atomic.Time
+	lastDataMessage atomic.Time
+	reconnectCount  atomic.Uint64
 
 	// For batched IGMP
 	joinPending atomic.Bool
@@ -352,7 +353,9 @@ func (rm *RelayManager) Open(ctx context.Context) error {
 	}
 
 	rm.state.Store(RelayStateActive)
-	rm.lastData.Store(time.Now())
+	now := time.Now()
+	rm.lastAnyMessage.Store(now)
+	rm.lastDataMessage.Store(now)
 
 	// Start read loop
 	go rm.readLoop()
@@ -643,11 +646,12 @@ func (rm *RelayManager) readLoop() {
 			return
 		}
 
-		rm.lastData.Store(time.Now())
+		rm.lastAnyMessage.Store(time.Now())
 
 		msgType := m.MessageType(buffer[0] & 0x0F)
 		switch msgType {
 		case m.MulticastDataType:
+			rm.lastDataMessage.Store(time.Now())
 			rm.routeDataToSubscription(buffer[:n])
 
 		case m.MembershipQueryType:
@@ -766,7 +770,7 @@ func (rm *RelayManager) keepaliveLoop() {
 			}
 
 			// Check if we've received data recently
-			if time.Since(rm.lastData.Load()) > rm.intervalTime*2 {
+			if time.Since(rm.lastDataMessage.Load()) > rm.intervalTime*2 {
 				// No data received, might need to reconnect
 				rm.protocol.Reset()
 				if err := rm.performHandshake(); err != nil {
@@ -851,7 +855,7 @@ func (rm *RelayManager) reconnectWithBackoff() {
 	}
 
 	rm.state.Store(RelayStateActive)
-	rm.lastData.Store(time.Now())
+	rm.lastAnyMessage.Store(time.Now())
 
 	// Restore all subscriptions
 	rm.subscriptions.Range(func(key SubscriptionKey, sub *Subscription) bool {
