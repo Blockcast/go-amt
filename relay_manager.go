@@ -457,6 +457,26 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	}
 	close(sub.dataChan)
 
+	// A relay keeps the previous membership until it receives a leave report.
+	// Only leave when no other local subscription still needs this (S,G) pair.
+	if rm.State() == RelayStateActive || rm.State() == RelayStateQuerying {
+		stillSubscribed := false
+		rm.subscriptions.Range(func(otherKey SubscriptionKey, _ *Subscription) bool {
+			if otherKey.Source == key.Source && otherKey.Group == key.Group {
+				stillSubscribed = true
+				return false
+			}
+			return true
+		})
+		if !stillSubscribed {
+			if report, err := rm.protocol.CreateIGMPLeaveReport(key.Source, key.Group); err == nil {
+				if update, err := rm.protocol.CreateMembershipUpdate(report); err == nil {
+					_ = rm.transport.Send(update)
+				}
+			}
+		}
+	}
+
 	// Re-send batched membership update without this subscription
 	rm.scheduleBatchedJoin()
 

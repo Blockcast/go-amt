@@ -187,6 +187,36 @@ func TestManagedConnOpenRejectsNonIPv4Subscription(t *testing.T) {
 	}
 }
 
+func TestPureGoProtocolCreatesLeaveCompatibleIGMPv3Report(t *testing.T) {
+	protocol, err := NewPureGoProtocol()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := protocol.CreateIGMPLeaveReport(
+		netip.MustParseAddr("192.0.2.1"),
+		netip.MustParseAddr("239.0.0.1"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report) != 36 {
+		t.Fatalf("leave report length = %d, want 36", len(report))
+	}
+	if report[20] != m.IGMPv3TypeMembershipReport {
+		t.Fatalf("IGMP type = %#x, want %#x", report[20], m.IGMPv3TypeMembershipReport)
+	}
+	if report[27] != 1 {
+		t.Fatalf("group record count = %d, want 1", report[27])
+	}
+	if report[28] != m.IGMPv3ChangeToIncludeMode {
+		t.Fatalf("record type = %d, want change-to-include", report[28])
+	}
+	if report[30] != 0 || report[31] != 0 {
+		t.Fatalf("leave record has sources: count bytes %#x %#x", report[30], report[31])
+	}
+}
+
 func TestManagedConnCloseUnblocksTunnelReads(t *testing.T) {
 	tests := []struct {
 		name string

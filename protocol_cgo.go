@@ -254,6 +254,10 @@ func (p *CGOProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []neti
 	return C.GoBytes(unsafe.Pointer(outReport.data), C.int(outReport.len)), nil
 }
 
+func (p *CGOProtocol) CreateIGMPLeaveReport(source, group netip.Addr) ([]byte, error) {
+	return buildIGMPLeaveReport(source, group, p.State())
+}
+
 func (p *CGOProtocol) CreateMembershipUpdate(igmpReport []byte) ([]byte, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
