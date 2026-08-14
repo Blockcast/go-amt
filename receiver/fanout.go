@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 
@@ -172,7 +173,7 @@ func (f *Fanout) run() {
 				messages[i] = ipv4.Message{Buffers: [][]byte{packet}, Addr: f.udpDest[index]}
 			}
 			f.next = (f.next + 1) % count
-			written, err := f.udpConn.WriteBatch(messages, 0)
+			written, err := writeUDPPacketBatch(f.udpConn, messages, runtime.GOOS == "linux")
 			f.egressPackets.Add(uint64(written))
 			if written != count {
 				f.writeErrors.Add(uint64(count - written))
@@ -191,4 +192,33 @@ func (f *Fanout) run() {
 			f.egressPackets.Add(1)
 		}
 	}
+}
+
+// writeUDPPacketBatch keeps one socket on every platform. x/net/ipv4 only
+// implements batching on Linux; its other implementations write one message
+// and return success, which would silently drop the remaining destinations.
+func writeUDPPacketBatch(conn *ipv4.PacketConn, messages []ipv4.Message, useBatch bool) (int, error) {
+	if useBatch {
+		return conn.WriteBatch(messages, 0)
+	}
+
+	written := 0
+	for _, message := range messages {
+		if len(message.Buffers) == 0 {
+			return written, errors.New("fan-out message has no payload")
+		}
+		payload := message.Buffers[0]
+		if len(payload) == 0 {
+			return written, errors.New("fan-out message has an empty payload")
+		}
+		n, err := conn.WriteTo(payload, nil, message.Addr)
+		if err != nil {
+			return written, err
+		}
+		if n != len(payload) {
+			return written, io.ErrShortWrite
+		}
+		written++
+	}
+	return written, nil
 }
