@@ -262,6 +262,7 @@ type RelayManager struct {
 	cancel          context.CancelFunc
 	mu              sync.RWMutex
 	handshakeMu     sync.Mutex
+	receiveMu       sync.Mutex
 	loopsMu         sync.Mutex
 	loopsCancel     context.CancelFunc
 	loopGeneration  uint64
@@ -538,7 +539,9 @@ func (rm *RelayManager) performHandshake() error {
 	}
 
 	for {
+		rm.receiveMu.Lock()
 		n, _, err := rm.transport.Receive(buffer)
+		rm.receiveMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("failed to receive response: %w", err)
 		}
@@ -696,7 +699,9 @@ func (rm *RelayManager) readLoop(ctx context.Context, generation uint64) {
 		default:
 		}
 
+		rm.receiveMu.Lock()
 		n, _, err := rm.transport.Receive(buffer)
+		rm.receiveMu.Unlock()
 		if err != nil {
 			if ctx.Err() != nil || rm.ctx.Err() != nil {
 				return // Context cancelled
@@ -834,13 +839,10 @@ func (rm *RelayManager) keepaliveLoop(ctx context.Context, generation uint64) {
 
 			// Check if we've received data recently
 			if time.Since(rm.lastDataMessage.Load()) > rm.intervalTime*2 {
-				// No data received, might need to reconnect
-				rm.protocol.Reset()
-				if err := rm.performHandshake(); err != nil {
-					go rm.reconnectWithBackoff()
-					return
-				}
-				_ = rm.sendBatchedMembershipUpdate()
+				// No data received: reconnectWithBackoff is the only recovery
+				// path so the reader is stopped before the handshake begins.
+				go rm.reconnectWithBackoff()
+				return
 			} else {
 				// Send keepalive request
 				request, err := rm.protocol.CreateRequestMessage(false)
@@ -919,7 +921,9 @@ func (rm *RelayManager) reconnectWithBackoff() {
 	}
 
 	rm.state.Store(RelayStateActive)
-	rm.lastAnyMessage.Store(time.Now())
+	now := time.Now()
+	rm.lastAnyMessage.Store(now)
+	rm.lastDataMessage.Store(now)
 	rm.startLoops()
 
 	// Restore all subscriptions
