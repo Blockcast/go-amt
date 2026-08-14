@@ -2,31 +2,54 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"strings"
 	"testing"
 )
 
-func TestSelftestFixturePrintsOrderedReceipt(t *testing.T) {
+// captureStdout runs work with os.Stdout redirected and returns what it wrote.
+func captureStdout(t *testing.T, work func() error) string {
+	t.Helper()
 	read, write, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
 	original := os.Stdout
 	os.Stdout = write
-	err = selftest([]string{"--fixture"})
+	workErr := work()
 	_ = write.Close()
 	os.Stdout = original
-	if err != nil {
-		t.Fatal(err)
+	if workErr != nil {
+		t.Fatal(workErr)
 	}
 	var output bytes.Buffer
 	if _, err := output.ReadFrom(read); err != nil {
 		t.Fatal(err)
 	}
-	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	return output.String()
+}
+
+func TestSelftestFixturePrintsOrderedReceipt(t *testing.T) {
+	output := captureStdout(t, func() error { return selftest([]string{"--fixture"}) })
+	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) != 3 || !strings.HasPrefix(lines[0], "time_to_32nd_shred") || !strings.HasPrefix(lines[1], "erasure") || !strings.HasPrefix(lines[2], "gap_ms") {
-		t.Fatalf("receipt output = %q", output.String())
+		t.Fatalf("receipt output = %q", output)
+	}
+}
+
+func TestSelftestFixtureJSONIsMachineReadable(t *testing.T) {
+	output := captureStdout(t, func() error { return selftest([]string{"--fixture", "--json"}) })
+	var receipt struct {
+		SetsTotal        int      `json:"sets_total"`
+		ErasureFraction  *float64 `json:"erasure_fraction"`
+		MeanShredsPerSet *float64 `json:"mean_shreds_per_set"`
+	}
+	if err := json.Unmarshal([]byte(output), &receipt); err != nil {
+		t.Fatalf("selftest --json output is not JSON: %v\n%s", err, output)
+	}
+	if receipt.SetsTotal == 0 || receipt.ErasureFraction == nil || receipt.MeanShredsPerSet == nil {
+		t.Fatalf("JSON receipt is missing fields: %s", output)
 	}
 }
 

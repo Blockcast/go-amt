@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -20,11 +21,15 @@ import (
 const help = `blockcast-shreds demo mode
 
 Usage:
-  blockcast-shreds [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...]
-  blockcast-shreds selftest --fixture
+  blockcast-shreds [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--json]
+  blockcast-shreds selftest --fixture [--json]
 
 Demo mode has no broker, certificates, accounts, or heartbeats. --feed is
-repeatable for first-arrival-wins scoring across multiple unicast UDP feeds.`
+repeatable for first-arrival-wins scoring across multiple unicast UDP feeds.
+With two or more feeds the receipt reports the measured worth of a second
+feed: each feed's own erasure fraction, the union's, and the FEC sets the
+extra feeds rescued. It measures this run only — it cannot tell whether the
+inputs are independently operated or share one tap.`
 
 type feeds []string
 
@@ -58,6 +63,7 @@ func run(args []string) error {
 	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed")
 	flags.StringVar(&listen, "listen", "0.0.0.0:20000", "unicast UDP listen address")
 	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated UDP forward destinations")
+	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -83,28 +89,43 @@ func run(args []string) error {
 			configured = append(configured, feed{name: name, address: address})
 		}
 	}
-	return listenAndScore(configured, splitNonempty(destinations))
+	return listenAndScore(configured, splitNonempty(destinations), *asJSON)
 }
 
 func selftest(args []string) error {
 	flags := flag.NewFlagSet("selftest", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	fixture := flags.Bool("fixture", false, "replay the bundled deterministic pcap")
+	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if !*fixture || flags.NArg() != 0 {
-		return errors.New("usage: blockcast-shreds selftest --fixture")
+		return errors.New("usage: blockcast-shreds selftest --fixture [--json]")
 	}
 	scorer := shred.NewScorer()
 	if err := shred.ReplayFixture(scorer); err != nil {
 		return err
 	}
-	fmt.Println(scorer.Receipt())
+	return printReceipt(scorer.Receipt(), *asJSON)
+}
+
+// printReceipt writes either the human table (the receipt's String form) or an
+// indented JSON document for machine consumption.
+func printReceipt(receipt fmt.Stringer, asJSON bool) error {
+	if !asJSON {
+		fmt.Println(receipt)
+		return nil
+	}
+	encoded, err := json.MarshalIndent(receipt, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(encoded))
 	return nil
 }
 
-func listenAndScore(feeds []feed, destinations []string) error {
+func listenAndScore(feeds []feed, destinations []string, asJSON bool) error {
 	var fanout *receiver.Fanout
 	var err error
 	if len(destinations) != 0 {
@@ -169,9 +190,8 @@ func listenAndScore(feeds []feed, destinations []string) error {
 		_ = conn.Close()
 	}
 	mu.Lock()
-	fmt.Println(scorer.Receipt())
-	mu.Unlock()
-	return nil
+	defer mu.Unlock()
+	return printReceipt(scorer.Receipt(), asJSON)
 }
 
 func splitNonempty(value string) []string {
