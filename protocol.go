@@ -50,6 +50,12 @@ type AMTProtocol interface {
 	Close()
 }
 
+// SourceSpecificLeaveReporter preserves other sources in a group when one
+// local (S,G) subscription is removed.
+type SourceSpecificLeaveReporter interface {
+	CreateIGMPSourceLeaveReport(source, group netip.Addr) ([]byte, error)
+}
+
 // AMTState represents the AMT gateway state machine states
 type AMTState int
 

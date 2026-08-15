@@ -223,6 +223,10 @@ func (p *PureGoProtocol) CreateIGMPLeaveReport(source, group netip.Addr) ([]byte
 	return buildIGMPLeaveReport(source, group, p.State())
 }
 
+func (p *PureGoProtocol) CreateIGMPSourceLeaveReport(source, group netip.Addr) ([]byte, error) {
+	return buildIGMPSourceLeaveReport(source, group, p.State())
+}
+
 func buildIGMPLeaveReport(source, group netip.Addr, state AMTState) ([]byte, error) {
 	if !source.Is4() {
 		return nil, fmt.Errorf("source address must be IPv4: %s", source)
@@ -243,6 +247,31 @@ func buildIGMPLeaveReport(source, group netip.Addr, state AMTState) ([]byte, err
 	igmpData, err := report.MarshalBinary()
 	if err != nil {
 		return nil, &ProtocolError{State: state, Message: "failed to marshal IGMP leave report", Cause: err}
+	}
+	return append(buildIGMPIPHeader(igmpData), igmpData...), nil
+}
+
+func buildIGMPSourceLeaveReport(source, group netip.Addr, state AMTState) ([]byte, error) {
+	if !source.Is4() {
+		return nil, fmt.Errorf("source address must be IPv4: %s", source)
+	}
+	if !group.Is4() {
+		return nil, fmt.Errorf("group address must be IPv4: %s", group)
+	}
+
+	report := &m.IGMPv3MembershipReport{
+		Type:            m.IGMPv3TypeMembershipReport,
+		NumGroupRecords: 1,
+		GroupRecords: []m.IGMPv3GroupRecord{{
+			RecordType: m.IGMPv3BlockOldSources,
+			NumSources: 1,
+			Multicast:  group.As4(),
+			Sources:    [][4]byte{source.As4()},
+		}},
+	}
+	igmpData, err := report.MarshalBinary()
+	if err != nil {
+		return nil, &ProtocolError{State: state, Message: "failed to marshal source-specific leave report", Cause: err}
 	}
 	return append(buildIGMPIPHeader(igmpData), igmpData...), nil
 }

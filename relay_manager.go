@@ -265,6 +265,7 @@ type RelayManager struct {
 	receiveMu       sync.Mutex
 	loopsMu         sync.Mutex
 	loopsCancel     context.CancelFunc
+	loopsWG         sync.WaitGroup
 	loopGeneration  uint64
 	intervalTime    time.Duration
 	lastAnyMessage  atomic.Time
@@ -400,7 +401,9 @@ func (rm *RelayManager) Close() error {
 	}
 
 	if rm.transport != nil {
-		return rm.transport.Close()
+		err := rm.transport.Close()
+		rm.waitLoops()
+		return err
 	}
 
 	return nil
@@ -459,18 +462,32 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	close(sub.dataChan)
 
 	// A relay keeps the previous membership until it receives a leave report.
-	// Only leave when no other local subscription still needs this (S,G) pair.
+	// Preserve other sources in the same group with a source-specific leave.
 	if rm.State() == RelayStateActive || rm.State() == RelayStateQuerying {
 		stillSubscribed := false
+		otherGroupSource := false
 		rm.subscriptions.Range(func(otherKey SubscriptionKey, _ *Subscription) bool {
 			if otherKey.Source == key.Source && otherKey.Group == key.Group {
 				stillSubscribed = true
-				return false
+			}
+			if otherKey.Group == key.Group {
+				otherGroupSource = true
 			}
 			return true
 		})
 		if !stillSubscribed {
-			if report, err := rm.protocol.CreateIGMPLeaveReport(key.Source, key.Group); err == nil {
+			var report []byte
+			var err error
+			if otherGroupSource {
+				if sourceLeaver, ok := rm.protocol.(SourceSpecificLeaveReporter); ok {
+					report, err = sourceLeaver.CreateIGMPSourceLeaveReport(key.Source, key.Group)
+				} else {
+					return fmt.Errorf("protocol does not support source-specific leave reports")
+				}
+			} else {
+				report, err = rm.protocol.CreateIGMPLeaveReport(key.Source, key.Group)
+			}
+			if err == nil {
 				if update, err := rm.protocol.CreateMembershipUpdate(report); err == nil {
 					_ = rm.transport.Send(update)
 				}
@@ -664,6 +681,7 @@ func (rm *RelayManager) startLoops() {
 	rm.loopsCancel = cancel
 	rm.loopGeneration++
 	generation := rm.loopGeneration
+	rm.loopsWG.Add(2)
 	go rm.readLoop(loopCtx, generation)
 	go rm.keepaliveLoop(loopCtx, generation)
 }
@@ -679,6 +697,10 @@ func (rm *RelayManager) stopLoops() {
 	}
 }
 
+func (rm *RelayManager) waitLoops() {
+	rm.loopsWG.Wait()
+}
+
 func (rm *RelayManager) generationActive(generation uint64) bool {
 	rm.loopsMu.Lock()
 	defer rm.loopsMu.Unlock()
@@ -687,6 +709,7 @@ func (rm *RelayManager) generationActive(generation uint64) bool {
 
 // readLoop continuously reads from the transport
 func (rm *RelayManager) readLoop(ctx context.Context, generation uint64) {
+	defer rm.loopsWG.Done()
 	buffer := make([]byte, rm.config.MTU)
 
 	for {
@@ -822,6 +845,7 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 
 // keepaliveLoop sends periodic keepalive requests
 func (rm *RelayManager) keepaliveLoop(ctx context.Context, generation uint64) {
+	defer rm.loopsWG.Done()
 	ticker := time.NewTicker(rm.intervalTime)
 	defer ticker.Stop()
 
@@ -889,8 +913,11 @@ func (rm *RelayManager) reconnectWithBackoff() {
 		// Reset protocol
 		rm.protocol.Reset()
 
-		// Close and reopen transport
+		// Close the transport and wait for the old reader before reopening it.
+		// Otherwise a receive blocked in the old generation can consume the new
+		// generation's handshake response after the socket is reopened.
 		_ = rm.transport.Close()
+		rm.waitLoops()
 		if err := rm.transport.Open(rm.ctx); err != nil {
 			return err
 		}

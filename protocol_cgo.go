@@ -258,6 +258,10 @@ func (p *CGOProtocol) CreateIGMPLeaveReport(source, group netip.Addr) ([]byte, e
 	return buildIGMPLeaveReport(source, group, p.State())
 }
 
+func (p *CGOProtocol) CreateIGMPSourceLeaveReport(source, group netip.Addr) ([]byte, error) {
+	return buildIGMPSourceLeaveReport(source, group, p.State())
+}
+
 func (p *CGOProtocol) CreateMembershipUpdate(igmpReport []byte) ([]byte, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

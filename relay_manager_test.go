@@ -217,6 +217,33 @@ func TestPureGoProtocolCreatesLeaveCompatibleIGMPv3Report(t *testing.T) {
 	}
 }
 
+func TestPureGoProtocolCreatesSourceSpecificLeaveReport(t *testing.T) {
+	protocol, err := NewPureGoProtocol()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	report, err := protocol.CreateIGMPSourceLeaveReport(
+		netip.MustParseAddr("192.0.2.1"),
+		netip.MustParseAddr("239.0.0.1"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report) != 40 {
+		t.Fatalf("source-specific leave report length = %d, want 40", len(report))
+	}
+	if report[28] != m.IGMPv3BlockOldSources {
+		t.Fatalf("record type = %d, want block-old-sources", report[28])
+	}
+	if report[30] != 0 || report[31] != 1 {
+		t.Fatalf("source count bytes = %#x %#x, want 0x00 0x01", report[30], report[31])
+	}
+	if !bytes.Equal(report[36:40], net.IPv4(192, 0, 2, 1).To4()) {
+		t.Fatalf("source = %v, want 192.0.2.1", net.IP(report[36:40]))
+	}
+}
+
 func TestManagedConnCloseUnblocksTunnelReads(t *testing.T) {
 	tests := []struct {
 		name string
