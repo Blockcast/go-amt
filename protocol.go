@@ -31,6 +31,9 @@ type AMTProtocol interface {
 	// CreateIGMPJoinReportMulti creates an IGMPv3 report for multiple groups from same source
 	CreateIGMPJoinReportMulti(source netip.Addr, groups []netip.Addr) ([]byte, error)
 
+	// CreateIGMPLeaveReport creates an IGMPv3 report that leaves one (S,G) pair.
+	CreateIGMPLeaveReport(source, group netip.Addr) ([]byte, error)
+
 	// CreateMembershipUpdate creates an AMT Membership Update message with IGMP report
 	CreateMembershipUpdate(igmpReport []byte) ([]byte, error)
 
@@ -45,6 +48,12 @@ type AMTProtocol interface {
 
 	// Close frees protocol resources
 	Close()
+}
+
+// SourceSpecificLeaveReporter preserves other sources in a group when one
+// local (S,G) subscription is removed.
+type SourceSpecificLeaveReporter interface {
+	CreateIGMPSourceLeaveReport(source, group netip.Addr) ([]byte, error)
 }
 
 // AMTState represents the AMT gateway state machine states

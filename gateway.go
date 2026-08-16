@@ -1,4 +1,4 @@
-//go:build (linux || darwin) && !ios && !android && cgo
+//go:build (linux || darwin) && !ios && !android && cgo && !purego
 
 package amt
 

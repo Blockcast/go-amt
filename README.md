@@ -91,6 +91,39 @@ index repeats across the FEC sets of a slot (the 31x distinct-shred undercount
 found in BLO-26535). The local index already unifies data (`0..num_data-1`) and
 coding (`num_data+position`) shreds.
 
+### Receiver metrics
+
+`--http-addr` serves Prometheus `/metrics` and a `/healthz` endpoint driven by
+last-received-packet freshness. Every counter is labelled by `feed` and is
+materialized at zero for each configured feed at startup, so a silent feed is
+distinguishable from an unconfigured one.
+
+| Metric | Unit | Meaning |
+|---|---|---|
+| `bcast_shred_gw_ingress_packets_total` | packets | Packets read from the feed socket. |
+| `bcast_shred_gw_egress_packets_total` | **datagrams** | Successful writes to validator destinations. |
+| `bcast_shred_gw_fanout_dropped_packets_total` | packets | Rejected at enqueue because the bounded ring was full. |
+| `bcast_shred_gw_fanout_write_errors_total` | **datagrams** | Destination writes that failed or were short. |
+| `bcast_shred_gw_shreds_unparsed_total` | packets | Delivered packets whose shred header did not parse. |
+
+**Egress and write errors are counted per destination write, not per packet.**
+One received packet fanned out to N `--dest-ip-ports` targets increments
+`egress_packets_total` by N. To recover packets forwarded, divide by the
+destination count:
+
+```promql
+rate(bcast_shred_gw_egress_packets_total[5m]) / <number of --dest-ip-ports>
+```
+
+The two silent drop sites are `fanout_dropped_packets_total` (ring overflow,
+counted at enqueue) and `fanout_write_errors_total` (counted at the write).
+Both represent packets that did not reach a destination; ingress minus drops is
+not by itself a delivery guarantee. Scoring and metrics never gate delivery, so
+a malformed or unattributable packet is still forwarded byte-identically.
+
+These are receiver-observed counters. They describe what this process read and
+wrote, not the validator's true replay deadline.
+
 ## License
 
 MIT

@@ -27,6 +27,9 @@ func TestReceiverMetricsExposePacketCountersAndExactWindow(t *testing.T) {
 	if err := metrics.IncFanoutDrop("feed-a"); err != nil {
 		t.Fatal(err)
 	}
+	if err := metrics.AddWriteErrors("feed-a", 3); err != nil {
+		t.Fatal(err)
+	}
 	if err := metrics.IncUnparsed("feed-a"); err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +56,7 @@ func TestReceiverMetricsExposePacketCountersAndExactWindow(t *testing.T) {
 	assertMetric(t, families, "bcast_shred_gw_ingress_packets_total", labels("feed", "feed-a"), 1)
 	assertMetric(t, families, "bcast_shred_gw_egress_packets_total", labels("feed", "feed-a"), 2)
 	assertMetric(t, families, "bcast_shred_gw_fanout_dropped_packets_total", labels("feed", "feed-a"), 1)
+	assertMetric(t, families, "bcast_shred_gw_fanout_write_errors_total", labels("feed", "feed-a"), 3)
 	assertMetric(t, families, "bcast_shred_gw_shreds_unparsed_total", labels("feed", "feed-a"), 1)
 	assertMetric(t, families, "bcast_shred_gw_erasure_sets", labels("feed", "feed-a", "result", "total"), 5)
 	assertMetric(t, families, "bcast_shred_gw_erasure_sets", labels("feed", "feed-a", "result", "erased"), 2)
@@ -68,6 +72,7 @@ func TestReceiverMetricsExposePacketCountersAndExactWindow(t *testing.T) {
 	assertMetric(t, families, "bcast_shred_gw_report_schema", labels("feed", "feed-a"), 1)
 
 	assertMetric(t, families, "bcast_shred_gw_ingress_packets_total", labels("feed", "feed-b"), 0)
+	assertMetric(t, families, "bcast_shred_gw_fanout_write_errors_total", labels("feed", "feed-b"), 0)
 	assertMetric(t, families, "bcast_shred_gw_gap_events", labels("feed", "feed-b", "bucket", ">=32"), 0)
 }
 
@@ -86,6 +91,9 @@ func TestReceiverMetricsRejectUnknownFeedWithoutCreatingSeries(t *testing.T) {
 	}
 	if err := metrics.IncFanoutDrop("attacker-controlled"); !errors.Is(err, ErrUnknownFeed) {
 		t.Fatalf("IncFanoutDrop() error = %v, want %v", err, ErrUnknownFeed)
+	}
+	if err := metrics.AddWriteErrors("attacker-controlled", 1); !errors.Is(err, ErrUnknownFeed) {
+		t.Fatalf("AddWriteErrors() error = %v, want %v", err, ErrUnknownFeed)
 	}
 	if err := metrics.IncUnparsed("attacker-controlled"); !errors.Is(err, ErrUnknownFeed) {
 		t.Fatalf("IncUnparsed() error = %v, want %v", err, ErrUnknownFeed)

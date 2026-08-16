@@ -182,9 +182,25 @@ func (p *PureGoProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []n
 		}
 	}
 
+	// netip.Addr.As4 panics on a non-IPv4 address. This builder runs from the
+	// batched-membership time.AfterFunc goroutine, where a panic is unrecoverable
+	// by any caller, so validate before converting.
+	if !source.Is4() && !source.Is4In6() {
+		return nil, &ProtocolError{
+			State:   p.state,
+			Message: fmt.Sprintf("source address must be IPv4: %s", source),
+		}
+	}
+
 	// Build IGMPv3 Membership Report
 	groupRecords := make([]m.IGMPv3GroupRecord, len(groups))
 	for i, g := range groups {
+		if !g.Is4() && !g.Is4In6() {
+			return nil, &ProtocolError{
+				State:   p.state,
+				Message: fmt.Sprintf("group address must be IPv4: %s", g),
+			}
+		}
 		g4 := g.As4()
 		s4 := source.As4()
 		groupRecords[i] = m.IGMPv3GroupRecord{
@@ -219,19 +235,91 @@ func (p *PureGoProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []n
 	return append(ipHeader, igmpData...), nil
 }
 
+func (p *PureGoProtocol) CreateIGMPLeaveReport(source, group netip.Addr) ([]byte, error) {
+	return buildIGMPLeaveReport(source, group, p.State())
+}
+
+func (p *PureGoProtocol) CreateIGMPSourceLeaveReport(source, group netip.Addr) ([]byte, error) {
+	return buildIGMPSourceLeaveReport(source, group, p.State())
+}
+
+func buildIGMPLeaveReport(source, group netip.Addr, state AMTState) ([]byte, error) {
+	if !source.Is4() {
+		return nil, fmt.Errorf("source address must be IPv4: %s", source)
+	}
+	if !group.Is4() {
+		return nil, fmt.Errorf("group address must be IPv4: %s", group)
+	}
+
+	report := &m.IGMPv3MembershipReport{
+		Type:            m.IGMPv3TypeMembershipReport,
+		NumGroupRecords: 1,
+		GroupRecords: []m.IGMPv3GroupRecord{{
+			// CHANGE_TO_INCLUDE_MODE with no sources is the IGMPv3 leave form.
+			RecordType: m.IGMPv3ChangeToIncludeMode,
+			Multicast:  group.As4(),
+		}},
+	}
+	igmpData, err := report.MarshalBinary()
+	if err != nil {
+		return nil, &ProtocolError{State: state, Message: "failed to marshal IGMP leave report", Cause: err}
+	}
+	return append(buildIGMPIPHeader(igmpData), igmpData...), nil
+}
+
+func buildIGMPSourceLeaveReport(source, group netip.Addr, state AMTState) ([]byte, error) {
+	if !source.Is4() {
+		return nil, fmt.Errorf("source address must be IPv4: %s", source)
+	}
+	if !group.Is4() {
+		return nil, fmt.Errorf("group address must be IPv4: %s", group)
+	}
+
+	report := &m.IGMPv3MembershipReport{
+		Type:            m.IGMPv3TypeMembershipReport,
+		NumGroupRecords: 1,
+		GroupRecords: []m.IGMPv3GroupRecord{{
+			RecordType: m.IGMPv3BlockOldSources,
+			NumSources: 1,
+			Multicast:  group.As4(),
+			Sources:    [][4]byte{source.As4()},
+		}},
+	}
+	igmpData, err := report.MarshalBinary()
+	if err != nil {
+		return nil, &ProtocolError{State: state, Message: "failed to marshal source-specific leave report", Cause: err}
+	}
+	return append(buildIGMPIPHeader(igmpData), igmpData...), nil
+}
+
+func buildIGMPIPHeader(payload []byte) []byte {
+	// Keep leave reports identical to the pure-Go protocol's normal IGMP envelope.
+	totalLen := 20 + len(payload)
+	header := make([]byte, 20)
+	header[0] = 0x45
+	header[1] = 0xc0
+	binary.BigEndian.PutUint16(header[2:4], uint16(totalLen))
+	header[8] = 1
+	header[9] = 2
+	copy(header[12:16], net.IPv4zero.To4())
+	copy(header[16:20], net.ParseIP("224.0.0.22").To4())
+	binary.BigEndian.PutUint16(header[10:12], (&PureGoProtocol{}).calculateIPChecksum(header))
+	return header
+}
+
 // buildIPHeader creates an IPv4 header for IGMP
 func (p *PureGoProtocol) buildIPHeader(payload []byte) []byte {
 	totalLen := 20 + len(payload) // IP header + payload
 
 	header := make([]byte, 20)
-	header[0] = 0x45                                        // Version (4) + IHL (5)
-	header[1] = 0xc0                                        // DSCP + ECN (0xc0 for IGMP)
+	header[0] = 0x45 // Version (4) + IHL (5)
+	header[1] = 0xc0 // DSCP + ECN (0xc0 for IGMP)
 	binary.BigEndian.PutUint16(header[2:4], uint16(totalLen))
-	binary.BigEndian.PutUint16(header[4:6], 0)              // Identification
-	binary.BigEndian.PutUint16(header[6:8], 0)              // Flags + Fragment Offset
-	header[8] = 1                                           // TTL = 1 for IGMP
-	header[9] = 2                                           // Protocol = IGMP
-	binary.BigEndian.PutUint16(header[10:12], 0)            // Checksum (calculated below)
+	binary.BigEndian.PutUint16(header[4:6], 0)   // Identification
+	binary.BigEndian.PutUint16(header[6:8], 0)   // Flags + Fragment Offset
+	header[8] = 1                                // TTL = 1 for IGMP
+	header[9] = 2                                // Protocol = IGMP
+	binary.BigEndian.PutUint16(header[10:12], 0) // Checksum (calculated below)
 
 	// Source: 0.0.0.0 (will be filled by kernel/relay)
 	copy(header[12:16], net.IPv4zero.To4())

@@ -1,4 +1,4 @@
-//go:build (linux || darwin) && !ios && !android && cgo
+//go:build (linux || darwin) && !ios && !android && cgo && !purego
 
 package amt
 
@@ -252,6 +252,14 @@ func (p *CGOProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []neti
 	defer C.amt_buffer_free(outReport)
 
 	return C.GoBytes(unsafe.Pointer(outReport.data), C.int(outReport.len)), nil
+}
+
+func (p *CGOProtocol) CreateIGMPLeaveReport(source, group netip.Addr) ([]byte, error) {
+	return buildIGMPLeaveReport(source, group, p.State())
+}
+
+func (p *CGOProtocol) CreateIGMPSourceLeaveReport(source, group netip.Addr) ([]byte, error) {
+	return buildIGMPSourceLeaveReport(source, group, p.State())
 }
 
 func (p *CGOProtocol) CreateMembershipUpdate(igmpReport []byte) ([]byte, error) {
