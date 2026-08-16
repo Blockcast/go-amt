@@ -144,7 +144,17 @@ func newOverlapProbedManager(t *testing.T, fr *fakeRelay) (*RelayManager, *recei
 		_ = rm.Close()
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	// This context becomes rm.ctx (relay_manager.go:313), so it bounds the whole
+	// manager's lifetime, not just Open. It must comfortably exceed the sum of the
+	// test body's own assertion timeouts (5s + 10s + 0.5s + 15s + 5s = 35.5s), or
+	// on an already-slow run rm.ctx expires first, the reconnect operation returns
+	// backoff.Permanent(rm.ctx.Err()) (relay_manager.go:994), the state goes to
+	// RelayStateError, and the failure surfaces as "state after reconnect = Error,
+	// want Active" instead of the timeout that names the actual stall. A healthy
+	// run completes the body in ~1s, so this bound only ever shapes diagnostics.
+	// Raise it if an assertion timeout is added.
+	const managerLifetime = 2 * time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), managerLifetime)
 	t.Cleanup(cancel)
 	if err := rm.Open(ctx); err != nil {
 		t.Fatalf("Open against fake relay: %v", err)
@@ -158,10 +168,14 @@ func newOverlapProbedManager(t *testing.T, fr *fakeRelay) (*RelayManager, *recei
 	// performHandshake (relay_manager.go:1011). That is a timing margin rather than
 	// a structural exclusion -- readLoop spawns a reconnect on any Receive error
 	// (relay_manager.go:813), not only on the keepalive interval -- but to reach the
-	// write it must first clear stopLoops, transport.Close, waitLoops,
-	// transport.Open and the backoff, which is milliseconds against the nanoseconds
-	// this read sits behind Open. keepaliveLoop reads it concurrently but never
-	// writes it.
+	// write it must first clear stopLoops, transport.Close, waitLoops and
+	// transport.Open, and then complete the full two-exchange handshake: discovery
+	// send (relay_manager.go:628), advertisement receive (:640), request send
+	// (:659), query receive (:640 again). That margin is two relay round-trips, not
+	// merely socket setup, against the nanoseconds this read sits behind Open. The
+	// retry backoff is not part of it: backoff.RetryNotify runs operation
+	// immediately on the first attempt and consumes InitialBackoff only between
+	// retries. keepaliveLoop reads this field concurrently but never writes it.
 	interval := rm.intervalTime
 	if interval < minKeepaliveMargin {
 		t.Fatalf("relay-advertised keepalive interval = %v, want >= %v: keepaliveLoop "+
