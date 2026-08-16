@@ -21,3 +21,20 @@ jobs:
           cache: true
       - run: go test ./...
       - run: go vet ./...
+
+  race:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      # The race detector needs cgo, but the default cgo build links against
+      # the native libamt_protocol, which is not available on a stock runner.
+      # The purego tag selects the pure-Go protocol/conn implementations so the
+      # race detector can run without that dependency. It does not alter the
+      # default (cgo) or CGO_ENABLED=0 build selections.
+      - run: go test -race -tags purego ./...

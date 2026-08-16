@@ -1,4 +1,4 @@
-//go:build !cgo || ios || android || js || wasm
+//go:build !cgo || purego || ios || android || js || wasm
 
 package amt
 
