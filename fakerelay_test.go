@@ -41,13 +41,31 @@ type fakeRelay struct {
 	advertised atomic.Int64
 	queried    atomic.Int64
 
+	// queryIntervalCode is the QQIC byte of the Membership Query. The gateway
+	// decodes it into RelayManager.intervalTime, which drives the keepalive
+	// ticker and its data-liveness threshold -- so a test that must not race the
+	// keepalive pins this rather than RelayManagerConfig.KeepaliveInterval, which
+	// performHandshake overwrites. Immutable once serve starts; set it through
+	// withQueryIntervalCode at construction, never afterwards.
+	queryIntervalCode byte
+
 	updateCh chan []byte
 	done     chan struct{}
 	wg       sync.WaitGroup
 }
 
+// fakeRelayOption customises a fakeRelay before its serve loop starts.
+type fakeRelayOption func(*fakeRelay)
+
+// withQueryIntervalCode overrides the QQIC byte the relay advertises in its
+// Membership Query. gopacket decodes byte 9 with igmpTimeDecode, so a code
+// below 0x80 means code*100ms: 0x0a is 1s (the default), 0x7f is 12.7s.
+func withQueryIntervalCode(code byte) fakeRelayOption {
+	return func(fr *fakeRelay) { fr.queryIntervalCode = code }
+}
+
 // newFakeRelay starts a relay bound to an ephemeral loopback port.
-func newFakeRelay(t *testing.T) *fakeRelay {
+func newFakeRelay(t *testing.T, opts ...fakeRelayOption) *fakeRelay {
 	t.Helper()
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -56,11 +74,18 @@ func newFakeRelay(t *testing.T) *fakeRelay {
 	}
 
 	fr := &fakeRelay{
-		t:         t,
-		conn:      conn,
-		queryResp: 100 * time.Millisecond,
-		updateCh:  make(chan []byte, 16),
-		done:      make(chan struct{}),
+		t:                 t,
+		conn:              conn,
+		queryResp:         100 * time.Millisecond,
+		queryIntervalCode: 0x0a,
+		updateCh:          make(chan []byte, 16),
+		done:              make(chan struct{}),
+	}
+	// Apply options before the serve goroutine exists: starting a goroutine is a
+	// happens-before edge, so the fields it reads need no further synchronisation.
+	// Mutating them after serve starts would be a genuine race.
+	for _, opt := range opts {
+		opt(fr)
 	}
 
 	fr.wg.Add(1)
@@ -191,7 +216,7 @@ func (fr *fakeRelay) encapsulatedIGMPQuery() []byte {
 	// igmp[2:4] checksum, filled below
 	// igmp[4:8] group address: zero for a General Query
 	igmp[8] = 0x02                             // QRV
-	igmp[9] = 0x0a                             // QQIC
+	igmp[9] = fr.queryIntervalCode             // QQIC
 	binary.BigEndian.PutUint16(igmp[10:12], 0) // no sources
 	binary.BigEndian.PutUint16(igmp[2:4], onesComplementChecksum(igmp))
 
