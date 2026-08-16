@@ -415,3 +415,47 @@ func TestUnsubscribeDuringPendingJoinPreservesOtherSource(t *testing.T) {
 		t.Fatalf("leave record type = %d, want BLOCK_OLD_SOURCES (%d)", rt, m.IGMPv3BlockOldSources)
 	}
 }
+
+// TestV4MappedSubscriptionCompletesFullLifecycle covers the boundary the
+// Subscribe guard actually draws (Ally, PR #33, head 937c12a, Important #2).
+//
+// The guard admits v4-mapped IPv6 (`::ffff:a.b.c.d`, Is4()==false but
+// Is4In6()==true) while both leave builders require strictly Is4(). So such a
+// subscription used to join and receive, and then on Unsubscribe the builder
+// errored, the error was discarded, no leave was ever sent, and Unsubscribe
+// still returned nil -- the caller believed it had detached while the relay kept
+// forwarding for the life of the session.
+//
+// Subscribe now normalises with Unmap(), so the mapped form is accepted and
+// works end to end, and a failed leave is surfaced rather than swallowed.
+func TestV4MappedSubscriptionCompletesFullLifecycle(t *testing.T) {
+	fr := newFakeRelay(t)
+	rm := newTestManager(t, fr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := rm.Open(ctx); err != nil {
+		t.Fatalf("Open against fake relay: %v", err)
+	}
+
+	mappedSrc := netip.MustParseAddr("::ffff:10.6.6.1")
+	mappedGrp := netip.MustParseAddr("::ffff:232.6.6.6")
+	if mappedSrc.Is4() || !mappedSrc.Is4In6() {
+		t.Fatalf("test premise broken: %s Is4=%v Is4In6=%v", mappedSrc, mappedSrc.Is4(), mappedSrc.Is4In6())
+	}
+
+	key := SubscriptionKey{Source: mappedSrc, Group: mappedGrp, Port: testHarnessPort}
+	subscribeActive(t, rm, key)
+	fr.DrainUpdates()
+
+	// The leave must actually be emitted, and Unsubscribe must not report
+	// success if it was not.
+	if err := rm.Unsubscribe(key); err != nil {
+		t.Fatalf("Unsubscribe(v4-mapped) reported an error: %v", err)
+	}
+
+	if _, err := fr.WaitForLeaveRecord(3 * time.Second); err != nil {
+		t.Fatalf("no leave emitted for a v4-mapped subscription: %v — "+
+			"the relay would keep forwarding this (S,G) for the session lifetime", err)
+	}
+}

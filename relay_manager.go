@@ -410,6 +410,18 @@ func (rm *RelayManager) Close() error {
 }
 
 // Subscribe creates a new subscription for the given (S,G,Port)
+// canonicalSubscriptionKey normalises a v4-mapped IPv6 address (::ffff:a.b.c.d)
+// down to canonical IPv4. Subscribe accepts both forms, but the IGMP report
+// builders require strictly Is4(); storing the mapped form lets a subscription
+// join successfully and then fail to build its leave report, which strands the
+// membership on the relay. Normalising at the boundary keeps one representation
+// in the maps so every downstream Is4() holds.
+func canonicalSubscriptionKey(key SubscriptionKey) SubscriptionKey {
+	key.Source = key.Source.Unmap()
+	key.Group = key.Group.Unmap()
+	return key
+}
+
 func (rm *RelayManager) Subscribe(key SubscriptionKey, callbacks SubscriptionCallbacks) (*Subscription, error) {
 	// Reject non-IPv4 (S,G) synchronously. The IGMPv3 report builder converts
 	// these with netip.Addr.As4, which panics, and it runs from the batched
@@ -420,6 +432,7 @@ func (rm *RelayManager) Subscribe(key SubscriptionKey, callbacks SubscriptionCal
 	if !key.Group.IsValid() || (!key.Group.Is4() && !key.Group.Is4In6()) {
 		return nil, fmt.Errorf("subscription group address must be IPv4: %s", key.Group)
 	}
+	key = canonicalSubscriptionKey(key)
 
 	rm.mu.RLock()
 	state := rm.State()
@@ -456,6 +469,10 @@ func (rm *RelayManager) Subscribe(key SubscriptionKey, callbacks SubscriptionCal
 
 // Unsubscribe removes a subscription
 func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
+	// Match the normalisation Subscribe applied, or a caller passing the
+	// v4-mapped form it subscribed with would miss the stored entry.
+	key = canonicalSubscriptionKey(key)
+
 	sub, ok := rm.subscriptions.LoadAndDelete(key)
 	if !ok {
 		// Also check pending
@@ -473,6 +490,7 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 
 	// A relay keeps the previous membership until it receives a leave report.
 	// Preserve other sources in the same group with a source-specific leave.
+	var leaveErr error
 	if rm.State() == RelayStateActive || rm.State() == RelayStateQuerying {
 		stillSubscribed := false
 		otherGroupSource := false
@@ -505,9 +523,17 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 			} else {
 				report, err = rm.protocol.CreateIGMPLeaveReport(key.Source, key.Group)
 			}
-			if err == nil {
-				if update, err := rm.protocol.CreateMembershipUpdate(report); err == nil {
-					_ = rm.transport.Send(update)
+			// Do not swallow this. A leave that is never sent leaves the relay
+			// forwarding the stream for the life of the session while the caller
+			// believes it detached, which is indistinguishable from success.
+			if err != nil {
+				leaveErr = fmt.Errorf("failed to build leave report for %s: %w", key.String(), err)
+			} else {
+				update, uerr := rm.protocol.CreateMembershipUpdate(report)
+				if uerr != nil {
+					leaveErr = fmt.Errorf("failed to build membership update for %s: %w", key.String(), uerr)
+				} else if serr := rm.transport.Send(update); serr != nil {
+					leaveErr = fmt.Errorf("failed to send leave for %s: %w", key.String(), serr)
 				}
 			}
 		}
@@ -516,7 +542,7 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	// Re-send batched membership update without this subscription
 	rm.scheduleBatchedJoin()
 
-	return nil
+	return leaveErr
 }
 
 // State returns the current relay state

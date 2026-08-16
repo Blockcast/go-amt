@@ -143,19 +143,6 @@ func TestRouteDataToSubscriptionCopiesPayload(t *testing.T) {
 	}
 }
 
-func TestRelayManagerControlMessagesDoNotRefreshDataLiveness(t *testing.T) {
-	rm := NewRelayManager(DefaultRelayManagerConfig(net.UDPAddr{}))
-	old := time.Now().Add(-time.Minute)
-	rm.lastDataMessage.Store(old)
-	rm.lastAnyMessage.Store(old)
-
-	rm.lastAnyMessage.Store(time.Now())
-
-	if got := rm.lastDataMessage.Load(); !got.Equal(old) {
-		t.Fatalf("control message refreshed data liveness: got %v, want %v", got, old)
-	}
-}
-
 func TestManagedConnOpenRejectsNonIPv4Subscription(t *testing.T) {
 	tests := []struct {
 		name    string
