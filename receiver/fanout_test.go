@@ -23,14 +23,14 @@ func TestUDPFanoutWritesByteIdenticalPacketsToEveryDestination(t *testing.T) {
 		defer conn.Close()
 	}
 
-	fanout, err := NewUDPFanout(addresses, 4)
+	fanout, err := NewUDPFanout(addresses, 4, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer fanout.Close()
 
 	packet := []byte{0xde, 0xad, 0xbe, 0xef}
-	if !fanout.Enqueue(packet) {
+	if !fanout.Enqueue("feed", packet) {
 		t.Fatal("Enqueue() dropped packet with an empty ring")
 	}
 	packet[0] = 0
@@ -52,12 +52,12 @@ func TestUDPFanoutWritesByteIdenticalPacketsToEveryDestination(t *testing.T) {
 
 func TestFanoutCountsOverflowAtEnqueue(t *testing.T) {
 	writer := newBlockingWriter()
-	fanout, err := NewFanout([]io.WriteCloser{writer}, 1)
+	fanout, err := NewFanout([]io.WriteCloser{writer}, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if !fanout.Enqueue([]byte("first")) {
+	if !fanout.Enqueue("feed", []byte("first")) {
 		t.Fatal("first packet dropped")
 	}
 	select {
@@ -65,10 +65,10 @@ func TestFanoutCountsOverflowAtEnqueue(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("fan-out worker did not enter writer")
 	}
-	if !fanout.Enqueue([]byte("second")) {
+	if !fanout.Enqueue("feed", []byte("second")) {
 		t.Fatal("second packet did not fill ring")
 	}
-	if fanout.Enqueue([]byte("overflow")) {
+	if fanout.Enqueue("feed", []byte("overflow")) {
 		t.Fatal("overflow packet was accepted")
 	}
 
@@ -91,11 +91,11 @@ func TestFanoutCountsOverflowAtEnqueue(t *testing.T) {
 func TestFanoutCountsWriteErrorsPerDestination(t *testing.T) {
 	good := &recordingWriter{}
 	bad := &errorWriter{err: errors.New("destination unavailable")}
-	fanout, err := NewFanout([]io.WriteCloser{good, bad}, 1)
+	fanout, err := NewFanout([]io.WriteCloser{good, bad}, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fanout.Enqueue([]byte("packet")) {
+	if !fanout.Enqueue("feed", []byte("packet")) {
 		t.Fatal("packet dropped")
 	}
 	if err := fanout.Close(); err != nil {
@@ -108,14 +108,77 @@ func TestFanoutCountsWriteErrorsPerDestination(t *testing.T) {
 	}
 }
 
+// TestFanoutAttributesDeliveryToTheOriginatingFeed pins the attribution rule.
+// One process-wide Fanout serves every feed, so the worker must charge each
+// packet to the feed that enqueued it rather than to a global total or to
+// whichever feed happened to enqueue last.
+func TestFanoutAttributesDeliveryToTheOriginatingFeed(t *testing.T) {
+	observer := &recordingObserver{}
+	good := &recordingWriter{}
+	bad := &errorWriter{err: errors.New("destination unavailable")}
+	fanout, err := NewFanout([]io.WriteCloser{good, bad}, 4, observer)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !fanout.Enqueue("feed-a", []byte("first")) {
+		t.Fatal("feed-a packet dropped")
+	}
+	if !fanout.Enqueue("feed-b", []byte("second")) {
+		t.Fatal("feed-b packet dropped")
+	}
+	if !fanout.Enqueue("feed-b", []byte("third")) {
+		t.Fatal("second feed-b packet dropped")
+	}
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// One good writer and one failing writer per packet: each packet yields
+	// exactly one egress and one write error for its own feed.
+	if got := observer.egressCopy(); got["feed-a"] != 1 || got["feed-b"] != 2 || len(got) != 2 {
+		t.Fatalf("egress by feed = %v, want feed-a=1 feed-b=2", got)
+	}
+	if got := observer.writeErrorsCopy(); got["feed-a"] != 1 || got["feed-b"] != 2 || len(got) != 2 {
+		t.Fatalf("write errors by feed = %v, want feed-a=1 feed-b=2", got)
+	}
+
+	// The process-wide totals stay consistent with the per-feed attribution.
+	if stats := fanout.Stats(); stats.EgressPackets != 3 || stats.WriteErrors != 3 {
+		t.Fatalf("Stats() = %+v, want egress=3 write_errors=3", stats)
+	}
+}
+
+// TestFanoutSurvivesAnObserverThatRejectsTheFeed asserts that accounting never
+// blocks or discards delivery work: an unknown feed loses attribution only.
+func TestFanoutSurvivesAnObserverThatRejectsTheFeed(t *testing.T) {
+	writer := &recordingWriter{}
+	fanout, err := NewFanout([]io.WriteCloser{writer}, 2, rejectingObserver{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fanout.Enqueue("unconfigured", []byte("packet")) {
+		t.Fatal("packet dropped")
+	}
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := writer.packets; !equalPackets(got, [][]byte{[]byte("packet")}) {
+		t.Fatalf("written packets = %q, want the packet delivered despite observer rejection", got)
+	}
+	if stats := fanout.Stats(); stats.EgressPackets != 1 {
+		t.Fatalf("Stats() = %+v, want egress=1", stats)
+	}
+}
+
 func TestNewFanoutValidatesConfiguration(t *testing.T) {
-	if _, err := NewFanout(nil, 1); err == nil {
+	if _, err := NewFanout(nil, 1, nil); err == nil {
 		t.Fatal("NewFanout() accepted no destinations")
 	}
-	if _, err := NewFanout([]io.WriteCloser{nil}, 1); err == nil {
+	if _, err := NewFanout([]io.WriteCloser{nil}, 1, nil); err == nil {
 		t.Fatal("NewFanout() accepted a nil destination")
 	}
-	if _, err := NewFanout([]io.WriteCloser{&recordingWriter{}}, 0); err == nil {
+	if _, err := NewFanout([]io.WriteCloser{&recordingWriter{}}, 0, nil); err == nil {
 		t.Fatal("NewFanout() accepted zero queue capacity")
 	}
 }
@@ -166,6 +229,54 @@ type errorWriter struct {
 
 func (w *errorWriter) Write([]byte) (int, error) { return 0, w.err }
 func (w *errorWriter) Close() error              { return nil }
+
+// recordingObserver captures per-feed egress attribution from the fan-out
+// worker. The worker reports from its own goroutine, so access is guarded.
+type recordingObserver struct {
+	mu          sync.Mutex
+	egress      map[string]uint64
+	writeErrors map[string]uint64
+}
+
+func (o *recordingObserver) AddEgress(feedID string, count uint64) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.egress == nil {
+		o.egress = make(map[string]uint64)
+	}
+	o.egress[feedID] += count
+	return nil
+}
+
+func (o *recordingObserver) AddWriteErrors(feedID string, count uint64) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.writeErrors == nil {
+		o.writeErrors = make(map[string]uint64)
+	}
+	o.writeErrors[feedID] += count
+	return nil
+}
+
+func (o *recordingObserver) egressCopy() map[string]uint64 { return o.snapshot(o.egress) }
+
+func (o *recordingObserver) writeErrorsCopy() map[string]uint64 { return o.snapshot(o.writeErrors) }
+
+func (o *recordingObserver) snapshot(source map[string]uint64) map[string]uint64 {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	result := make(map[string]uint64, len(source))
+	for feedID, count := range source {
+		result[feedID] = count
+	}
+	return result
+}
+
+// rejectingObserver models ReceiverMetrics rejecting an unconfigured feed.
+type rejectingObserver struct{}
+
+func (rejectingObserver) AddEgress(string, uint64) error      { return ErrUnknownFeed }
+func (rejectingObserver) AddWriteErrors(string, uint64) error { return ErrUnknownFeed }
 
 func equalPackets(a, b [][]byte) bool {
 	if len(a) != len(b) {
