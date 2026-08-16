@@ -239,14 +239,14 @@ func DefaultRelayManagerConfigWithDRIAD(sourceAddr netip.Addr) RelayManagerConfi
 
 // RelayManagerStats contains relay manager statistics
 type RelayManagerStats struct {
-	State              RelayState
-	SubscriptionCount  int
-	TotalPackets       uint64
-	TotalBytes         uint64
-	ReconnectCount     uint64
-	LastReconnectTime  time.Time
-	TransportType      TransportType
-	ProtocolType       ProtocolType
+	State             RelayState
+	SubscriptionCount int
+	TotalPackets      uint64
+	TotalBytes        uint64
+	ReconnectCount    uint64
+	LastReconnectTime time.Time
+	TransportType     TransportType
+	ProtocolType      ProtocolType
 }
 
 // RelayManager manages a shared AMT relay connection for multiple subscriptions
@@ -258,12 +258,19 @@ type RelayManager struct {
 	subscriptions *xsync.MapOf[SubscriptionKey, *Subscription]
 	pendingJoins  *xsync.MapOf[SubscriptionKey, *Subscription]
 
-	ctx           context.Context
-	cancel        context.CancelFunc
-	mu            sync.RWMutex
-	intervalTime  time.Duration
-	lastData      atomic.Time
-	reconnectCount atomic.Uint64
+	ctx             context.Context
+	cancel          context.CancelFunc
+	mu              sync.RWMutex
+	handshakeMu     sync.Mutex
+	receiveMu       sync.Mutex
+	loopsMu         sync.Mutex
+	loopsCancel     context.CancelFunc
+	loopsWG         sync.WaitGroup
+	loopGeneration  uint64
+	intervalTime    time.Duration
+	lastAnyMessage  atomic.Time
+	lastDataMessage atomic.Time
+	reconnectCount  atomic.Uint64
 
 	// For batched IGMP
 	joinPending atomic.Bool
@@ -352,13 +359,12 @@ func (rm *RelayManager) Open(ctx context.Context) error {
 	}
 
 	rm.state.Store(RelayStateActive)
-	rm.lastData.Store(time.Now())
+	now := time.Now()
+	rm.lastAnyMessage.Store(now)
+	rm.lastDataMessage.Store(now)
 
-	// Start read loop
-	go rm.readLoop()
-
-	// Start keepalive loop
-	go rm.keepaliveLoop()
+	// Start exactly one read/keepalive pair for the initial generation.
+	rm.startLoops()
 
 	return nil
 }
@@ -371,6 +377,7 @@ func (rm *RelayManager) Close() error {
 	if rm.cancel != nil {
 		rm.cancel()
 	}
+	rm.stopLoops()
 
 	rm.state.Store(RelayStateClosed)
 
@@ -394,14 +401,39 @@ func (rm *RelayManager) Close() error {
 	}
 
 	if rm.transport != nil {
-		return rm.transport.Close()
+		err := rm.transport.Close()
+		rm.waitLoops()
+		return err
 	}
 
 	return nil
 }
 
 // Subscribe creates a new subscription for the given (S,G,Port)
+// canonicalSubscriptionKey normalises a v4-mapped IPv6 address (::ffff:a.b.c.d)
+// down to canonical IPv4. Subscribe accepts both forms, but the IGMP report
+// builders require strictly Is4(); storing the mapped form lets a subscription
+// join successfully and then fail to build its leave report, which strands the
+// membership on the relay. Normalising at the boundary keeps one representation
+// in the maps so every downstream Is4() holds.
+func canonicalSubscriptionKey(key SubscriptionKey) SubscriptionKey {
+	key.Source = key.Source.Unmap()
+	key.Group = key.Group.Unmap()
+	return key
+}
+
 func (rm *RelayManager) Subscribe(key SubscriptionKey, callbacks SubscriptionCallbacks) (*Subscription, error) {
+	// Reject non-IPv4 (S,G) synchronously. The IGMPv3 report builder converts
+	// these with netip.Addr.As4, which panics, and it runs from the batched
+	// membership time.AfterFunc goroutine where no recover() can catch it.
+	if !key.Source.IsValid() || (!key.Source.Is4() && !key.Source.Is4In6()) {
+		return nil, fmt.Errorf("subscription source address must be IPv4: %s", key.Source)
+	}
+	if !key.Group.IsValid() || (!key.Group.Is4() && !key.Group.Is4In6()) {
+		return nil, fmt.Errorf("subscription group address must be IPv4: %s", key.Group)
+	}
+	key = canonicalSubscriptionKey(key)
+
 	rm.mu.RLock()
 	state := rm.State()
 	rm.mu.RUnlock()
@@ -435,8 +467,19 @@ func (rm *RelayManager) Subscribe(key SubscriptionKey, callbacks SubscriptionCal
 	return sub, nil
 }
 
-// Unsubscribe removes a subscription
+// Unsubscribe removes a subscription.
+//
+// The subscription is always torn down and removed, regardless of the returned
+// error: a non-nil return reports that the leave could not be delivered to the
+// relay, not that the caller still holds the subscription. Retrying is
+// pointless — a second call short-circuits to nil because the entry is already
+// gone. Callers should log the error (the relay will keep forwarding until its
+// membership times out) rather than loop on it.
 func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
+	// Match the normalisation Subscribe applied, or a caller passing the
+	// v4-mapped form it subscribed with would miss the stored entry.
+	key = canonicalSubscriptionKey(key)
+
 	sub, ok := rm.subscriptions.LoadAndDelete(key)
 	if !ok {
 		// Also check pending
@@ -452,10 +495,74 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	}
 	close(sub.dataChan)
 
+	// A relay keeps the previous membership until it receives a leave report.
+	// Preserve other sources in the same group with a source-specific leave.
+	var leaveErr error
+	if rm.State() == RelayStateActive || rm.State() == RelayStateQuerying {
+		stillSubscribed := false
+		otherGroupSource := false
+
+		// Both maps must be consulted. Subscribe parks a new subscription in
+		// pendingJoins until the debounced batch promotes it, so scanning only
+		// subscriptions misses a sibling source joined within that window and
+		// emits a group-wide leave that withdraws its membership too.
+		scan := func(otherKey SubscriptionKey, _ *Subscription) bool {
+			if otherKey.Source == key.Source && otherKey.Group == key.Group {
+				stillSubscribed = true
+			}
+			if otherKey.Group == key.Group {
+				otherGroupSource = true
+			}
+			return true
+		}
+		// Scan order is load-bearing, not stylistic. Promotion in
+		// sendBatchedMembershipUpdate stores into subscriptions before it
+		// clears pendingJoins, so scanning in the opposite direction to that
+		// transfer observes a concurrently-promoted sibling in at least one
+		// map: absence from pendingJoins implies the clear already ran, which
+		// implies the store landed, and subscriptions is scanned strictly
+		// later. Scanning subscriptions first leaves the entry invisible to
+		// both ranges and emits a group-wide leave.
+		rm.pendingJoins.Range(scan)
+		rm.subscriptions.Range(scan)
+
+		if !stillSubscribed {
+			var report []byte
+			var err error
+			if otherGroupSource {
+				sourceLeaver, ok := rm.protocol.(SourceSpecificLeaveReporter)
+				if !ok {
+					// Converge on leaveErr rather than returning here. Teardown
+					// above is already irreversible, so an early return would
+					// drop the subscription and still skip scheduleBatchedJoin,
+					// leaving the relay's membership un-refreshed.
+					err = fmt.Errorf("protocol does not support source-specific leave reports")
+				} else {
+					report, err = sourceLeaver.CreateIGMPSourceLeaveReport(key.Source, key.Group)
+				}
+			} else {
+				report, err = rm.protocol.CreateIGMPLeaveReport(key.Source, key.Group)
+			}
+			// Do not swallow this. A leave that is never sent leaves the relay
+			// forwarding the stream for the life of the session while the caller
+			// believes it detached, which is indistinguishable from success.
+			if err != nil {
+				leaveErr = fmt.Errorf("failed to build leave report for %s: %w", key.String(), err)
+			} else {
+				update, uerr := rm.protocol.CreateMembershipUpdate(report)
+				if uerr != nil {
+					leaveErr = fmt.Errorf("failed to build membership update for %s: %w", key.String(), uerr)
+				} else if serr := rm.transport.Send(update); serr != nil {
+					leaveErr = fmt.Errorf("failed to send leave for %s: %w", key.String(), serr)
+				}
+			}
+		}
+	}
+
 	// Re-send batched membership update without this subscription
 	rm.scheduleBatchedJoin()
 
-	return nil
+	return leaveErr
 }
 
 // State returns the current relay state
@@ -492,6 +599,9 @@ func (rm *RelayManager) Stats() RelayManagerStats {
 
 // performHandshake performs the AMT discovery handshake
 func (rm *RelayManager) performHandshake() error {
+	rm.handshakeMu.Lock()
+	defer rm.handshakeMu.Unlock()
+
 	rm.state.Store(RelayStateDiscovering)
 
 	// Send discovery
@@ -510,7 +620,9 @@ func (rm *RelayManager) performHandshake() error {
 	}
 
 	for {
+		rm.receiveMu.Lock()
 		n, _, err := rm.transport.Receive(buffer)
+		rm.receiveMu.Unlock()
 		if err != nil {
 			return fmt.Errorf("failed to receive response: %w", err)
 		}
@@ -622,20 +734,63 @@ func (rm *RelayManager) sendBatchedMembershipUpdate() error {
 	return nil
 }
 
+// startLoops launches one read/keepalive pair and records its generation.
+func (rm *RelayManager) startLoops() {
+	rm.loopsMu.Lock()
+	defer rm.loopsMu.Unlock()
+	if rm.loopsCancel != nil {
+		return
+	}
+	loopCtx, cancel := context.WithCancel(rm.ctx)
+	rm.loopsCancel = cancel
+	rm.loopGeneration++
+	generation := rm.loopGeneration
+	rm.loopsWG.Add(2)
+	go rm.readLoop(loopCtx, generation)
+	go rm.keepaliveLoop(loopCtx, generation)
+}
+
+// stopLoops cancels the current generation. Transport closure during reconnect
+// releases any receive blocked by the old generation.
+func (rm *RelayManager) stopLoops() {
+	rm.loopsMu.Lock()
+	defer rm.loopsMu.Unlock()
+	if rm.loopsCancel != nil {
+		rm.loopsCancel()
+		rm.loopsCancel = nil
+	}
+}
+
+func (rm *RelayManager) waitLoops() {
+	rm.loopsWG.Wait()
+}
+
+func (rm *RelayManager) generationActive(generation uint64) bool {
+	rm.loopsMu.Lock()
+	defer rm.loopsMu.Unlock()
+	return rm.loopGeneration == generation && rm.loopsCancel != nil
+}
+
 // readLoop continuously reads from the transport
-func (rm *RelayManager) readLoop() {
+func (rm *RelayManager) readLoop(ctx context.Context, generation uint64) {
+	defer rm.loopsWG.Done()
 	buffer := make([]byte, rm.config.MTU)
 
 	for {
+		if !rm.generationActive(generation) {
+			return
+		}
 		select {
-		case <-rm.ctx.Done():
+		case <-ctx.Done():
 			return
 		default:
 		}
 
+		rm.receiveMu.Lock()
 		n, _, err := rm.transport.Receive(buffer)
+		rm.receiveMu.Unlock()
 		if err != nil {
-			if rm.ctx.Err() != nil {
+			if ctx.Err() != nil || rm.ctx.Err() != nil {
 				return // Context cancelled
 			}
 			// Trigger reconnection
@@ -643,11 +798,12 @@ func (rm *RelayManager) readLoop() {
 			return
 		}
 
-		rm.lastData.Store(time.Now())
+		rm.lastAnyMessage.Store(time.Now())
 
 		msgType := m.MessageType(buffer[0] & 0x0F)
 		switch msgType {
 		case m.MulticastDataType:
+			rm.lastDataMessage.Store(time.Now())
 			rm.routeDataToSubscription(buffer[:n])
 
 		case m.MembershipQueryType:
@@ -721,6 +877,11 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 	}
 	payloadData := append([]byte(nil), payload.Payload()...)
 
+	// ip.SrcIP aliases the read buffer too (gopacket.NoCopy), and the address we
+	// hand out outlives this iteration via dataChan. Own those bytes as well.
+	srcIP := append(net.IP(nil), ip.SrcIP...)
+	srcPort := int(udp.SrcPort)
+
 	// Update stats
 	sub.packetsReceived.Add(1)
 	sub.bytesReceived.Add(uint64(len(payloadData)))
@@ -729,8 +890,8 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 	// Send to callback or channel
 	if sub.callbacks.OnPacket != nil {
 		srcUDP := &net.UDPAddr{
-			IP:   ip.SrcIP,
-			Port: int(udp.SrcPort),
+			IP:   srcIP,
+			Port: srcPort,
 		}
 		if err := sub.callbacks.OnPacket(payloadData, srcUDP); err != nil {
 			if sub.callbacks.OnError != nil {
@@ -743,7 +904,7 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 	select {
 	case sub.dataChan <- &DataPacket{
 		Data:      payloadData,
-		Source:    &net.UDPAddr{IP: ip.SrcIP, Port: int(udp.SrcPort)},
+		Source:    &net.UDPAddr{IP: srcIP, Port: srcPort},
 		Timestamp: time.Now(),
 	}:
 	default:
@@ -752,13 +913,17 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 }
 
 // keepaliveLoop sends periodic keepalive requests
-func (rm *RelayManager) keepaliveLoop() {
+func (rm *RelayManager) keepaliveLoop(ctx context.Context, generation uint64) {
+	defer rm.loopsWG.Done()
 	ticker := time.NewTicker(rm.intervalTime)
 	defer ticker.Stop()
 
 	for {
+		if !rm.generationActive(generation) {
+			return
+		}
 		select {
-		case <-rm.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			if rm.State() != RelayStateActive {
@@ -766,14 +931,11 @@ func (rm *RelayManager) keepaliveLoop() {
 			}
 
 			// Check if we've received data recently
-			if time.Since(rm.lastData.Load()) > rm.intervalTime*2 {
-				// No data received, might need to reconnect
-				rm.protocol.Reset()
-				if err := rm.performHandshake(); err != nil {
-					go rm.reconnectWithBackoff()
-					return
-				}
-				_ = rm.sendBatchedMembershipUpdate()
+			if time.Since(rm.lastDataMessage.Load()) > rm.intervalTime*2 {
+				// No data received: reconnectWithBackoff is the only recovery
+				// path so the reader is stopped before the handshake begins.
+				go rm.reconnectWithBackoff()
+				return
 			} else {
 				// Send keepalive request
 				request, err := rm.protocol.CreateRequestMessage(false)
@@ -795,6 +957,7 @@ func (rm *RelayManager) reconnectWithBackoff() {
 	}
 	rm.state.Store(RelayStateReconnecting)
 	rm.mu.Unlock()
+	rm.stopLoops()
 
 	// Suspend all subscriptions
 	rm.subscriptions.Range(func(key SubscriptionKey, sub *Subscription) bool {
@@ -819,8 +982,11 @@ func (rm *RelayManager) reconnectWithBackoff() {
 		// Reset protocol
 		rm.protocol.Reset()
 
-		// Close and reopen transport
+		// Close the transport and wait for the old reader before reopening it.
+		// Otherwise a receive blocked in the old generation can consume the new
+		// generation's handshake response after the socket is reopened.
 		_ = rm.transport.Close()
+		rm.waitLoops()
 		if err := rm.transport.Open(rm.ctx); err != nil {
 			return err
 		}
@@ -851,7 +1017,10 @@ func (rm *RelayManager) reconnectWithBackoff() {
 	}
 
 	rm.state.Store(RelayStateActive)
-	rm.lastData.Store(time.Now())
+	now := time.Now()
+	rm.lastAnyMessage.Store(now)
+	rm.lastDataMessage.Store(now)
+	rm.startLoops()
 
 	// Restore all subscriptions
 	rm.subscriptions.Range(func(key SubscriptionKey, sub *Subscription) bool {
