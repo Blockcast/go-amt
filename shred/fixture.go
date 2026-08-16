@@ -15,8 +15,19 @@ import (
 //go:embed testdata/fixture.pcap
 var fixturePCAP []byte
 
-// ReplayPCAP sends UDP payloads from a pcap through the production scorer.
-func ReplayPCAP(reader io.Reader, scorer *Scorer) error {
+// Observer is the scoring seam the replay path drives. Both *Scorer and
+// *GenericScorer satisfy it, which is what keeps shred mode and generic mode one
+// client with a mode flag rather than two replay paths that can drift.
+//
+// FeedScorer deliberately does not satisfy it: its Observe takes the feed name
+// first, because per-feed accounting is a different contract from single-stream
+// scoring.
+type Observer interface {
+	Observe(packet []byte, receivedAt time.Time) (bool, error)
+}
+
+// ReplayPCAP sends UDP payloads from a pcap through the supplied scorer.
+func ReplayPCAP(reader io.Reader, scorer Observer) error {
 	pcap, err := pcapgo.NewReader(reader)
 	if err != nil {
 		return fmt.Errorf("read pcap header: %w", err)
