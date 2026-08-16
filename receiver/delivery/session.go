@@ -1,0 +1,313 @@
+// Package delivery implements the delivery-session wire contract emitted by
+// the unicast fan-out sender. It is the producer side of W3's billing record:
+// every subscriber flow carries a session identity, a durable emit sequence,
+// a cumulative duration, a delta byte count, and a close reason.
+//
+// Two semantics in here are load-bearing and asymmetric, because the Traffic
+// Ops rollup is MAX(duration_ms) but SUM(bytes_out):
+//
+//   - DurationMS is CUMULATIVE — every record restates the session's total
+//     elapsed time, so a duplicate or retried record is idempotent under MAX.
+//   - BytesOut and PacketsOut are DELTAS — each record covers only the
+//     interval since the previous record, so replayed records sum correctly
+//     provided they are deduplicated by (SessionID, Seq).
+//
+// Getting that backwards silently double-bills, so both are pinned by tests.
+package delivery
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// CloseReason explains why a delivery session ended. It travels on the wire so
+// an invoice can account for a gap; without it a five-minute hole in a
+// subscriber's delivery is indistinguishable from a billing bug.
+type CloseReason string
+
+const (
+	// CloseHeartbeatAbsent means the subscriber stopped proving liveness.
+	CloseHeartbeatAbsent CloseReason = "HEARTBEAT_ABSENT"
+	// CloseTicketExpired means the broker grant backing the session lapsed.
+	CloseTicketExpired CloseReason = "TICKET_EXPIRED"
+	// CloseStaleTimeout means no traffic moved for the stale interval.
+	CloseStaleTimeout CloseReason = "STALE_TIMEOUT"
+	// CloseBlockOldSources means the source was rejected as too old.
+	CloseBlockOldSources CloseReason = "BLOCK_OLD_SOURCES"
+	// CloseShutdown means the sender terminated the session deliberately.
+	CloseShutdown CloseReason = "SHUTDOWN"
+)
+
+// Valid reports whether reason is a close reason the wire contract defines.
+func (r CloseReason) Valid() bool {
+	switch r {
+	case CloseHeartbeatAbsent, CloseTicketExpired, CloseStaleTimeout,
+		CloseBlockOldSources, CloseShutdown:
+		return true
+	default:
+		return false
+	}
+}
+
+// Note there is deliberately no TEARDOWN close reason. An AMT Teardown is
+// unauthenticated — any observer that has seen a Membership Query can forge
+// one — so it is only ever a liveness hint here (see Tracker.Teardown), never
+// a close. Sessions close on heartbeat absence, ticket expiry, or stale
+// timeout, all of which the sender can attest to itself.
+
+var (
+	// ErrNoSession is returned when a subscriber has no open session.
+	ErrNoSession = errors.New("delivery: subscriber has no open session")
+	// ErrSessionOpen is returned when opening over a session already open.
+	ErrSessionOpen = errors.New("delivery: subscriber already has an open session")
+)
+
+// Record is one delivery-session record as it appears on the wire.
+//
+// Records are deduplicated downstream by (SessionID, Seq). Seq is durable
+// across a sender restart, so a replayed record cannot collide with a
+// different record under first-write-wins.
+type Record struct {
+	SessionID    string      `json:"session_id"`
+	SubscriberID string      `json:"subscriber_id"`
+	Seq          uint64      `json:"seq"`
+	DurationMS   int64       `json:"duration_ms"`
+	BytesOut     uint64      `json:"bytes_out"`
+	PacketsOut   uint64      `json:"packets_out"`
+	CloseReason  CloseReason `json:"close_reason,omitempty"`
+	Final        bool        `json:"final"`
+	OpenedAt     time.Time   `json:"opened_at"`
+	EmittedAt    time.Time   `json:"emitted_at"`
+}
+
+// SeqStore reserves durable per-session emit sequence numbers. Implementations
+// must not return a sequence number until it has survived to stable storage,
+// so a crash between reservation and emission can only skip a sequence number,
+// never reuse one.
+type SeqStore interface {
+	NextSeq(sessionID string) (uint64, error)
+}
+
+type session struct {
+	id             string
+	subscriberID   string
+	openedAt       time.Time
+	bytesTotal     uint64
+	packetsTotal   uint64
+	bytesEmitted   uint64
+	packetsEmitted uint64
+	lastTeardown   time.Time
+}
+
+// Tracker owns per-subscriber delivery-session state for the fan-out sender.
+// It is safe for concurrent use.
+type Tracker struct {
+	mu       sync.Mutex
+	sessions map[string]*session
+	seqs     SeqStore
+	newID    func() (string, error)
+	now      func() time.Time
+}
+
+// TrackerOption customizes a Tracker. Options exist so tests can pin time and
+// session identity; production callers need none of them.
+type TrackerOption func(*Tracker)
+
+// WithClock overrides the Tracker clock.
+func WithClock(now func() time.Time) TrackerOption {
+	return func(t *Tracker) { t.now = now }
+}
+
+// WithIDFunc overrides session UUID minting.
+func WithIDFunc(newID func() (string, error)) TrackerOption {
+	return func(t *Tracker) { t.newID = newID }
+}
+
+// NewTracker returns a Tracker that reserves emit sequence numbers from seqs.
+func NewTracker(seqs SeqStore, options ...TrackerOption) (*Tracker, error) {
+	if seqs == nil {
+		return nil, errors.New("delivery: sequence store is nil")
+	}
+	tracker := &Tracker{
+		sessions: make(map[string]*session),
+		seqs:     seqs,
+		newID:    NewSessionID,
+		now:      time.Now,
+	}
+	for _, option := range options {
+		option(tracker)
+	}
+	return tracker, nil
+}
+
+// Open mints a new session for subscriberID and returns its session UUID.
+//
+// Every open mints a distinct UUID, including a reopen after a teardown or a
+// close. Sessions are never identified by subscriber alone, so two consecutive
+// sessions for the same subscriber can never be merged into one billing row.
+func (t *Tracker) Open(subscriberID string) (string, error) {
+	if subscriberID == "" {
+		return "", errors.New("delivery: subscriber ID is empty")
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if _, exists := t.sessions[subscriberID]; exists {
+		return "", fmt.Errorf("%w: %s", ErrSessionOpen, subscriberID)
+	}
+	id, err := t.newID()
+	if err != nil {
+		return "", fmt.Errorf("delivery: mint session ID: %w", err)
+	}
+	t.sessions[subscriberID] = &session{
+		id:           id,
+		subscriberID: subscriberID,
+		openedAt:     t.now(),
+	}
+	return id, nil
+}
+
+// Observe accumulates delivered bytes and packets against the open session.
+// It is called on the egress path, so it never allocates or does I/O.
+func (t *Tracker) Observe(subscriberID string, bytes, packets uint64) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	current, ok := t.sessions[subscriberID]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrNoSession, subscriberID)
+	}
+	current.bytesTotal += bytes
+	current.packetsTotal += packets
+	return nil
+}
+
+// Teardown records an unauthenticated teardown hint. It deliberately does NOT
+// close the session and does NOT affect duration, because an AMT Teardown is
+// forgeable. Callers should treat a true return as a prompt to run an
+// accelerated liveness probe, then close through Close if that probe fails.
+func (t *Tracker) Teardown(subscriberID string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	current, ok := t.sessions[subscriberID]
+	if !ok {
+		return false
+	}
+	current.lastTeardown = t.now()
+	return true
+}
+
+// Emit produces a periodic (non-final) record for the open session.
+func (t *Tracker) Emit(subscriberID string) (Record, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.emitLocked(subscriberID, "", false)
+}
+
+// Close produces the final record for the open session and retires it. A
+// subsequent Open for the same subscriber mints a fresh session UUID.
+func (t *Tracker) Close(subscriberID string, reason CloseReason) (Record, error) {
+	if !reason.Valid() {
+		return Record{}, fmt.Errorf("delivery: invalid close reason %q", string(reason))
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	record, err := t.emitLocked(subscriberID, reason, true)
+	if err != nil {
+		return Record{}, err
+	}
+	delete(t.sessions, subscriberID)
+	return record, nil
+}
+
+// emitLocked builds a record and advances the delta watermark. The caller must
+// hold t.mu.
+func (t *Tracker) emitLocked(subscriberID string, reason CloseReason, final bool) (Record, error) {
+	current, ok := t.sessions[subscriberID]
+	if !ok {
+		return Record{}, fmt.Errorf("%w: %s", ErrNoSession, subscriberID)
+	}
+
+	seq, err := t.seqs.NextSeq(current.id)
+	if err != nil {
+		return Record{}, fmt.Errorf("delivery: reserve sequence for session %s: %w", current.id, err)
+	}
+
+	now := t.now()
+	// Duration is cumulative from session open, never from the previous emit,
+	// so duplicate records collapse correctly under the MAX rollup.
+	duration := now.Sub(current.openedAt)
+	if duration < 0 {
+		duration = 0
+	}
+
+	record := Record{
+		SessionID:    current.id,
+		SubscriberID: current.subscriberID,
+		Seq:          seq,
+		DurationMS:   duration.Milliseconds(),
+		// Bytes and packets are deltas since the previous record, so replayed
+		// records sum correctly under the SUM rollup.
+		BytesOut:    current.bytesTotal - current.bytesEmitted,
+		PacketsOut:  current.packetsTotal - current.packetsEmitted,
+		CloseReason: reason,
+		Final:       final,
+		OpenedAt:    current.openedAt,
+		EmittedAt:   now,
+	}
+
+	// Advance the watermark only after the record is fully built, so a failed
+	// sequence reservation above cannot silently discard delivered bytes.
+	current.bytesEmitted = current.bytesTotal
+	current.packetsEmitted = current.packetsTotal
+	return record, nil
+}
+
+// SessionID returns the open session UUID for subscriberID.
+func (t *Tracker) SessionID(subscriberID string) (string, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	current, ok := t.sessions[subscriberID]
+	if !ok {
+		return "", false
+	}
+	return current.id, true
+}
+
+// Open reports how many sessions are currently open.
+func (t *Tracker) OpenSessions() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.sessions)
+}
+
+// NewSessionID mints an RFC 4122 version 4 UUID.
+func NewSessionID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	raw[6] = (raw[6] & 0x0f) | 0x40 // version 4
+	raw[8] = (raw[8] & 0x3f) | 0x80 // RFC 4122 variant
+
+	var out [36]byte
+	hex.Encode(out[0:8], raw[0:4])
+	out[8] = '-'
+	hex.Encode(out[9:13], raw[4:6])
+	out[13] = '-'
+	hex.Encode(out[14:18], raw[6:8])
+	out[18] = '-'
+	hex.Encode(out[19:23], raw[8:10])
+	out[23] = '-'
+	hex.Encode(out[24:36], raw[10:16])
+	return string(out[:]), nil
+}
