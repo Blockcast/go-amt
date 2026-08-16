@@ -32,7 +32,7 @@ type receiveOverlapTransport struct {
 
 	inFlight  atomic.Int32
 	maxSeen   atomic.Int32
-	calls     atomic.Int64
+	calls     atomic.Int64 // total Receive entries; used for non-vacuity
 	deadlines atomic.Int64 // only performHandshake calls SetReadDeadline
 
 	holdArmed   atomic.Bool
@@ -78,11 +78,31 @@ func (t *receiveOverlapTransport) SetReadDeadline(deadline time.Time) error {
 
 // armHold makes the next Receive to return from the underlying transport park
 // inside Receive until releaseHold is called.
+//
+// Single-shot for the lifetime of the probe: the parked call closes holdEntered,
+// which is not re-openable, so arming a second time would panic on the second
+// close. One hold is all this test needs, and a re-armable version would need a
+// fresh channel per arm rather than a sync.Once (which would silently swallow
+// the second signal instead of delivering it).
 func (t *receiveOverlapTransport) armHold() { t.holdArmed.Store(true) }
 
 func (t *receiveOverlapTransport) releaseHold() {
 	t.releaseOnce.Do(func() { close(t.holdRelease) })
 }
+
+// minKeepaliveMargin is the floor this test requires of the relay-advertised
+// keepalive interval. keepaliveLoop fires a reconnect of its own once no data
+// has arrived for intervalTime*2 (relay_manager.go:950), which would race the
+// reconnect this test drives itself.
+//
+// Note this is NOT RelayManagerConfig.KeepaliveInterval. That field only seeds
+// intervalTime at construction (relay_manager.go:298); performHandshake then
+// overwrites it with the interval decoded from the relay's Membership Query
+// (relay_manager.go:669), and keepaliveLoop reads only the overwritten field
+// (relay_manager.go:934, :950). Setting the config field here would look like a
+// safety knob while doing nothing at all, so the fixture pins the QQIC byte
+// instead and the assertion below checks what the code actually reads.
+const minKeepaliveMargin = 10 * time.Second
 
 // newOverlapProbedManager wires a RelayManager to the fake relay through a
 // receiveOverlapTransport, using the RelayManagerConfig.TransportFactory seam.
@@ -91,6 +111,9 @@ func (t *receiveOverlapTransport) releaseHold() {
 // reconnection reuses that Transport rather than constructing a new one, so this
 // single probe covers the initial handshake, every readLoop generation and every
 // reconnect handshake.
+//
+// fr must have been built with a QQIC that clears minKeepaliveMargin; this
+// asserts that rather than trusting it.
 func newOverlapProbedManager(t *testing.T, fr *fakeRelay) (*RelayManager, *receiveOverlapTransport) {
 	t.Helper()
 
@@ -100,9 +123,6 @@ func newOverlapProbedManager(t *testing.T, fr *fakeRelay) (*RelayManager, *recei
 	cfg.TransportConfig.Timeout = 2 * time.Second
 	cfg.InitialBackoff = 10 * time.Millisecond
 	cfg.MaxBackoff = 100 * time.Millisecond
-	// Stop the keepalive data-liveness check from firing a reconnect of its own;
-	// this test drives reconnects itself and asserts on loop generations.
-	cfg.KeepaliveInterval = 30 * time.Second
 
 	var probe *receiveOverlapTransport
 	cfg.TransportFactory = func(tc TransportConfig) (Transport, error) {
@@ -131,6 +151,17 @@ func newOverlapProbedManager(t *testing.T, fr *fakeRelay) (*RelayManager, *recei
 	}
 	if probe == nil {
 		t.Fatal("TransportFactory was never called: Open still builds its own transport")
+	}
+	// Safe to read: performHandshake wrote this on our own goroutine inside Open,
+	// so the write is in program order behind us, and no reconnect (the only other
+	// writer, relay_manager.go:1011) can be in flight yet. keepaliveLoop reads it
+	// concurrently but never writes it.
+	interval := rm.intervalTime
+	if interval < minKeepaliveMargin {
+		t.Fatalf("relay-advertised keepalive interval = %v, want >= %v: keepaliveLoop "+
+			"would reconnect on its own after %v without data and race the reconnect "+
+			"this test drives (relay_manager.go:950). Raise the fake relay's QQIC via "+
+			"withQueryIntervalCode.", interval, minKeepaliveMargin, interval*2)
 	}
 	return rm, probe
 }
@@ -171,7 +202,10 @@ func waitFor(t *testing.T, timeout time.Duration, cond func() bool, what string)
 //	   yes         no       PASS -- the handshake blocks on receiveMu
 //	   no          no       FAIL -- 2 concurrent Receive calls observed
 func TestReceiveIsSerializedAcrossHandshakeAndReadLoop(t *testing.T) {
-	fr := newFakeRelay(t)
+	// 0x7f decodes to 12.7s, so the keepalive data-liveness check cannot fire
+	// inside this test's active window. The default 0x0a is only 1s (a 2s
+	// threshold), which is not enough margin to be relied on.
+	fr := newFakeRelay(t, withQueryIntervalCode(0x7f))
 	rm, probe := newOverlapProbedManager(t, fr)
 
 	// The initial handshake ran on this goroutine and has returned, so anything
@@ -186,6 +220,7 @@ func TestReceiveIsSerializedAcrossHandshakeAndReadLoop(t *testing.T) {
 	genBefore := rm.loopGeneration
 	rm.loopsMu.Unlock()
 	deadlinesBefore := probe.deadlines.Load()
+	callsBefore := probe.calls.Load()
 
 	// Hold the reader inside Receive the moment transport.Close() unblocks it.
 	probe.armHold()
@@ -247,6 +282,12 @@ func TestReceiveIsSerializedAcrossHandshakeAndReadLoop(t *testing.T) {
 	}
 	if got := probe.deadlines.Load(); got <= deadlinesBefore {
 		t.Fatalf("SetReadDeadline count did not move (%d): the reconnect handshake never ran", got)
+	}
+	// The overlap counter is only meaningful if Receive was actually re-entered
+	// after the hold: maxSeen <= 1 is trivially true on a transport nobody called.
+	if got := probe.calls.Load(); got <= callsBefore {
+		t.Fatalf("Receive entry count did not move (%d -> %d): no Receive ran across the "+
+			"reconnect, so the overlap counter proves nothing", callsBefore, got)
 	}
 	if got := rm.State(); got != RelayStateActive {
 		t.Fatalf("state after reconnect = %v, want %v", got, RelayStateActive)
