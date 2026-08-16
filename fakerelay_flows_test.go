@@ -507,7 +507,7 @@ func TestDataStarvationReconnectsDespiteControlTraffic(t *testing.T) {
 	// Reading it after the bump instead would count the reconnect's *own*
 	// handshake Request -- reconnectWithBackoff runs performHandshake
 	// (relay_manager.go:1011), which sends a Request that fakeRelay.handleRequest
-	// counts (fakerelay_test.go:179), and only then calls startLoops
+	// counts (fakerelay_test.go:188), and only then calls startLoops
 	// (relay_manager.go:1039) to bump the generation. A post-bump count is
 	// therefore unconditionally greater and the guard below could never fail.
 	var queriesDuringStarvation int64

@@ -179,7 +179,7 @@ func (fr *fakeRelay) handleRequest(msg []byte, addr *net.UDPAddr) {
 		return
 	}
 	nonce := msg[4:8]
-	// Counted before the reply is sent; see handleAdvertisement. The counter
+	// Counted before the reply is sent; see handleDiscovery. The counter
 	// therefore attests "the relay received a Request and is about to reply",
 	// not "the client received the Query". A consumer reasoning about the
 	// client-side effect of the Query -- e.g. that it refreshed lastAnyMessage
