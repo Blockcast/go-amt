@@ -152,10 +152,16 @@ func newOverlapProbedManager(t *testing.T, fr *fakeRelay) (*RelayManager, *recei
 	if probe == nil {
 		t.Fatal("TransportFactory was never called: Open still builds its own transport")
 	}
-	// Safe to read: performHandshake wrote this on our own goroutine inside Open,
-	// so the write is in program order behind us, and no reconnect (the only other
-	// writer, relay_manager.go:1011) can be in flight yet. keepaliveLoop reads it
-	// concurrently but never writes it.
+	// Safe to read: performHandshake wrote this (relay_manager.go:669) on our own
+	// goroutine inside Open, so that write is in program order behind us. The only
+	// other writer is the reconnect path, which reaches the same line through
+	// performHandshake (relay_manager.go:1011). That is a timing margin rather than
+	// a structural exclusion -- readLoop spawns a reconnect on any Receive error
+	// (relay_manager.go:813), not only on the keepalive interval -- but to reach the
+	// write it must first clear stopLoops, transport.Close, waitLoops,
+	// transport.Open and the backoff, which is milliseconds against the nanoseconds
+	// this read sits behind Open. keepaliveLoop reads it concurrently but never
+	// writes it.
 	interval := rm.intervalTime
 	if interval < minKeepaliveMargin {
 		t.Fatalf("relay-advertised keepalive interval = %v, want >= %v: keepaliveLoop "+
