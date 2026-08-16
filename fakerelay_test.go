@@ -179,7 +179,12 @@ func (fr *fakeRelay) handleRequest(msg []byte, addr *net.UDPAddr) {
 		return
 	}
 	nonce := msg[4:8]
-	// Counted before the reply is sent; see handleAdvertisement.
+	// Counted before the reply is sent; see handleAdvertisement. The counter
+	// therefore attests "the relay received a Request and is about to reply",
+	// not "the client received the Query". A consumer reasoning about the
+	// client-side effect of the Query -- e.g. that it refreshed lastAnyMessage
+	// -- is relying on the send that follows, which over loopback UDP is
+	// effectively immediate but is not what the count itself proves.
 	fr.queried.Add(1)
 	_, _ = fr.conn.WriteToUDP(fr.buildQuery(nonce), addr)
 }

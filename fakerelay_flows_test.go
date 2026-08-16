@@ -548,10 +548,17 @@ func TestDataStarvationReconnectsDespiteControlTraffic(t *testing.T) {
 	// (relay_manager.go:813), producing an identical generation bump, so a
 	// spurious one would otherwise read as a pass. Starvation cannot be declared
 	// until intervalTime*2 after the stamp Open seeded just before startLoops
-	// (relay_manager.go:379), so requiring a single interval here is a
-	// conservative floor that an early transport-error reconnect misses. It is a
-	// lower bound by construction -- a loaded runner only makes elapsed larger --
-	// so unlike sampling the stamp's own age it cannot flake.
+	// (relay_manager.go:380 -- lastDataMessage; :379 is lastAnyMessage, and it is
+	// the data stamp that governs here), so requiring a single interval is a
+	// conservative floor that an early transport-error reconnect misses.
+	//
+	// The bound is not unconditional: elapsed runs from start (:518), taken
+	// *after* Open seeded, so with skew d = start - seed the real guarantee is
+	// elapsed > 2*interval - d. A loaded runner delaying the reconnect only makes
+	// elapsed larger; the one direction that shrinks it is descheduling inside d.
+	// Requiring interval therefore tolerates d < interval, i.e. 100ms of headroom
+	// against the two field reads and one mutex pair that separate Open from
+	// :518 -- microseconds of real work. Ample, but a margin, not a certainty.
 	if elapsed < interval {
 		t.Errorf("reconnect came %v after the generation was sampled, sooner than "+
 			"data starvation can be declared (>%v after Open seeds "+
