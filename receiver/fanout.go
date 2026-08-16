@@ -12,6 +12,8 @@ import (
 )
 
 // FanoutStats is a point-in-time snapshot of the bounded fan-out path.
+// EgressPackets and WriteErrors are process-wide totals across every feed and
+// every destination; per-feed attribution is reported to an EgressObserver.
 type FanoutStats struct {
 	QueuedPackets  uint64
 	DroppedPackets uint64
@@ -19,11 +21,29 @@ type FanoutStats struct {
 	WriteErrors    uint64
 }
 
+// EgressObserver receives the per-feed outcome of each fanned-out packet.
+// Counts are per destination write, so one received packet reports up to one
+// egress per configured destination. Implementations must be safe for
+// concurrent use: the fan-out worker calls them from its own goroutine.
+type EgressObserver interface {
+	AddEgress(feedID string, count uint64) error
+	AddWriteErrors(feedID string, count uint64) error
+}
+
+// queuedPacket carries the originating feed alongside the packet so the worker
+// can attribute delivery to a feed. A single process-wide Fanout serves every
+// feed, so the worker cannot infer the feed from the packet itself.
+type queuedPacket struct {
+	feedID string
+	packet []byte
+}
+
 // Fanout copies packets into a bounded ring and writes each packet to every
 // destination from a dedicated worker. Enqueue never blocks the ingress path.
 type Fanout struct {
-	writers []io.WriteCloser
-	queue   chan []byte
+	writers  []io.WriteCloser
+	queue    chan queuedPacket
+	observer EgressObserver
 
 	mu        sync.RWMutex
 	closed    bool
@@ -38,8 +58,9 @@ type Fanout struct {
 }
 
 // NewFanout starts a bounded fan-out worker for writers. The worker owns and
-// closes the writers. queueCapacity must be positive.
-func NewFanout(writers []io.WriteCloser, queueCapacity int) (*Fanout, error) {
+// closes the writers. queueCapacity must be positive. observer may be nil, in
+// which case only the process-wide Stats counters are maintained.
+func NewFanout(writers []io.WriteCloser, queueCapacity int, observer EgressObserver) (*Fanout, error) {
 	if len(writers) == 0 {
 		return nil, errors.New("fan-out requires at least one destination")
 	}
@@ -53,8 +74,9 @@ func NewFanout(writers []io.WriteCloser, queueCapacity int) (*Fanout, error) {
 	}
 
 	f := &Fanout{
-		writers: append([]io.WriteCloser(nil), writers...),
-		queue:   make(chan []byte, queueCapacity),
+		writers:  append([]io.WriteCloser(nil), writers...),
+		queue:    make(chan queuedPacket, queueCapacity),
+		observer: observer,
 	}
 	f.wg.Add(1)
 	go f.run()
@@ -62,7 +84,7 @@ func NewFanout(writers []io.WriteCloser, queueCapacity int) (*Fanout, error) {
 }
 
 // NewUDPFanout dials each destination and starts a bounded fan-out worker.
-func NewUDPFanout(destinations []string, queueCapacity int) (*Fanout, error) {
+func NewUDPFanout(destinations []string, queueCapacity int, observer EgressObserver) (*Fanout, error) {
 	writers := make([]io.WriteCloser, 0, len(destinations))
 	for _, destination := range destinations {
 		conn, err := net.Dial("udp", destination)
@@ -75,7 +97,7 @@ func NewUDPFanout(destinations []string, queueCapacity int) (*Fanout, error) {
 		writers = append(writers, conn)
 	}
 
-	f, err := NewFanout(writers, queueCapacity)
+	f, err := NewFanout(writers, queueCapacity, observer)
 	if err != nil {
 		for _, writer := range writers {
 			_ = writer.Close()
@@ -85,11 +107,11 @@ func NewUDPFanout(destinations []string, queueCapacity int) (*Fanout, error) {
 	return f, nil
 }
 
-// Enqueue copies packet into the bounded ring. It returns false when the ring
-// is full or the fan-out has been closed. Only ring overflow increments the
-// drop counter.
-func (f *Fanout) Enqueue(packet []byte) bool {
-	owned := append([]byte(nil), packet...)
+// Enqueue copies packet into the bounded ring, attributing it to feedID. It
+// returns false when the ring is full or the fan-out has been closed. Only ring
+// overflow increments the drop counter.
+func (f *Fanout) Enqueue(feedID string, packet []byte) bool {
+	owned := queuedPacket{feedID: feedID, packet: append([]byte(nil), packet...)}
 
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -139,14 +161,34 @@ func (f *Fanout) Close() error {
 
 func (f *Fanout) run() {
 	defer f.wg.Done()
-	for packet := range f.queue {
+	for item := range f.queue {
+		var delivered, failed uint64
 		for _, writer := range f.writers {
-			n, err := writer.Write(packet)
-			if err != nil || n != len(packet) {
-				f.writeErrors.Add(1)
+			n, err := writer.Write(item.packet)
+			if err != nil || n != len(item.packet) {
+				failed++
 				continue
 			}
-			f.egressPackets.Add(1)
+			delivered++
 		}
+		f.egressPackets.Add(delivered)
+		f.writeErrors.Add(failed)
+		f.report(item.feedID, delivered, failed)
+	}
+}
+
+// report attributes one packet's delivery outcome to its originating feed.
+// Observer errors are deliberately ignored: scoring and accounting must never
+// block or discard delivery work, so an unknown feed loses attribution rather
+// than stalling the egress path.
+func (f *Fanout) report(feedID string, delivered, failed uint64) {
+	if f.observer == nil || feedID == "" {
+		return
+	}
+	if delivered > 0 {
+		_ = f.observer.AddEgress(feedID, delivered)
+	}
+	if failed > 0 {
+		_ = f.observer.AddWriteErrors(feedID, failed)
 	}
 }

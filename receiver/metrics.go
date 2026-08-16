@@ -15,6 +15,9 @@ var ErrUnknownFeed = errors.New("receiver metrics feed is not configured")
 
 var gapBuckets = []string{"<1", "1-2.4", "2.4-7", "7-32", ">=32"}
 
+// ReceiverMetrics is the fan-out worker's egress observer.
+var _ EgressObserver = (*ReceiverMetrics)(nil)
+
 // ReceiverMetrics exposes packet-path counters and the latest delivery report
 // for a fixed set of configured feeds. Unknown feeds are rejected so packet
 // data cannot create unbounded Prometheus label cardinality.
@@ -24,10 +27,11 @@ type ReceiverMetrics struct {
 	feeds   map[string]feedMetrics
 	windows map[string]erasure.Window
 
-	ingress  *prometheus.CounterVec
-	egress   *prometheus.CounterVec
-	dropped  *prometheus.CounterVec
-	unparsed *prometheus.CounterVec
+	ingress     *prometheus.CounterVec
+	egress      *prometheus.CounterVec
+	dropped     *prometheus.CounterVec
+	writeErrors *prometheus.CounterVec
+	unparsed    *prometheus.CounterVec
 
 	setsDesc     *prometheus.Desc
 	fractionDesc *prometheus.Desc
@@ -38,10 +42,11 @@ type ReceiverMetrics struct {
 }
 
 type feedMetrics struct {
-	ingress  prometheus.Counter
-	egress   prometheus.Counter
-	dropped  prometheus.Counter
-	unparsed prometheus.Counter
+	ingress     prometheus.Counter
+	egress      prometheus.Counter
+	dropped     prometheus.Counter
+	writeErrors prometheus.Counter
+	unparsed    prometheus.Counter
 }
 
 // NewReceiverMetrics registers receiver metrics and materializes zero-valued
@@ -77,12 +82,17 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string) (*Re
 	metrics.egress = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: receiverMetricsNamespace,
 		Name:      "egress_packets_total",
-		Help:      "Packets written successfully to validator destinations.",
+		Help:      "Datagrams written successfully to validator destinations. Counted per destination write, so one received packet increments this once for every configured --dest-ip-ports target; divide by the destination count to recover packets forwarded.",
 	}, []string{"feed"})
 	metrics.dropped = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: receiverMetricsNamespace,
 		Name:      "fanout_dropped_packets_total",
 		Help:      "Packets rejected because the bounded fan-out ring was full.",
+	}, []string{"feed"})
+	metrics.writeErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: receiverMetricsNamespace,
+		Name:      "fanout_write_errors_total",
+		Help:      "Datagram writes to validator destinations that failed or were short. Counted per destination write; each one is a packet that did not reach that destination.",
 	}, []string{"feed"})
 	metrics.unparsed = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: receiverMetricsNamespace,
@@ -116,10 +126,11 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string) (*Re
 
 	for _, feedID := range feedIDs {
 		metrics.feeds[feedID] = feedMetrics{
-			ingress:  metrics.ingress.WithLabelValues(feedID),
-			egress:   metrics.egress.WithLabelValues(feedID),
-			dropped:  metrics.dropped.WithLabelValues(feedID),
-			unparsed: metrics.unparsed.WithLabelValues(feedID),
+			ingress:     metrics.ingress.WithLabelValues(feedID),
+			egress:      metrics.egress.WithLabelValues(feedID),
+			dropped:     metrics.dropped.WithLabelValues(feedID),
+			writeErrors: metrics.writeErrors.WithLabelValues(feedID),
+			unparsed:    metrics.unparsed.WithLabelValues(feedID),
 		}
 		metrics.windows[feedID] = erasure.Window{}
 	}
@@ -134,6 +145,7 @@ func (m *ReceiverMetrics) Describe(ch chan<- *prometheus.Desc) {
 	m.ingress.Describe(ch)
 	m.egress.Describe(ch)
 	m.dropped.Describe(ch)
+	m.writeErrors.Describe(ch)
 	m.unparsed.Describe(ch)
 	ch <- m.setsDesc
 	ch <- m.fractionDesc
@@ -149,6 +161,7 @@ func (m *ReceiverMetrics) Collect(ch chan<- prometheus.Metric) {
 	m.ingress.Collect(ch)
 	m.egress.Collect(ch)
 	m.dropped.Collect(ch)
+	m.writeErrors.Collect(ch)
 	m.unparsed.Collect(ch)
 
 	m.mu.RLock()
@@ -185,13 +198,25 @@ func (m *ReceiverMetrics) IncIngress(feedID string) error {
 	return nil
 }
 
-// AddEgress records successful writes across all validator destinations.
+// AddEgress records successful destination writes. count is per destination,
+// so one packet fanned out to N destinations adds N.
 func (m *ReceiverMetrics) AddEgress(feedID string, count uint64) error {
 	feed, err := m.feed(feedID)
 	if err != nil {
 		return err
 	}
 	feed.egress.Add(float64(count))
+	return nil
+}
+
+// AddWriteErrors records failed or short destination writes. count is per
+// destination, matching AddEgress.
+func (m *ReceiverMetrics) AddWriteErrors(feedID string, count uint64) error {
+	feed, err := m.feed(feedID)
+	if err != nil {
+		return err
+	}
+	feed.writeErrors.Add(float64(count))
 	return nil
 }
 

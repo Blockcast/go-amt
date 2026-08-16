@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -15,12 +16,14 @@ import (
 
 	"github.com/blockcast/go-amt/receiver"
 	"github.com/blockcast/go-amt/shred"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const help = `blockcast-shreds demo mode
 
 Usage:
-  blockcast-shreds [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...]
+  blockcast-shreds [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT]
   blockcast-shreds selftest --fixture
 
 Demo mode has no broker, certificates, accounts, or heartbeats. --feed is
@@ -54,10 +57,11 @@ func run(args []string) error {
 	flags.SetOutput(os.Stderr)
 	flags.Usage = func() { fmt.Fprintln(flags.Output(), help) }
 	var configuredFeeds feeds
-	var listen, destinations string
+	var listen, destinations, httpAddress string
 	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed")
 	flags.StringVar(&listen, "listen", "0.0.0.0:20000", "unicast UDP listen address")
 	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated UDP forward destinations")
+	flags.StringVar(&httpAddress, "http-addr", "127.0.0.1:8080", "metrics and health HTTP address; empty disables HTTP")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -83,7 +87,7 @@ func run(args []string) error {
 			configured = append(configured, feed{name: name, address: address})
 		}
 	}
-	return listenAndScore(configured, splitNonempty(destinations))
+	return listenAndScore(configured, splitNonempty(destinations), httpAddress)
 }
 
 func selftest(args []string) error {
@@ -104,22 +108,40 @@ func selftest(args []string) error {
 	return nil
 }
 
-func listenAndScore(feeds []feed, destinations []string) error {
+func listenAndScore(feeds []feed, destinations []string, httpAddress string) error {
+	names := make([]string, 0, len(feeds))
+	for _, feed := range feeds {
+		names = append(names, feed.name)
+	}
+	scorer := shred.NewFeedScorer(names)
+	registry := prometheus.NewRegistry()
+	metrics, err := receiver.NewReceiverMetrics(registry, names)
+	if err != nil {
+		return err
+	}
+
+	// The fan-out is constructed after the metrics so the worker can attribute
+	// each delivered datagram back to the feed that received it.
 	var fanout *receiver.Fanout
-	var err error
 	if len(destinations) != 0 {
-		fanout, err = receiver.NewUDPFanout(destinations, 4096)
+		fanout, err = receiver.NewUDPFanout(destinations, 4096, metrics)
 		if err != nil {
 			return err
 		}
 		defer fanout.Close()
 	}
 
-	names := make([]string, 0, len(feeds))
-	for _, feed := range feeds {
-		names = append(names, feed.name)
+	health, err := receiver.NewHealth(30 * time.Second)
+	if err != nil {
+		return err
 	}
-	scorer := shred.NewFeedScorer(names)
+	httpServer, err := startHTTP(httpAddress, registry, health)
+	if err != nil {
+		return err
+	}
+	if httpServer != nil {
+		defer func() { _ = httpServer.Close() }()
+	}
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	defer signal.Stop(stop)
@@ -145,14 +167,11 @@ func listenAndScore(feeds []feed, destinations []string) error {
 					return
 				}
 				mu.Lock()
-				accepted, parseErr := scorer.Observe(feedName, packet[:n], time.Now())
+				receivedAt := time.Now()
+				health.MarkReceived(receivedAt)
+				_ = metrics.IncIngress(feedName)
+				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics)
 				mu.Unlock()
-				if parseErr != nil {
-					continue
-				}
-				if accepted && fanout != nil {
-					fanout.Enqueue(packet[:n])
-				}
 			}
 		}(feed.name, conn)
 	}
@@ -172,6 +191,38 @@ func listenAndScore(feeds []feed, destinations []string) error {
 	fmt.Println(scorer.Receipt())
 	mu.Unlock()
 	return nil
+}
+
+func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer *shred.FeedScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics) {
+	_, parseErr := scorer.Observe(feedName, packet, receivedAt)
+	// Delivery is independent of scoring: malformed and duplicate packets must
+	// still reach every configured validator destination unchanged.
+	if fanout != nil && !fanout.Enqueue(feedName, packet) {
+		_ = metrics.IncFanoutDrop(feedName)
+	}
+	if parseErr != nil {
+		_ = metrics.IncUnparsed(feedName)
+	}
+}
+
+func startHTTP(address string, registry *prometheus.Registry, health http.Handler) (*http.Server, error) {
+	if strings.TrimSpace(address) == "" {
+		return nil, nil
+	}
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{}))
+	mux.Handle("/healthz", health)
+	server := &http.Server{Addr: address, Handler: mux}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("listen HTTP endpoint %q: %w", address, err)
+	}
+	go func() {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			fmt.Fprintln(os.Stderr, "blockcast-shreds HTTP:", err)
+		}
+	}()
+	return server, nil
 }
 
 func splitNonempty(value string) []string {
