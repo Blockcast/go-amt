@@ -266,6 +266,46 @@ func (fr *fakeRelay) WaitForUpdate(timeout time.Duration) ([]byte, error) {
 	}
 }
 
+// DrainUpdates discards any Membership Updates recorded so far, so a test can
+// assert on the next one without matching earlier joins.
+func (fr *fakeRelay) DrainUpdates() {
+	for {
+		select {
+		case <-fr.updateCh:
+		default:
+			return
+		}
+	}
+}
+
+// WaitForLeaveRecord returns the IGMPv3 record type of the next Membership
+// Update carrying a leave, i.e. CHANGE_TO_INCLUDE_MODE (group-wide) or
+// BLOCK_OLD_SOURCES (source-specific).
+//
+// Update layout is 12 bytes (header, response MAC, nonce) followed by the
+// encapsulated IGMPv3 report, whose record type sits at report offset 28.
+func (fr *fakeRelay) WaitForLeaveRecord(timeout time.Duration) (byte, error) {
+	const recordTypeOffset = 12 + 28
+
+	deadline := time.After(timeout)
+	for {
+		select {
+		case u := <-fr.updateCh:
+			if len(u) <= recordTypeOffset {
+				continue
+			}
+			switch rt := u[recordTypeOffset]; rt {
+			case m.IGMPv3ChangeToIncludeMode, m.IGMPv3BlockOldSources:
+				return rt, nil
+			default:
+				continue // a join, keep looking
+			}
+		case <-deadline:
+			return 0, fmt.Errorf("timed out after %s waiting for a leave record", timeout)
+		}
+	}
+}
+
 func onesComplementChecksum(b []byte) uint16 {
 	var sum uint32
 	for i := 0; i+1 < len(b); i += 2 {

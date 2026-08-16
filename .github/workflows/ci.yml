@@ -37,4 +37,8 @@ jobs:
       # The purego tag selects the pure-Go protocol/conn implementations so the
       # race detector can run without that dependency. It does not alter the
       # default (cgo) or CGO_ENABLED=0 build selections.
+      #
+      # Coverage caveat: because purego deselects them, gateway.go, conn.go,
+      # protocol_cgo.go and e2e_test.go get NO race coverage here. relay_manager.go
+      # and the rest of the package are untagged and are covered.
       - run: go test -race -tags purego ./...

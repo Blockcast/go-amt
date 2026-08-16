@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	m "github.com/blockcast/go-amt/messages"
 )
 
 var (
@@ -356,4 +358,60 @@ func TestConcurrentSubscribeIsRaceFree(t *testing.T) {
 
 	fr.SendData(testHarnessSource, testHarnessGroup, 1234, testHarnessPort, []byte("x"))
 	time.Sleep(200 * time.Millisecond)
+}
+
+// TestUnsubscribeDuringPendingJoinPreservesOtherSource covers the review finding
+// on relay_manager.go:479 (Ally, PR #33, head 36ce988).
+//
+// Unsubscribe decides between a group-wide CHANGE_TO_INCLUDE_MODE leave and a
+// source-specific BLOCK_OLD_SOURCES leave by scanning for other subscribers of
+// the same group -- but it scans only rm.subscriptions. Subscribe parks a new
+// subscription in rm.pendingJoins, where it stays until the 50ms debounced batch
+// promotes it. Unsubscribing (S1,G) inside that window therefore cannot see
+// (S2,G), emits the group-wide leave, and withdraws S2's membership for G.
+//
+// The window is real but narrow, so this test deliberately does NOT let the
+// debounce drain after subscribing S2.
+func TestUnsubscribeDuringPendingJoinPreservesOtherSource(t *testing.T) {
+	fr := newFakeRelay(t)
+	rm := newTestManager(t, fr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := rm.Open(ctx); err != nil {
+		t.Fatalf("Open against fake relay: %v", err)
+	}
+
+	group := testHarnessGroup
+	s1 := netip.MustParseAddr("10.7.7.1")
+	s2 := netip.MustParseAddr("10.7.7.2")
+
+	key1 := SubscriptionKey{Source: s1, Group: group, Port: testHarnessPort}
+	key2 := SubscriptionKey{Source: s2, Group: group, Port: testHarnessPort + 1}
+
+	// S1 fully joined; its batch has drained.
+	subscribeActive(t, rm, key1)
+	fr.DrainUpdates()
+
+	// S2 queued but deliberately still in pendingJoins.
+	if _, err := rm.Subscribe(key2, SubscriptionCallbacks{}); err != nil {
+		t.Fatalf("Subscribe(s2): %v", err)
+	}
+	if err := rm.Unsubscribe(key1); err != nil {
+		t.Fatalf("Unsubscribe(s1): %v", err)
+	}
+
+	rt, err := fr.WaitForLeaveRecord(3 * time.Second)
+	if err != nil {
+		t.Fatalf("leave record: %v", err)
+	}
+
+	if rt == m.IGMPv3ChangeToIncludeMode {
+		t.Fatalf("Unsubscribe emitted a group-wide CHANGE_TO_INCLUDE_MODE leave while (%s,%s) "+
+			"was still pending: this withdraws the other source's membership for the group",
+			s2, group)
+	}
+	if rt != m.IGMPv3BlockOldSources {
+		t.Fatalf("leave record type = %d, want BLOCK_OLD_SOURCES (%d)", rt, m.IGMPv3BlockOldSources)
+	}
 }

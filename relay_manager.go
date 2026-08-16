@@ -476,7 +476,12 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	if rm.State() == RelayStateActive || rm.State() == RelayStateQuerying {
 		stillSubscribed := false
 		otherGroupSource := false
-		rm.subscriptions.Range(func(otherKey SubscriptionKey, _ *Subscription) bool {
+
+		// Both maps must be consulted. Subscribe parks a new subscription in
+		// pendingJoins until the debounced batch promotes it, so scanning only
+		// subscriptions misses a sibling source joined within that window and
+		// emits a group-wide leave that withdraws its membership too.
+		scan := func(otherKey SubscriptionKey, _ *Subscription) bool {
 			if otherKey.Source == key.Source && otherKey.Group == key.Group {
 				stillSubscribed = true
 			}
@@ -484,7 +489,10 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 				otherGroupSource = true
 			}
 			return true
-		})
+		}
+		rm.subscriptions.Range(scan)
+		rm.pendingJoins.Range(scan)
+
 		if !stillSubscribed {
 			var report []byte
 			var err error
