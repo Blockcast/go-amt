@@ -32,12 +32,14 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 
 	// Reuse the address
 	if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		_ = syscall.Close(sock)
 		return nil, fmt.Errorf("could not set socket reuseaddr: %w", err)
 	}
 
 	// Reuse the port
 	const SO_REUSEPORT = 0x0f
 	if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, SO_REUSEPORT, 1); err != nil {
+		_ = syscall.Close(sock)
 		return nil, fmt.Errorf("could not set socket reuseport: %w", err)
 	}
 
@@ -55,6 +57,7 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 		b := (*[unix.SizeofSockFprog]byte)(unsafe.Pointer(&prog))[:unix.SizeofSockFprog]
 		err := syscall.SetsockoptString(sock, syscall.SOL_SOCKET, syscall.SO_ATTACH_FILTER, string(b))
 		if err != nil {
+			_ = syscall.Close(sock)
 			return nil, fmt.Errorf("failed to set bpf: %w", err)
 		}
 	}
@@ -63,6 +66,7 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 	if timestamp {
 		if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_TIMESTAMPNS, 1); err != nil {
 			if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_TIMESTAMP, 1); err != nil {
+				_ = syscall.Close(sock)
 				return nil, fmt.Errorf("failed to enable SO_TIMESTAMP: %w", err)
 			}
 		}
@@ -71,6 +75,7 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 	lsa := syscall.SockaddrInet4{Port: gaddr.Port}
 	copy(lsa.Addr[:], net.IPv4zero.To4()) // Bind to 0.0.0.0
 	if err := syscall.Bind(sock, &lsa); err != nil {
+		_ = syscall.Close(sock)
 		return nil, fmt.Errorf("could not bind socket: %w", err)
 	}
 
@@ -86,20 +91,24 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 
 	// Set multicast interface for both sending and receiving
 	if err := conn.SetMulticastInterface(ifi); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("set multicast interface: %w", err)
 	}
 
 	// Optional: Enable multicast loopback if you want to receive your own multicast packets
 	if err := conn.SetMulticastLoopback(true); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("could not enable multicast loopback: %w", err)
 	}
 
 	// Set multicast TTL
 	if err := conn.SetMulticastTTL(ttl); err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("could not set multicast TTL: %w", err)
 	}
 
 	if err := conn.SetControlMessage(flags4, true); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 
@@ -114,6 +123,7 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 		err = conn.JoinGroup(ifi, gaddr)
 	}
 	if err != nil {
+		_ = conn.Close()
 		return nil, fmt.Errorf("join ssg (%s): %w", saddr.String(), err)
 	}
 

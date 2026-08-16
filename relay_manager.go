@@ -411,6 +411,16 @@ func (rm *RelayManager) Close() error {
 
 // Subscribe creates a new subscription for the given (S,G,Port)
 func (rm *RelayManager) Subscribe(key SubscriptionKey, callbacks SubscriptionCallbacks) (*Subscription, error) {
+	// Reject non-IPv4 (S,G) synchronously. The IGMPv3 report builder converts
+	// these with netip.Addr.As4, which panics, and it runs from the batched
+	// membership time.AfterFunc goroutine where no recover() can catch it.
+	if !key.Source.IsValid() || (!key.Source.Is4() && !key.Source.Is4In6()) {
+		return nil, fmt.Errorf("subscription source address must be IPv4: %s", key.Source)
+	}
+	if !key.Group.IsValid() || (!key.Group.Is4() && !key.Group.Is4In6()) {
+		return nil, fmt.Errorf("subscription group address must be IPv4: %s", key.Group)
+	}
+
 	rm.mu.RLock()
 	state := rm.State()
 	rm.mu.RUnlock()
@@ -813,6 +823,11 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 	}
 	payloadData := append([]byte(nil), payload.Payload()...)
 
+	// ip.SrcIP aliases the read buffer too (gopacket.NoCopy), and the address we
+	// hand out outlives this iteration via dataChan. Own those bytes as well.
+	srcIP := append(net.IP(nil), ip.SrcIP...)
+	srcPort := int(udp.SrcPort)
+
 	// Update stats
 	sub.packetsReceived.Add(1)
 	sub.bytesReceived.Add(uint64(len(payloadData)))
@@ -821,8 +836,8 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 	// Send to callback or channel
 	if sub.callbacks.OnPacket != nil {
 		srcUDP := &net.UDPAddr{
-			IP:   ip.SrcIP,
-			Port: int(udp.SrcPort),
+			IP:   srcIP,
+			Port: srcPort,
 		}
 		if err := sub.callbacks.OnPacket(payloadData, srcUDP); err != nil {
 			if sub.callbacks.OnError != nil {
@@ -835,7 +850,7 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 	select {
 	case sub.dataChan <- &DataPacket{
 		Data:      payloadData,
-		Source:    &net.UDPAddr{IP: ip.SrcIP, Port: int(udp.SrcPort)},
+		Source:    &net.UDPAddr{IP: srcIP, Port: srcPort},
 		Timestamp: time.Now(),
 	}:
 	default:

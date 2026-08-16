@@ -182,9 +182,25 @@ func (p *PureGoProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []n
 		}
 	}
 
+	// netip.Addr.As4 panics on a non-IPv4 address. This builder runs from the
+	// batched-membership time.AfterFunc goroutine, where a panic is unrecoverable
+	// by any caller, so validate before converting.
+	if !source.Is4() && !source.Is4In6() {
+		return nil, &ProtocolError{
+			State:   p.state,
+			Message: fmt.Sprintf("source address must be IPv4: %s", source),
+		}
+	}
+
 	// Build IGMPv3 Membership Report
 	groupRecords := make([]m.IGMPv3GroupRecord, len(groups))
 	for i, g := range groups {
+		if !g.Is4() && !g.Is4In6() {
+			return nil, &ProtocolError{
+				State:   p.state,
+				Message: fmt.Sprintf("group address must be IPv4: %s", g),
+			}
+		}
 		g4 := g.As4()
 		s4 := source.As4()
 		groupRecords[i] = m.IGMPv3GroupRecord{
