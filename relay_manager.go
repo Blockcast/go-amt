@@ -467,7 +467,14 @@ func (rm *RelayManager) Subscribe(key SubscriptionKey, callbacks SubscriptionCal
 	return sub, nil
 }
 
-// Unsubscribe removes a subscription
+// Unsubscribe removes a subscription.
+//
+// The subscription is always torn down and removed, regardless of the returned
+// error: a non-nil return reports that the leave could not be delivered to the
+// relay, not that the caller still holds the subscription. Retrying is
+// pointless — a second call short-circuits to nil because the entry is already
+// gone. Callers should log the error (the relay will keep forwarding until its
+// membership times out) rather than loop on it.
 func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	// Match the normalisation Subscribe applied, or a caller passing the
 	// v4-mapped form it subscribed with would miss the stored entry.
@@ -508,17 +515,30 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 			}
 			return true
 		}
-		rm.subscriptions.Range(scan)
+		// Scan order is load-bearing, not stylistic. Promotion in
+		// sendBatchedMembershipUpdate stores into subscriptions before it
+		// clears pendingJoins, so scanning in the opposite direction to that
+		// transfer observes a concurrently-promoted sibling in at least one
+		// map: absence from pendingJoins implies the clear already ran, which
+		// implies the store landed, and subscriptions is scanned strictly
+		// later. Scanning subscriptions first leaves the entry invisible to
+		// both ranges and emits a group-wide leave.
 		rm.pendingJoins.Range(scan)
+		rm.subscriptions.Range(scan)
 
 		if !stillSubscribed {
 			var report []byte
 			var err error
 			if otherGroupSource {
-				if sourceLeaver, ok := rm.protocol.(SourceSpecificLeaveReporter); ok {
-					report, err = sourceLeaver.CreateIGMPSourceLeaveReport(key.Source, key.Group)
+				sourceLeaver, ok := rm.protocol.(SourceSpecificLeaveReporter)
+				if !ok {
+					// Converge on leaveErr rather than returning here. Teardown
+					// above is already irreversible, so an early return would
+					// drop the subscription and still skip scheduleBatchedJoin,
+					// leaving the relay's membership un-refreshed.
+					err = fmt.Errorf("protocol does not support source-specific leave reports")
 				} else {
-					return fmt.Errorf("protocol does not support source-specific leave reports")
+					report, err = sourceLeaver.CreateIGMPSourceLeaveReport(key.Source, key.Group)
 				}
 			} else {
 				report, err = rm.protocol.CreateIGMPLeaveReport(key.Source, key.Group)
