@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 func TestUDPFanoutWritesByteIdenticalPacketsToEveryDestination(t *testing.T) {
@@ -35,6 +37,57 @@ func TestUDPFanoutWritesByteIdenticalPacketsToEveryDestination(t *testing.T) {
 	}
 	packet[0] = 0
 
+	var sourcePort int
+	for i, listener := range listeners {
+		if err := listener.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, 64)
+		n, source, err := listener.ReadFromUDP(got)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			sourcePort = source.Port
+		} else if source.Port != sourcePort {
+			t.Fatalf("destination %d saw source port %d, want shared source port %d", i, source.Port, sourcePort)
+		}
+		if want := []byte{0xde, 0xad, 0xbe, 0xef}; !bytes.Equal(got[:n], want) {
+			t.Fatalf("received %x, want %x", got[:n], want)
+		}
+	}
+}
+
+func TestUDPPacketBatchFallbackWritesEveryDestination(t *testing.T) {
+	listeners := make([]*net.UDPConn, 2)
+	messages := make([]ipv4.Message, len(listeners))
+	for i := range listeners {
+		conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners[i] = conn
+		messages[i] = ipv4.Message{
+			Buffers: [][]byte{[]byte("fallback")},
+			Addr:    conn.LocalAddr().(*net.UDPAddr),
+		}
+		defer conn.Close()
+	}
+
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packetConn := ipv4.NewPacketConn(conn)
+	defer packetConn.Close()
+
+	written, err := writeUDPPacketBatch(packetConn, messages, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != len(messages) {
+		t.Fatalf("fallback wrote %d messages, want %d", written, len(messages))
+	}
 	for _, listener := range listeners {
 		if err := listener.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
 			t.Fatal(err)
@@ -44,8 +97,8 @@ func TestUDPFanoutWritesByteIdenticalPacketsToEveryDestination(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want := []byte{0xde, 0xad, 0xbe, 0xef}; !bytes.Equal(got[:n], want) {
-			t.Fatalf("received %x, want %x", got[:n], want)
+		if string(got[:n]) != "fallback" {
+			t.Fatalf("received %q, want fallback", got[:n])
 		}
 	}
 }

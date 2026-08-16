@@ -7,8 +7,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
+
+	"golang.org/x/net/ipv4"
 )
 
 // FanoutStats is a point-in-time snapshot of the bounded fan-out path.
@@ -24,6 +27,9 @@ type FanoutStats struct {
 type Fanout struct {
 	writers []io.WriteCloser
 	queue   chan []byte
+	udpConn *ipv4.PacketConn
+	udpDest []*net.UDPAddr
+	next    int
 
 	mu        sync.RWMutex
 	closed    bool
@@ -48,40 +54,55 @@ func NewFanout(writers []io.WriteCloser, queueCapacity int) (*Fanout, error) {
 			return nil, fmt.Errorf("fan-out destination %d is nil", i)
 		}
 	}
+	f, err := newFanout(queueCapacity)
+	if err != nil {
+		return nil, err
+	}
+	f.writers = append([]io.WriteCloser(nil), writers...)
+	return f, nil
+}
+
+func newFanout(queueCapacity int) (*Fanout, error) {
 	if queueCapacity <= 0 {
 		return nil, errors.New("fan-out queue capacity must be positive")
 	}
-
 	f := &Fanout{
-		writers: append([]io.WriteCloser(nil), writers...),
-		queue:   make(chan []byte, queueCapacity),
+		queue: make(chan []byte, queueCapacity),
 	}
 	f.wg.Add(1)
 	go f.run()
 	return f, nil
 }
 
-// NewUDPFanout dials each destination and starts a bounded fan-out worker.
+// NewUDPFanout starts a bounded fan-out worker using one UDP socket. Packets
+// are sent as one batch, with destination order rotated for each packet.
 func NewUDPFanout(destinations []string, queueCapacity int) (*Fanout, error) {
-	writers := make([]io.WriteCloser, 0, len(destinations))
+	if len(destinations) == 0 {
+		return nil, errors.New("fan-out requires at least one destination")
+	}
+	addresses := make([]*net.UDPAddr, 0, len(destinations))
 	for _, destination := range destinations {
-		conn, err := net.Dial("udp", destination)
+		address, err := net.ResolveUDPAddr("udp4", destination)
 		if err != nil {
-			for _, writer := range writers {
-				_ = writer.Close()
-			}
-			return nil, fmt.Errorf("dial UDP destination %q: %w", destination, err)
+			return nil, fmt.Errorf("resolve UDP destination %q: %w", destination, err)
 		}
-		writers = append(writers, conn)
+		if address.IP == nil || address.IP.To4() == nil {
+			return nil, fmt.Errorf("UDP destination %q is not IPv4", destination)
+		}
+		addresses = append(addresses, address)
 	}
 
-	f, err := NewFanout(writers, queueCapacity)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
 	if err != nil {
-		for _, writer := range writers {
-			_ = writer.Close()
-		}
+		return nil, fmt.Errorf("open fan-out UDP socket: %w", err)
+	}
+	f, err := newFanout(queueCapacity)
+	if err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
+	f.udpConn = ipv4.NewPacketConn(conn)
+	f.udpDest = addresses
 	return f, nil
 }
 
@@ -126,6 +147,10 @@ func (f *Fanout) Close() error {
 		f.mu.Unlock()
 
 		f.wg.Wait()
+		if f.udpConn != nil {
+			f.closeErr = f.udpConn.Close()
+			return
+		}
 		var errs []error
 		for _, writer := range f.writers {
 			if err := writer.Close(); err != nil {
@@ -140,6 +165,24 @@ func (f *Fanout) Close() error {
 func (f *Fanout) run() {
 	defer f.wg.Done()
 	for packet := range f.queue {
+		if f.udpConn != nil {
+			count := len(f.udpDest)
+			messages := make([]ipv4.Message, count)
+			for i := range f.udpDest {
+				index := (f.next + i) % count
+				messages[i] = ipv4.Message{Buffers: [][]byte{packet}, Addr: f.udpDest[index]}
+			}
+			f.next = (f.next + 1) % count
+			written, err := writeUDPPacketBatch(f.udpConn, messages, runtime.GOOS == "linux")
+			f.egressPackets.Add(uint64(written))
+			if written != count {
+				f.writeErrors.Add(uint64(count - written))
+			}
+			if err != nil && written == count {
+				f.writeErrors.Add(1)
+			}
+			continue
+		}
 		for _, writer := range f.writers {
 			n, err := writer.Write(packet)
 			if err != nil || n != len(packet) {
@@ -149,4 +192,33 @@ func (f *Fanout) run() {
 			f.egressPackets.Add(1)
 		}
 	}
+}
+
+// writeUDPPacketBatch keeps one socket on every platform. x/net/ipv4 only
+// implements batching on Linux; its other implementations write one message
+// and return success, which would silently drop the remaining destinations.
+func writeUDPPacketBatch(conn *ipv4.PacketConn, messages []ipv4.Message, useBatch bool) (int, error) {
+	if useBatch {
+		return conn.WriteBatch(messages, 0)
+	}
+
+	written := 0
+	for _, message := range messages {
+		if len(message.Buffers) == 0 {
+			return written, errors.New("fan-out message has no payload")
+		}
+		payload := message.Buffers[0]
+		if len(payload) == 0 {
+			return written, errors.New("fan-out message has an empty payload")
+		}
+		n, err := conn.WriteTo(payload, nil, message.Addr)
+		if err != nil {
+			return written, err
+		}
+		if n != len(payload) {
+			return written, io.ErrShortWrite
+		}
+		written++
+	}
+	return written, nil
 }
