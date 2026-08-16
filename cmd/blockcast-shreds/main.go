@@ -109,16 +109,6 @@ func selftest(args []string) error {
 }
 
 func listenAndScore(feeds []feed, destinations []string, httpAddress string) error {
-	var fanout *receiver.Fanout
-	var err error
-	if len(destinations) != 0 {
-		fanout, err = receiver.NewUDPFanout(destinations, 4096)
-		if err != nil {
-			return err
-		}
-		defer fanout.Close()
-	}
-
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
@@ -129,6 +119,18 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string) err
 	if err != nil {
 		return err
 	}
+
+	// The fan-out is constructed after the metrics so the worker can attribute
+	// each delivered datagram back to the feed that received it.
+	var fanout *receiver.Fanout
+	if len(destinations) != 0 {
+		fanout, err = receiver.NewUDPFanout(destinations, 4096, metrics)
+		if err != nil {
+			return err
+		}
+		defer fanout.Close()
+	}
+
 	health, err := receiver.NewHealth(30 * time.Second)
 	if err != nil {
 		return err
@@ -195,7 +197,7 @@ func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer 
 	_, parseErr := scorer.Observe(feedName, packet, receivedAt)
 	// Delivery is independent of scoring: malformed and duplicate packets must
 	// still reach every configured validator destination unchanged.
-	if fanout != nil && !fanout.Enqueue(packet) {
+	if fanout != nil && !fanout.Enqueue(feedName, packet) {
 		_ = metrics.IncFanoutDrop(feedName)
 	}
 	if parseErr != nil {
