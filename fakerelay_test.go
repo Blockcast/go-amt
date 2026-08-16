@@ -165,8 +165,12 @@ func (fr *fakeRelay) handleDiscovery(msg []byte, addr *net.UDPAddr) {
 	adv = append(adv, msg[4:8]...)
 	adv = append(adv, 127, 0, 0, 1) // relay address
 
-	_, _ = fr.conn.WriteToUDP(adv, addr)
+	// Counted before the reply is sent, not after. The client observes the
+	// packet, so a counter bumped afterwards can still read stale to a test that
+	// asserts on it once the handshake has completed -- the relay goroutine may
+	// not have run yet. Race instrumentation widens that window enough to fail.
 	fr.advertised.Add(1)
+	_, _ = fr.conn.WriteToUDP(adv, addr)
 }
 
 // handleRequest answers a Request with a Membership Query.
@@ -175,8 +179,14 @@ func (fr *fakeRelay) handleRequest(msg []byte, addr *net.UDPAddr) {
 		return
 	}
 	nonce := msg[4:8]
-	_, _ = fr.conn.WriteToUDP(fr.buildQuery(nonce), addr)
+	// Counted before the reply is sent; see handleDiscovery. The counter
+	// therefore attests "the relay received a Request and is about to reply",
+	// not "the client received the Query". A consumer reasoning about the
+	// client-side effect of the Query -- e.g. that it refreshed lastAnyMessage
+	// -- is relying on the send that follows, which over loopback UDP is
+	// effectively immediate but is not what the count itself proves.
 	fr.queried.Add(1)
+	_, _ = fr.conn.WriteToUDP(fr.buildQuery(nonce), addr)
 }
 
 func (fr *fakeRelay) handleUpdate(msg []byte) {
