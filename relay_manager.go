@@ -204,6 +204,18 @@ type RelayManagerConfig struct {
 
 	// KeepaliveInterval is the interval for sending keepalive requests
 	KeepaliveInterval time.Duration
+
+	// TransportFactory, when non-nil, constructs the Transport in place of
+	// CreatePlatformTransport. Production callers leave it nil; it exists so a
+	// test can wrap or replace the transport, which is otherwise unreachable
+	// because Open assigns rm.transport itself and swapping the field afterwards
+	// races the running readLoop.
+	//
+	// Open calls it exactly once. Reconnection reuses that same Transport through
+	// its Close/Open methods rather than building a new one, so a decorator
+	// installed here observes every generation, including the reconnect
+	// handshake.
+	TransportFactory func(TransportConfig) (Transport, error)
 }
 
 // DefaultRelayManagerConfig returns a config with sensible defaults
@@ -326,7 +338,11 @@ func (rm *RelayManager) Open(ctx context.Context) error {
 	}
 
 	// Create transport
-	transport, err := CreatePlatformTransport(rm.config.TransportConfig)
+	newTransport := rm.config.TransportFactory
+	if newTransport == nil {
+		newTransport = CreatePlatformTransport
+	}
+	transport, err := newTransport(rm.config.TransportConfig)
 	if err != nil {
 		return fmt.Errorf("failed to create transport: %w", err)
 	}
