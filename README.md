@@ -71,11 +71,25 @@ To measure the value of a second feed, bind one socket per named input:
   --feed existing=0.0.0.0:20001
 ```
 
-The receipt reports each feed's erasure fraction, the first-arrival-wins union
-fraction, and the gap the second feed closes relative to the first feed. This
-measures what the observed second input added during the run. It does not prove
-the feeds are independently operated or path-decorrelated; state their actual
-origins when presenting the result.
+The receipt is the **measured worth of a second feed**: each feed's own
+unrecoverable (erasure) fraction and mean distinct shreds per FEC set, the
+first-arrival-wins union's fraction, the FEC sets the extra feeds rescued
+(`second_feed_measured_worth ... rescued_sets= gap_closed_fraction=`), and what
+share of unique shreds arrived first on each feed. Pass `--json` (also accepted
+by `selftest --fixture`) for the same numbers as a machine-readable document.
+
+Honesty caveat: the union numbers quantify what the observed second input added
+during this run — nothing more. They do not prove the feeds are independently
+operated or path-decorrelated, and if both inputs ultimately share one tap the
+tool cannot detect it. Do not present the union figure as evidence of
+decorrelated infrastructure; state each input's actual origin, and prefer a
+second feed the viewer already operates as the genuinely independent input.
+
+Shreds are deduplicated on `(slot, fec_set_index, local_index)` — never on
+`(slot, shred_index)` alone, which collapses distinct shreds because the in-set
+index repeats across the FEC sets of a slot (the 31x distinct-shred undercount
+found in BLO-26535). The local index already unifies data (`0..num_data-1`) and
+coding (`num_data+position`) shreds.
 
 ### Receiver metrics
 
