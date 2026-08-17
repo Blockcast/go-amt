@@ -24,7 +24,23 @@ func captureStdout(t *testing.T, work func() error) string {
 	}
 	original := os.Stdout
 	os.Stdout = write
+	// Restore os.Stdout and release both pipe ends on every exit path, including
+	// the abnormal ones: work may panic, and t.Fatal below unwinds via
+	// runtime.Goexit. Leaving the process-global os.Stdout pointed at a
+	// reader-less pipe would strand output from unrelated tests in this package,
+	// far from the cause. Both closes are idempotent, so the happy path can still
+	// close the write end early.
+	defer func() {
+		os.Stdout = original
+		_ = write.Close()
+		_ = read.Close()
+	}()
+	// work writes into the pipe with nothing draining it concurrently, so its
+	// output must stay under the pipe buffer (64 KiB on Linux) or this blocks
+	// forever rather than failing. Today's receipts are three lines and a small
+	// JSON object; drain from a goroutine before reusing this for bulk output.
 	workErr := work()
+	// Close the write end before draining so ReadFrom sees EOF.
 	_ = write.Close()
 	os.Stdout = original
 	if workErr != nil {
