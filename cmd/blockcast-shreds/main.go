@@ -24,7 +24,7 @@ import (
 const help = `blockcast-shreds demo mode
 
 Usage:
-  blockcast-shreds [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--json]
+  blockcast-shreds [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--json]
   blockcast-shreds selftest --fixture [--json]
 
 Demo mode has no broker, certificates, accounts, or heartbeats. --feed is
@@ -32,7 +32,11 @@ repeatable for first-arrival-wins scoring across multiple unicast UDP feeds.
 With two or more feeds the receipt reports the measured worth of a second
 feed: each feed's own erasure fraction, the union's, and the FEC sets the
 extra feeds rescued. It measures this run only — it cannot tell whether the
-inputs are independently operated or share one tap.`
+inputs are independently operated or share one tap.
+
+/healthz is readiness-shaped: it reports unhealthy until the first packet
+arrives, so it is not a safe liveness probe. --health-max-age sets the
+ingress freshness window.`
 
 type feeds []string
 
@@ -63,11 +67,13 @@ func run(args []string) error {
 	flags.Usage = func() { fmt.Fprintln(flags.Output(), help) }
 	var configuredFeeds feeds
 	var listen, destinations, httpAddress string
+	var healthMaxAge time.Duration
 	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed")
 	flags.StringVar(&listen, "listen", "0.0.0.0:20000", "unicast UDP listen address")
 	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated UDP forward destinations")
 	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	flags.StringVar(&httpAddress, "http-addr", "127.0.0.1:8080", "metrics and health HTTP address; empty disables HTTP")
+	flags.DurationVar(&healthMaxAge, "health-max-age", 30*time.Second, "/healthz ingress freshness window; readiness-shaped, see README")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -93,7 +99,10 @@ func run(args []string) error {
 			configured = append(configured, feed{name: name, address: address})
 		}
 	}
-	return listenAndScore(configured, splitNonempty(destinations), httpAddress, *asJSON)
+	if healthMaxAge <= 0 {
+		return fmt.Errorf("--health-max-age must be positive, got %s", healthMaxAge)
+	}
+	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON)
 }
 
 func selftest(args []string) error {
@@ -129,7 +138,7 @@ func printReceipt(receipt fmt.Stringer, asJSON bool) error {
 	return nil
 }
 
-func listenAndScore(feeds []feed, destinations []string, httpAddress string, asJSON bool) error {
+func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
@@ -152,7 +161,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, asJ
 		defer fanout.Close()
 	}
 
-	health, err := receiver.NewHealth(30 * time.Second)
+	health, err := receiver.NewHealth(healthMaxAge)
 	if err != nil {
 		return err
 	}
@@ -187,12 +196,13 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, asJ
 					errCh <- err
 					return
 				}
-				mu.Lock()
 				receivedAt := time.Now()
+				// health and the Prometheus counters are internally
+				// synchronized, so only the scorer needs mu, and it is taken
+				// inside processPacket after delivery.
 				health.MarkReceived(receivedAt)
 				_ = metrics.IncIngress(feedName)
-				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics)
-				mu.Unlock()
+				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics, &mu)
 			}
 		}(feed.name, conn)
 	}
@@ -213,13 +223,25 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, asJ
 	return printReceipt(scorer.Receipt(), asJSON)
 }
 
-func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer *shred.FeedScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics) {
-	_, parseErr := scorer.Observe(feedName, packet, receivedAt)
-	// Delivery is independent of scoring: malformed and duplicate packets must
-	// still reach every configured validator destination unchanged.
-	if fanout != nil && !fanout.Enqueue(feedName, packet) {
+// processPacket delivers a packet and then scores it.
+//
+// Delivery runs before and outside the scorer lock. Fanout is independently
+// synchronized and copies the packet itself, so holding the scorer's mutex
+// across Enqueue would serialize every feed goroutine behind one per-packet
+// heap copy on the ingress hot path. mu guards only the FeedScorer, which is
+// the sole shared value here that is not internally synchronized.
+//
+// Only EnqueueOverflow counts as a drop. A closed fan-out also refuses the
+// packet, but that is a shutdown artifact rather than receiver overload, and
+// charging it to the ring-overflow counter would let shutdown inflate a metric
+// the README defines as ring-full only.
+func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer *shred.FeedScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics, mu *sync.Mutex) {
+	if fanout != nil && fanout.Enqueue(feedName, packet) == receiver.EnqueueOverflow {
 		_ = metrics.IncFanoutDrop(feedName)
 	}
+	mu.Lock()
+	_, parseErr := scorer.Observe(feedName, packet, receivedAt)
+	mu.Unlock()
 	if parseErr != nil {
 		_ = metrics.IncUnparsed(feedName)
 	}

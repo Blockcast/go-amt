@@ -98,6 +98,13 @@ last-received-packet freshness. Every counter is labelled by `feed` and is
 materialized at zero for each configured feed at startup, so a silent feed is
 distinguishable from an unconfigured one.
 
+`/healthz` is **readiness-shaped, not liveness-shaped.** It returns `503` from
+process start until the first packet arrives, and again whenever the newest
+packet is older than `--health-max-age` (default `30s`). Wiring it to a
+Kubernetes `livenessProbe` will restart-loop a receiver that is healthy but has
+simply not been sent traffic yet; use it as a `readinessProbe`, or gate the
+liveness probe on something else.
+
 | Metric | Unit | Meaning |
 |---|---|---|
 | `bcast_shred_gw_ingress_packets_total` | packets | Packets read from the feed socket. |
@@ -120,6 +127,13 @@ counted at enqueue) and `fanout_write_errors_total` (counted at the write).
 Both represent packets that did not reach a destination; ingress minus drops is
 not by itself a delivery guarantee. Scoring and metrics never gate delivery, so
 a malformed or unattributable packet is still forwarded byte-identically.
+
+`fanout_dropped_packets_total` counts **ring overflow only.** Enqueue also
+refuses packets once the fan-out is closed, but that is a shutdown artifact
+rather than receiver overload, so it is deliberately not counted: otherwise a
+clean shutdown would inflate the metric and leave it disagreeing with
+`Fanout.Stats().DroppedPackets`. A non-zero rate here always means the receiver
+could not keep up.
 
 These are receiver-observed counters. They describe what this process read and
 wrote, not the validator's true replay deadline.

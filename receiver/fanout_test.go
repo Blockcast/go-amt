@@ -30,7 +30,7 @@ func TestUDPFanoutWritesByteIdenticalPacketsToEveryDestination(t *testing.T) {
 	defer fanout.Close()
 
 	packet := []byte{0xde, 0xad, 0xbe, 0xef}
-	if !fanout.Enqueue("feed", packet) {
+	if fanout.Enqueue("feed", packet) != EnqueueAccepted {
 		t.Fatal("Enqueue() dropped packet with an empty ring")
 	}
 	packet[0] = 0
@@ -57,7 +57,7 @@ func TestFanoutCountsOverflowAtEnqueue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !fanout.Enqueue("feed", []byte("first")) {
+	if fanout.Enqueue("feed", []byte("first")) != EnqueueAccepted {
 		t.Fatal("first packet dropped")
 	}
 	select {
@@ -65,10 +65,10 @@ func TestFanoutCountsOverflowAtEnqueue(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("fan-out worker did not enter writer")
 	}
-	if !fanout.Enqueue("feed", []byte("second")) {
+	if fanout.Enqueue("feed", []byte("second")) != EnqueueAccepted {
 		t.Fatal("second packet did not fill ring")
 	}
-	if fanout.Enqueue("feed", []byte("overflow")) {
+	if fanout.Enqueue("feed", []byte("overflow")) != EnqueueOverflow {
 		t.Fatal("overflow packet was accepted")
 	}
 
@@ -95,7 +95,7 @@ func TestFanoutCountsWriteErrorsPerDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fanout.Enqueue("feed", []byte("packet")) {
+	if fanout.Enqueue("feed", []byte("packet")) != EnqueueAccepted {
 		t.Fatal("packet dropped")
 	}
 	if err := fanout.Close(); err != nil {
@@ -121,13 +121,13 @@ func TestFanoutAttributesDeliveryToTheOriginatingFeed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !fanout.Enqueue("feed-a", []byte("first")) {
+	if fanout.Enqueue("feed-a", []byte("first")) != EnqueueAccepted {
 		t.Fatal("feed-a packet dropped")
 	}
-	if !fanout.Enqueue("feed-b", []byte("second")) {
+	if fanout.Enqueue("feed-b", []byte("second")) != EnqueueAccepted {
 		t.Fatal("feed-b packet dropped")
 	}
-	if !fanout.Enqueue("feed-b", []byte("third")) {
+	if fanout.Enqueue("feed-b", []byte("third")) != EnqueueAccepted {
 		t.Fatal("second feed-b packet dropped")
 	}
 	if err := fanout.Close(); err != nil {
@@ -157,7 +157,7 @@ func TestFanoutSurvivesAnObserverThatRejectsTheFeed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fanout.Enqueue("unconfigured", []byte("packet")) {
+	if fanout.Enqueue("unconfigured", []byte("packet")) != EnqueueAccepted {
 		t.Fatal("packet dropped")
 	}
 	if err := fanout.Close(); err != nil {
@@ -364,7 +364,7 @@ func TestUDPFanoutDeliversEveryPacketExactlyOnceToEveryDestination(t *testing.T)
 	defer fanout.Close()
 
 	for sequence := 0; sequence < packets; sequence++ {
-		if !fanout.Enqueue("feed", []byte{byte(sequence)}) {
+		if fanout.Enqueue("feed", []byte{byte(sequence)}) != EnqueueAccepted {
 			t.Fatalf("Enqueue dropped packet %d with a sized ring", sequence)
 		}
 	}
@@ -397,5 +397,27 @@ func TestUDPFanoutDeliversEveryPacketExactlyOnceToEveryDestination(t *testing.T)
 
 	if stats := fanout.Stats(); stats.EgressPackets != destinations*packets {
 		t.Fatalf("EgressPackets = %d, want %d", stats.EgressPackets, destinations*packets)
+	}
+}
+
+// TestEnqueueAfterCloseIsNotCountedAsOverflow separates the two rejection
+// reasons. Both refuse the packet, but only a full ring means the receiver
+// could not keep up; a closed fan-out means the process is shutting down while
+// an ingress goroutine is still reading. Folding them together lets shutdown
+// inflate DroppedPackets, which is documented as ring-full only.
+func TestEnqueueAfterCloseIsNotCountedAsOverflow(t *testing.T) {
+	fanout, err := NewFanout([]io.WriteCloser{&recordingWriter{}}, 4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := fanout.Enqueue("feed", []byte("after close")); got != EnqueueClosed {
+		t.Fatalf("Enqueue() after Close = %v, want %v", got, EnqueueClosed)
+	}
+	if got := fanout.Stats().DroppedPackets; got != 0 {
+		t.Fatalf("DroppedPackets = %d after a post-close Enqueue, want 0; shutdown must not read as ring overflow", got)
 	}
 }
