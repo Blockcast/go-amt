@@ -39,8 +39,14 @@ type EgressObserver interface {
 type EnqueueResult int
 
 const (
+	// enqueueUnknown is the zero value and is never returned. It exists so a
+	// zero-valued EnqueueResult — a forgotten assignment, or a struct field that
+	// was never set — does not silently read as "delivered". Callers branch on
+	// delivery outcomes, so the default must be a value that fails loudly rather
+	// than the success case.
+	enqueueUnknown EnqueueResult = iota
 	// EnqueueAccepted means the packet was copied into the ring for delivery.
-	EnqueueAccepted EnqueueResult = iota
+	EnqueueAccepted
 	// EnqueueOverflow means the ring was full and the packet was lost. This is
 	// the only outcome that counts toward the documented drop counters.
 	EnqueueOverflow
@@ -53,6 +59,8 @@ const (
 // String renders the result for logs and test failures.
 func (r EnqueueResult) String() string {
 	switch r {
+	case enqueueUnknown:
+		return "unknown"
 	case EnqueueAccepted:
 		return "accepted"
 	case EnqueueOverflow:
