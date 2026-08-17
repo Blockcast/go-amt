@@ -306,6 +306,7 @@ type failingSeqStore struct {
 	calls     int
 	failUntil int
 	inner     SeqStore
+	retired   []string
 }
 
 func (f *failingSeqStore) NextSeq(sessionID string) (uint64, error) {
@@ -314,6 +315,123 @@ func (f *failingSeqStore) NextSeq(sessionID string) (uint64, error) {
 		return 0, errors.New("sequence store unavailable")
 	}
 	return f.inner.NextSeq(sessionID)
+}
+
+func (f *failingSeqStore) Retire(sessionID string) {
+	f.retired = append(f.retired, sessionID)
+	f.inner.Retire(sessionID)
+}
+
+// TestCloseRetiresSequenceState pins the retirement hook. Without it the
+// sequence store keeps one entry per session for the lifetime of the process,
+// and a durable store keeps one record per session in its file forever.
+func TestCloseRetiresSequenceState(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0).UTC()}
+	store := &failingSeqStore{inner: NewMemorySeqStore()}
+	tracker := newTestTracker(t, clock, store)
+
+	sessionID, err := tracker.Open("subscriber-a")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := tracker.Emit("subscriber-a"); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if len(store.retired) != 0 {
+		t.Fatalf("a periodic emit retired the session: %v", store.retired)
+	}
+
+	final, err := tracker.Close("subscriber-a", CloseShutdown)
+	if err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if len(store.retired) != 1 || store.retired[0] != sessionID {
+		t.Fatalf("Close retired %v, want exactly [%s]", store.retired, sessionID)
+	}
+	// Retirement happens after the final record is built, so the final record
+	// still carries a sequence number from the same run of the session.
+	if final.Seq != 2 {
+		t.Fatalf("final Seq = %d, want 2; retirement must not precede the record", final.Seq)
+	}
+}
+
+// TestFailedCloseDoesNotRetire pins that a session whose final record could not
+// be built keeps its sequence state, so a retry can still produce one.
+func TestFailedCloseDoesNotRetire(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0).UTC()}
+	store := &failingSeqStore{failUntil: 1, inner: NewMemorySeqStore()}
+	tracker := newTestTracker(t, clock, store)
+
+	if _, err := tracker.Open("subscriber-a"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if _, err := tracker.Close("subscriber-a", CloseShutdown); err == nil {
+		t.Fatal("Close should fail while the sequence store fails")
+	}
+	if len(store.retired) != 0 {
+		t.Fatalf("a failed Close retired the session anyway: %v", store.retired)
+	}
+	if _, err := tracker.Close("subscriber-a", CloseShutdown); err != nil {
+		t.Fatalf("Close after recovery: %v", err)
+	}
+	if len(store.retired) != 1 {
+		t.Fatalf("the retry did not retire the session: %v", store.retired)
+	}
+}
+
+// TestEmitWatermarkAdvancesOnConstruction pins the retry contract documented on
+// Tracker.Emit, because the wrong reflex is the natural one: calling Emit again
+// after a shipment failure does NOT reproduce the lost interval, it silently
+// drops it. The contract is to retransmit the returned Record verbatim.
+func TestEmitWatermarkAdvancesOnConstruction(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0).UTC()}
+	tracker := newTestTracker(t, clock, nil)
+
+	if _, err := tracker.Open("subscriber-a"); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := tracker.Observe("subscriber-a", 1_000, 10); err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	clock.Add(10 * time.Second)
+
+	shipped, err := tracker.Emit("subscriber-a")
+	if err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	if shipped.BytesOut != 1_000 {
+		t.Fatalf("first delta = %d, want 1000", shipped.BytesOut)
+	}
+
+	// Shipping failed. The wrong reflex: emit again instead of retransmitting.
+	clock.Add(10 * time.Second)
+	regenerated, err := tracker.Emit("subscriber-a")
+	if err != nil {
+		t.Fatalf("second Emit: %v", err)
+	}
+	if regenerated.BytesOut != 0 {
+		t.Fatalf("second Emit restated %d bytes; the documented contract is that "+
+			"it does not, and callers must retransmit the first Record verbatim",
+			regenerated.BytesOut)
+	}
+	if regenerated.Seq == shipped.Seq {
+		t.Fatalf("a second Emit reused Seq %d; the sink would drop it as a duplicate", shipped.Seq)
+	}
+
+	// Retransmitting the first record verbatim is the safe path, and the
+	// documented rollup reconstructs the truth from it.
+	seen := make(map[uint64]struct{})
+	var total uint64
+	for _, record := range []Record{shipped, shipped, regenerated} {
+		if _, duplicate := seen[record.Seq]; duplicate {
+			continue
+		}
+		seen[record.Seq] = struct{}{}
+		total += record.BytesOut
+	}
+	if total != 1_000 {
+		t.Fatalf("SUM(bytes_out) after a verbatim retransmit = %d, want 1000", total)
+	}
 }
 
 func TestNewSessionIDIsUUIDv4(t *testing.T) {

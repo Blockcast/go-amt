@@ -71,6 +71,11 @@ var (
 // Records are deduplicated downstream by (SessionID, Seq). Seq is durable
 // across a sender restart, so a replayed record cannot collide with a
 // different record under first-write-wins.
+//
+// A Record is the sender's only copy of the interval it describes: BytesOut
+// and PacketsOut are never restated by a later record. A record that fails to
+// ship must be retransmitted verbatim, not regenerated — see the retry
+// contract on Tracker.Emit.
 type Record struct {
 	SessionID    string      `json:"session_id"`
 	SubscriberID string      `json:"subscriber_id"`
@@ -90,6 +95,15 @@ type Record struct {
 // never reuse one.
 type SeqStore interface {
 	NextSeq(sessionID string) (uint64, error)
+	// Retire releases the state held for a session that has closed and will
+	// never emit again. Without it a store accumulates one entry per session
+	// for the lifetime of the process — and, for a durable store, one record
+	// per session in its file forever, since every compaction rewrites what
+	// the previous one preserved. Tracker.Close calls it after the final
+	// record is built, so no sequence number is ever released before it has
+	// been used. It cannot fail: releasing state is an optimisation, and a
+	// store that could not release it is merely larger than necessary.
+	Retire(sessionID string)
 }
 
 type session struct {
@@ -204,6 +218,23 @@ func (t *Tracker) Teardown(subscriberID string) bool {
 }
 
 // Emit produces a periodic (non-final) record for the open session.
+//
+// RETRY CONTRACT — read this before writing the retry loop around it. The
+// delta watermark advances when Emit RETURNS, not when the record is shipped.
+// The returned Record is therefore the only copy of that interval's bytes and
+// packets: BytesOut and PacketsOut cover exactly the traffic observed since
+// the previous successful Emit, and no later record will ever restate them.
+//
+// So if shipping fails, retransmit THAT Record verbatim until the sink accepts
+// it. Do not call Emit again to obtain a fresh record — the natural reflex and
+// the wrong one. The second call returns only the delta accumulated since the
+// first, and the first record's bytes are gone, under-billing the subscriber
+// by exactly the interval that failed to ship. Nothing reports this; it is
+// silent by construction, which is why it is written down here.
+//
+// Retransmitting is always safe. Records are deduplicated downstream by
+// (SessionID, Seq), so a duplicate is discarded rather than counted twice, and
+// DurationMS is cumulative so it collapses correctly under MAX.
 func (t *Tracker) Emit(subscriberID string) (Record, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -212,6 +243,11 @@ func (t *Tracker) Emit(subscriberID string) (Record, error) {
 
 // Close produces the final record for the open session and retires it. A
 // subsequent Open for the same subscriber mints a fresh session UUID.
+//
+// The retry contract on Emit applies here too, and matters more: the final
+// record carries the last delta and the close reason, and the session is gone
+// afterwards, so there is nothing left to re-emit from. Retransmit the
+// returned Record verbatim until the sink accepts it.
 func (t *Tracker) Close(subscriberID string, reason CloseReason) (Record, error) {
 	if !reason.Valid() {
 		return Record{}, fmt.Errorf("delivery: invalid close reason %q", string(reason))
@@ -225,6 +261,11 @@ func (t *Tracker) Close(subscriberID string, reason CloseReason) (Record, error)
 		return Record{}, err
 	}
 	delete(t.sessions, subscriberID)
+	// The sequence number has already been issued and put in the record, so
+	// releasing the store's state for it now cannot lose anything. Doing it
+	// here rather than leaving it to the caller is what keeps the store from
+	// growing for the lifetime of the process.
+	t.seqs.Retire(record.SessionID)
 	return record, nil
 }
 
@@ -265,7 +306,10 @@ func (t *Tracker) emitLocked(subscriberID string, reason CloseReason, final bool
 	}
 
 	// Advance the watermark only after the record is fully built, so a failed
-	// sequence reservation above cannot silently discard delivered bytes.
+	// sequence reservation above cannot silently discard delivered bytes. It
+	// advances here rather than on successful shipment because there is no
+	// shipment to observe from inside this package — see the retry contract on
+	// Emit for what that obliges the caller to do.
 	current.bytesEmitted = current.bytesTotal
 	current.packetsEmitted = current.packetsTotal
 	return record, nil
