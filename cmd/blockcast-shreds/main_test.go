@@ -18,20 +18,6 @@ import (
 // captureStdout runs work with os.Stdout redirected and returns what it wrote.
 func captureStdout(t *testing.T, work func() error) string {
 	t.Helper()
-}
-
-type captureWriter struct {
-	packets chan []byte
-}
-
-func (w *captureWriter) Write(packet []byte) (int, error) {
-	w.packets <- append([]byte(nil), packet...)
-	return len(packet), nil
-}
-
-func (w *captureWriter) Close() error { return nil }
-
-func TestSelftestFixturePrintsOrderedReceipt(t *testing.T) {
 	read, write, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -50,6 +36,17 @@ func TestSelftestFixturePrintsOrderedReceipt(t *testing.T) {
 	}
 	return output.String()
 }
+
+type captureWriter struct {
+	packets chan []byte
+}
+
+func (w *captureWriter) Write(packet []byte) (int, error) {
+	w.packets <- append([]byte(nil), packet...)
+	return len(packet), nil
+}
+
+func (w *captureWriter) Close() error { return nil }
 
 func TestSelftestFixturePrintsOrderedReceipt(t *testing.T) {
 	output := captureStdout(t, func() error { return selftest([]string{"--fixture"}) })
