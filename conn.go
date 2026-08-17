@@ -1,4 +1,4 @@
-//go:build (linux || darwin) && !ios && !android && cgo
+//go:build (linux || darwin) && !ios && !android && cgo && !purego
 
 package amt
 
@@ -125,6 +125,7 @@ func (mc *MulticastConn) Open() error {
 				MTU:         mc.IFace.MTU,
 				RcvBufBytes: mc.RcvBufBytes,
 				SndBufBytes: mc.SndBufBytes,
+				Timeout:     mc.Timeout,
 			}
 			if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
 				mc.amtGw.SourceAddr = mc.SrcAddr.AsSlice()

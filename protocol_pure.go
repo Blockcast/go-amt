@@ -182,9 +182,25 @@ func (p *PureGoProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []n
 		}
 	}
 
+	// netip.Addr.As4 panics on a non-IPv4 address. This builder runs from the
+	// batched-membership time.AfterFunc goroutine, where a panic is unrecoverable
+	// by any caller, so validate before converting.
+	if !source.Is4() && !source.Is4In6() {
+		return nil, &ProtocolError{
+			State:   p.state,
+			Message: fmt.Sprintf("source address must be IPv4: %s", source),
+		}
+	}
+
 	// Build IGMPv3 Membership Report
 	groupRecords := make([]m.IGMPv3GroupRecord, len(groups))
 	for i, g := range groups {
+		if !g.Is4() && !g.Is4In6() {
+			return nil, &ProtocolError{
+				State:   p.state,
+				Message: fmt.Sprintf("group address must be IPv4: %s", g),
+			}
+		}
 		g4 := g.As4()
 		s4 := source.As4()
 		groupRecords[i] = m.IGMPv3GroupRecord{
@@ -215,19 +231,92 @@ func (p *PureGoProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []n
 	}
 
 	// Encapsulate in IP header
-	ipHeader := p.buildIPHeader(igmpData)
+	ipHeader := buildIGMPIPHeader(igmpData)
 	return append(ipHeader, igmpData...), nil
 }
 
-// buildIPHeader creates an IPv4 header for IGMP
-func (p *PureGoProtocol) buildIPHeader(payload []byte) []byte {
-	const headerLen = 24
-	totalLen := headerLen + len(payload)
+func (p *PureGoProtocol) CreateIGMPLeaveReport(source, group netip.Addr) ([]byte, error) {
+	return buildIGMPLeaveReport(source, group, p.State())
+}
 
-	header := make([]byte, headerLen)
-	header[0] = 0x46 // Version (4) + IHL (6)
-	header[1] = 0xc0 // DSCP + ECN (0xc0 for IGMP)
-	binary.BigEndian.PutUint16(header[2:4], uint16(totalLen))
+func (p *PureGoProtocol) CreateIGMPSourceLeaveReport(source, group netip.Addr) ([]byte, error) {
+	return buildIGMPSourceLeaveReport(source, group, p.State())
+}
+
+func buildIGMPLeaveReport(source, group netip.Addr, state AMTState) ([]byte, error) {
+	if !source.Is4() {
+		return nil, fmt.Errorf("source address must be IPv4: %s", source)
+	}
+	if !group.Is4() {
+		return nil, fmt.Errorf("group address must be IPv4: %s", group)
+	}
+
+	report := &m.IGMPv3MembershipReport{
+		Type:            m.IGMPv3TypeMembershipReport,
+		NumGroupRecords: 1,
+		GroupRecords: []m.IGMPv3GroupRecord{{
+			// CHANGE_TO_INCLUDE_MODE with no sources is the IGMPv3 leave form.
+			RecordType: m.IGMPv3ChangeToIncludeMode,
+			Multicast:  group.As4(),
+		}},
+	}
+	igmpData, err := report.MarshalBinary()
+	if err != nil {
+		return nil, &ProtocolError{State: state, Message: "failed to marshal IGMP leave report", Cause: err}
+	}
+	return append(buildIGMPIPHeader(igmpData), igmpData...), nil
+}
+
+func buildIGMPSourceLeaveReport(source, group netip.Addr, state AMTState) ([]byte, error) {
+	if !source.Is4() {
+		return nil, fmt.Errorf("source address must be IPv4: %s", source)
+	}
+	if !group.Is4() {
+		return nil, fmt.Errorf("group address must be IPv4: %s", group)
+	}
+
+	report := &m.IGMPv3MembershipReport{
+		Type:            m.IGMPv3TypeMembershipReport,
+		NumGroupRecords: 1,
+		GroupRecords: []m.IGMPv3GroupRecord{{
+			RecordType: m.IGMPv3BlockOldSources,
+			NumSources: 1,
+			Multicast:  group.As4(),
+			Sources:    [][4]byte{source.As4()},
+		}},
+	}
+	igmpData, err := report.MarshalBinary()
+	if err != nil {
+		return nil, &ProtocolError{State: state, Message: "failed to marshal source-specific leave report", Cause: err}
+	}
+	return append(buildIGMPIPHeader(igmpData), igmpData...), nil
+}
+
+// igmpRouterAlert is the IPv4 Router Alert option (RFC 2113): option type 0x94,
+// length 4, value 0. RFC 3376 requires it on every IGMPv3 message, and relays
+// that enforce it drop reports that omit it. Being 4 bytes long, it also keeps
+// the header 4-byte aligned with no separate padding.
+var igmpRouterAlert = [4]byte{0x94, 0x04, 0x00, 0x00}
+
+// igmpIPHeaderLen is the fixed 20-byte IPv4 header plus the Router Alert option.
+const igmpIPHeaderLen = 20 + len(igmpRouterAlert)
+
+// buildIGMPIPHeader builds the IPv4 header that carries an IGMPv3 message.
+//
+// Every IGMPv3 report this package emits is encapsulated here -- joins and
+// leaves, pure-Go and CGO alike -- so the Router Alert option cannot be present
+// on one path and missing on another. It briefly was: the join path and the
+// leave path each had their own copy of this function, and only the join copy
+// was given the option. Keep it that way; add report types, not headers.
+//
+// The header length, the IHL nibble, and the total-length field are all derived
+// from igmpIPHeaderLen so they cannot disagree with each other or with the
+// allocation.
+func buildIGMPIPHeader(payload []byte) []byte {
+	header := make([]byte, igmpIPHeaderLen)
+	header[0] = 0x40 | byte(igmpIPHeaderLen/4) // Version (4) + IHL (6)
+	header[1] = 0xc0                           // DSCP + ECN (0xc0 for IGMP)
+	binary.BigEndian.PutUint16(header[2:4], uint16(igmpIPHeaderLen+len(payload)))
 	binary.BigEndian.PutUint16(header[4:6], 0)   // Identification
 	binary.BigEndian.PutUint16(header[6:8], 0)   // Flags + Fragment Offset
 	header[8] = 1                                // TTL = 1 for IGMP
@@ -240,17 +329,17 @@ func (p *PureGoProtocol) buildIPHeader(payload []byte) []byte {
 	// Destination: 224.0.0.22 (IGMP report address)
 	copy(header[16:20], net.ParseIP("224.0.0.22").To4())
 
-	// RFC 3376 requires every IGMPv3 message to carry Router Alert.
-	copy(header[20:24], []byte{0x94, 0x04, 0x00, 0x00})
+	copy(header[20:], igmpRouterAlert[:])
 
-	// Calculate IP header checksum
-	checksum := p.calculateIPChecksum(header)
-	binary.BigEndian.PutUint16(header[10:12], checksum)
+	// Checksum covers the whole header, options included, and so must be
+	// computed after the option is in place.
+	binary.BigEndian.PutUint16(header[10:12], ipChecksum(header))
 
 	return header
 }
 
-func (p *PureGoProtocol) calculateIPChecksum(header []byte) uint16 {
+// ipChecksum is the standard RFC 1071 one's-complement checksum over header.
+func ipChecksum(header []byte) uint16 {
 	var sum uint32
 	for i := 0; i < len(header)-1; i += 2 {
 		sum += uint32(binary.BigEndian.Uint16(header[i:]))
@@ -262,6 +351,10 @@ func (p *PureGoProtocol) calculateIPChecksum(header []byte) uint16 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
 	return ^uint16(sum)
+}
+
+func (p *PureGoProtocol) calculateIPChecksum(header []byte) uint16 {
+	return ipChecksum(header)
 }
 
 func (p *PureGoProtocol) CreateMembershipUpdate(igmpReport []byte) ([]byte, error) {
