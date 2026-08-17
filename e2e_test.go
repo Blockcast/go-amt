@@ -59,23 +59,6 @@ func TestE2E_ReceiveMulticastData(t *testing.T) {
 	t.Logf("Relay: %s:%d", relayAddr, testRelayPort)
 	t.Logf("Source: %s, Group: %s:%d", sourceAddr, groupAddr, groupPort)
 
-	// Get default interface
-	iface, err := net.InterfaceByName("eth0")
-	if err != nil {
-		// Try to get any interface
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			if i.Flags&net.FlagUp != 0 && i.Flags&net.FlagLoopback == 0 {
-				iface = &i
-				break
-			}
-		}
-	}
-	if iface == nil {
-		t.Fatal("No suitable network interface found")
-	}
-	t.Logf("Using interface: %s (MTU: %d)", iface.Name, iface.MTU)
-
 	config := DefaultRelayManagerConfig(net.UDPAddr{
 		IP:   net.ParseIP(relayAddr),
 		Port: testRelayPort,
