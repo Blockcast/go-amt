@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -177,7 +176,6 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	defer signal.Stop(stop)
 	errCh := make(chan error, len(feeds))
 	var sockets []*net.UDPConn
-	var mu sync.Mutex
 	for _, feed := range feeds {
 		udpAddress, err := net.ResolveUDPAddr("udp", feed.address)
 		if err != nil {
@@ -196,13 +194,13 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 					errCh <- err
 					return
 				}
+				// receivedAt is captured here, before any per-packet work, so it
+				// is a true arrival timestamp rather than a lock-ordered one.
+				// Every consumer below synchronizes itself.
 				receivedAt := time.Now()
-				// health and the Prometheus counters are internally
-				// synchronized, so only the scorer needs mu, and it is taken
-				// inside processPacket after delivery.
 				health.MarkReceived(receivedAt)
 				_ = metrics.IncIngress(feedName)
-				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics, &mu)
+				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics)
 			}
 		}(feed.name, conn)
 	}
@@ -218,31 +216,36 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	for _, conn := range sockets {
 		_ = conn.Close()
 	}
-	mu.Lock()
-	defer mu.Unlock()
+	// Sockets are closed, but a reader goroutine can still be mid-packet: it may
+	// be blocked in Enqueue or between the read and Observe. FeedScorer.Receipt
+	// takes the scorer's own lock, so the receipt is a consistent snapshot even
+	// if a late Observe lands after it.
 	return printReceipt(scorer.Receipt(), asJSON)
 }
 
 // processPacket delivers a packet and then scores it.
 //
-// Delivery runs before and outside the scorer lock. Fanout is independently
-// synchronized and copies the packet itself, so holding the scorer's mutex
-// across Enqueue would serialize every feed goroutine behind one per-packet
-// heap copy on the ingress hot path. mu guards only the FeedScorer, which is
-// the sole shared value here that is not internally synchronized.
+// Delivery runs first and is never held up by scoring: malformed and duplicate
+// packets must still reach every configured validator destination unchanged.
+// Every value used here is internally synchronized — Fanout copies the packet
+// under its own lock, FeedScorer serializes its own state, and Health and
+// ReceiverMetrics each carry their own — so feed goroutines do not serialize
+// behind a caller-held lock on the ingress hot path.
+//
+// receivedAt is captured at the socket read, so concurrent feeds can present it
+// out of order. That is the scorer's problem to absorb, and it does: see
+// Scorer.Observe on why the gap frontier and per-set extent advance
+// monotonically rather than assuming call order matches timestamp order.
 //
 // Only EnqueueOverflow counts as a drop. A closed fan-out also refuses the
 // packet, but that is a shutdown artifact rather than receiver overload, and
 // charging it to the ring-overflow counter would let shutdown inflate a metric
 // the README defines as ring-full only.
-func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer *shred.FeedScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics, mu *sync.Mutex) {
+func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer *shred.FeedScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics) {
 	if fanout != nil && fanout.Enqueue(feedName, packet) == receiver.EnqueueOverflow {
 		_ = metrics.IncFanoutDrop(feedName)
 	}
-	mu.Lock()
-	_, parseErr := scorer.Observe(feedName, packet, receivedAt)
-	mu.Unlock()
-	if parseErr != nil {
+	if _, parseErr := scorer.Observe(feedName, packet, receivedAt); parseErr != nil {
 		_ = metrics.IncUnparsed(feedName)
 	}
 }

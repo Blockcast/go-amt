@@ -85,6 +85,19 @@ tool cannot detect it. Do not present the union figure as evidence of
 decorrelated infrastructure; state each input's actual origin, and prefer a
 second feed the viewer already operates as the genuinely independent input.
 
+The `gap_ms` line ends with `reordered=`, which counts arrivals whose timestamp
+did not advance the frontier and from which no inter-arrival gap could be
+derived. Arrival timestamps are captured at the socket read, before any
+per-packet work, so with more than one `--feed` two goroutines can capture
+`t1 < t2` and reach the scorer as `t2, t1`. Those arrivals are counted here
+rather than bucketed, because the alternative — a negative gap — falls through
+the bucket ladder into `<1` and silently inflates the sub-millisecond count.
+The buckets plus `reordered` account for every non-first shred, so a non-zero
+`reordered` means the histogram is a sample of arrivals rather than all of
+them. Completion latency is unaffected: it measures each FEC set's true arrival
+extent (newest minus oldest), not the timestamp of whichever shred happened to
+be processed 32nd.
+
 Shreds are deduplicated on `(slot, fec_set_index, local_index)` — never on
 `(slot, shred_index)` alone, which collapses distinct shreds because the in-set
 index repeats across the FEC sets of a slot (the 31x distinct-shred undercount

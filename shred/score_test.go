@@ -128,7 +128,7 @@ func TestFeedScorerReportsPerFeedAndUnionBenefit(t *testing.T) {
 	}
 	want := "time_to_32nd_shred union p50=31ms p95=31ms p99=31ms\n" +
 		"union erasure sets=1 erased=0 fraction=0.000000 mean_shreds_per_set=63.00\n" +
-		"gap_ms union <1=0 1-2.4=62 2.4-7=0 7-32=0 >=32=0\n" +
+		"gap_ms union <1=0 1-2.4=62 2.4-7=0 7-32=0 >=32=0 reordered=0\n" +
 		"feed name=blockcast erasure sets=1 erased=1 fraction=1.000000 mean_shreds_per_set=31.00 unique_first=31 first_arrival_fraction=0.492063\n" +
 		"feed name=external erasure sets=1 erased=0 fraction=0.000000 mean_shreds_per_set=32.00 unique_first=32 first_arrival_fraction=0.507937\n" +
 		"second_feed_measured_worth baseline=blockcast rescued_sets=1 gap_closed_fraction=1.000000"
@@ -377,4 +377,83 @@ func codingPacket(slot uint64, fec, position uint32) []byte {
 	binary.LittleEndian.PutUint16(packet[85:87], 32)
 	binary.LittleEndian.PutUint16(packet[87:89], uint16(position))
 	return packet
+}
+
+// TestScorerToleratesOutOfOrderArrivalTimestamps pins the ordering contract that
+// the receiver's ingress path relies on. receivedAt is captured at the socket
+// read, before any per-packet work, so two feed goroutines can capture t1 < t2
+// and reach Observe as t2, t1. Nothing in the scorer may assume otherwise.
+//
+// The regression this guards is silent and single-directional: a negative gap
+// falls through the bucket ladder into LT1, inflating the sub-millisecond count
+// that a customer reads as "this feed is dense"; lastArrival regresses so the
+// next gap is measured from a stale frontier; and a set can report a negative
+// completion latency, which sorts to the front of the latency slice and drags
+// every completion percentile down.
+func TestScorerToleratesOutOfOrderArrivalTimestamps(t *testing.T) {
+	started := time.Unix(40, 0)
+	at := func(ms int) time.Time { return started.Add(time.Duration(ms) * time.Millisecond) }
+
+	scorer := NewScorerWithFormat(FormatAgave)
+	// Deliver a full set with every pair of adjacent arrivals transposed, so the
+	// true extent is still 0..31ms but the call order regresses 16 times.
+	// Timestamps are 2ms apart, so no honest gap can land in LT1.
+	for i := 0; i < 32; i += 2 {
+		observeTestPacket(t, scorer, dataPacket(90, 0, uint32(i+1)), at(2*(i+1)))
+		observeTestPacket(t, scorer, dataPacket(90, 0, uint32(i)), at(2*i))
+	}
+
+	got := scorer.Receipt()
+	if got.SetsTotal != 1 || got.SetsErased != 0 {
+		t.Fatalf("Receipt() = %+v, want 1 complete set", got)
+	}
+	// Extent is min..max over the 32 arrivals: 0ms .. 62ms.
+	if want := 62 * time.Millisecond; got.CompletionP50 != want {
+		t.Fatalf("CompletionP50 = %s, want %s; completion must measure the set's arrival extent, not the timestamp of whichever shred was processed 32nd", got.CompletionP50, want)
+	}
+	if got.CompletionP50 < 0 {
+		t.Fatalf("CompletionP50 = %s is negative; a negative latency understates time_to_32nd_shred", got.CompletionP50)
+	}
+	// 31 non-first arrivals: 15 advance the frontier by 4ms (the first element of
+	// each transposed pair after the opening one), and 16 regress — the 15
+	// trailing elements plus the opening pair's second element.
+	if got.Gaps.LT1 != 0 {
+		t.Fatalf("Gaps.LT1 = %d, want 0; reordered arrivals must not be charged to the sub-millisecond bucket", got.Gaps.LT1)
+	}
+	if got.Gaps.Reordered != 16 {
+		t.Fatalf("Gaps.Reordered = %d, want 16", got.Gaps.Reordered)
+	}
+	// Every non-first arrival is either bucketed or counted as reordered.
+	bucketed := got.Gaps.LT1 + got.Gaps.From1To2_4 + got.Gaps.From2_4To7 + got.Gaps.From7To32 + got.Gaps.GTE32
+	if bucketed+got.Gaps.Reordered != 31 {
+		t.Fatalf("bucketed(%d) + reordered(%d) = %d, want 31 non-first arrivals accounted for", bucketed, got.Gaps.Reordered, bucketed+got.Gaps.Reordered)
+	}
+}
+
+// TestScorerGapFrontierDoesNotRegress isolates the stale-frontier half of the
+// bug: after a late arrival, the next honest gap must be measured from the
+// newest timestamp seen, not from the late one.
+func TestScorerGapFrontierDoesNotRegress(t *testing.T) {
+	started := time.Unix(50, 0)
+	at := func(ms int) time.Time { return started.Add(time.Duration(ms) * time.Millisecond) }
+
+	scorer := NewScorerWithFormat(FormatAgave)
+	observeTestPacket(t, scorer, dataPacket(91, 0, 0), at(0))
+	observeTestPacket(t, scorer, dataPacket(91, 0, 1), at(30)) // +30ms -> 7-32 bucket
+	observeTestPacket(t, scorer, dataPacket(91, 0, 2), at(10)) // regression -> reordered
+	observeTestPacket(t, scorer, dataPacket(91, 0, 3), at(31)) // +1ms from 30, NOT +21ms from 10
+
+	got := scorer.Receipt()
+	if got.Gaps.Reordered != 1 {
+		t.Fatalf("Gaps.Reordered = %d, want 1", got.Gaps.Reordered)
+	}
+	// at(31) is 1ms after the frontier at(30): the 1-2.4ms bucket.
+	if got.Gaps.From1To2_4 != 1 {
+		t.Fatalf("Gaps.From1To2_4 = %d, want 1; the gap after a late arrival must be measured from the frontier", got.Gaps.From1To2_4)
+	}
+	// Only the at(30) step belongs in 7-32ms. If the frontier had regressed to
+	// at(10), at(31) would have produced a second 7-32ms sample (+21ms).
+	if got.Gaps.From7To32 != 1 {
+		t.Fatalf("Gaps.From7To32 = %d, want 1; a regressed frontier inflates the next gap", got.Gaps.From7To32)
+	}
 }

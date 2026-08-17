@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,6 +21,13 @@ type GapHistogram struct {
 	From2_4To7 uint64 `json:"from_2_4ms_to_7ms"`
 	From7To32  uint64 `json:"from_7ms_to_32ms"`
 	GTE32      uint64 `json:"gte_32ms"`
+	// Reordered counts arrivals whose timestamp did not advance the frontier, so
+	// no inter-arrival gap could be derived from them. These are excluded from
+	// the buckets above rather than folded into LT1. It is reported so the
+	// buckets stay auditable: bucket total + Reordered is the number of
+	// non-first accepted shreds, and a nonzero value here means the histogram
+	// is a sample of arrivals rather than all of them.
+	Reordered uint64 `json:"reordered"`
 }
 
 type Receipt struct {
@@ -39,6 +47,12 @@ type Receipt struct {
 type setScore struct {
 	seen  uint64
 	first time.Time
+	// last is the newest arrival timestamp among the distinct shreds counted
+	// into seen. Together with first it gives the set's true arrival extent,
+	// which is what completed measures. Tracking it explicitly (rather than
+	// using the timestamp of whichever shred happened to be processed 32nd)
+	// keeps the extent correct when arrivals are presented out of order.
+	last time.Time
 	// completed is only meaningful when complete is true. A duration of zero is
 	// a legitimate value — a set whose 32nd distinct shred lands in the same
 	// clock tick as its first — so completion must not be inferred from
@@ -95,7 +109,15 @@ type UnionReceipt struct {
 
 // FeedScorer keeps each feed's loss accounting separate while applying
 // first-arrival-wins deduplication to the union.
+//
+// FeedScorer is safe for concurrent use. It is the type shared across a
+// receiver's per-feed ingress goroutines, so it synchronizes itself rather than
+// requiring every caller to bring a lock — the same contract receiver.Health and
+// receiver.ReceiverMetrics already offer. The embedded Scorers are NOT
+// individually safe for concurrent use and must only be reached through here;
+// a bare Scorer (as used by fixture replay) stays lock-free.
 type FeedScorer struct {
+	mu            sync.Mutex
 	names         []string
 	feeds         map[string]*Scorer
 	union         *Scorer
@@ -121,6 +143,8 @@ func NewFeedScorerWithFormat(format Format, names []string) *FeedScorer {
 }
 
 func (s *FeedScorer) Observe(feed string, packet []byte, receivedAt time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	scorer := s.feeds[feed]
 	if scorer == nil {
 		return false, fmt.Errorf("unknown feed %q", feed)
@@ -136,6 +160,8 @@ func (s *FeedScorer) Observe(feed string, packet []byte, receivedAt time.Time) (
 }
 
 func (s *FeedScorer) Receipt() UnionReceipt {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	keys := make([]SetKey, 0, len(s.union.sets))
 	for key := range s.union.sets {
 		keys = append(keys, key)
@@ -223,15 +249,29 @@ func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
 	}
 	s.dedup[key] = struct{}{}
 
+	// receivedAt is a true arrival timestamp, captured at the read before any
+	// per-packet work, so it is NOT guaranteed to be nondecreasing across calls:
+	// concurrent feed goroutines can capture t1 < t2 and reach Observe as t2, t1.
+	// Nothing here may assume call order matches timestamp order. A regressing
+	// timestamp would otherwise yield a negative gap, which falls through the
+	// bucket ladder into LT1 and silently inflates the sub-millisecond count,
+	// and would drag lastArrival backwards so the *next* gap is measured from a
+	// stale frontier and reads too large.
 	if !s.lastArrival.IsZero() {
-		s.gaps.observe(receivedAt.Sub(s.lastArrival))
+		if gap := receivedAt.Sub(s.lastArrival); gap > 0 {
+			s.gaps.observe(gap)
+		} else {
+			s.gaps.Reordered++
+		}
 	}
-	s.lastArrival = receivedAt
+	if receivedAt.After(s.lastArrival) {
+		s.lastArrival = receivedAt
+	}
 
 	setKey := SetKey{Slot: header.Slot, FECSetIndex: header.FECSetIndex}
 	set := s.sets[setKey]
 	if set == nil {
-		set = &setScore{first: receivedAt}
+		set = &setScore{first: receivedAt, last: receivedAt}
 		s.sets[setKey] = set
 	}
 	bit := uint64(1) << header.IndexWithinSet
@@ -239,9 +279,21 @@ func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
 		return false, nil
 	}
 	set.seen |= bit
+	// Widen the extent to this arrival before testing completion, so first is a
+	// true minimum and last a true maximum over the shreds counted into seen.
+	// This is what keeps completed from going negative — a negative duration
+	// sorts to the front of the latency slice and drags every completion
+	// percentile down, understating time_to_32nd_shred on a customer-facing
+	// receipt.
+	if receivedAt.Before(set.first) {
+		set.first = receivedAt
+	}
+	if receivedAt.After(set.last) {
+		set.last = receivedAt
+	}
 	if !set.complete && bitsSet64(set.seen) == completionThreshold {
 		set.complete = true
-		set.completed = receivedAt.Sub(set.first)
+		set.completed = set.last.Sub(set.first)
 	}
 	return true, nil
 }
@@ -284,8 +336,8 @@ func (r UnionReceipt) String() string {
 	var output strings.Builder
 	fmt.Fprintf(&output, "time_to_32nd_shred union p50=%s p95=%s p99=%s\n", r.Union.CompletionP50, r.Union.CompletionP95, r.Union.CompletionP99)
 	fmt.Fprintf(&output, "union erasure sets=%d erased=%d fraction=%.6f mean_shreds_per_set=%.2f\n", r.Union.SetsTotal, r.Union.SetsErased, r.Union.ErasureFraction, r.Union.MeanShredsPerSet)
-	fmt.Fprintf(&output, "gap_ms union <1=%d 1-2.4=%d 2.4-7=%d 7-32=%d >=32=%d\n",
-		r.Union.Gaps.LT1, r.Union.Gaps.From1To2_4, r.Union.Gaps.From2_4To7, r.Union.Gaps.From7To32, r.Union.Gaps.GTE32)
+	fmt.Fprintf(&output, "gap_ms union <1=%d 1-2.4=%d 2.4-7=%d 7-32=%d >=32=%d reordered=%d\n",
+		r.Union.Gaps.LT1, r.Union.Gaps.From1To2_4, r.Union.Gaps.From2_4To7, r.Union.Gaps.From7To32, r.Union.Gaps.GTE32, r.Union.Gaps.Reordered)
 	for _, feed := range r.Feeds {
 		fmt.Fprintf(&output, "feed name=%s erasure sets=%d erased=%d fraction=%.6f mean_shreds_per_set=%.2f unique_first=%d first_arrival_fraction=%.6f\n",
 			feed.Name, feed.Receipt.SetsTotal, feed.Receipt.SetsErased, feed.Receipt.ErasureFraction, feed.Receipt.MeanShredsPerSet, feed.UniqueFirst, feed.FirstArrivalFraction)
@@ -298,9 +350,9 @@ func (r UnionReceipt) String() string {
 }
 
 func (r Receipt) String() string {
-	return fmt.Sprintf("time_to_32nd_shred p50=%s p95=%s p99=%s\nerasure sets=%d erased=%d fraction=%.6f mean_shreds_per_set=%.2f\ngap_ms <1=%d 1-2.4=%d 2.4-7=%d 7-32=%d >=32=%d",
+	return fmt.Sprintf("time_to_32nd_shred p50=%s p95=%s p99=%s\nerasure sets=%d erased=%d fraction=%.6f mean_shreds_per_set=%.2f\ngap_ms <1=%d 1-2.4=%d 2.4-7=%d 7-32=%d >=32=%d reordered=%d",
 		r.CompletionP50, r.CompletionP95, r.CompletionP99, r.SetsTotal, r.SetsErased, r.ErasureFraction, r.MeanShredsPerSet,
-		r.Gaps.LT1, r.Gaps.From1To2_4, r.Gaps.From2_4To7, r.Gaps.From7To32, r.Gaps.GTE32)
+		r.Gaps.LT1, r.Gaps.From1To2_4, r.Gaps.From2_4To7, r.Gaps.From7To32, r.Gaps.GTE32, r.Gaps.Reordered)
 }
 
 func (h *GapHistogram) observe(gap time.Duration) {
