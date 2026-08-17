@@ -86,8 +86,8 @@ func TestBuildDRIADQuery_Invalid(t *testing.T) {
 func TestParseAMTRelayRdata_IPv4(t *testing.T) {
 	// AMTRELAY RDATA: precedence=10, D=0, type=1 (IPv4), relay=192.0.2.1
 	rdata := []byte{
-		0x0A,       // precedence = 10
-		0x01,       // D=0, type=1 (IPv4)
+		0x0A,         // precedence = 10
+		0x01,         // D=0, type=1 (IPv4)
 		192, 0, 2, 1, // relay IP
 	}
 
@@ -116,8 +116,8 @@ func TestParseAMTRelayRdata_IPv4(t *testing.T) {
 func TestParseAMTRelayRdata_IPv4_WithDFlag(t *testing.T) {
 	// AMTRELAY RDATA: precedence=5, D=1, type=1 (IPv4), relay=10.0.0.1
 	rdata := []byte{
-		0x05,       // precedence = 5
-		0x81,       // D=1, type=1 (IPv4)
+		0x05,        // precedence = 5
+		0x81,        // D=1, type=1 (IPv4)
 		10, 0, 0, 1, // relay IP
 	}
 
@@ -195,8 +195,8 @@ func TestBuildAMTRelayRdata_IPv4(t *testing.T) {
 	rdata := BuildAMTRelayRdata(10, false, addr)
 
 	expected := []byte{
-		0x0A,       // precedence = 10
-		0x01,       // D=0, type=1 (IPv4)
+		0x0A,         // precedence = 10
+		0x01,         // D=0, type=1 (IPv4)
 		192, 0, 2, 1, // relay IP
 	}
 

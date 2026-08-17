@@ -317,10 +317,14 @@ func (fr *fakeRelay) DrainUpdates() {
 // Update carrying a leave, i.e. CHANGE_TO_INCLUDE_MODE (group-wide) or
 // BLOCK_OLD_SOURCES (source-specific).
 //
-// Update layout is 12 bytes (header, response MAC, nonce) followed by the
-// encapsulated IGMPv3 report, whose record type sits at report offset 28.
+// Update layout is 12 bytes (header, response MAC, nonce), then the IPv4 header
+// encapsulating the report, then the 8-byte IGMPv3 report header, and the first
+// group record's type byte sits immediately after. The IPv4 length is taken from
+// igmpIPHeaderLen rather than written out, so adding an IPv4 option shifts this
+// offset with it.
 func (fr *fakeRelay) WaitForLeaveRecord(timeout time.Duration) (byte, error) {
-	const recordTypeOffset = 12 + 28
+	const igmpv3ReportHeaderLen = 8
+	const recordTypeOffset = 12 + igmpIPHeaderLen + igmpv3ReportHeaderLen
 
 	deadline := time.After(timeout)
 	for {

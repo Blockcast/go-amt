@@ -231,7 +231,7 @@ func (p *PureGoProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []n
 	}
 
 	// Encapsulate in IP header
-	ipHeader := p.buildIPHeader(igmpData)
+	ipHeader := buildIGMPIPHeader(igmpData)
 	return append(ipHeader, igmpData...), nil
 }
 
@@ -292,29 +292,31 @@ func buildIGMPSourceLeaveReport(source, group netip.Addr, state AMTState) ([]byt
 	return append(buildIGMPIPHeader(igmpData), igmpData...), nil
 }
 
+// igmpRouterAlert is the IPv4 Router Alert option (RFC 2113): option type 0x94,
+// length 4, value 0. RFC 3376 requires it on every IGMPv3 message, and relays
+// that enforce it drop reports that omit it. Being 4 bytes long, it also keeps
+// the header 4-byte aligned with no separate padding.
+var igmpRouterAlert = [4]byte{0x94, 0x04, 0x00, 0x00}
+
+// igmpIPHeaderLen is the fixed 20-byte IPv4 header plus the Router Alert option.
+const igmpIPHeaderLen = 20 + len(igmpRouterAlert)
+
+// buildIGMPIPHeader builds the IPv4 header that carries an IGMPv3 message.
+//
+// Every IGMPv3 report this package emits is encapsulated here -- joins and
+// leaves, pure-Go and CGO alike -- so the Router Alert option cannot be present
+// on one path and missing on another. It briefly was: the join path and the
+// leave path each had their own copy of this function, and only the join copy
+// was given the option. Keep it that way; add report types, not headers.
+//
+// The header length, the IHL nibble, and the total-length field are all derived
+// from igmpIPHeaderLen so they cannot disagree with each other or with the
+// allocation.
 func buildIGMPIPHeader(payload []byte) []byte {
-	// Keep leave reports identical to the pure-Go protocol's normal IGMP envelope.
-	totalLen := 20 + len(payload)
-	header := make([]byte, 20)
-	header[0] = 0x45
-	header[1] = 0xc0
-	binary.BigEndian.PutUint16(header[2:4], uint16(totalLen))
-	header[8] = 1
-	header[9] = 2
-	copy(header[12:16], net.IPv4zero.To4())
-	copy(header[16:20], net.ParseIP("224.0.0.22").To4())
-	binary.BigEndian.PutUint16(header[10:12], (&PureGoProtocol{}).calculateIPChecksum(header))
-	return header
-}
-
-// buildIPHeader creates an IPv4 header for IGMP
-func (p *PureGoProtocol) buildIPHeader(payload []byte) []byte {
-	totalLen := 20 + len(payload) // IP header + payload
-
-	header := make([]byte, 20)
-	header[0] = 0x45 // Version (4) + IHL (5)
-	header[1] = 0xc0 // DSCP + ECN (0xc0 for IGMP)
-	binary.BigEndian.PutUint16(header[2:4], uint16(totalLen))
+	header := make([]byte, igmpIPHeaderLen)
+	header[0] = 0x40 | byte(igmpIPHeaderLen/4) // Version (4) + IHL (6)
+	header[1] = 0xc0                           // DSCP + ECN (0xc0 for IGMP)
+	binary.BigEndian.PutUint16(header[2:4], uint16(igmpIPHeaderLen+len(payload)))
 	binary.BigEndian.PutUint16(header[4:6], 0)   // Identification
 	binary.BigEndian.PutUint16(header[6:8], 0)   // Flags + Fragment Offset
 	header[8] = 1                                // TTL = 1 for IGMP
@@ -327,14 +329,17 @@ func (p *PureGoProtocol) buildIPHeader(payload []byte) []byte {
 	// Destination: 224.0.0.22 (IGMP report address)
 	copy(header[16:20], net.ParseIP("224.0.0.22").To4())
 
-	// Calculate IP header checksum
-	checksum := p.calculateIPChecksum(header)
-	binary.BigEndian.PutUint16(header[10:12], checksum)
+	copy(header[20:], igmpRouterAlert[:])
+
+	// Checksum covers the whole header, options included, and so must be
+	// computed after the option is in place.
+	binary.BigEndian.PutUint16(header[10:12], ipChecksum(header))
 
 	return header
 }
 
-func (p *PureGoProtocol) calculateIPChecksum(header []byte) uint16 {
+// ipChecksum is the standard RFC 1071 one's-complement checksum over header.
+func ipChecksum(header []byte) uint16 {
 	var sum uint32
 	for i := 0; i < len(header)-1; i += 2 {
 		sum += uint32(binary.BigEndian.Uint16(header[i:]))
@@ -346,6 +351,10 @@ func (p *PureGoProtocol) calculateIPChecksum(header []byte) uint16 {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
 	return ^uint16(sum)
+}
+
+func (p *PureGoProtocol) calculateIPChecksum(header []byte) uint16 {
+	return ipChecksum(header)
 }
 
 func (p *PureGoProtocol) CreateMembershipUpdate(igmpReport []byte) ([]byte, error) {

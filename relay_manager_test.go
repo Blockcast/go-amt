@@ -187,20 +187,23 @@ func TestPureGoProtocolCreatesLeaveCompatibleIGMPv3Report(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report) != 36 {
-		t.Fatalf("leave report length = %d, want 36", len(report))
+	// Offsets are relative to the end of the IPv4 header, which carries the
+	// Router Alert option and so is igmpIPHeaderLen rather than a bare 20.
+	const igmp = igmpIPHeaderLen
+	if len(report) != igmp+16 {
+		t.Fatalf("leave report length = %d, want %d", len(report), igmp+16)
 	}
-	if report[20] != m.IGMPv3TypeMembershipReport {
-		t.Fatalf("IGMP type = %#x, want %#x", report[20], m.IGMPv3TypeMembershipReport)
+	if report[igmp] != m.IGMPv3TypeMembershipReport {
+		t.Fatalf("IGMP type = %#x, want %#x", report[igmp], m.IGMPv3TypeMembershipReport)
 	}
-	if report[27] != 1 {
-		t.Fatalf("group record count = %d, want 1", report[27])
+	if report[igmp+7] != 1 {
+		t.Fatalf("group record count = %d, want 1", report[igmp+7])
 	}
-	if report[28] != m.IGMPv3ChangeToIncludeMode {
-		t.Fatalf("record type = %d, want change-to-include", report[28])
+	if report[igmp+8] != m.IGMPv3ChangeToIncludeMode {
+		t.Fatalf("record type = %d, want change-to-include", report[igmp+8])
 	}
-	if report[30] != 0 || report[31] != 0 {
-		t.Fatalf("leave record has sources: count bytes %#x %#x", report[30], report[31])
+	if report[igmp+10] != 0 || report[igmp+11] != 0 {
+		t.Fatalf("leave record has sources: count bytes %#x %#x", report[igmp+10], report[igmp+11])
 	}
 }
 
@@ -217,17 +220,18 @@ func TestPureGoProtocolCreatesSourceSpecificLeaveReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report) != 40 {
-		t.Fatalf("source-specific leave report length = %d, want 40", len(report))
+	const igmp = igmpIPHeaderLen
+	if len(report) != igmp+20 {
+		t.Fatalf("source-specific leave report length = %d, want %d", len(report), igmp+20)
 	}
-	if report[28] != m.IGMPv3BlockOldSources {
-		t.Fatalf("record type = %d, want block-old-sources", report[28])
+	if report[igmp+8] != m.IGMPv3BlockOldSources {
+		t.Fatalf("record type = %d, want block-old-sources", report[igmp+8])
 	}
-	if report[30] != 0 || report[31] != 1 {
-		t.Fatalf("source count bytes = %#x %#x, want 0x00 0x01", report[30], report[31])
+	if report[igmp+10] != 0 || report[igmp+11] != 1 {
+		t.Fatalf("source count bytes = %#x %#x, want 0x00 0x01", report[igmp+10], report[igmp+11])
 	}
-	if !bytes.Equal(report[36:40], net.IPv4(192, 0, 2, 1).To4()) {
-		t.Fatalf("source = %v, want 192.0.2.1", net.IP(report[36:40]))
+	if !bytes.Equal(report[igmp+16:igmp+20], net.IPv4(192, 0, 2, 1).To4()) {
+		t.Fatalf("source = %v, want 192.0.2.1", net.IP(report[igmp+16:igmp+20]))
 	}
 }
 
