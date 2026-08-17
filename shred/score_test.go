@@ -3,6 +3,7 @@ package shred
 import (
 	"encoding/binary"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -148,6 +149,114 @@ func TestFeedScorerDeduplicatesUnionFirstArrival(t *testing.T) {
 	}
 	if got := scorer.Receipt(); got.Feeds[0].Receipt.SetsTotal != 1 || got.Feeds[1].Receipt.SetsTotal != 1 || got.Union.SetsTotal != 1 {
 		t.Fatalf("feed universe mismatch: %+v", got)
+	}
+}
+
+// First-arrival credit must follow the arrival timestamp, not the order the
+// feeds happened to reach the scorer. The two feed goroutines capture receivedAt
+// at their own socket read and then race through health, metrics and fan-out
+// before scoring, so the later-timestamped copy can easily be observed first.
+// Deciding unique_shreds_first on processing order makes the "is the second feed
+// earning its keep" numbers a report on the Go scheduler.
+//
+// Both interleavings of the same two arrivals must therefore produce byte-equal
+// receipts, with the credit on the earlier one either way.
+func TestFeedScorerCreditsFirstArrivalByTimestampNotProcessingOrder(t *testing.T) {
+	packet := dataPacket(31, 0, 0)
+	early, late := time.Unix(4, 0), time.Unix(5, 0)
+
+	receiptFor := func(t *testing.T, firstObserved string) UnionReceipt {
+		t.Helper()
+		scorer := NewFeedScorerWithFormat(FormatAgave, []string{"early", "late"})
+		at := map[string]time.Time{"early": early, "late": late}
+		order := []string{"early", "late"}
+		if firstObserved == "late" {
+			order = []string{"late", "early"}
+		}
+		for _, feed := range order {
+			if _, err := scorer.Observe(feed, packet, at[feed]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return scorer.Receipt()
+	}
+
+	inOrder := receiptFor(t, "early")
+	reversed := receiptFor(t, "late")
+
+	for _, test := range []struct {
+		name    string
+		receipt UnionReceipt
+	}{{"early observed first", inOrder}, {"late observed first", reversed}} {
+		feeds := map[string]FeedReceipt{}
+		for _, feed := range test.receipt.Feeds {
+			feeds[feed.Name] = feed
+		}
+		if feeds["early"].UniqueFirst != 1 || feeds["late"].UniqueFirst != 0 {
+			t.Errorf("%s: credit = early %d, late %d, want 1 and 0",
+				test.name, feeds["early"].UniqueFirst, feeds["late"].UniqueFirst)
+		}
+		if feeds["early"].FirstArrivalFraction != 1 || feeds["late"].FirstArrivalFraction != 0 {
+			t.Errorf("%s: fraction = early %.6f, late %.6f, want 1 and 0",
+				test.name, feeds["early"].FirstArrivalFraction, feeds["late"].FirstArrivalFraction)
+		}
+	}
+	if inOrder.String() != reversed.String() {
+		t.Fatalf("receipt depends on processing order:\n in-order: %s\nreversed: %s", inOrder.String(), reversed.String())
+	}
+}
+
+// The same shred delivered down two feeds at once is the contended case that
+// decides attribution, and nothing covered it: the receiver's concurrency test
+// gives every feed a disjoint FEC set by design, so its feeds never compete for
+// credit on one shred.
+//
+// Every shred here arrives on "early" strictly before "late", so a
+// timestamp-decided attribution has exactly one answer no matter how the
+// goroutines interleave. Run under -race in CI (the race job), this pins both
+// halves: no data race, and no scheduling-dependent result.
+func TestFeedScorerAttributionIsStableUnderConcurrentDuplicateDelivery(t *testing.T) {
+	const shreds = 64
+	scorer := NewFeedScorer([]string{"early", "late"})
+	base := time.Unix(200, 0)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for _, feed := range []string{"early", "late"} {
+		wg.Add(1)
+		go func(feed string) {
+			defer wg.Done()
+			offset := time.Duration(0)
+			if feed == "late" {
+				offset = time.Millisecond
+			}
+			<-start
+			for i := 0; i < shreds; i++ {
+				at := base.Add(time.Duration(i)*10*time.Millisecond + offset)
+				// Two full FEC sets: a data shred's local index only spans the
+				// 32 data shreds of its own set.
+				fecSet, index := uint32(i/32)*64, uint32(i%32)
+				if _, err := scorer.Observe(feed, forwarderPacket(3, 300, fecSet, index, false, 0), at); err != nil {
+					t.Errorf("observe on %s: %v", feed, err)
+					return
+				}
+			}
+		}(feed)
+	}
+	close(start)
+	wg.Wait()
+
+	got := scorer.Receipt()
+	if got.UniqueShreds != shreds {
+		t.Fatalf("unique shreds = %d, want %d", got.UniqueShreds, shreds)
+	}
+	if got.Feeds[0].UniqueFirst != shreds || got.Feeds[1].UniqueFirst != 0 {
+		t.Fatalf("credit = early %d, late %d, want %d and 0 — attribution followed processing order, not arrival time",
+			got.Feeds[0].UniqueFirst, got.Feeds[1].UniqueFirst, shreds)
+	}
+	// Re-attribution moves credit between feeds; it must never mint or lose it.
+	if total := got.Feeds[0].UniqueFirst + got.Feeds[1].UniqueFirst; total != got.UniqueShreds {
+		t.Fatalf("first arrivals sum to %d, want %d unique shreds", total, got.UniqueShreds)
 	}
 }
 

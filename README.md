@@ -98,6 +98,17 @@ them. Completion latency is unaffected: it measures each FEC set's true arrival
 extent (newest minus oldest), not the timestamp of whichever shred happened to
 be processed 32nd.
 
+`unique_first` and `first_arrival_fraction` are decided by the same arrival
+timestamps, not by which feed's goroutine reached the scorer first. When a shred
+already counted for one feed shows up on another with an earlier timestamp, the
+credit moves to the earlier arrival. The recorded first arrival is therefore the
+running minimum over every copy seen, and the totals are a function of the
+arrivals alone: replaying one capture always yields the same split, and so does
+any interleaving of it. Copies arriving within the same clock tick keep the
+credit on whichever was processed first — with a coarse clock that tie-break,
+not the concurrency, is the remaining ambiguity. Re-attribution only moves
+credit between feeds, so `unique_first` still sums to `unique_shreds_total`.
+
 Shreds are deduplicated on `(slot, fec_set_index, local_index)` — never on
 `(slot, shred_index)` alone, which collapses distinct shreds because the in-set
 index repeats across the FEC sets of a slot (the 31x distinct-shred undercount

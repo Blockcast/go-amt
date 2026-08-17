@@ -64,8 +64,13 @@ type setScore struct {
 // Scorer applies first-arrival-wins deduplication across feeds and scores each
 // consensus 32+32 FEC set when its 32nd distinct shred arrives.
 type Scorer struct {
-	format      Format
-	dedup       map[dedupKey]struct{}
+	format Format
+	// dedup maps each distinct shred to the earliest arrival timestamp seen for
+	// it, not merely to its presence. Keeping the running minimum is what lets a
+	// duplicate that is older than the incumbent be recognised as the true first
+	// arrival, which is how FeedScorer attributes first-arrival credit by
+	// timestamp instead of by whichever goroutine reached the lock first.
+	dedup       map[dedupKey]time.Time
 	sets        map[SetKey]*setScore
 	lastArrival time.Time
 	gaps        GapHistogram
@@ -75,6 +80,12 @@ type FeedReceipt struct {
 	Name string `json:"name"`
 	// UniqueFirst counts the union-unique shreds whose first arrival was on this
 	// feed. Summed across feeds it equals UnionReceipt.UniqueShreds.
+	//
+	// "First" is decided by arrival timestamp, not by which feed's goroutine
+	// reached the scorer first, so the value is a function of the arrivals alone
+	// and is reproducible from a capture. Shreds arriving on two feeds within the
+	// same clock tick are credited to whichever was processed first; on a coarse
+	// clock that tie-break, not the concurrency, is the residual ambiguity.
 	UniqueFirst          uint64  `json:"unique_shreds_first"`
 	FirstArrivalFraction float64 `json:"first_arrival_fraction"`
 	Receipt              Receipt `json:"receipt"`
@@ -122,6 +133,14 @@ type FeedScorer struct {
 	feeds         map[string]*Scorer
 	union         *Scorer
 	firstArrivals map[string]uint64
+	// firstBy records which feed currently holds first-arrival credit for each
+	// union-unique shred, so that credit can be moved when a later-processed but
+	// earlier-timestamped copy of the same shred arrives on another feed.
+	//
+	// Nil when fewer than two feeds are configured: with one feed every
+	// union-unique shred is trivially its own first arrival, so there is nothing
+	// to re-attribute and no reason to carry a per-shred map to prove it.
+	firstBy map[dedupKey]string
 }
 
 // NewFeedScorer scores the shred-forwarder wire format on every feed.
@@ -134,14 +153,26 @@ func NewFeedScorerWithFormat(format Format, names []string) *FeedScorer {
 	for _, name := range names {
 		feeds[name] = NewScorerWithFormat(format)
 	}
-	return &FeedScorer{
+	scorer := &FeedScorer{
 		names:         append([]string(nil), names...),
 		feeds:         feeds,
 		union:         NewScorerWithFormat(format),
 		firstArrivals: make(map[string]uint64, len(names)),
 	}
+	if len(names) > 1 {
+		scorer.firstBy = make(map[dedupKey]string)
+	}
+	return scorer
 }
 
+// Observe scores packet against feed's own scorer and against the first-arrival
+// union, reporting whether this call was the union's first sighting of the shred.
+//
+// The reported bool is a processing-order fact and is deliberately left as one:
+// callers use it to decide whether they are the goroutine that must do
+// once-per-shred work, and exactly one caller must win that regardless of
+// timestamps. First-arrival *credit* is a different question and is not decided
+// by it — see the re-attribution below.
 func (s *FeedScorer) Observe(feed string, packet []byte, receivedAt time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -152,11 +183,39 @@ func (s *FeedScorer) Observe(feed string, packet []byte, receivedAt time.Time) (
 	if _, err := scorer.Observe(packet, receivedAt); err != nil {
 		return false, err
 	}
-	accepted, err := s.union.Observe(packet, receivedAt)
+	key, accepted, incumbent, err := s.union.observe(packet, receivedAt)
+	if err != nil {
+		return false, err
+	}
 	if accepted {
 		s.firstArrivals[feed]++
+		if s.firstBy != nil {
+			s.firstBy[key] = feed
+		}
+		return true, nil
 	}
-	return accepted, err
+	// A duplicate whose arrival timestamp precedes the incumbent's was in truth
+	// the first arrival; it only looks second because its feed's goroutine
+	// reached the lock later. receivedAt is captured at the socket read, ahead of
+	// health, metrics and fan-out work, so the interval between capture and this
+	// call is real and differs per feed. Without this, unique_shreds_first and
+	// first_arrival_fraction — the numbers a customer reads as "is the second
+	// feed earning its keep" — would be decided by scheduling.
+	//
+	// Moving the credit to the earlier arrival makes attribution a function of
+	// the timestamps alone: the incumbent is always the running minimum, so the
+	// outcome is the same for every interleaving of the same arrivals. Equal
+	// timestamps keep the incumbent, so a coarse clock degrades to first-processed
+	// rather than to flapping. The total is conserved — one feed's counter falls
+	// as another's rises — so UniqueFirst continues to partition UniqueShreds.
+	if s.firstBy != nil && receivedAt.Before(incumbent) {
+		if holder, held := s.firstBy[key]; held && holder != feed {
+			s.firstArrivals[holder]--
+			s.firstArrivals[feed]++
+			s.firstBy[key] = feed
+		}
+	}
+	return false, nil
 }
 
 func (s *FeedScorer) Receipt() UnionReceipt {
@@ -229,25 +288,40 @@ func NewScorer() *Scorer {
 func NewScorerWithFormat(format Format) *Scorer {
 	return &Scorer{
 		format: format,
-		dedup:  make(map[dedupKey]struct{}),
+		dedup:  make(map[dedupKey]time.Time),
 		sets:   make(map[SetKey]*setScore),
 	}
 }
 
 func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
+	_, accepted, _, err := s.observe(packet, receivedAt)
+	return accepted, err
+}
+
+// observe is Observe plus the deduplication detail a FeedScorer needs in order
+// to attribute first arrival: the shred's dedup key, and — when the shred is a
+// duplicate — the earliest arrival timestamp recorded for it so far.
+//
+// incumbent is only meaningful when accepted is false.
+func (s *Scorer) observe(packet []byte, receivedAt time.Time) (key dedupKey, accepted bool, incumbent time.Time, err error) {
 	header, err := Parse(packet, s.format)
 	if err != nil {
-		return false, err
+		return dedupKey{}, false, time.Time{}, err
 	}
-	key := dedupKey{
+	key = dedupKey{
 		slot:           header.Slot,
 		fecSetIndex:    header.FECSetIndex,
 		indexWithinSet: header.IndexWithinSet,
 	}
-	if _, exists := s.dedup[key]; exists {
-		return false, nil
+	if first, exists := s.dedup[key]; exists {
+		// Hold the running minimum so the recorded first arrival is the earliest
+		// one seen, not the earliest one that happened to be processed first.
+		if receivedAt.Before(first) {
+			s.dedup[key] = receivedAt
+		}
+		return key, false, first, nil
 	}
-	s.dedup[key] = struct{}{}
+	s.dedup[key] = receivedAt
 
 	// receivedAt is a true arrival timestamp, captured at the read before any
 	// per-packet work, so it is NOT guaranteed to be nondecreasing across calls:
@@ -276,7 +350,13 @@ func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
 	}
 	bit := uint64(1) << header.IndexWithinSet
 	if set.seen&bit != 0 {
-		return false, nil
+		// Unreachable while the dedup key and the set bitmap carry the same
+		// (slot, fec_set_index, index_within_set) identity — the dedup miss above
+		// implies a clear bit. Kept as a belt-and-braces guard so the bitmap can
+		// never double-count. There is no incumbent timestamp to report here: the
+		// zero value cannot precede any real arrival, so it withholds credit
+		// rather than mis-assigning it.
+		return key, false, time.Time{}, nil
 	}
 	set.seen |= bit
 	// Widen the extent to this arrival before testing completion, so first is a
@@ -295,7 +375,7 @@ func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
 		set.complete = true
 		set.completed = set.last.Sub(set.first)
 	}
-	return true, nil
+	return key, true, time.Time{}, nil
 }
 
 func (s *Scorer) Receipt() Receipt {
