@@ -68,9 +68,14 @@ func (spec GenericFixtureSpec) Build() []GenericRecord {
 	var sequence uint64
 	clock := start
 
-	emit := func(window uint64, index uint16) {
+	// emit takes the sequence explicitly rather than reading the counter it is
+	// closed over. Emission order and sequence assignment differ whenever a
+	// window reorders, and a closure that reads the live counter invites
+	// rewinding it around an out-of-order emit — which silently hands two
+	// records the same sequence.
+	emit := func(seq uint64, window uint64, index uint16) {
 		payload := AppendGenericHeader(nil, GenericHeader{
-			Sequence:      sequence,
+			Sequence:      seq,
 			Window:        window,
 			IndexInWindow: index,
 			WindowLength:  spec.WindowLength,
@@ -110,18 +115,22 @@ func (spec GenericFixtureSpec) Build() []GenericRecord {
 			}
 			if prior := index - 1; index > 0 {
 				if _, ok := swapped[prior]; ok {
+					// Reserve both sequence numbers up front, in index order,
+					// then emit in reversed order. Sequence assignment must stay
+					// monotonic in index — that is the framing contract the
+					// receipt rests on — while the *emission* order is what
+					// makes the record detectably out-of-order. Both slots are
+					// consumed whether or not either record is dropped, so a
+					// drop inside a swapped pair leaves a detectable hole
+					// exactly as it does on the normal path below.
+					priorSeq := sequence + 1
+					indexSeq := priorSeq + 1
+					sequence = indexSeq
 					if _, gone := dropped[index]; !gone {
-						sequence++
-						emit(window, index)
+						emit(indexSeq, window, index)
 					}
 					if _, gone := dropped[prior]; !gone {
-						// The reordered record keeps its original, lower
-						// sequence number — that is what makes it detectable as
-						// out-of-order rather than as a fresh record.
-						saved := sequence
-						sequence--
-						emit(window, prior)
-						sequence = saved
+						emit(priorSeq, window, prior)
 					}
 					continue
 				}
@@ -131,9 +140,11 @@ func (spec GenericFixtureSpec) Build() []GenericRecord {
 				continue
 			}
 			sequence++
-			emit(window, index)
+			emit(sequence, window, index)
 			if _, dup := duplicated[index]; dup {
-				emit(window, index)
+				// A redelivery carries the same sequence: it is the same
+				// record arriving twice, not a new one.
+				emit(sequence, window, index)
 			}
 		}
 	}

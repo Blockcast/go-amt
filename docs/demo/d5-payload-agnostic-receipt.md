@@ -61,6 +61,16 @@ given (`send_errors=0`, `packets_in == packets_out`), and the scoring is
 therefore transport-independent. The timing lines differ between the two runs,
 and should: those are real wire arrivals rather than fixture timestamps.
 
+> **Note on the `gap_ms` line above.** This receipt was captured before the
+> duplicate-gap correction: at the time, a duplicate arrival did not advance the
+> scorer's last-arrival mark, so the next distinct record's gap spanned two
+> intervals. The histogram therefore accounts for 185 gaps across 188 arrivals
+> rather than 187, with two entries pushed one bucket high. The correction
+> touches only the arrival-gap distribution — every loss and completeness figure
+> quoted above is unaffected, which is why they still match the fixture replay
+> exactly. The line is left as captured rather than rewritten, because it is a
+> record of an observed run and not a claim about current output.
+
 ## The input is synthetic, and says so
 
 The feed is generated, not captured. It contains no third-party content.

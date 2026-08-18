@@ -3,6 +3,7 @@ package shred
 import (
 	"bytes"
 	"errors"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -279,7 +280,7 @@ func TestGenericFixtureReceiptIsDeterministic(t *testing.T) {
 window_fill p50=27.9ms p95=29.7ms p99=29.7ms
 completeness windows=6 complete=4 expected=192 received=186 fraction=0.968750
 loss interior=3 trailing=3 duplicates=2 out_of_order=2
-gap_ms <1=183 1-2.4=2 2.4-7=0 7-32=0 >=32=0`
+gap_ms <1=187 1-2.4=0 2.4-7=0 7-32=0 >=32=0`
 
 	for attempt := 0; attempt < 3; attempt++ {
 		scorer := NewGenericScorer(GenericSyntheticSource, GenericSyntheticRightsBasis)
@@ -317,6 +318,67 @@ func TestGenericFixtureExercisesEveryAnomaly(t *testing.T) {
 	if receipt.WindowsComplete == 0 || receipt.WindowsComplete == receipt.Windows {
 		t.Errorf("windows complete = %d of %d: the fixture must show both clean and lossy windows",
 			receipt.WindowsComplete, receipt.Windows)
+	}
+}
+
+// The fixture is the reference feed shipped to demonstrate the framing
+// contract, so it is the one artifact that must not violate it. A reordered
+// pair is *delivered* out of order but must still carry distinct sequence
+// numbers that increase with index — an earlier revision rewound the counter
+// after emitting the pair, handing two records the same sequence. The receipt
+// survived that only because Observe compares with a strict `<`, i.e. it was
+// right by luck rather than by construction, which is exactly the kind of thing
+// a demo artifact must not rely on.
+func TestGenericFixtureSequencesAreDistinctAndIndexMonotonic(t *testing.T) {
+	type slot struct {
+		window uint64
+		index  uint16
+	}
+	seqOf := make(map[slot]uint64)
+	owner := make(map[uint64]slot)
+
+	for i, record := range DefaultGenericFixtureSpec().Build() {
+		header, err := ParseGeneric(record.Payload)
+		if err != nil {
+			t.Fatalf("record %d: parse: %v", i, err)
+		}
+		key := slot{header.Window, header.IndexInWindow}
+		if first, seen := seqOf[key]; seen {
+			// A redelivery is the same record arriving twice, so it must reuse
+			// its original sequence rather than consume a fresh one.
+			if first != header.Sequence {
+				t.Errorf("w%d/i%d redelivered as seq=%d, first copy carried seq=%d",
+					key.window, key.index, header.Sequence, first)
+			}
+			continue
+		}
+		if other, taken := owner[header.Sequence]; taken {
+			t.Errorf("seq=%d carried by both w%d/i%d and w%d/i%d",
+				header.Sequence, other.window, other.index, key.window, key.index)
+		}
+		seqOf[key] = header.Sequence
+		owner[header.Sequence] = key
+	}
+
+	// Sequence must increase with (window, index) even where arrival order does
+	// not: that ordering is what lets a late record be detected as out-of-order
+	// rather than counted as a fresh one.
+	slots := make([]slot, 0, len(seqOf))
+	for key := range seqOf {
+		slots = append(slots, key)
+	}
+	sort.Slice(slots, func(i, j int) bool {
+		if slots[i].window != slots[j].window {
+			return slots[i].window < slots[j].window
+		}
+		return slots[i].index < slots[j].index
+	})
+	for i := 1; i < len(slots); i++ {
+		if seqOf[slots[i]] <= seqOf[slots[i-1]] {
+			t.Fatalf("sequence not monotonic in index: w%d/i%d seq=%d follows w%d/i%d seq=%d",
+				slots[i].window, slots[i].index, seqOf[slots[i]],
+				slots[i-1].window, slots[i-1].index, seqOf[slots[i-1]])
+		}
 	}
 }
 

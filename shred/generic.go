@@ -175,6 +175,18 @@ func (s *GenericScorer) Observe(record []byte, receivedAt time.Time) (bool, erro
 		return false, fmt.Errorf("%w: window %d declared length %d then %d", ErrNotGenericFrame, header.Window, window.length, header.WindowLength)
 	}
 
+	// Inter-arrival gaps are a delivery observation, not a completeness one, so
+	// they are recorded before the duplicate check below: a redelivered record
+	// did arrive on the wire, and it both closes the preceding gap and opens the
+	// next one. Excluding it would make the following record's gap span two
+	// intervals and systematically inflate the upper buckets under multi-path
+	// delivery, where duplication is routine rather than exceptional. Only the
+	// first record of a run contributes no gap, having nothing to measure from.
+	if !s.lastArrival.IsZero() {
+		s.gaps.observe(receivedAt.Sub(s.lastArrival))
+	}
+	s.lastArrival = receivedAt
+
 	if _, duplicate := window.seen[header.IndexInWindow]; duplicate {
 		s.duplicates++
 		return false, nil
@@ -190,13 +202,6 @@ func (s *GenericScorer) Observe(record []byte, receivedAt time.Time) (bool, erro
 		s.highestSeq = header.Sequence
 		s.haveSeq = true
 	}
-
-	// Inter-arrival gaps are only defined between two records this scorer
-	// actually saw, so the first record of a run contributes no gap.
-	if !s.lastArrival.IsZero() {
-		s.gaps.observe(receivedAt.Sub(s.lastArrival))
-	}
-	s.lastArrival = receivedAt
 
 	window.seen[header.IndexInWindow] = struct{}{}
 	if header.IndexInWindow > window.maxIndex {
