@@ -10,8 +10,20 @@
 #
 # Usage: packaging/smoke-test.sh [path-to-binary]
 #
-# Requires: bash, curl. python3 is optional and enables the byte-identity
-# check; without it that one step is skipped rather than silently passing.
+# Requires: bash, curl, and a way to bind a local UDP sink (python3 or nc).
+#
+# The sink is mandatory, not optional. Byte-identity is the only assertion in
+# this script that proves a forwarded packet reached a destination at all: the
+# fan-out socket is unconnected (receiver/fanout.go: net.ListenUDP + WriteTo), so
+# a send to a closed local port succeeds and never surfaces ICMP
+# port-unreachable. With no sink bound, egress_packets_total still reads 1 and
+# fanout_write_errors_total still reads 0 — the counter checks cannot substitute
+# for the sink, and every other step is indifferent to fan-out. Skipping it would
+# leave a run that exits 0 having proven nothing about delivery.
+#
+# Set SMOKE_ALLOW_NO_SINK=1 to run the remaining steps without a sink. That is an
+# explicit, loudly-reported downgrade for a host with neither interpreter — never
+# the default.
 
 set -euo pipefail
 
@@ -23,6 +35,7 @@ HTTP_PORT="${SMOKE_HTTP_PORT:-21080}"
 WORKDIR="$(mktemp -d)"
 GW_PID=""
 SINK_PID=""
+SINK_KIND=""
 FAILURES=0
 
 cleanup() {
@@ -78,18 +91,86 @@ esac
 # 2. Start the receiver with a fan-out destination pointed at a local sink.
 # ---------------------------------------------------------------------------
 echo "[2/5] receiver starts and serves /healthz + /metrics"
+
+# Bind the sink BEFORE the receiver, and wait for the bind to be observable
+# rather than sleeping: a listener that binds after the datagram is sent loses it
+# and fails the byte-identity check for a reason that has nothing to do with the
+# binary under test.
+sink_is_bound() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -lun 2>/dev/null | grep -q ":$SINK_PORT\b"
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -lun 2>/dev/null | grep -q ":$SINK_PORT\b"
+  else
+    # No way to observe the bind; fall back to the readiness marker the python
+    # sink writes for itself, and to a bounded settle for nc.
+    [ -f "$WORKDIR/sink.ready" ]
+  fi
+}
+
+wait_for_sink() {
+  # Bounded wait for the sink to be observably bound.
+  local _
+  for _ in $(seq 1 40); do
+    sink_is_bound && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# Try each sink implementation and confirm it actually bound before accepting it.
+# Falling through on failure rather than dying keeps this robust across netcat
+# variants, whose -u -l argument forms differ, while still failing closed if no
+# candidate works.
 if command -v python3 >/dev/null 2>&1; then
   python3 -c "
 import socket
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.bind(('127.0.0.1', $SINK_PORT))
+open('$WORKDIR/sink.ready', 'w').close()
 with open('$WORKDIR/sink.bin', 'wb') as f:
     while True:
         data, _ = s.recvfrom(65535)
         f.write(data); f.flush()
 " &
   SINK_PID=$!
-  sleep 0.5
+  if wait_for_sink; then
+    SINK_KIND="python3"
+  else
+    kill -KILL "$SINK_PID" 2>/dev/null || true
+    SINK_PID=""
+  fi
+fi
+
+if [ -z "$SINK_KIND" ] && command -v nc >/dev/null 2>&1; then
+  nc -u -l 127.0.0.1 "$SINK_PORT" > "$WORKDIR/sink.bin" 2>/dev/null &
+  SINK_PID=$!
+  if wait_for_sink; then
+    SINK_KIND="nc"
+  else
+    kill -KILL "$SINK_PID" 2>/dev/null || true
+    SINK_PID=""
+  fi
+fi
+
+if [ -n "$SINK_KIND" ]; then
+  pass "fan-out sink bound on 127.0.0.1:$SINK_PORT ($SINK_KIND)"
+elif [ "${SMOKE_ALLOW_NO_SINK:-0}" = "1" ]; then
+  SINK_KIND="none"
+  printf '  WARN  no UDP sink could be bound (tried python3, nc).\n'
+  printf '  WARN  SMOKE_ALLOW_NO_SINK=1 is set, so continuing WITHOUT the only\n'
+  printf '  WARN  assertion that proves fan-out delivers. Counters cannot cover\n'
+  printf '  WARN  it: the fan-out socket is unconnected, so a send to a closed\n'
+  printf '  WARN  port succeeds. This run does not verify delivery.\n'
+else
+  echo "smoke: could not bind a fan-out sink on 127.0.0.1:$SINK_PORT." >&2
+  echo "smoke: tried python3 and nc; neither is present or neither bound." >&2
+  echo "smoke: byte-identity is the only proof that fan-out delivers; the" >&2
+  echo "smoke: counters pass with nothing listening, so skipping it silently" >&2
+  echo "smoke: would make this script exit 0 having proven no delivery." >&2
+  echo "smoke: install python3, or set SMOKE_ALLOW_NO_SINK=1 to accept an" >&2
+  echo "smoke: explicitly unverified run." >&2
+  exit 2
 fi
 
 "$BINARY" \
@@ -123,7 +204,15 @@ check_eq "/healthz before traffic" "503" \
 # ---------------------------------------------------------------------------
 echo "[4/5] one malformed datagram: delivered, forwarded, counted as unparsed"
 printf 'not-a-valid-shred-header' > "/dev/udp/127.0.0.1/$FEED_PORT"
-sleep 0.8
+
+# /dev/udp is fire-and-forget, so poll for the counter to move rather than
+# sleeping a fixed interval and hoping. Still fails closed: if the packet never
+# lands, the loop times out and the check_eq below reports the real value.
+for _ in $(seq 1 50); do
+  curl -fsS "http://127.0.0.1:$HTTP_PORT/metrics" > "$WORKDIR/metrics.txt" 2>/dev/null || true
+  [ "$(metric 'bcast_shred_gw_ingress_packets_total{feed="default"}')" = "1" ] && break
+  sleep 0.1
+done
 curl -fsS "http://127.0.0.1:$HTTP_PORT/metrics" > "$WORKDIR/metrics.txt"
 
 check_eq "ingress_packets_total"  "1" "$(metric 'bcast_shred_gw_ingress_packets_total{feed="default"}')"
@@ -134,14 +223,22 @@ check_eq "fanout_write_errors"    "0" "$(metric 'bcast_shred_gw_fanout_write_err
 check_eq "/healthz after traffic" "200" \
   "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$HTTP_PORT/healthz")"
 
-if [ -n "$SINK_PID" ]; then
+if [ "$SINK_KIND" = "none" ]; then
+  # Reached only under an explicit SMOKE_ALLOW_NO_SINK=1. Reported as a failure-
+  # shaped line rather than a quiet "skip" so it cannot be read as a pass.
+  printf '  UNVERIFIED  fan-out byte-identity: no sink was bound (SMOKE_ALLOW_NO_SINK=1).\n'
+  printf '  UNVERIFIED  delivery is NOT proven by this run.\n'
+else
+  # The sink flushes per datagram, but the write races this read; poll briefly.
+  for _ in $(seq 1 30); do
+    [ -s "$WORKDIR/sink.bin" ] && break
+    sleep 0.1
+  done
   if [ "$(cat "$WORKDIR/sink.bin" 2>/dev/null)" = "not-a-valid-shred-header" ]; then
     pass "fan-out is byte-identical to ingress"
   else
-    fail "fan-out payload differs from ingress"
+    fail "fan-out payload differs from ingress (sink got: '$(cat "$WORKDIR/sink.bin" 2>/dev/null)')"
   fi
-else
-  echo "  skip  fan-out byte-identity (python3 not available)"
 fi
 
 # NOTE: the erasure, shreds_per_second and gap_events series are deliberately

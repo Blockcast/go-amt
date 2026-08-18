@@ -20,7 +20,28 @@ unchanged; scoring failures cannot drop or delay a packet.
 
 ## Install
 
-### Binary
+> ⚠ **No release artifacts are published yet.** The repository has tags but zero
+> GitHub releases, and no image is pushed to a registry — CI builds both on every
+> commit (`goreleaser build --snapshot`, `docker build --push=false`) but nothing
+> publishes them. **The tarball and Docker commands below will 404 today.** Until
+> [BLO-28464](https://paperclip.blockcast.net/BLO/issues/BLO-28464) adds the
+> tag-triggered release job and the image push, use *Build from source* below.
+> Both sections are written and verified against the artifacts CI already
+> produces, so they become correct the moment publishing lands.
+
+### Build from source (works today)
+
+```sh
+git clone https://github.com/Blockcast/go-amt
+cd go-amt
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o blockcast-shreds ./cmd/blockcast-shreds
+sudo install -m 0755 blockcast-shreds /usr/local/bin/blockcast-shreds
+```
+
+`CGO_ENABLED=0` is what makes the result dependency-free; CI asserts the release
+binary is statically linked so this cannot regress silently.
+
+### Binary (pending BLO-28464)
 
 ```sh
 VERSION=<release>
@@ -30,6 +51,12 @@ sha256sum --check --ignore-missing checksums.txt
 tar -xzf "blockcast-shreds_${VERSION}_linux_amd64.tar.gz"
 sudo install -m 0755 blockcast-shreds /usr/local/bin/blockcast-shreds
 ```
+
+`checksums.txt` travels over the same channel as the artifact it validates, so it
+gives integrity against corruption but **not** authenticity: anyone who can serve
+a bad tarball can serve a matching checksum file. Artifact signing is tracked on
+[BLO-28464](https://paperclip.blockcast.net/BLO/issues/BLO-28464) and should land
+with the release job rather than after it.
 
 ### systemd
 
@@ -53,14 +80,37 @@ systemctl is-active blockcast-shreds
 curl -fsS http://127.0.0.1:8080/healthz
 ```
 
-### Docker
+**Requires systemd ≥ 247.** The hardening set uses `ProtectProc=` (247),
+`ProtectClock=` (245), `ProtectKernelLogs=` (244) and `Type=exec` (240). On older
+systemd — Ubuntu 20.04 ships 245, RHEL 8 ships 239 — an unknown directive is
+logged as `Unknown lvalue` and *ignored*: the service still starts, but with
+weaker isolation than this document describes, and `Type=exec` silently degrades
+to `simple` so a failed exec is no longer reported at start. Check before you
+rely on the hardening:
 
 ```sh
+systemctl --version | head -1
+journalctl -u blockcast-shreds | grep -i 'unknown lvalue'
+```
+
+`EnvironmentFile=` intentionally has no `-` prefix: a missing
+`/etc/blockcast/shreds.env` fails the unit loudly rather than starting the
+receiver with default arguments that silently forward nowhere.
+
+### Docker (pending BLO-28464)
+
+No image is published yet — `.goreleaser.yaml` has no `dockers:` block and CI
+builds with `push: false`. Build it locally in the meantime:
+
+```sh
+docker build -t blockcast-shreds:local .
 docker run --rm \
   -p 20000:20000/udp -p 8080:8080 \
-  ghcr.io/blockcast/blockcast-shreds:<tag> \
+  blockcast-shreds:local \
   --listen 0.0.0.0:20000 --dest-ip-ports 10.0.0.5:8001 --http-addr 0.0.0.0:8080
 ```
+
+Once publishing lands the image will be `ghcr.io/blockcast/blockcast-shreds:<tag>`.
 
 Fan-out targets must be reachable from inside the container: `127.0.0.1` refers
 to the container, not the host.
@@ -76,6 +126,14 @@ This exercises the shipped binary end to end — the documented scoring numbers,
 byte-identical fan-out, and graceful `SIGTERM` shutdown. It is the same check CI
 runs on every commit.
 
+**Needs `python3` or `nc`** to bind a local UDP sink. That sink is not optional
+padding: byte-identity is the only assertion here that proves a forwarded packet
+actually arrived. The fan-out socket is unconnected, so a send to a closed port
+succeeds — `egress_packets_total` and `fanout_write_errors_total` both look
+healthy with nothing listening. Without a sink the script exits 2 rather than
+passing. If you must run on a host with neither, `SMOKE_ALLOW_NO_SINK=1` runs the
+remaining checks and reports the delivery assertion as `UNVERIFIED`.
+
 ## Configuration
 
 | Flag | Default | Meaning |
@@ -84,21 +142,51 @@ runs on every commit.
 | `--feed NAME=IP:PORT` | — | Repeatable. Enables multi-feed first-arrival-wins scoring. Replaces `--listen` when given. |
 | `--dest-ip-ports` | *(none)* | Comma-separated validator TVU targets. Empty means score-only, no forwarding. |
 | `--http-addr` | `127.0.0.1:8080` | `/metrics` and `/healthz`. Empty disables HTTP. |
-| `--health-max-age` | `30s` | Ingress freshness window for `/healthz`. |
-| `--retain` | `2s` | How far behind the newest arrival per-shred scoring state is kept. |
 | `--json` | off | Emit the shutdown receipt as JSON instead of a table. |
 
-### `--retain` bounds memory, and also bounds duplicate detection
+These are all of them. The binary parses flags with `flag.ContinueOnError`, so any
+flag not in this table is a parse error that exits non-zero — under the systemd
+unit's `Restart=on-failure` that is a restart loop, so do not put a flag in
+`BLOCKCAST_SHREDS_ARGS` that is not listed above. `TestHelpDocumentsEveryFlag`
+fails the build if this table and the registered flag set drift apart.
 
-State is held for `--retain` past each arrival, so the receiver reaches a steady
-size instead of growing for as long as it runs. Two seconds is roughly five
-Solana slots.
+### Fixed for v1
 
-The trade-off is real: `--retain` is also how long a second copy of a shred is
-still recognised as a duplicate. If you run two feeds whose skew exceeds it, the
-later copy is counted as a new shred and the union score is overstated. Raise it
-if your feeds are further apart than a second; do not lower it below your worst
-inter-feed skew.
+Two behaviours an operator might expect to tune are compiled in for v1, like the
+gap-bucket edges:
+
+- **`/healthz` freshness window: 30s.** `/healthz` reports unhealthy when no
+  ingress packet has arrived for 30 seconds. Not configurable.
+- **Scoring-state retention: none.** See below — this one is a defect, not a
+  design choice.
+
+### Scoring state is not bounded (BLO-28455)
+
+Per-shred deduplication state is **never reclaimed**. The receiver's scorer keeps
+one entry per distinct `(slot, fec_set_index, index_within_set)` for the lifetime
+of the process and never deletes any of them, so its memory grows for as long as
+it runs rather than reaching a steady size.
+
+Measured: **59 bytes retained per distinct shred**, with nothing freed
+(500,000 shreds → 29.5 MB). Multiply by your feed's shred rate to project it — at
+an illustrative 10,000 shreds/s that is roughly 2.1 GB/hour.
+
+Until [BLO-28455](https://paperclip.blockcast.net/BLO/issues/BLO-28455) lands,
+treat the receiver as a process that must be restarted on a schedule, and give it
+a memory ceiling so a leak degrades one service rather than the host:
+
+```ini
+# /etc/systemd/system/blockcast-shreds.service.d/memory.conf
+[Service]
+MemoryMax=2G
+```
+
+Restarting resets the receipt, so scrape `/metrics` before a planned restart if
+you need the window. Note the trade-off retention *would* buy if it were
+configurable: it is also how long a second copy of a shred is recognised as a
+duplicate, so a bounded window smaller than your worst inter-feed skew would
+count the later copy as a new shred and overstate the union score. That is why
+the fix is a real retention window rather than a blunt cap.
 
 ### Receive buffer
 
@@ -113,6 +201,11 @@ sudo sysctl -w net.core.rmem_default=134217728
 
 Losses inside the receiver — as opposed to before it — appear as
 `fanout_dropped_packets_total`, never as silent gaps.
+
+Sizing it at the host is the only lever today. A per-socket setter exists and is
+tested (`receiver.OpenUDPFlow`, `RcvBufBytes`), but the shipped binary opens its
+ingress socket with bare `net.ListenUDP` and never calls it — the same
+built-but-unwired shape as the erasure defect above.
 
 ## What the score actually means
 
@@ -133,10 +226,20 @@ Losses inside the receiver — as opposed to before it — appear as
 The v1 specification scores a set at **`slot_boundary + erasure_grace`**, with
 `erasure_grace` defaulting to **400 ms**.
 
-**The shipped binary does not do this yet.** It scores a set when that set falls
-out of the `--retain` window (default 2 s past the newest arrival). The
-completion threshold, the dedup rule and the gap buckets are all as specified;
-the *deadline* is retention expiry rather than a slot-boundary-anchored grace.
+**The shipped binary does not do this yet.** It has no scoring deadline at all:
+`Scorer.Receipt()` walks every FEC set it has ever seen and counts any set still
+short of 32 distinct shreds as erased. The effective deadline is therefore
+**whenever the receipt is produced** — process shutdown — not a slot-boundary
+grace. The completion threshold, the dedup rule and the gap buckets are all as
+specified; only the deadline differs.
+
+Two consequences worth knowing before you quote the number:
+
+- A set that was still legitimately in flight when you sent `SIGTERM` is counted
+  as erased. On a short run that tail bias is visible; on a long one it is
+  negligible.
+- Because sets are never aged out, the receipt is a whole-run figure, not a
+  windowed one. It cannot be compared against a 30-second heartbeat window.
 
 The grace-anchored implementation exists and is tested (`erasure.Tracker`) but is
 not yet driven by the binary — tracked as
@@ -187,9 +290,10 @@ a statement about consensus performance.
 
 ### `/healthz` is a readiness probe, not a liveness probe
 
-It reports healthy only once a packet has arrived within `--health-max-age`, so
-it is **unhealthy at startup and stays unhealthy until traffic flows**. Wiring it
-to a liveness probe produces a restart loop on a feed that is merely idle:
+It reports healthy only once a packet has arrived within the fixed 30-second
+freshness window, so it is **unhealthy at startup and stays unhealthy until
+traffic flows**. Wiring it to a liveness probe produces a restart loop on a feed
+that is merely idle:
 
 ```
 503 {"status":"unhealthy"}   # no packet yet, or none within the window
