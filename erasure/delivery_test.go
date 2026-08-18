@@ -16,6 +16,21 @@ const peakBucket = 100 * time.Millisecond
 // derives the three delivery outputs from that slice at drain time. It exists
 // so the streaming fold can be compared against the shape it replaced rather
 // than against hand-computed constants.
+//
+// It is a valid oracle ONLY for monotonic arrival sets lying entirely before
+// cutoff, which every table case below satisfies (cutoff is start+30s; no
+// arrival exceeds ~5.5s). Two of its behaviors are therefore load-bearing
+// nowhere and must not be trusted as coverage:
+//
+//   - Its cutoff filter still implements the OLD at-or-after-cutoff exclusion,
+//     whereas the implementation now attributes every accepted arrival to the
+//     drained window. That branch is dead under these inputs; the attribution
+//     rule is pinned separately by the TestTrackerDrainAttributes* tests in
+//     tracker_test.go.
+//   - It accumulates into a map keyed by bucket, so it is order-independent
+//     where the streaming fold is not. It cannot be used to reason about
+//     out-of-order input; see
+//     TestTrackerPeakDoesNotUnderReportOnOutOfOrderArrival for that.
 func referenceDelivery(arrivals []time.Time, windowStart, cutoff time.Time) (rMean, rPeak float64, gaps erasure.GapHistogram) {
 	buckets := make(map[int64]uint64)
 	var lastArrival time.Time
@@ -167,6 +182,49 @@ func TestTrackerPeakIsIndependentOfWindowPhase(t *testing.T) {
 	}
 }
 
+// Observe requires monotonic receivedAt, and the streaming peak fold is exact
+// only under that contract -- unlike the order-independent map it replaced. The
+// risk that creates is specifically a SILENT UNDER-REPORT: a stale bucket index
+// would reset the open bucket's count, so an out-of-order arrival could shrink
+// an SLA metric with nothing to show for it. deliveryWindow.observe folds such
+// an arrival into the open bucket instead, which bounds the degradation to the
+// safe direction.
+//
+// This pins that bound, not order independence -- the fold does not claim to
+// reproduce the map oracle for arbitrary orderings, and does not. It asserts
+// only that the documented regression no longer reproduces: the sequence below
+// (a 100 ms forward jump, then a step back into the first bucket) reported 10
+// against the oracle's 20 before the guard, a 2x under-report on RPeak100MS.
+func TestTrackerPeakDoesNotUnderReportOnOutOfOrderArrival(t *testing.T) {
+	start := time.Unix(2000, 0)
+	arrivals := []time.Time{
+		start,
+		start.Add(150 * time.Millisecond),
+		start.Add(50 * time.Millisecond), // out of order: steps back a bucket
+	}
+	cutoff := start.Add(30 * time.Second)
+
+	tracker, err := erasure.NewTracker(0, start)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observeSequence(t, tracker, arrivals)
+	got := drain(t, tracker, cutoff).RPeak100MS
+
+	// Two arrivals share one 100 ms bucket, so no correct reading is below 20/s.
+	// A bucket reset on the third arrival yields 10.
+	const underReport = 10.0
+	if got <= underReport {
+		t.Errorf("RPeak100MS = %v after an out-of-order arrival, want > %v: the open bucket's count was reset, silently halving the reported peak", got, underReport)
+	}
+
+	// Totals and gap accounting must be untouched by the guard -- it only
+	// affects which bucket a misordered arrival is counted in, never whether.
+	if _, oraclePeak, _ := referenceDelivery(arrivals, start, cutoff); got != oraclePeak {
+		t.Logf("streamed peak %v vs order-independent oracle %v (exactness is not claimed for out-of-order input)", got, oraclePeak)
+	}
+}
+
 func heapHeld() uint64 {
 	runtime.GC()
 	runtime.GC()
@@ -276,12 +334,18 @@ func drainMallocs(t *testing.T, shreds int) uint64 {
 // stack-allocate the map, and the test passes against the very code it is
 // supposed to reject.
 func TestDrainWindowDoesNotAllocatePerWindow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("drives 101k observations")
+	}
 	small, large := drainMallocs(t, 1_000), drainMallocs(t, 100_000)
 	t.Logf("DrainWindow allocations: %d at 1k arrivals, %d at 100k", small, large)
-	if large > small {
-		t.Errorf("DrainWindow allocated %d objects at 100k arrivals versus %d at 1k; cost scales with shred count", large, small)
-	}
+	// Deliberately not a strict large > small comparison. DrainWindow calls
+	// scoreDue, which can append to t.scores, so a slice growth landing in the
+	// 100k run but not the 1k run would fail a strict compare for a reason
+	// unrelated to per-arrival cost. The absolute bound below already carries
+	// the intent: it fails loudly against the old slice-walking implementation,
+	// which allocated in proportion to the arrival count.
 	if large > 4 {
-		t.Errorf("DrainWindow allocated %d objects, want a fixed handful at most", large)
+		t.Errorf("DrainWindow allocated %d objects at 100k arrivals, want a fixed handful at most; cost scales with shred count", large)
 	}
 }

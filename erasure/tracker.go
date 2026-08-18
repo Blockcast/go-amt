@@ -71,10 +71,13 @@ type scoreEvent struct {
 // output is an O(1) fold, so none of that retention bought anything.
 //
 // Every field is a running fold over arrivals in Observe order. Observe
-// documents that receivedAt is monotonic, which is what makes the peak fold
-// exact: buckets are keyed on absolute time, so once an arrival opens a new
-// bucket the previous one can never be revisited and only the current bucket
-// count has to stay live.
+// requires receivedAt to be monotonic, and that requirement -- not merely the
+// absolute bucket keying -- is what makes the peak fold exact: under it, an
+// arrival landing in a different bucket proves the previous bucket closed for
+// good, so only the current bucket's count has to stay live. The slice form
+// this replaces accumulated into a map keyed by bucket and so was
+// order-independent; observe degrades that loss conservatively rather than
+// silently (see the out-of-order note there).
 type deliveryWindow struct {
 	arrivals    uint64
 	peakRate    float64
@@ -88,8 +91,18 @@ type deliveryWindow struct {
 func (w *deliveryWindow) observe(receivedAt time.Time) {
 	w.arrivals++
 
+	// Monotonic receivedAt is Observe's contract, and under it a differing
+	// bucket index always means the previous bucket closed for good. Were that
+	// contract ever broken, rotating on the stale index would reset the open
+	// bucket's count and *under-report* the peak -- the one direction an SLA
+	// metric must not fail in, and one no equivalence test over monotonic input
+	// can catch. Folding an out-of-order arrival into the open bucket instead
+	// keeps the failure conservative: the peak may be overstated, never hidden.
+	// This is a safety net, not a second supported ordering; the fold is exact
+	// only for monotonic input.
 	bucket := receivedAt.UnixNano() / peakRateBucket.Nanoseconds()
-	if !w.bucketOpen || bucket != w.bucketIndex {
+	outOfOrder := !w.lastArrival.IsZero() && receivedAt.Before(w.lastArrival)
+	if !w.bucketOpen || (bucket != w.bucketIndex && !outOfOrder) {
 		w.bucketIndex = bucket
 		w.bucketCount = 0
 		w.bucketOpen = true
@@ -149,9 +162,13 @@ func NewTracker(grace time.Duration, windowStart time.Time) (*Tracker, error) {
 	}, nil
 }
 
-// Observe records one parsed shred. receivedAt must be monotonic for consecutive
-// gap reporting, as it is on the receiver's serial UDP read path. It returns
-// false for duplicate, stale, invalid, or already-scored observations.
+// Observe records one parsed shred. receivedAt must be monotonic for both peak
+// and consecutive-gap reporting, as it is on the receiver's serial UDP read
+// path -- the timestamp is taken and folded in under the same lock, so the two
+// cannot reorder. Out-of-order input does not corrupt totals or erasure
+// scoring; it degrades RPeak100MS conservatively (see deliveryWindow.observe).
+// It returns false for duplicate, stale, invalid, or already-scored
+// observations.
 func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -231,13 +248,14 @@ func (t *Tracker) Advance(now time.Time) {
 // space -- un-counting an arrival needs its timestamp, which is the retention
 // this type exists to remove -- so the alternatives were to reject such a
 // cutoff, to carry a single pending arrival, or to attribute as above. The
-// first two are unsafe here, and not in a hypothetical way: the shipped
-// receiver drains from a ticker goroutine that does NOT hold the read-path
-// mutex and passes the ticker's own fire time as cutoff, while the read loop
-// keeps stamping later arrivals (cmd/blockcast-shreds/main.go, the reporter at
-// the reportInterval ticker versus the mu-guarded ReadFromUDP loop). Arrivals
-// at or after cutoff are therefore routine and arbitrarily many, not an
-// empty-barring-clock-skew set. Rejecting the cutoff would make publishWindows
+// first two are unsafe for the receiver this tracker is being built for. Note
+// that at this commit DrainWindow has no production caller: the reporter that
+// drives it arrives with #47, which adds a reportInterval ticker goroutine that
+// does NOT hold the read-path mutex and passes the ticker's own fire time as
+// cutoff, while the mu-guarded ReadFromUDP loop keeps stamping later arrivals
+// (cmd/blockcast-shreds/main.go, once #47 lands). Under that wiring, arrivals
+// at or after cutoff are routine and arbitrarily many, not an
+// empty-barring-clock-skew set. Rejecting the cutoff would make the reporter
 // skip the drain on every tick and freeze the erasure SLA at its last value --
 // the confidently-clean-feed failure this reporting path exists to prevent --
 // and one pending arrival cannot hold a suffix that is thousands of shreds long
