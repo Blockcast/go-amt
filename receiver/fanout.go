@@ -112,6 +112,41 @@ type Fanout struct {
 	droppedPackets atomic.Uint64
 	egressPackets  atomic.Uint64
 	writeErrors    atomic.Uint64
+
+	// Per-destination ledger, indexed by destination position. Only the worker
+	// goroutine writes these; they are atomic because DestinationStats reads
+	// them from the caller's goroutine.
+	destNames   []string
+	destPackets []atomic.Uint64
+	destBytes   []atomic.Uint64
+	destDrops   []atomic.Uint64
+	destErrors  []atomic.Uint64
+
+	// sendBatch is writeUDPPacketBatch in production. It is a field so tests
+	// can drive partial sends, which is the only condition under which batch
+	// slot and destination index diverge observably.
+	sendBatch func(*ipv4.PacketConn, []ipv4.Message, bool) (int, error)
+}
+
+// DestinationStat is one destination's entry in the delivery ledger.
+//
+// Packets+Drops is invariant across destinations: it equals the number of
+// packets the worker has processed, whatever each destination's outcome was.
+// That invariant is what makes the ledger auditable — a per-destination
+// shortfall cannot hide as a process-wide average.
+//
+// WriteErrors is a subset of Drops. A drop is "this destination did not get
+// this packet"; a write error is the narrower "the write for this destination
+// actively failed". They differ because a partial sendmmsg abandons the
+// remaining messages in the batch: those destinations are dropped without ever
+// being attempted, and blaming them for a fault they did not cause would point
+// at the wrong subscriber.
+type DestinationStat struct {
+	Destination string
+	Packets     uint64
+	Bytes       uint64
+	Drops       uint64
+	WriteErrors uint64
 }
 
 // NewFanout starts a bounded fan-out worker for writers. The worker owns and
@@ -135,9 +170,47 @@ func NewFanout(writers []io.WriteCloser, queueCapacity int, observer EgressObser
 		queue:    make(chan queuedPacket, queueCapacity),
 		observer: observer,
 	}
+	names := make([]string, len(writers))
+	for i := range writers {
+		names[i] = fmt.Sprintf("writer[%d]", i)
+	}
+	f.initDestinations(names)
 	f.wg.Add(1)
 	go f.run()
 	return f, nil
+}
+
+// initDestinations sizes the per-destination ledger. It must be called before
+// the worker starts, because the worker indexes these slices without a lock.
+func (f *Fanout) initDestinations(names []string) {
+	f.destNames = names
+	f.destPackets = make([]atomic.Uint64, len(names))
+	f.destBytes = make([]atomic.Uint64, len(names))
+	f.destDrops = make([]atomic.Uint64, len(names))
+	f.destErrors = make([]atomic.Uint64, len(names))
+	if f.sendBatch == nil {
+		f.sendBatch = writeUDPPacketBatch
+	}
+}
+
+// DestinationStats returns the per-destination delivery ledger, indexed in
+// configured destination order.
+//
+// This is the per-subscriber accounting surface: process-wide Stats cannot
+// answer "is destination 7 actually receiving its stream", and the per-feed
+// EgressObserver cannot either, because one feed fans out to every subscriber.
+func (f *Fanout) DestinationStats() []DestinationStat {
+	stats := make([]DestinationStat, len(f.destNames))
+	for i := range f.destNames {
+		stats[i] = DestinationStat{
+			Destination: f.destNames[i],
+			Packets:     f.destPackets[i].Load(),
+			Bytes:       f.destBytes[i].Load(),
+			Drops:       f.destDrops[i].Load(),
+			WriteErrors: f.destErrors[i].Load(),
+		}
+	}
+	return stats
 }
 
 // NewUDPFanout starts a bounded fan-out worker over a single UDP socket. Each
@@ -174,6 +247,11 @@ func NewUDPFanout(destinations []string, queueCapacity int, observer EgressObser
 		udpConn:  ipv4.NewPacketConn(conn),
 		udpDest:  addresses,
 	}
+	names := make([]string, len(addresses))
+	for i, address := range addresses {
+		names[i] = address.String()
+	}
+	f.initDestinations(names)
 	f.wg.Add(1)
 	go f.run()
 	return f, nil
@@ -252,29 +330,58 @@ func (f *Fanout) run() {
 
 // deliver writes one packet to every destination and reports how many landed.
 func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
+	size := uint64(len(packet))
 	if f.udpConn == nil {
-		for _, writer := range f.writers {
+		for i, writer := range f.writers {
 			n, err := writer.Write(packet)
 			if err != nil || n != len(packet) {
+				// This path attempts every writer, so a failure here is always
+				// attributable to the destination that produced it.
+				f.destDrops[i].Add(1)
+				f.destErrors[i].Add(1)
 				failed++
 				continue
 			}
+			f.destPackets[i].Add(1)
+			f.destBytes[i].Add(size)
 			delivered++
 		}
 		return delivered, failed
 	}
 
 	count := len(f.udpDest)
-	messages := f.rotatedMessages(packet)
+	messages, offset := f.rotatedMessages(packet)
 
-	written, err := writeUDPPacketBatch(f.udpConn, messages, runtime.GOOS == "linux")
+	written, err := f.sendBatch(f.udpConn, messages, runtime.GOOS == "linux")
 	if written < 0 || written > count {
 		written = 0
 	}
+	// Batch position is not destination index: rotatedMessages started this
+	// batch at offset, so batch slot i carries destination (offset+i)%count.
+	// Charging the ledger by slot would smear a single broken subscriber
+	// across every destination as the rotation walks, which is precisely the
+	// fault this ledger exists to localise.
+	for i := 0; i < written; i++ {
+		destination := (offset + i) % count
+		f.destPackets[destination].Add(1)
+		f.destBytes[destination].Add(size)
+	}
+	for i := written; i < count; i++ {
+		f.destDrops[(offset+i)%count].Add(1)
+	}
+	// sendmmsg stops at the first failure and abandons the rest of the batch,
+	// so exactly one destination earns the write error; the rest were never
+	// attempted and are dropped without blame.
+	if written < count && err != nil {
+		f.destErrors[(offset+written)%count].Add(1)
+	}
+
 	delivered = uint64(written)
 	failed = uint64(count - written)
 	// A batch can report every message written and still surface an error. Do
 	// not let that pass as a clean send, or a persistent fault is invisible.
+	// This is a process-wide safety net only: with every message written there
+	// is no destination to charge, so the ledger stays exact and silent.
 	if err != nil && failed == 0 {
 		failed = 1
 	}
@@ -297,27 +404,32 @@ func (f *Fanout) report(feedID string, delivered, failed uint64) {
 	}
 }
 
-// rotatedMessages builds the send batch for one packet and advances the
-// rotation by exactly one position.
+// rotatedMessages builds the send batch for one packet, returning the batch
+// and the destination offset it starts at, and advances the rotation by
+// exactly one position.
 //
 // Every destination appears exactly once per batch, so rotation changes the
 // ORDER of a send, never its membership: no destination can be skipped or
 // served twice. The batch is ordered starting at f.next, so across count
 // consecutive packets each destination leads exactly once.
 //
+// The returned offset is what lets a caller map a batch slot back to the
+// destination it carried; without it a partial send cannot be attributed.
+//
 // The caller must be the single fan-out worker goroutine; f.next is
 // deliberately unsynchronized because only that goroutine touches it.
-func (f *Fanout) rotatedMessages(packet []byte) []ipv4.Message {
+func (f *Fanout) rotatedMessages(packet []byte) ([]ipv4.Message, int) {
 	count := len(f.udpDest)
+	offset := f.next
 	messages := make([]ipv4.Message, count)
 	for i := range f.udpDest {
-		index := (f.next + i) % count
+		index := (offset + i) % count
 		messages[i] = ipv4.Message{Buffers: [][]byte{packet}, Addr: f.udpDest[index]}
 	}
 	// Advance once per packet, not once per destination, so the starting
 	// offset walks the destination list one position at a time.
 	f.next = (f.next + 1) % count
-	return messages
+	return messages, offset
 }
 
 // writeUDPPacketBatch keeps one socket on every platform.
