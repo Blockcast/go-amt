@@ -262,9 +262,25 @@ func fraction(numerator, denominator uint64) float64 {
 	return float64(numerator) / float64(denominator)
 }
 
+// reclaimOldSlots drops scoring state that can no longer change.
+//
+// Slot state is retained until it has been SCORED, not merely until it is two
+// slots behind the newest. Slot numbers are not contiguous on a real feed --
+// this receiver sees only the shreds for its own feed, so consecutive observed
+// slots routinely differ by tens or hundreds -- and reclaiming on slot-number
+// distance alone deletes a set in the same Observe call that first gave it a
+// boundary, which is always before boundary+grace has elapsed. Every set is
+// then destroyed unscored and the erasure SLA reads a permanent zero under
+// arbitrary real loss. The same race fires on contiguous slots whenever three
+// slots arrive within one grace period.
+//
+// Retention stays bounded: scoreDue runs on every Observe and Advance, so a
+// slot is scored once its deadline passes and reclaimed on the next pass. Only
+// the newest slot is held indefinitely, and only because a slot cannot be
+// scored until a later slot proves it ended.
 func (t *Tracker) reclaimOldSlots() {
-	for slot := range t.slots {
-		if slot < t.newestSlot && t.newestSlot-slot > 2 {
+	for slot, state := range t.slots {
+		if slot < t.newestSlot && t.newestSlot-slot > 2 && state.scored {
 			delete(t.slots, slot)
 		}
 	}

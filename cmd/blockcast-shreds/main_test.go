@@ -119,7 +119,7 @@ func TestPacketDeliveryDoesNotDependOnScoring(t *testing.T) {
 	packet := []byte{0x01, 0x02, 0x03}
 
 	for range 2 {
-		processPacket("feed", packet, time.Now(), scorer, fanout, metrics)
+		processPacket("feed", packet, time.Now(), scorer, fanout, metrics, nil)
 	}
 
 	for range 2 {
@@ -152,7 +152,7 @@ func TestFanoutPublishesEgressToTheScrapedRegistry(t *testing.T) {
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
 	for range 2 {
-		processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics)
+		processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics, nil)
 	}
 	for range 2 {
 		select {
@@ -193,7 +193,7 @@ func TestFanoutPublishesWriteErrorsToTheScrapedRegistry(t *testing.T) {
 	}
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
-	processPacket("feed", []byte{0x09}, time.Now(), scorer, fanout, metrics)
+	processPacket("feed", []byte{0x09}, time.Now(), scorer, fanout, metrics, nil)
 	if err := fanout.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -261,8 +261,8 @@ func TestUnparsablePacketPublishesUnparsedToTheScrapedRegistry(t *testing.T) {
 	}
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
-	processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics)
-	processPacket("feed", fixtureShred(t), time.Now(), scorer, fanout, metrics)
+	processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics, nil)
+	processPacket("feed", fixtureShred(t), time.Now(), scorer, fanout, metrics, nil)
 	for range 2 {
 		select {
 		case <-writer.packets:
@@ -312,7 +312,7 @@ func TestValidShredDuplicateIsForwardedByteIdentically(t *testing.T) {
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
 	for range 2 {
-		processPacket("feed", packet, time.Now(), scorer, fanout, metrics)
+		processPacket("feed", packet, time.Now(), scorer, fanout, metrics, nil)
 	}
 	for range 2 {
 		select {
@@ -403,7 +403,7 @@ func TestShutdownDoesNotInflateTheFanoutDropCounter(t *testing.T) {
 	}
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
-	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics)
+	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics, nil)
 
 	if got := gaugeValue(t, registry, "bcast_shred_gw_fanout_dropped_packets_total", "feed"); got != 0 {
 		t.Fatalf("scraped fanout_dropped_packets_total = %v, want 0; a post-close reject is shutdown, not ring overflow", got)
@@ -429,14 +429,14 @@ func TestRingOverflowIncrementsTheFanoutDropCounter(t *testing.T) {
 	}
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
-	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics)
+	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics, nil)
 	select {
 	case <-writer.entered:
 	case <-time.After(time.Second):
 		t.Fatal("fan-out worker did not enter the writer")
 	}
-	processPacket("feed", []byte{0x02}, time.Now(), scorer, fanout, metrics) // fills the ring
-	processPacket("feed", []byte{0x03}, time.Now(), scorer, fanout, metrics) // overflows
+	processPacket("feed", []byte{0x02}, time.Now(), scorer, fanout, metrics, nil) // fills the ring
+	processPacket("feed", []byte{0x03}, time.Now(), scorer, fanout, metrics, nil) // overflows
 
 	if got := gaugeValue(t, registry, "bcast_shred_gw_fanout_dropped_packets_total", "feed"); got != 1 {
 		t.Fatalf("scraped fanout_dropped_packets_total = %v, want 1", got)
@@ -521,7 +521,7 @@ func TestConcurrentProcessPacketIsRaceFreeAndOrderTolerant(t *testing.T) {
 			slot := uint64(500 + feedIndex)
 			for i := 0; i < shredsPerSet; i++ {
 				at := base.Add(time.Duration(shredsPerSet-i) * time.Millisecond)
-				processPacket(names[feedIndex], forwarderDataShred(slot, 0, uint32(i)), at, scorer, fanout, metrics)
+				processPacket(names[feedIndex], forwarderDataShred(slot, 0, uint32(i)), at, scorer, fanout, metrics, nil)
 			}
 		}(f)
 	}
