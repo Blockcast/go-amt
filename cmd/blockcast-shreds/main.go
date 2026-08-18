@@ -23,7 +23,7 @@ import (
 const help = `blockcast-shreds demo mode
 
 Usage:
-  blockcast-shreds [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--json]
+  blockcast-shreds [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
   blockcast-shreds selftest --fixture [--json]
 
 Demo mode has no broker, certificates, accounts, or heartbeats. --feed is
@@ -35,7 +35,13 @@ inputs are independently operated or share one tap.
 
 /healthz is readiness-shaped: it reports unhealthy until the first packet
 arrives, so it is not a safe liveness probe. --health-max-age sets the
-ingress freshness window.`
+ingress freshness window.
+
+--retain bounds the scorer's memory: per-shred state is kept for that long
+past each arrival, so the receiver reaches a steady state instead of growing
+for as long as it runs. The receipt still covers the whole run; the window is
+how long a second copy of a shred can still be recognised as a duplicate.
+See the README.`
 
 type feeds []string
 
@@ -73,6 +79,7 @@ func run(args []string) error {
 	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	flags.StringVar(&httpAddress, "http-addr", "127.0.0.1:8080", "metrics and health HTTP address; empty disables HTTP")
 	flags.DurationVar(&healthMaxAge, "health-max-age", 30*time.Second, "/healthz ingress freshness window; readiness-shaped, see README")
+	retention := flags.Duration("retain", shred.DefaultRetention, "how far behind the newest arrival to keep per-shred scoring state; see README")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -101,7 +108,12 @@ func run(args []string) error {
 	if healthMaxAge <= 0 {
 		return fmt.Errorf("--health-max-age must be positive, got %s", healthMaxAge)
 	}
-	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON)
+	// A non-positive window would evict each shred as it was written, so every
+	// arrival would read as new and duplicate suppression would stop working.
+	if *retention <= 0 {
+		return fmt.Errorf("--retain must be positive, got %s", *retention)
+	}
+	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON, *retention)
 }
 
 func selftest(args []string) error {
@@ -137,12 +149,12 @@ func printReceipt(receipt fmt.Stringer, asJSON bool) error {
 	return nil
 }
 
-func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool) error {
+func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, retention time.Duration) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
 	}
-	scorer := shred.NewFeedScorer(names)
+	scorer := shred.NewFeedScorerWithRetention(shred.FormatForwarder, names, retention)
 	registry := prometheus.NewRegistry()
 	metrics, err := receiver.NewReceiverMetrics(registry, names)
 	if err != nil {

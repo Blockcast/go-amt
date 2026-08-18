@@ -2,7 +2,6 @@ package shred
 
 import (
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -72,17 +71,47 @@ type setScore struct {
 
 // Scorer applies first-arrival-wins deduplication across feeds and scores each
 // consensus 32+32 FEC set when its 32nd distinct shred arrives.
+//
+// # Retention
+//
+// The maps below are per-shred and per-set, so on a live feed they are unbounded
+// in exactly the way the shred stream is. Scorer therefore keeps them only for
+// arrivals within window of the newest arrival it has seen; older entries are
+// finalized into the counters beside them and dropped. Every number the receipt
+// reports is one of those counters, so the receipt covers the whole run even
+// though the state behind it does not.
+//
+// What the window bounds is not what is counted but what can still be recognised
+// as a *repeat*: a second copy of a shred arriving more than window after the
+// first has no surviving identity to match against and is counted as a new
+// unique shred. The duplicates this exists to recognise arrive milliseconds
+// apart on a second feed, so the default window clears them by three orders of
+// magnitude — see DefaultRetention.
 type Scorer struct {
 	format Format
+	window time.Duration
 	// dedup maps each distinct shred to the earliest arrival timestamp seen for
 	// it, not merely to its presence. Keeping the running minimum is what lets a
 	// duplicate that is older than the incumbent be recognised as the true first
 	// arrival, which is how FeedScorer attributes first-arrival credit by
-	// timestamp instead of by whichever goroutine reached the lock first.
+	// timestamp instead of by whichever goroutine reached the lock first. It is
+	// also what eviction ages entries by.
 	dedup       map[dedupKey]time.Time
 	sets        map[SetKey]*setScore
 	lastArrival time.Time
 	gaps        GapHistogram
+
+	// nextSweep is when reclamation next runs. See scheduleSweep.
+	nextSweep time.Time
+
+	// Counters below outlive the maps. They are the receipt: each is advanced
+	// when an entry leaves the window, and receiptFor adds whatever is still
+	// live.
+	uniqueShreds uint64
+	setsTotal    uint64
+	setsErased   uint64
+	setsShreds   uint64
+	completions  completionHistogram
 }
 
 type FeedReceipt struct {
@@ -150,6 +179,10 @@ type FeedScorer struct {
 	// union-unique shred is trivially its own first arrival, so there is nothing
 	// to re-attribute and no reason to carry a per-shred map to prove it.
 	firstBy map[dedupKey]string
+	// rescuedSets accumulates the sets counted by secondFeedWorth as they leave
+	// the retention window, for the same reason the Scorers carry counters: the
+	// per-set state the correlation reads is gone after eviction.
+	rescuedSets int
 }
 
 // NewFeedScorer scores the shred-forwarder wire format on every feed.
@@ -158,14 +191,20 @@ func NewFeedScorer(names []string) *FeedScorer {
 }
 
 func NewFeedScorerWithFormat(format Format, names []string) *FeedScorer {
+	return NewFeedScorerWithRetention(format, names, DefaultRetention)
+}
+
+// NewFeedScorerWithRetention builds a feed scorer whose scorers all keep
+// per-shred identity for window past each arrival. See DefaultRetention.
+func NewFeedScorerWithRetention(format Format, names []string, window time.Duration) *FeedScorer {
 	feeds := make(map[string]*Scorer, len(names))
 	for _, name := range names {
-		feeds[name] = NewScorerWithFormat(format)
+		feeds[name] = NewScorerWithRetention(format, window)
 	}
 	scorer := &FeedScorer{
 		names:         append([]string(nil), names...),
 		feeds:         feeds,
-		union:         NewScorerWithFormat(format),
+		union:         NewScorerWithRetention(format, window),
 		firstArrivals: make(map[string]uint64, len(names)),
 	}
 	if len(names) > 1 {
@@ -201,30 +240,92 @@ func (s *FeedScorer) Observe(feed string, packet []byte, receivedAt time.Time) (
 		if s.firstBy != nil {
 			s.firstBy[key] = feed
 		}
-		return true, nil
-	}
-	// A duplicate whose arrival timestamp precedes the incumbent's was in truth
-	// the first arrival; it only looks second because its feed's goroutine
-	// reached the lock later. receivedAt is captured at the socket read, ahead of
-	// health, metrics and fan-out work, so the interval between capture and this
-	// call is real and differs per feed. Without this, unique_shreds_first and
-	// first_arrival_fraction — the numbers a customer reads as "is the second
-	// feed earning its keep" — would be decided by scheduling.
-	//
-	// Moving the credit to the earlier arrival makes attribution a function of
-	// the timestamps alone: the incumbent is always the running minimum, so the
-	// outcome is the same for every interleaving of the same arrivals. Equal
-	// timestamps keep the incumbent, so a coarse clock degrades to first-processed
-	// rather than to flapping. The total is conserved — one feed's counter falls
-	// as another's rises — so UniqueFirst continues to partition UniqueShreds.
-	if s.firstBy != nil && receivedAt.Before(incumbent) {
+	} else if s.firstBy != nil && receivedAt.Before(incumbent) {
+		// A duplicate whose arrival timestamp precedes the incumbent's was in truth
+		// the first arrival; it only looks second because its feed's goroutine
+		// reached the lock later. receivedAt is captured at the socket read, ahead of
+		// health, metrics and fan-out work, so the interval between capture and this
+		// call is real and differs per feed. Without this, unique_shreds_first and
+		// first_arrival_fraction — the numbers a customer reads as "is the second
+		// feed earning its keep" — would be decided by scheduling.
+		//
+		// Moving the credit to the earlier arrival makes attribution a function of
+		// the timestamps alone: the incumbent is always the running minimum, so the
+		// outcome is the same for every interleaving of the same arrivals. Equal
+		// timestamps keep the incumbent, so a coarse clock degrades to first-processed
+		// rather than to flapping. The total is conserved — one feed's counter falls
+		// as another's rises — so UniqueFirst continues to partition UniqueShreds.
+		//
+		// The window bounds how long this remains possible: once the shred's entry
+		// is evicted its firstBy record is gone, and a straggler that would have
+		// won credit can no longer take it. That interval, not the run, is what
+		// "exact" means for first_arrival_fraction.
 		if holder, held := s.firstBy[key]; held && holder != feed {
 			s.firstArrivals[holder]--
 			s.firstArrivals[feed]++
 			s.firstBy[key] = feed
 		}
 	}
-	return false, nil
+	if s.union.scheduleSweep(s.union.lastArrival) {
+		s.evict()
+	}
+	return accepted, nil
+}
+
+// evict finalizes and releases every scorer against one common set universe and
+// one common floor, the union's.
+//
+// Order matters twice over: the rescued-set correlation has to read the baseline
+// and union set state before either is dropped, and each feed has to be
+// finalized against the union's set universe rather than its own so that a set a
+// feed never saw still counts against that feed as erased.
+func (s *FeedScorer) evict() {
+	floor := s.union.retentionFloor()
+	keys := s.union.expiredKeys(floor)
+	if len(keys) != 0 && len(s.names) > 1 {
+		s.rescuedSets += s.rescuedAmong(keys)
+	}
+	dropped := s.union.evict(floor, keys)
+	for _, scorer := range s.feeds {
+		scorer.evict(floor, keys)
+	}
+	for _, key := range dropped {
+		delete(s.firstBy, key)
+	}
+}
+
+// rescuedAmong counts, over keys, the sets the baseline feed could not complete
+// alone but the union could.
+func (s *FeedScorer) rescuedAmong(keys []SetKey) int {
+	baseline := s.feeds[s.names[0]]
+	rescued := 0
+	for _, key := range keys {
+		if set := baseline.sets[key]; set != nil && set.complete {
+			continue
+		}
+		if set := s.union.sets[key]; set != nil && set.complete {
+			rescued++
+		}
+	}
+	return rescued
+}
+
+// Retention reports the per-shred state the scorer is currently holding, across
+// the union and every feed. It is what binds the retention bound in tests
+// without going through process memory.
+//
+// Newest and Window are the union's, since the union's frontier is the one every
+// feed is aged against.
+func (s *FeedScorer) Retention() Retention {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	retention := s.union.retention()
+	retention.TrackedAttributions = len(s.firstBy)
+	for _, scorer := range s.feeds {
+		retention.TrackedShreds += len(scorer.dedup)
+		retention.TrackedSets += len(scorer.sets)
+	}
+	return retention
 }
 
 func (s *FeedScorer) Receipt() UnionReceipt {
@@ -237,7 +338,7 @@ func (s *FeedScorer) Receipt() UnionReceipt {
 	receipt := UnionReceipt{
 		Feeds:        make([]FeedReceipt, 0, len(s.names)),
 		Union:        s.union.receiptFor(keys),
-		UniqueShreds: uint64(len(s.union.dedup)),
+		UniqueShreds: s.union.uniqueShreds,
 	}
 	for _, name := range s.names {
 		feed := FeedReceipt{Name: name, UniqueFirst: s.firstArrivals[name], Receipt: s.feeds[name].receiptFor(keys)}
@@ -258,19 +359,17 @@ func (s *FeedScorer) Receipt() UnionReceipt {
 // union sees a superset of every feed's shreds, so a set complete on the
 // baseline is always complete in the union; the rescued count is therefore
 // exactly the erasure gap the other feeds closed.
+//
+// keys covers only the sets still inside the retention window; everything older
+// was correlated by evict as it was dropped and is carried in rescuedSets.
 func (s *FeedScorer) secondFeedWorth(keys []SetKey) *SecondFeedWorth {
-	baseline := s.feeds[s.names[0]]
-	worth := &SecondFeedWorth{Label: secondFeedLabel, Baseline: s.names[0]}
-	for _, key := range keys {
-		if set := baseline.sets[key]; set != nil && set.complete {
-			continue
-		}
-		if set := s.union.sets[key]; set != nil && set.complete {
-			worth.RescuedSets++
-		}
+	worth := &SecondFeedWorth{
+		Label:       secondFeedLabel,
+		Baseline:    s.names[0],
+		RescuedSets: s.rescuedSets + s.rescuedAmong(keys),
 	}
-	if len(keys) != 0 {
-		worth.GapClosed = float64(worth.RescuedSets) / float64(len(keys))
+	if total := s.union.setsTotal + uint64(len(keys)); total != 0 {
+		worth.GapClosed = float64(worth.RescuedSets) / float64(total)
 	}
 	return worth
 }
@@ -295,8 +394,16 @@ func NewScorer() *Scorer {
 }
 
 func NewScorerWithFormat(format Format) *Scorer {
+	return NewScorerWithRetention(format, DefaultRetention)
+}
+
+// NewScorerWithRetention builds a scorer that keeps per-shred identity for
+// window past each shred's arrival. See DefaultRetention for what the bound
+// costs and Scorer's retention contract for what it buys.
+func NewScorerWithRetention(format Format, window time.Duration) *Scorer {
 	return &Scorer{
 		format: format,
+		window: window,
 		dedup:  make(map[dedupKey]time.Time),
 		sets:   make(map[SetKey]*setScore),
 	}
@@ -304,6 +411,12 @@ func NewScorerWithFormat(format Format) *Scorer {
 
 func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
 	_, accepted, _, err := s.observe(packet, receivedAt)
+	// A bare Scorer reclaims on its own frontier. Inside a FeedScorer this method
+	// is bypassed for observe, because reclamation there must run at one frontier
+	// across every feed and the union.
+	if s.scheduleSweep(s.lastArrival) {
+		s.evict(s.retentionFloor(), nil)
+	}
 	return accepted, err
 }
 
@@ -347,6 +460,7 @@ func (s *Scorer) observe(packet []byte, receivedAt time.Time) (key dedupKey, acc
 		return key, false, first, nil
 	}
 	s.dedup[key] = receivedAt
+	s.uniqueShreds++
 
 	// receivedAt is a true arrival timestamp, captured at the read before any
 	// per-packet work, so it is NOT guaranteed to be nondecreasing across calls:
@@ -420,6 +534,77 @@ func (s *Scorer) observe(packet []byte, receivedAt time.Time) (key dedupKey, acc
 	return key, true, time.Time{}, nil
 }
 
+// retentionFloor is the oldest arrival still inside the window. Entries older
+// than it hold nothing a later arrival could revise.
+func (s *Scorer) retentionFloor() time.Time {
+	return s.lastArrival.Add(-s.window)
+}
+
+// expiredKeys lists the sets whose newest arrival has fallen out of the window
+// and which are therefore ready to be folded into counters. A set's newest
+// arrival is used, not its oldest: a set still collecting shreds is still live.
+func (s *Scorer) expiredKeys(floor time.Time) []SetKey {
+	var keys []SetKey
+	for key, set := range s.sets {
+		if set.last.Before(floor) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// finalize folds keys into this scorer's cumulative counters. The caller passes
+// the set universe — for a FeedScorer that is the union's, so every feed is
+// scored over the same denominator and a set a feed never saw counts against it
+// as erased, exactly as receiptFor did while the sets were still live.
+func (s *Scorer) finalize(keys []SetKey) {
+	for _, key := range keys {
+		s.setsTotal++
+		set := s.sets[key]
+		if set == nil {
+			s.setsErased++
+			continue
+		}
+		s.setsShreds += uint64(bitsSet64(set.seen))
+		if !set.complete {
+			s.setsErased++
+			continue
+		}
+		s.completions.observe(set.completed)
+	}
+}
+
+// evict finalizes the sets that have left the window and releases their state,
+// along with every dedup entry that first arrived before floor.
+//
+// floor is passed in rather than derived from this scorer's own frontier: inside
+// a FeedScorer every scorer ages against the union's frontier, and a feed that
+// has gone quiet would otherwise hold its last shreds forever because its own
+// frontier stops advancing. It must not be conflated with lastArrival, which is
+// the gap histogram's frontier and has to stay this feed's own.
+//
+// keys, when non-nil, is the set universe to finalize against — a FeedScorer
+// passes the union's so that a set a feed never saw still counts against that
+// feed as erased. dropped collects the dedup keys released, which is how
+// FeedScorer keeps firstBy in lockstep with the union's identities rather than
+// ageing it separately.
+func (s *Scorer) evict(floor time.Time, keys []SetKey) (dropped []dedupKey) {
+	if keys == nil {
+		keys = s.expiredKeys(floor)
+	}
+	s.finalize(keys)
+	for _, key := range keys {
+		delete(s.sets, key)
+	}
+	for key, first := range s.dedup {
+		if first.Before(floor) {
+			delete(s.dedup, key)
+			dropped = append(dropped, key)
+		}
+	}
+	return dropped
+}
+
 func (s *Scorer) Receipt() Receipt {
 	keys := make([]SetKey, 0, len(s.sets))
 	for key := range s.sets {
@@ -428,29 +613,41 @@ func (s *Scorer) Receipt() Receipt {
 	return s.receiptFor(keys)
 }
 
+// receiptFor reports the scorer's cumulative counters plus whatever keys are
+// still live. keys is the set universe the caller wants scored — for a
+// FeedScorer that is the union's live keys, so every feed shares one
+// denominator — and it must contain only sets still inside the window; sets
+// below the floor were already folded in by finalize and would double-count.
 func (s *Scorer) receiptFor(keys []SetKey) Receipt {
-	receipt := Receipt{SetsTotal: len(keys), Gaps: s.gaps}
-	latencies := make([]time.Duration, 0, len(keys))
-	shreds := 0
+	total := s.setsTotal
+	erased := s.setsErased
+	shreds := s.setsShreds
+	// The histogram is a fixed-size array, so this is a copy, not an alias: the
+	// live sets below are scored into the receipt without being committed to the
+	// scorer, which would double-count them once they are finalized for real.
+	completions := s.completions
 	for _, key := range keys {
+		total++
 		set := s.sets[key]
-		if set != nil {
-			shreds += bitsSet64(set.seen)
-		}
-		if set == nil || !set.complete {
-			receipt.SetsErased++
+		if set == nil {
+			erased++
 			continue
 		}
-		latencies = append(latencies, set.completed)
+		shreds += uint64(bitsSet64(set.seen))
+		if !set.complete {
+			erased++
+			continue
+		}
+		completions.observe(set.completed)
 	}
-	if receipt.SetsTotal != 0 {
-		receipt.ErasureFraction = float64(receipt.SetsErased) / float64(receipt.SetsTotal)
-		receipt.MeanShredsPerSet = float64(shreds) / float64(receipt.SetsTotal)
+	receipt := Receipt{SetsTotal: int(total), SetsErased: int(erased), Gaps: s.gaps}
+	if total != 0 {
+		receipt.ErasureFraction = float64(erased) / float64(total)
+		receipt.MeanShredsPerSet = float64(shreds) / float64(total)
 	}
-	sort.Slice(latencies, func(i, j int) bool { return latencies[i] < latencies[j] })
-	receipt.CompletionP50 = percentile(latencies, 50)
-	receipt.CompletionP95 = percentile(latencies, 95)
-	receipt.CompletionP99 = percentile(latencies, 99)
+	receipt.CompletionP50 = completions.percentile(50)
+	receipt.CompletionP95 = completions.percentile(95)
+	receipt.CompletionP99 = completions.percentile(99)
 	return receipt
 }
 
@@ -492,6 +689,12 @@ func (h *GapHistogram) observe(gap time.Duration) {
 	}
 }
 
+// percentile is nearest-rank over an already-sorted slice. The Scorer's own
+// completion percentiles come from a bounded histogram instead (see
+// completionHistogram.percentile, which reproduces this ranking), but the helper
+// stays: it is the shared primitive the generic-mode scorer ranks its window
+// latencies with, where the value count is bounded by the window rather than by
+// the run.
 func percentile(values []time.Duration, p int) time.Duration {
 	if len(values) == 0 {
 		return 0
