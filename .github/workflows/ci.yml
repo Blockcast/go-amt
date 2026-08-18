@@ -44,3 +44,33 @@ jobs:
       # but skips unless AMT_E2E_RELAY is set, so it contributes no coverage
       # here either.
       - run: go test -race -tags purego ./...
+
+  # Type-check the cgo selection, which no other job compiles at all.
+  #
+  # The `test` job sets CGO_ENABLED=0 and `race` sets -tags purego, and conn.go
+  # and gateway.go are tagged `cgo && !purego` — so both jobs deselect them.
+  # Before this job, the native multicast join, the AMT tunnel handover and the
+  # gateway handshake were built by nothing on CI, and gateway_timeout_test.go
+  # never ran. BLO-28640 (a probe window that made native multicast structurally
+  # unreachable) reached production through that gap.
+  #
+  # This job type-checks rather than tests, because linking needs the native
+  # libamt_protocol (see the note in `race`) which is not on a stock runner.
+  # `go vet` runs the cgo preprocessor and the Go type checker, which need only
+  # gcc — preinstalled on ubuntu-latest — and amt_protocol.h from the repo root
+  # via `#cgo CFLAGS: -I${SRCDIR}`. It does not link, so it needs no .so.
+  #
+  # Running the cgo tests for real needs libamt_protocol built in CI; that is
+  # tracked separately. Type-checking is the cheap part and catches the class of
+  # error that cannot be caught locally on a machine without a C compiler.
+  cgo-typecheck:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
