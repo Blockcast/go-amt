@@ -1,0 +1,70 @@
+[Unit]
+Description=Blockcast shred receiver and delivery scorer
+Documentation=https://github.com/Blockcast/go-amt/blob/main/docs/operations/install.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+EnvironmentFile=/etc/blockcast/shreds.env
+ExecStart=/usr/local/bin/blockcast-shreds $BLOCKCAST_SHREDS_ARGS
+
+# The receiver prints its delivery receipt to stdout during shutdown, so the
+# journal is where the run's final scoring numbers land. Do not redirect to
+# /dev/null.
+StandardOutput=journal
+StandardError=journal
+
+# SIGTERM is the graceful path: it closes the ingress sockets, drains, and
+# prints the receipt before exiting 0. TimeoutStopSec must therefore be long
+# enough for that write, or systemd will SIGKILL over the top of the receipt.
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=5s
+
+# Unprivileged: both listeners are above 1024, so no capabilities are needed.
+# DynamicUser gives a per-boot UID with no login shell and no home directory.
+DynamicUser=yes
+AmbientCapabilities=
+CapabilityBoundingSet=
+
+# Filesystem: the receiver reads its certificates (broker lane) and writes
+# nothing. StateDirectory exists for that future key material rather than being
+# needed today.
+StateDirectory=blockcast-shreds
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+
+# The process speaks UDP and TCP over IP only. AF_NETLINK is required by Go's
+# resolver to read interface state; removing it breaks address resolution.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# A receiver that cannot keep up drops packets in the bounded fan-out ring and
+# counts them; it does not grow without limit. This cap is a backstop against
+# the scorer retention bug class, not a tuning knob — see the retention notes in
+# docs/operations/install.md before lowering it.
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target
