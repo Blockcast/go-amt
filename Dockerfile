@@ -2,17 +2,22 @@
 #
 # The build stage tracks the toolchain floor in go.mod (go 1.24.0) rather than
 # "latest", so a rebuild cannot silently jump a major Go version. Note what this
-# does NOT buy: `1.24-bookworm` is a floating patch tag, so a rebuild picks up
-# whatever 1.24.x is current and the output is not byte-identical — `-trimpath`
-# removes path nondeterminism, not toolchain nondeterminism. That is the
-# deliberate trade: patch-level Go security fixes on rebuild, in exchange for
-# reproducibility. For a byte-identical rebuild, override the tag with a digest:
+# does NOT buy: `golang:1.24-bookworm` is a floating patch tag, so a rebuild
+# picks up whatever 1.24.x is current and the output is not byte-identical —
+# `-trimpath` removes path nondeterminism, not toolchain nondeterminism. That is
+# the deliberate trade: patch-level Go security fixes on rebuild, in exchange for
+# reproducibility.
 #
-#   docker build --build-arg GO_VERSION=1.24.0 .
+# The whole image reference is one ARG so that a digest is actually passable.
+# Pinning the patch tag alone is not enough — `golang:1.24.0-bookworm` is itself
+# rebuilt when its base image updates, so only a digest gives a byte-identical
+# rebuild:
 #
-ARG GO_VERSION=1.24
+#   docker build --build-arg GO_IMAGE=golang@sha256:<digest> .
+#
+ARG GO_IMAGE=golang:1.24-bookworm
 
-FROM golang:${GO_VERSION}-bookworm AS build
+FROM ${GO_IMAGE} AS build
 WORKDIR /src
 
 # Dependencies resolve in their own layer so a source-only edit does not

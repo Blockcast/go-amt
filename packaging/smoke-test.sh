@@ -10,7 +10,7 @@
 #
 # Usage: packaging/smoke-test.sh [path-to-binary]
 #
-# Requires: bash, curl, and a way to bind a local UDP sink (python3 or nc).
+# Requires: bash, curl, cmp, and a way to bind a local UDP sink (python3 or nc).
 #
 # The sink is mandatory, not optional. Byte-identity is the only assertion in
 # this script that proves a forwarded packet reached a destination at all: the
@@ -31,6 +31,13 @@ BINARY="${1:-./blockcast-shreds}"
 FEED_PORT="${SMOKE_FEED_PORT:-21000}"
 SINK_PORT="${SMOKE_SINK_PORT:-21001}"
 HTTP_PORT="${SMOKE_HTTP_PORT:-21080}"
+
+# The datagram driven through the receiver in step 4. Deliberately not a valid
+# shred header. Written to a file and compared with cmp so the byte-identity
+# assertion is exact — command substitution strips all trailing newlines, which
+# would make the one check carrying the delivery guarantee blind to
+# trailing-whitespace corruption in the payload.
+PAYLOAD='not-a-valid-shred-header'
 
 WORKDIR="$(mktemp -d)"
 GW_PID=""
@@ -97,13 +104,21 @@ echo "[2/5] receiver starts and serves /healthz + /metrics"
 # and fails the byte-identity check for a reason that has nothing to do with the
 # binary under test.
 sink_is_bound() {
+  # A dead sink is never bound. The port checks below match ANY listener on the
+  # port, so a leaked sink from an aborted earlier run would otherwise satisfy
+  # the wait while the sink just started died on EADDRINUSE — and the run would
+  # fail later at byte-identity with an empty sink, pointing the reader at
+  # fan-out rather than at the stale process.
+  kill -0 "$SINK_PID" 2>/dev/null || return 1
+
   if command -v ss >/dev/null 2>&1; then
     ss -lun 2>/dev/null | grep -q ":$SINK_PORT\b"
   elif command -v netstat >/dev/null 2>&1; then
     netstat -lun 2>/dev/null | grep -q ":$SINK_PORT\b"
   else
-    # No way to observe the bind; fall back to the readiness marker the python
-    # sink writes for itself, and to a bounded settle for nc.
+    # No way to observe the bind; fall back to the readiness marker. Both sinks
+    # write one: python from inside the process once bind() has returned, nc
+    # after a bounded settle (it has no readiness signal of its own).
     [ -f "$WORKDIR/sink.ready" ]
   fi
 }
@@ -115,6 +130,10 @@ wait_for_sink() {
     sink_is_bound && return 0
     sleep 0.1
   done
+  if ! kill -0 "$SINK_PID" 2>/dev/null; then
+    printf '  note  sink exited before binding; port %s may be held by a stale run\n' \
+      "$SINK_PORT" >&2
+  fi
   return 1
 }
 
@@ -139,17 +158,32 @@ with open('$WORKDIR/sink.bin', 'wb') as f:
   else
     kill -KILL "$SINK_PID" 2>/dev/null || true
     SINK_PID=""
+    rm -f "$WORKDIR/sink.ready"
   fi
 fi
 
 if [ -z "$SINK_KIND" ] && command -v nc >/dev/null 2>&1; then
   nc -u -l 127.0.0.1 "$SINK_PORT" > "$WORKDIR/sink.bin" 2>/dev/null &
   SINK_PID=$!
+  # nc cannot announce its own bind, so on a host with neither ss nor netstat the
+  # marker below is the only thing sink_is_bound can observe. Without it this
+  # branch could never be accepted there: wait_for_sink would exhaust every
+  # iteration and the script would exit 2 claiming no sink bound — refusing a
+  # host that docs/operations/install.md explicitly says is supported, and
+  # leaving SMOKE_ALLOW_NO_SINK=1 (which drops the delivery assertion) as the
+  # operator's only route forward.
+  #
+  # Only announce if nc is still running: a netcat variant that rejected these
+  # arguments has already exited, and marking that ready would hand back a sink
+  # that isn't there.
+  sleep 0.3
+  kill -0 "$SINK_PID" 2>/dev/null && touch "$WORKDIR/sink.ready"
   if wait_for_sink; then
     SINK_KIND="nc"
   else
     kill -KILL "$SINK_PID" 2>/dev/null || true
     SINK_PID=""
+    rm -f "$WORKDIR/sink.ready"
   fi
 fi
 
@@ -203,14 +237,27 @@ check_eq "/healthz before traffic" "503" \
 #    shreds_unparsed_total and otherwise leaves delivery byte-identical.
 # ---------------------------------------------------------------------------
 echo "[4/5] one malformed datagram: delivered, forwarded, counted as unparsed"
-printf 'not-a-valid-shred-header' > "/dev/udp/127.0.0.1/$FEED_PORT"
+printf '%s' "$PAYLOAD" > "$WORKDIR/expected.bin"
+printf '%s' "$PAYLOAD" > "/dev/udp/127.0.0.1/$FEED_PORT"
 
-# /dev/udp is fire-and-forget, so poll for the counter to move rather than
-# sleeping a fixed interval and hoping. Still fails closed: if the packet never
-# lands, the loop times out and the check_eq below reports the real value.
+# /dev/udp is fire-and-forget, so poll rather than sleeping a fixed interval and
+# hoping. Gate on EVERY counter this step asserts, not just the first one to
+# move: cmd/blockcast-shreds/main.go increments ingress BEFORE calling
+# processPacket, which only enqueues onto the fan-out's bounded channel
+# (receiver/fanout.go Enqueue) — the write and egress_packets_total land later,
+# on the worker goroutine in Fanout.run. shreds_unparsed_total is incremented
+# after that enqueue too. Breaking on ingress alone can therefore re-scrape while
+# egress and unparsed still read 0, reporting a failure that says nothing about
+# the binary. Still fails closed: if a counter genuinely never moves, the loop
+# times out and the check_eq calls below report its real value.
+counters_settled() {
+  [ "$(metric 'bcast_shred_gw_ingress_packets_total{feed="default"}')"  = "1" ] &&
+  [ "$(metric 'bcast_shred_gw_egress_packets_total{feed="default"}')"   = "1" ] &&
+  [ "$(metric 'bcast_shred_gw_shreds_unparsed_total{feed="default"}')"  = "1" ]
+}
 for _ in $(seq 1 50); do
   curl -fsS "http://127.0.0.1:$HTTP_PORT/metrics" > "$WORKDIR/metrics.txt" 2>/dev/null || true
-  [ "$(metric 'bcast_shred_gw_ingress_packets_total{feed="default"}')" = "1" ] && break
+  counters_settled && break
   sleep 0.1
 done
 curl -fsS "http://127.0.0.1:$HTTP_PORT/metrics" > "$WORKDIR/metrics.txt"
@@ -234,10 +281,10 @@ else
     [ -s "$WORKDIR/sink.bin" ] && break
     sleep 0.1
   done
-  if [ "$(cat "$WORKDIR/sink.bin" 2>/dev/null)" = "not-a-valid-shred-header" ]; then
+  if cmp -s "$WORKDIR/expected.bin" "$WORKDIR/sink.bin"; then
     pass "fan-out is byte-identical to ingress"
   else
-    fail "fan-out payload differs from ingress (sink got: '$(cat "$WORKDIR/sink.bin" 2>/dev/null)')"
+    fail "fan-out payload differs from ingress (sent $(wc -c < "$WORKDIR/expected.bin") bytes, sink got $(wc -c < "$WORKDIR/sink.bin" 2>/dev/null || echo 0): '$(cat "$WORKDIR/sink.bin" 2>/dev/null)')"
   fi
 fi
 
