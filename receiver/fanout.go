@@ -33,6 +33,45 @@ type EgressObserver interface {
 	AddWriteErrors(feedID string, count uint64) error
 }
 
+// EnqueueResult reports how the bounded ring handled a packet. It exists so the
+// ingress caller can tell a real delivery drop (EnqueueOverflow) apart from a
+// shutdown-time rejection (EnqueueClosed), which is not a drop.
+type EnqueueResult int
+
+const (
+	// enqueueUnknown is the zero value and is never returned. It exists so a
+	// zero-valued EnqueueResult — a forgotten assignment, or a struct field that
+	// was never set — does not silently read as "delivered". Callers branch on
+	// delivery outcomes, so the default must be a value that fails loudly rather
+	// than the success case.
+	enqueueUnknown EnqueueResult = iota
+	// EnqueueAccepted means the packet was copied into the ring for delivery.
+	EnqueueAccepted
+	// EnqueueOverflow means the ring was full and the packet was lost. This is
+	// the only outcome that counts toward the documented drop counters.
+	EnqueueOverflow
+	// EnqueueClosed means the fan-out was already shut down. The packet was not
+	// delivered, but it is a shutdown artifact rather than receiver overload,
+	// so it must not be charged to the ring-overflow counters.
+	EnqueueClosed
+)
+
+// String renders the result for logs and test failures.
+func (r EnqueueResult) String() string {
+	switch r {
+	case enqueueUnknown:
+		return "unknown"
+	case EnqueueAccepted:
+		return "accepted"
+	case EnqueueOverflow:
+		return "overflow"
+	case EnqueueClosed:
+		return "closed"
+	default:
+		return fmt.Sprintf("EnqueueResult(%d)", int(r))
+	}
+}
+
 // queuedPacket carries the originating feed alongside the packet so the worker
 // can attribute delivery to a feed. A single process-wide Fanout serves every
 // feed, so the worker cannot infer the feed from the packet itself.
@@ -140,25 +179,30 @@ func NewUDPFanout(destinations []string, queueCapacity int, observer EgressObser
 	return f, nil
 }
 
-// Enqueue copies packet into the bounded ring, attributing it to feedID. It
-// returns false when the ring is full or the fan-out has been closed. Only ring
-// overflow increments the drop counter.
-func (f *Fanout) Enqueue(feedID string, packet []byte) bool {
+// Enqueue copies packet into the bounded ring, attributing it to feedID.
+//
+// The two rejection reasons are reported separately because only one of them is
+// a delivery drop. A full ring means the receiver could not keep up and the
+// packet was lost; a closed fan-out means the process is shutting down and the
+// ingress goroutine has not stopped reading yet. Charging both to the same
+// counter lets shutdown inflate the ring-overflow metric, which is documented
+// as ring-full only and would then disagree with Stats().DroppedPackets.
+func (f *Fanout) Enqueue(feedID string, packet []byte) EnqueueResult {
 	owned := queuedPacket{feedID: feedID, packet: append([]byte(nil), packet...)}
 
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	if f.closed {
-		return false
+		return EnqueueClosed
 	}
 
 	select {
 	case f.queue <- owned:
 		f.queuedPackets.Add(1)
-		return true
+		return EnqueueAccepted
 	default:
 		f.droppedPackets.Add(1)
-		return false
+		return EnqueueOverflow
 	}
 }
 

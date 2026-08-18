@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -362,3 +365,202 @@ func gaugeValue(t *testing.T, registry *prometheus.Registry, name, feedID string
 	t.Fatalf("metric %s{feed=%q} is absent from the registry", name, feedID)
 	return 0
 }
+
+// blockingWriter parks the fan-out worker inside a write so the bounded ring
+// can be filled deterministically.
+type blockingWriter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.entered) })
+	<-w.release
+	return len(p), nil
+}
+
+func (w *blockingWriter) Close() error { return nil }
+
+// TestShutdownDoesNotInflateTheFanoutDropCounter pins the call-site half of the
+// drop-counter contract. The README defines fanout_dropped_packets_total as
+// ring-full only, but Enqueue also refuses packets once the fan-out is closed.
+// Reader goroutines are not joined before Close, so an in-flight packet can hit
+// a closed fan-out during shutdown; charging that to the overflow counter makes
+// the scraped metric disagree with Fanout.Stats().DroppedPackets.
+func TestShutdownDoesNotInflateTheFanoutDropCounter(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fanout, err := receiver.NewFanout([]io.WriteCloser{&captureWriter{packets: make(chan []byte, 4)}}, 4, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+	scorer := shred.NewFeedScorer([]string{"feed"})
+
+	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics)
+
+	if got := gaugeValue(t, registry, "bcast_shred_gw_fanout_dropped_packets_total", "feed"); got != 0 {
+		t.Fatalf("scraped fanout_dropped_packets_total = %v, want 0; a post-close reject is shutdown, not ring overflow", got)
+	}
+	if got := fanout.Stats().DroppedPackets; got != 0 {
+		t.Fatalf("Stats().DroppedPackets = %d, want 0; the metric and the counter must agree", got)
+	}
+}
+
+// TestRingOverflowIncrementsTheFanoutDropCounter is the positive half: a
+// genuinely full ring must still be counted, so the fix above cannot be
+// satisfied by never counting drops at all.
+func TestRingOverflowIncrementsTheFanoutDropCounter(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := &blockingWriter{entered: make(chan struct{}), release: make(chan struct{})}
+	fanout, err := receiver.NewFanout([]io.WriteCloser{writer}, 1, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scorer := shred.NewFeedScorer([]string{"feed"})
+
+	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics)
+	select {
+	case <-writer.entered:
+	case <-time.After(time.Second):
+		t.Fatal("fan-out worker did not enter the writer")
+	}
+	processPacket("feed", []byte{0x02}, time.Now(), scorer, fanout, metrics) // fills the ring
+	processPacket("feed", []byte{0x03}, time.Now(), scorer, fanout, metrics) // overflows
+
+	if got := gaugeValue(t, registry, "bcast_shred_gw_fanout_dropped_packets_total", "feed"); got != 1 {
+		t.Fatalf("scraped fanout_dropped_packets_total = %v, want 1", got)
+	}
+	close(writer.release)
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := fanout.Stats().DroppedPackets; got != 1 {
+		t.Fatalf("Stats().DroppedPackets = %d, want 1; the metric and the counter must agree", got)
+	}
+}
+
+func TestRunRejectsNonPositiveHealthMaxAge(t *testing.T) {
+	for _, value := range []string{"0", "-5s"} {
+		err := run([]string{"--health-max-age", value})
+		if err == nil || !strings.Contains(err.Error(), "--health-max-age must be positive") {
+			t.Fatalf("run(--health-max-age %s) error = %v", value, err)
+		}
+	}
+}
+
+// forwarderDataShred builds a valid 28-byte-framed forwarder data shred so this
+// package can drive the real scoring path. Package shred's own builder is a
+// test helper and is not importable from here.
+func forwarderDataShred(slot uint64, fecSet uint32, localIndex uint32) []byte {
+	packet := make([]byte, 28+64)
+	packet[0] = 3 // wire version
+	binary.LittleEndian.PutUint64(packet[1:9], slot)
+	binary.LittleEndian.PutUint32(packet[9:13], fecSet)
+	binary.LittleEndian.PutUint32(packet[13:17], localIndex)
+	// flags 0 (data), and data shreds must advertise no geometry.
+	return packet
+}
+
+// TestConcurrentProcessPacketIsRaceFreeAndOrderTolerant pins the concurrency
+// claim processPacket's doc comment makes. Every prior test here was
+// single-goroutine, so nothing exercised the shared FeedScorer, Fanout and
+// ReceiverMetrics under the access pattern the receiver actually uses: one
+// goroutine per feed, all calling processPacket against the same values.
+//
+// Two halves:
+//
+//   - Data races. Covered by CI's race job (go test -race -tags purego), not by
+//     assertions here. This test is what gives that job something to detect.
+//   - Ordering. receivedAt is captured at the socket read, so concurrent feeds
+//     present it out of order. Each feed hands out DEscending timestamps, so
+//     within a feed goroutine the regression is program order and therefore
+//     deterministic no matter how the goroutines interleave — which is what
+//     makes the per-feed assertions below stable assertions rather than a race
+//     for the scheduler to win. A scorer that assumed nondecreasing receivedAt
+//     reports completed = 1ms - 32ms = -31ms and charges all 31 steps to the
+//     sub-millisecond bucket.
+func TestConcurrentProcessPacketIsRaceFreeAndOrderTolerant(t *testing.T) {
+	const feedCount, shredsPerSet = 4, 32
+
+	names := make([]string, feedCount)
+	for i := range names {
+		names[i] = fmt.Sprintf("feed-%d", i)
+	}
+	registry := prometheus.NewRegistry()
+	metrics, err := receiver.NewReceiverMetrics(registry, names)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fanout, err := receiver.NewFanout([]io.WriteCloser{&discardWriter{}}, feedCount*shredsPerSet, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scorer := shred.NewFeedScorer(names)
+	base := time.Unix(100, 0)
+
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for f := 0; f < feedCount; f++ {
+		wg.Add(1)
+		go func(feedIndex int) {
+			defer wg.Done()
+			<-start
+			// Each feed completes its own FEC set, so per-feed accounting is
+			// independent of the interleaving.
+			slot := uint64(500 + feedIndex)
+			for i := 0; i < shredsPerSet; i++ {
+				at := base.Add(time.Duration(shredsPerSet-i) * time.Millisecond)
+				processPacket(names[feedIndex], forwarderDataShred(slot, 0, uint32(i)), at, scorer, fanout, metrics)
+			}
+		}(f)
+	}
+	close(start)
+	wg.Wait()
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	receipt := scorer.Receipt()
+	if got := receipt.Union.CompletionP50; got < 0 {
+		t.Fatalf("Union.CompletionP50 = %s is negative under concurrent out-of-order arrival", got)
+	}
+	for _, feed := range receipt.Feeds {
+		// Each feed is scored against the union's set universe, so it "erases"
+		// the other feeds' sets by construction. Its own is the complete one.
+		if feed.Receipt.SetsTotal != feedCount || feed.Receipt.SetsErased != feedCount-1 {
+			t.Fatalf("feed %s scored %d sets with %d erased, want %d/%d", feed.Name, feed.Receipt.SetsTotal, feed.Receipt.SetsErased, feedCount, feedCount-1)
+		}
+		// Extent is 1ms..32ms regardless of the order the shreds were presented.
+		if want := 31 * time.Millisecond; feed.Receipt.CompletionP50 != want {
+			t.Fatalf("feed %s CompletionP50 = %s, want %s; completion must measure the set's arrival extent", feed.Name, feed.Receipt.CompletionP50, want)
+		}
+		if got := feed.Receipt.Gaps.LT1; got != 0 {
+			t.Fatalf("feed %s Gaps.LT1 = %d, want 0; regressing arrivals must not be charged to the sub-millisecond bucket", feed.Name, got)
+		}
+		if got := feed.Receipt.Gaps.Reordered; got != shredsPerSet-1 {
+			t.Fatalf("feed %s Gaps.Reordered = %d, want %d", feed.Name, got, shredsPerSet-1)
+		}
+	}
+	// The ring was sized for every packet, so nothing may be charged as a drop.
+	for _, name := range names {
+		if got := gaugeValue(t, registry, "bcast_shred_gw_fanout_dropped_packets_total", name); got != 0 {
+			t.Fatalf("scraped fanout_dropped_packets_total{feed=%q} = %v, want 0", name, got)
+		}
+	}
+}
+
+type discardWriter struct{}
+
+func (w *discardWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w *discardWriter) Close() error                { return nil }
