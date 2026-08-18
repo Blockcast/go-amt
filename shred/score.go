@@ -45,14 +45,23 @@ type Receipt struct {
 }
 
 type setScore struct {
-	seen  uint64
+	seen uint64
+	// first and last are the oldest and newest arrival timestamps among the
+	// distinct shreds counted into seen, as presented to observe. Together they
+	// give the set's arrival extent, which is what completed measures. Tracking
+	// them explicitly (rather than using the timestamp of whichever shred
+	// happened to be processed 32nd) keeps the extent correct when arrivals are
+	// presented out of order, and a duplicate carrying an earlier timestamp
+	// lowers first so the floor does not depend on which copy arrived first.
+	//
+	// Both stop moving at completion, and neither is repaired retroactively: a
+	// duplicate older than the copy already counted can only lower first while
+	// the set is still incomplete, and it can never lower last. So a set whose
+	// newest-counted shred was itself raced keeps a slightly wide extent. Making
+	// both true extremes over true arrivals needs per-shred earliest-arrival
+	// tracking, which this type deliberately does not carry.
 	first time.Time
-	// last is the newest arrival timestamp among the distinct shreds counted
-	// into seen. Together with first it gives the set's true arrival extent,
-	// which is what completed measures. Tracking it explicitly (rather than
-	// using the timestamp of whichever shred happened to be processed 32nd)
-	// keeps the extent correct when arrivals are presented out of order.
-	last time.Time
+	last  time.Time
 	// completed is only meaningful when complete is true. A duration of zero is
 	// a legitimate value — a set whose 32nd distinct shred lands in the same
 	// clock tick as its first — so completion must not be inferred from
@@ -318,6 +327,22 @@ func (s *Scorer) observe(packet []byte, receivedAt time.Time) (key dedupKey, acc
 		// one seen, not the earliest one that happened to be processed first.
 		if receivedAt.Before(first) {
 			s.dedup[key] = receivedAt
+			// This copy does not change *which* shreds the set has seen — the bit
+			// is already set — but it does lower the set's true arrival floor, and
+			// completion latency is measured from that floor. Without this, the
+			// floor is whichever copy of a raced shred was processed first, so
+			// time_to_32nd_shred would keep the processing-order dependence that
+			// first-arrival attribution no longer has.
+			//
+			// Only a set that has not completed yet can be repaired: completed is
+			// frozen when the 32nd distinct shred lands, so an earlier duplicate
+			// observed after that point has nothing left to move. Repairing it
+			// would need per-shred earliest-arrival tracking so the extent could
+			// be recomputed over true arrivals rather than presented ones.
+			setKey := SetKey{Slot: header.Slot, FECSetIndex: header.FECSetIndex}
+			if set := s.sets[setKey]; set != nil && !set.complete && receivedAt.Before(set.first) {
+				set.first = receivedAt
+			}
 		}
 		return key, false, first, nil
 	}
@@ -352,10 +377,20 @@ func (s *Scorer) observe(packet []byte, receivedAt time.Time) (key dedupKey, acc
 	if set.seen&bit != 0 {
 		// Unreachable while the dedup key and the set bitmap carry the same
 		// (slot, fec_set_index, index_within_set) identity — the dedup miss above
-		// implies a clear bit. Kept as a belt-and-braces guard so the bitmap can
-		// never double-count. There is no incumbent timestamp to report here: the
-		// zero value cannot precede any real arrival, so it withholds credit
-		// rather than mis-assigning it.
+		// implies a clear bit. The shift is in range for the same reason: Parse
+		// rejects a data index outside 0..31 and a coding index outside 32..63
+		// before the header is built, so IndexWithinSet is always < 64 and the
+		// shift can never widen to zero and quietly disable this guard.
+		//
+		// Kept as a belt-and-braces guard so the bitmap can never double-count.
+		// There is no incumbent timestamp to report here: the zero value cannot
+		// precede any real arrival, so it withholds credit rather than
+		// mis-assigning it. Worth naming what reaching this line would mean,
+		// because it is not mis-attribution: s.dedup[key] is already written
+		// above, so the shred counts toward UniqueShreds while no feed is
+		// credited for it, and firstBy never records a holder — so no later copy
+		// can repair it either. That is a silent breach of the partition
+		// invariant sum(UniqueFirst) == UniqueShreds, not a rounding error.
 		return key, false, time.Time{}, nil
 	}
 	set.seen |= bit
@@ -365,15 +400,22 @@ func (s *Scorer) observe(packet []byte, receivedAt time.Time) (key dedupKey, acc
 	// sorts to the front of the latency slice and drags every completion
 	// percentile down, understating time_to_32nd_shred on a customer-facing
 	// receipt.
-	if receivedAt.Before(set.first) {
-		set.first = receivedAt
-	}
-	if receivedAt.After(set.last) {
-		set.last = receivedAt
-	}
-	if !set.complete && bitsSet64(set.seen) == completionThreshold {
-		set.complete = true
-		set.completed = set.last.Sub(set.first)
+	//
+	// Widening stops at completion. completed is frozen there, so shreds 33..63
+	// could only drift first and last away from the extent that produced it;
+	// keeping the whole block behind the same guard makes completed == last minus
+	// first an invariant rather than something that holds only at one instant.
+	if !set.complete {
+		if receivedAt.Before(set.first) {
+			set.first = receivedAt
+		}
+		if receivedAt.After(set.last) {
+			set.last = receivedAt
+		}
+		if bitsSet64(set.seen) == completionThreshold {
+			set.complete = true
+			set.completed = set.last.Sub(set.first)
+		}
 	}
 	return key, true, time.Time{}, nil
 }

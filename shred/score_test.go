@@ -206,6 +206,87 @@ func TestFeedScorerCreditsFirstArrivalByTimestampNotProcessingOrder(t *testing.T
 	}
 }
 
+// The test above stops before its FEC set completes, so it never exercises the
+// completion fields. Driving the same two raced copies to a completed set is
+// what shows whether time_to_32nd_shred is decided by arrival timestamps or by
+// which copy the scheduler presented first: the set's latency is measured from
+// its arrival floor, and the floor is exactly what a duplicate older than the
+// counted copy has to lower.
+//
+// Before the duplicate path widened the extent, the two orders read p50=1.031s
+// and p50=31ms on identical arrivals — the later understating by the whole
+// inter-feed skew, which is the harm the extent tracking is supposed to prevent.
+//
+// The gap histogram is deliberately NOT asserted equal here. Gaps are derived
+// from the first-*processed* copy of each shred against a running frontier, so a
+// duplicate that turns out to be older cannot re-derive a gap already recorded.
+// That residual is documented in README.md and on setScore; the assertion below
+// pins it, so closing it forces this test and that prose to be updated together.
+func TestFeedScorerCompletionLatencyIgnoresDuplicateProcessingOrder(t *testing.T) {
+	const slot, fecSet = 31, 0
+	early, late := time.Unix(4, 0), time.Unix(5, 0)
+
+	receiptFor := func(t *testing.T, firstObserved string) UnionReceipt {
+		t.Helper()
+		scorer := NewFeedScorerWithFormat(FormatAgave, []string{"early", "late"})
+		raced := dataPacket(slot, fecSet, 0)
+		at := map[string]time.Time{"early": early, "late": late}
+		order := []string{"early", "late"}
+		if firstObserved == "late" {
+			order = []string{"late", "early"}
+		}
+		for _, feed := range order {
+			if _, err := scorer.Observe(feed, raced, at[feed]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// Complete the set on "late" alone, 1ms apart, so the only variable
+		// between the two receipts is the order of the two copies of shred 0.
+		for index := uint32(1); index < completionThreshold; index++ {
+			at := late.Add(time.Duration(index) * time.Millisecond)
+			if _, err := scorer.Observe("late", dataPacket(slot, fecSet, index), at); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return scorer.Receipt()
+	}
+
+	inOrder := receiptFor(t, "early")
+	reversed := receiptFor(t, "late")
+
+	// The floor is the early copy at t=4s and the 32nd shred lands at t=5.031s,
+	// so the set's extent is 1.031s whichever copy was processed first.
+	const want = 1031 * time.Millisecond
+	for _, test := range []struct {
+		name    string
+		receipt UnionReceipt
+	}{{"early observed first", inOrder}, {"late observed first", reversed}} {
+		union := test.receipt.Union
+		if union.SetsTotal != 1 || union.SetsErased != 0 {
+			t.Errorf("%s: sets = %d total, %d erased, want 1 and 0",
+				test.name, union.SetsTotal, union.SetsErased)
+		}
+		for _, percentile := range []struct {
+			label string
+			got   time.Duration
+		}{{"p50", union.CompletionP50}, {"p95", union.CompletionP95}, {"p99", union.CompletionP99}} {
+			if percentile.got != want {
+				t.Errorf("%s: completion %s = %v, want %v",
+					test.name, percentile.label, percentile.got, want)
+			}
+		}
+	}
+
+	// Known residual, pinned: the raced shred contributes its processed timestamp
+	// to the frontier, so the >=32ms gap into the rest of the set is recorded only
+	// when the early copy was processed first.
+	if inOrder.Union.Gaps.GTE32 != 1 || reversed.Union.Gaps.GTE32 != 0 {
+		t.Errorf("gap residual moved: >=32 = %d in-order, %d reversed, want 1 and 0 "+
+			"(if the frontier now re-derives gaps, update README.md and setScore)",
+			inOrder.Union.Gaps.GTE32, reversed.Union.Gaps.GTE32)
+	}
+}
+
 // The same shred delivered down two feeds at once is the contended case that
 // decides attribution, and nothing covered it: the receiver's concurrency test
 // gives every feed a disjoint FEC set by design, so its feeds never compete for

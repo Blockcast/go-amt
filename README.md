@@ -94,9 +94,16 @@ rather than bucketed, because the alternative — a negative gap — falls throu
 the bucket ladder into `<1` and silently inflates the sub-millisecond count.
 The buckets plus `reordered` account for every non-first shred, so a non-zero
 `reordered` means the histogram is a sample of arrivals rather than all of
-them. Completion latency is unaffected: it measures each FEC set's true arrival
-extent (newest minus oldest), not the timestamp of whichever shred happened to
-be processed 32nd.
+them. The histogram itself is derived from the first-*processed* copy of each
+shred: a duplicate that turns out to be older does not retroactively re-derive
+the gap already recorded against it, so with more than one `--feed` the gap
+buckets keep the processing-order dependence that `unique_first` no longer has.
+Completion latency is repaired rather than merely unaffected: an earlier
+duplicate lowers its FEC set's arrival floor, so `time_to_32nd_shred` measures
+the set's arrival extent and not the timestamp of whichever copy was processed
+first. The repair reaches only sets that are still incomplete — a set's latency
+is frozen when its 32nd distinct shred lands — and it lowers the floor only, so
+a set whose newest counted shred was itself raced keeps a slightly wide extent.
 
 `unique_first` and `first_arrival_fraction` are decided by the same arrival
 timestamps, not by which feed's goroutine reached the scorer first. When a shred
