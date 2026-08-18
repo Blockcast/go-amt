@@ -203,6 +203,136 @@ func TestFanoutPublishesWriteErrorsToTheScrapedRegistry(t *testing.T) {
 	}
 }
 
+// fixtureShred returns the first datagram of the bundled deterministic capture,
+// having confirmed the production parser accepts it. Hand-rolled bytes would
+// only prove that processPacket forwards whatever this file's own builder
+// produced, and would encode the forwarder framing a second time; the pcap is
+// the same real capture selftest --fixture replays, so a framing change shows up
+// here instead of being satisfied by a stale local copy of the layout.
+func fixtureShred(t *testing.T) []byte {
+	t.Helper()
+	var first []byte
+	err := shred.ReplayFixtureFunc(func(payload []byte, _ time.Time) error {
+		if first == nil {
+			first = append([]byte(nil), payload...)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == nil {
+		t.Fatal("bundled fixture carries no UDP payloads")
+	}
+	// NewFeedScorer scores FormatForwarder, so that is the frame the caller is
+	// about to feed processPacket. Assert it here rather than inferring it from a
+	// zero unparsed counter, which would also read as zero if the metric wiring
+	// under test were the thing that broke.
+	if _, err := shred.Parse(first, shred.FormatForwarder); err != nil {
+		t.Fatalf("fixture packet does not parse as a shred: %v", err)
+	}
+	return first
+}
+
+// TestUnparsablePacketPublishesUnparsedToTheScrapedRegistry binds
+// processPacket's parse-failure branch to the counter /metrics actually serves.
+// receiver/metrics_test.go exercises IncUnparsed directly, which proves the
+// counter increments when something calls it -- not that the ingest path ever
+// does. Delete the call in processPacket and that unit test stays green while
+// shreds_unparsed_total sits at zero through a feed of pure garbage, which reads
+// as a clean feed rather than a broken one.
+//
+// A valid shred goes through the same path so the assertion pins the branch and
+// not merely the call: a counter raised unconditionally would also satisfy
+// "malformed input increments unparsed".
+func TestUnparsablePacketPublishesUnparsedToTheScrapedRegistry(t *testing.T) {
+	writer := &captureWriter{packets: make(chan []byte, 2)}
+	registry := prometheus.NewRegistry()
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fanout, err := receiver.NewFanout([]io.WriteCloser{writer}, 2, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scorer := shred.NewFeedScorer([]string{"feed"})
+
+	processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics)
+	processPacket("feed", fixtureShred(t), time.Now(), scorer, fanout, metrics)
+	for range 2 {
+		select {
+		case <-writer.packets:
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for forwarded packet")
+		}
+	}
+	// Close drains the ring and joins the worker, so every observer callback has
+	// landed before the registry is scraped.
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := gaugeValue(t, registry, "bcast_shred_gw_shreds_unparsed_total", "feed"); got != 1 {
+		t.Fatalf("scraped shreds_unparsed_total = %v, want 1 (processPacket's parse failure is not wired to the registry)", got)
+	}
+	if got := gaugeValue(t, registry, "bcast_shred_gw_egress_packets_total", "feed"); got != 2 {
+		t.Fatalf("scraped egress_packets_total = %v, want 2; an unparsable packet must still be delivered", got)
+	}
+}
+
+// TestValidShredDuplicateIsForwardedByteIdentically covers what
+// TestPacketDeliveryDoesNotDependOnScoring cannot. That test's 3-byte packet
+// fails to parse, so both copies are rejected for the same reason and it never
+// reaches the duplicate path its name claims -- nor does it show that a
+// well-formed shred survives the path unchanged. Here the first copy parses and
+// is accepted, first-arrival-wins dedup rejects the second (Scorer.Observe
+// returns accepted=false), and both must still reach every destination byte for
+// byte: what to do with a duplicate is the validator's decision, not this
+// process's.
+func TestValidShredDuplicateIsForwardedByteIdentically(t *testing.T) {
+	packet := fixtureShred(t)
+	// Compare against an independent copy: if processPacket mutated the caller's
+	// slice in place, comparing the delivered bytes back to packet would compare
+	// the corruption with itself and pass.
+	want := append([]byte(nil), packet...)
+	writer := &captureWriter{packets: make(chan []byte, 2)}
+	registry := prometheus.NewRegistry()
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fanout, err := receiver.NewFanout([]io.WriteCloser{writer}, 2, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scorer := shred.NewFeedScorer([]string{"feed"})
+
+	for range 2 {
+		processPacket("feed", packet, time.Now(), scorer, fanout, metrics)
+	}
+	for range 2 {
+		select {
+		case got := <-writer.packets:
+			if !bytes.Equal(got, want) {
+				t.Fatalf("forwarded packet = %x, want %x", got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for forwarded packet")
+		}
+	}
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := gaugeValue(t, registry, "bcast_shred_gw_shreds_unparsed_total", "feed"); got != 0 {
+		t.Fatalf("scraped shreds_unparsed_total = %v, want 0; a duplicate of a valid shred is not a parse failure", got)
+	}
+	if got := gaugeValue(t, registry, "bcast_shred_gw_egress_packets_total", "feed"); got != 2 {
+		t.Fatalf("scraped egress_packets_total = %v, want 2; the duplicate must still be delivered", got)
+	}
+}
+
 type failingWriter struct{}
 
 func (w *failingWriter) Write([]byte) (int, error) { return 0, errors.New("destination unavailable") }
