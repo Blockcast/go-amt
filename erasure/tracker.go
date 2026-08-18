@@ -60,6 +60,63 @@ type scoreEvent struct {
 	erased bool
 }
 
+// deliveryWindow accumulates the three delivery outputs of one report window --
+// mean rate, peak 100 ms rate, and the consecutive-gap histogram -- in space
+// that does not depend on how many shreds the window observed.
+//
+// The tracker previously kept every arrival timestamp in a slice until the
+// window drained, which pinned 24 bytes per shred per feed and, because
+// DrainWindow reused the backing array, never released the high-water capacity:
+// one 50k/s burst held ~38 MB of timestamps for the process lifetime. Each
+// output is an O(1) fold, so none of that retention bought anything.
+//
+// Every field is a running fold over arrivals in Observe order. Observe
+// documents that receivedAt is monotonic, which is what makes the peak fold
+// exact: buckets are keyed on absolute time, so once an arrival opens a new
+// bucket the previous one can never be revisited and only the current bucket
+// count has to stay live.
+type deliveryWindow struct {
+	arrivals    uint64
+	peakRate    float64
+	bucketIndex int64
+	bucketOpen  bool
+	bucketCount uint64
+	lastArrival time.Time
+	gaps        GapHistogram
+}
+
+func (w *deliveryWindow) observe(receivedAt time.Time) {
+	w.arrivals++
+
+	bucket := receivedAt.UnixNano() / peakRateBucket.Nanoseconds()
+	if !w.bucketOpen || bucket != w.bucketIndex {
+		w.bucketIndex = bucket
+		w.bucketCount = 0
+		w.bucketOpen = true
+	}
+	w.bucketCount++
+	if rate := float64(w.bucketCount) / peakRateBucket.Seconds(); rate > w.peakRate {
+		w.peakRate = rate
+	}
+
+	// A window's first arrival has no predecessor to measure against, so it
+	// contributes no gap. lastArrival is cleared on drain, which is what keeps
+	// a gap from being reported across a window boundary.
+	if !w.lastArrival.IsZero() {
+		w.gaps.observe(receivedAt.Sub(w.lastArrival))
+	}
+	w.lastArrival = receivedAt
+}
+
+// report folds the window into rep and resets the accumulator for the next one.
+// elapsed is the wall interval the report covers.
+func (w *deliveryWindow) report(rep *Window, elapsed time.Duration) {
+	rep.RMean = float64(w.arrivals) / elapsed.Seconds()
+	rep.RPeak100MS = w.peakRate
+	rep.GapMSHist = w.gaps
+	*w = deliveryWindow{}
+}
+
 // Tracker deduplicates shred positions and scores observed FEC sets once their
 // slot boundary plus the configured grace has elapsed.
 type Tracker struct {
@@ -71,7 +128,7 @@ type Tracker struct {
 	boundaries  map[uint64]time.Time
 	slots       map[uint64]*slotState
 	windowStart time.Time
-	arrivals    []time.Time
+	delivery    deliveryWindow
 	scores      []scoreEvent
 }
 
@@ -146,7 +203,7 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 		return false
 	}
 	state.sets[key] |= bit
-	t.observeDelivery(receivedAt)
+	t.delivery.observe(receivedAt)
 	return true
 }
 
@@ -161,6 +218,37 @@ func (t *Tracker) Advance(now time.Time) {
 // DrainWindow scores through cutoff, returns one report, and resets its
 // counters. The broker normally calls it every 30 seconds; delayed calls use
 // their actual elapsed interval so the mean rate is not silently distorted.
+//
+// Arrival attribution: every shred Observe accepted before this call belongs to
+// the window being drained, whatever its timestamp is relative to cutoff.
+// cutoff fixes the window's elapsed time and the next window's start; it does
+// not re-partition arrivals that have already been folded into the counters.
+// Scores are still partitioned by cutoff, because a score carries its own
+// deadline and can legitimately fall in a later window than the drain.
+//
+// This rule replaces the old one, under which arrivals at or after cutoff were
+// held back and re-counted in the next window. That is unrepresentable in O(1)
+// space -- un-counting an arrival needs its timestamp, which is the retention
+// this type exists to remove -- so the alternatives were to reject such a
+// cutoff, to carry a single pending arrival, or to attribute as above. The
+// first two are unsafe here, and not in a hypothetical way: the shipped
+// receiver drains from a ticker goroutine that does NOT hold the read-path
+// mutex and passes the ticker's own fire time as cutoff, while the read loop
+// keeps stamping later arrivals (cmd/blockcast-shreds/main.go, the reporter at
+// the reportInterval ticker versus the mu-guarded ReadFromUDP loop). Arrivals
+// at or after cutoff are therefore routine and arbitrarily many, not an
+// empty-barring-clock-skew set. Rejecting the cutoff would make publishWindows
+// skip the drain on every tick and freeze the erasure SLA at its last value --
+// the confidently-clean-feed failure this reporting path exists to prevent --
+// and one pending arrival cannot hold a suffix that is thousands of shreds long
+// at 50k/s. Only the final drain, which runs under mu after the sockets close,
+// sees the quiescent case.
+//
+// The cost is bounded and self-correcting: an arrival is still counted exactly
+// once, so totals are conserved across windows, and only reporter scheduling
+// lag can shift one between them. RPeak100MS gets more accurate, since a burst
+// straddling the cutoff is now scored in one whole bucket instead of being
+// split across two windows and understated.
 func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -184,27 +272,7 @@ func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 	t.scores = retainedScores
 	window.ErasureFraction = fraction(window.SetsErased, window.SetsTotal)
 
-	retainedArrivals := t.arrivals[:0]
-	rateBuckets := make(map[int64]uint64)
-	var lastArrival time.Time
-	for _, arrival := range t.arrivals {
-		if !arrival.Before(cutoff) {
-			retainedArrivals = append(retainedArrivals, arrival)
-			continue
-		}
-		window.RMean++
-		bucket := arrival.UnixNano() / peakRateBucket.Nanoseconds()
-		rateBuckets[bucket]++
-		if rate := float64(rateBuckets[bucket]) / peakRateBucket.Seconds(); rate > window.RPeak100MS {
-			window.RPeak100MS = rate
-		}
-		if !lastArrival.IsZero() {
-			window.GapMSHist.observe(arrival.Sub(lastArrival))
-		}
-		lastArrival = arrival
-	}
-	t.arrivals = retainedArrivals
-	window.RMean /= cutoff.Sub(t.windowStart).Seconds()
+	t.delivery.report(&window, cutoff.Sub(t.windowStart))
 	t.windowStart = cutoff
 	return window, nil
 }
@@ -234,10 +302,6 @@ func (t *Tracker) scoreDue(now time.Time) {
 		}
 		state.scored = true
 	}
-}
-
-func (t *Tracker) observeDelivery(receivedAt time.Time) {
-	t.arrivals = append(t.arrivals, receivedAt)
 }
 
 func (h *GapHistogram) observe(gap time.Duration) {
