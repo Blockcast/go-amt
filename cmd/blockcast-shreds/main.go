@@ -23,8 +23,10 @@ import (
 const help = `blockcast-shreds demo mode
 
 Usage:
-  blockcast-shreds [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
+  blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
   blockcast-shreds selftest --fixture [--json]
+  blockcast-shreds selftest --generic [--json]
+  blockcast-shreds gensend --to IP:PORT [--iface IP]
 
 Demo mode has no broker, certificates, accounts, or heartbeats. --feed is
 repeatable for first-arrival-wins scoring across multiple unicast UDP feeds.
@@ -32,6 +34,13 @@ With two or more feeds the receipt reports the measured worth of a second
 feed: each feed's own erasure fraction, the union's, and the FEC sets the
 extra feeds rescued. It measures this run only — it cannot tell whether the
 inputs are independently operated or share one tap.
+
+--mode generic scores generic framed records instead of shreds: the same
+delivery receipt, on a payload that isn't shreds. It reports no FEC erasure,
+because this mode does no erasure coding, and no cross-feed union, because
+nothing in this mode establishes that two feeds carry the same stream.
+gensend emits the synthetic framed feed so the receipt can be driven
+end-to-end through the demo tap.
 
 /healthz is readiness-shaped: it reports unhealthy until the first packet
 arrives, so it is not a safe liveness probe. --health-max-age sets the
@@ -42,6 +51,19 @@ past each arrival, so the receiver reaches a steady state instead of growing
 for as long as it runs. The receipt still covers the whole run; the window is
 how long a second copy of a shred can still be recognised as a duplicate.
 See the README.`
+
+// sessionScorer is the seam that keeps shred mode and generic mode one client.
+// Both modes are selected once at construction; the packet loop below has no
+// mode switch in it.
+//
+// SessionReceipt returns fmt.Stringer so both modes render through the same
+// printReceipt, which is what makes --json compose with --mode rather than being
+// a shred-only flag. Each scorer supplies it in the shred package, so call sites
+// pass the concrete scorer with no wrapper.
+type sessionScorer interface {
+	Observe(feed string, packet []byte, receivedAt time.Time) (bool, error)
+	SessionReceipt() fmt.Stringer
+}
 
 type feeds []string
 
@@ -67,17 +89,23 @@ func run(args []string) error {
 	if len(args) != 0 && args[0] == "selftest" {
 		return selftest(args[1:])
 	}
+	if len(args) != 0 && args[0] == "gensend" {
+		return gensend(args[1:])
+	}
 	flags := flag.NewFlagSet("blockcast-shreds", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	flags.Usage = func() { fmt.Fprintln(flags.Output(), help) }
 	var configuredFeeds feeds
-	var listen, destinations, httpAddress string
+	var listen, destinations, httpAddress, mode, sourceLabel, rightsBasis string
 	var healthMaxAge time.Duration
 	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed")
 	flags.StringVar(&listen, "listen", "0.0.0.0:20000", "unicast UDP listen address")
 	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated UDP forward destinations")
 	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	flags.StringVar(&httpAddress, "http-addr", "127.0.0.1:8080", "metrics and health HTTP address; empty disables HTTP")
+	flags.StringVar(&mode, "mode", "shred", "scoring mode: shred or generic")
+	flags.StringVar(&sourceLabel, "source-label", "", "generic mode: provenance of the input, e.g. synthetic")
+	flags.StringVar(&rightsBasis, "rights-basis", "", "generic mode: recorded rights basis for the input")
 	flags.DurationVar(&healthMaxAge, "health-max-age", 30*time.Second, "/healthz ingress freshness window; readiness-shaped, see README")
 	retention := flags.Duration("retain", shred.DefaultRetention, "how far behind the newest arrival to keep per-shred scoring state; see README")
 	if err := flags.Parse(args); err != nil {
@@ -88,6 +116,22 @@ func run(args []string) error {
 	}
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
+	}
+	switch mode {
+	case "shred":
+		if sourceLabel != "" || rightsBasis != "" {
+			return errors.New("--source-label and --rights-basis apply to --mode generic only")
+		}
+	case "generic":
+		// Both labels are mandatory rather than defaulted. A generic receipt
+		// whose input provenance is unstated is the artifact the rights
+		// guardrail exists to prevent, and defaulting to "synthetic" would let
+		// a real capture be scored under a synthetic label by omission.
+		if sourceLabel == "" || rightsBasis == "" {
+			return errors.New("--mode generic requires --source-label and --rights-basis")
+		}
+	default:
+		return fmt.Errorf("--mode %q must be shred or generic", mode)
 	}
 	configured := []feed{{name: "default", address: listen}}
 	if len(configuredFeeds) != 0 {
@@ -113,19 +157,29 @@ func run(args []string) error {
 	if *retention <= 0 {
 		return fmt.Errorf("--retain must be positive, got %s", *retention)
 	}
-	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON, *retention)
+	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON, *retention, mode, sourceLabel, rightsBasis)
 }
 
 func selftest(args []string) error {
 	flags := flag.NewFlagSet("selftest", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	fixture := flags.Bool("fixture", false, "replay the bundled deterministic pcap")
+	generic := flags.Bool("generic", false, "replay the deterministic synthetic generic feed")
 	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if !*fixture || flags.NArg() != 0 {
-		return errors.New("usage: blockcast-shreds selftest --fixture [--json]")
+	// Exactly one mode: *fixture == *generic rejects both "neither" and "both",
+	// so the selftest can never silently pick a mode the caller did not name.
+	if flags.NArg() != 0 || *fixture == *generic {
+		return errors.New("usage: blockcast-shreds selftest --fixture | --generic [--json]")
+	}
+	if *generic {
+		scorer := shred.NewGenericScorer(shred.GenericSyntheticSource, shred.GenericSyntheticRightsBasis)
+		if err := shred.ReplayGenericFixture(scorer); err != nil {
+			return err
+		}
+		return printReceipt(scorer.Receipt(), *asJSON)
 	}
 	scorer := shred.NewScorer()
 	if err := shred.ReplayFixture(scorer); err != nil {
@@ -149,12 +203,72 @@ func printReceipt(receipt fmt.Stringer, asJSON bool) error {
 	return nil
 }
 
-func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, retention time.Duration) error {
+// gensend emits the synthetic generic feed as real datagrams so the receipt can
+// be driven end-to-end through the demo tap rather than only in-process. It
+// sends the same records the selftest scores, so the two paths cannot disagree
+// about what the fixture is.
+func gensend(args []string) error {
+	flags := flag.NewFlagSet("gensend", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	to := flags.String("to", "", "destination IP:PORT, typically the tap's SSM group")
+	iface := flags.String("iface", "", "local interface IP to send from; required for same-host multicast")
+	pace := flags.Bool("pace", true, "sleep between records to match the fixture's arrival spacing")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *to == "" || flags.NArg() != 0 {
+		return errors.New("usage: blockcast-shreds gensend --to IP:PORT [--iface IP] [--pace=false]")
+	}
+	destination, err := net.ResolveUDPAddr("udp4", *to)
+	if err != nil {
+		return fmt.Errorf("resolve --to %q: %w", *to, err)
+	}
+	// Binding the source address is what makes same-host SSM work: the tap
+	// filters on source, so a datagram leaving an unexpected interface is
+	// dropped by the join with no error anywhere.
+	var local *net.UDPAddr
+	if *iface != "" {
+		local = &net.UDPAddr{IP: net.ParseIP(*iface)}
+		if local.IP == nil {
+			return fmt.Errorf("--iface %q is not an IP address", *iface)
+		}
+	}
+	conn, err := net.DialUDP("udp4", local, destination)
+	if err != nil {
+		return fmt.Errorf("dial %q: %w", *to, err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	spec := shred.DefaultGenericFixtureSpec()
+	records := spec.Build()
+	for _, record := range records {
+		if _, err := conn.Write(record.Payload); err != nil {
+			return fmt.Errorf("send record: %w", err)
+		}
+		if *pace {
+			time.Sleep(spec.Interval)
+		}
+	}
+	fmt.Printf("gensend source=%s rights=%s records=%d to=%s\n",
+		shred.GenericSyntheticSource, shred.GenericSyntheticRightsBasis, len(records), *to)
+	return nil
+}
+
+func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, retention time.Duration, mode, sourceLabel, rightsBasis string) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
 	}
-	scorer := shred.NewFeedScorerWithRetention(shred.FormatForwarder, names, retention)
+	var scorer sessionScorer
+	if mode == "generic" {
+		scorer = shred.NewGenericFeedScorer(names, sourceLabel, rightsBasis)
+		// The provenance is announced at start, not only in the closing
+		// receipt, so a run that is interrupted still has its input labelled.
+		// It goes to stderr so --json keeps stdout a single JSON document.
+		fmt.Fprintf(os.Stderr, "mode=generic source=%s rights=%s\n", sourceLabel, rightsBasis)
+	} else {
+		scorer = shred.NewFeedScorerWithRetention(shred.FormatForwarder, names, retention)
+	}
 	registry := prometheus.NewRegistry()
 	metrics, err := receiver.NewReceiverMetrics(registry, names)
 	if err != nil {
@@ -229,10 +343,10 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		_ = conn.Close()
 	}
 	// Sockets are closed, but a reader goroutine can still be mid-packet: it may
-	// be blocked in Enqueue or between the read and Observe. FeedScorer.Receipt
-	// takes the scorer's own lock, so the receipt is a consistent snapshot even
-	// if a late Observe lands after it.
-	return printReceipt(scorer.Receipt(), asJSON)
+	// be blocked in Enqueue or between the read and Observe. Both scorers behind
+	// sessionScorer take their own lock in Receipt, so the receipt is a
+	// consistent snapshot even if a late Observe lands after it.
+	return printReceipt(scorer.SessionReceipt(), asJSON)
 }
 
 // processPacket delivers a packet and then scores it.
@@ -240,9 +354,9 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 // Delivery runs first and is never held up by scoring: malformed and duplicate
 // packets must still reach every configured validator destination unchanged.
 // Every value used here is internally synchronized — Fanout copies the packet
-// under its own lock, FeedScorer serializes its own state, and Health and
-// ReceiverMetrics each carry their own — so feed goroutines do not serialize
-// behind a caller-held lock on the ingress hot path.
+// under its own lock, both sessionScorer implementations serialize their own
+// state, and Health and ReceiverMetrics each carry their own — so feed
+// goroutines do not serialize behind a caller-held lock on the ingress hot path.
 //
 // receivedAt is captured at the socket read, so concurrent feeds can present it
 // out of order. That is the scorer's problem to absorb, and it does: see
@@ -253,7 +367,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 // packet, but that is a shutdown artifact rather than receiver overload, and
 // charging it to the ring-overflow counter would let shutdown inflate a metric
 // the README defines as ring-full only.
-func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer *shred.FeedScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics) {
+func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer sessionScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics) {
 	if fanout != nil && fanout.Enqueue(feedName, packet) == receiver.EnqueueOverflow {
 		_ = metrics.IncFanoutDrop(feedName)
 	}

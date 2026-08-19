@@ -168,6 +168,32 @@ index repeats across the FEC sets of a slot (the 31x distinct-shred undercount
 found in BLO-26535). The local index already unifies data (`0..num_data-1`) and
 coding (`num_data+position`) shreds.
 
+### Generic mode — a payload that isn't shreds
+
+The same client scores generic framed records: the same delivery receipt, on a
+payload that isn't shreds. It reports window completeness, arrival percentiles
+and arrival gaps, and reports no FEC erasure, because this mode does no erasure
+coding.
+
+```bash
+./blockcast-shreds selftest --generic
+```
+
+Generic mode requires the provenance of its input to be stated, and refuses to
+start otherwise — a receipt whose input provenance is unstated is exactly what
+the rights guardrail exists to prevent:
+
+```bash
+./blockcast-shreds --mode generic --listen 127.0.0.1:7201 \
+  --source-label synthetic \
+  --rights-basis synthetic-generated-no-third-party-content
+```
+
+`gensend` emits the same synthetic feed as real datagrams so the receipt can be
+driven end to end through the demo tap. See
+[docs/demo/d5-payload-agnostic-receipt.md](docs/demo/d5-payload-agnostic-receipt.md)
+for the framing contract, the end-to-end run, and the bounds of the claim.
+
 ### Receiver metrics
 
 `--http-addr` serves Prometheus `/metrics` and a `/healthz` endpoint driven by
