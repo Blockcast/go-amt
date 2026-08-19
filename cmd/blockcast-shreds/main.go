@@ -23,7 +23,7 @@ import (
 const help = `blockcast-shreds demo mode
 
 Usage:
-  blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--json]
+  blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
   blockcast-shreds selftest --fixture [--json]
   blockcast-shreds selftest --generic [--json]
   blockcast-shreds gensend --to IP:PORT [--iface IP]
@@ -44,7 +44,16 @@ end-to-end through the demo tap.
 
 /healthz is readiness-shaped: it reports unhealthy until the first packet
 arrives, so it is not a safe liveness probe. --health-max-age sets the
-ingress freshness window.`
+ingress freshness window.
+
+--retain bounds the scorer's memory: per-shred state is kept for that long
+past each arrival, so the receiver reaches a steady state instead of growing
+for as long as it runs. The receipt still covers the whole run; the window is
+how long a second copy of a shred can still be recognised as a duplicate.
+It does not bound completion percentiles: a set that keeps receiving is never
+evicted, so its span can exceed the histogram's ceiling at any window. The
+receipt reports completions_above_ceiling when that happened; a nonzero value
+means time_to_32nd_shred understates. See the README.`
 
 // sessionScorer is the seam that keeps shred mode and generic mode one client.
 // Both modes are selected once at construction; the packet loop below has no
@@ -101,6 +110,7 @@ func run(args []string) error {
 	flags.StringVar(&sourceLabel, "source-label", "", "generic mode: provenance of the input, e.g. synthetic")
 	flags.StringVar(&rightsBasis, "rights-basis", "", "generic mode: recorded rights basis for the input")
 	flags.DurationVar(&healthMaxAge, "health-max-age", 30*time.Second, "/healthz ingress freshness window; readiness-shaped, see README")
+	retention := flags.Duration("retain", shred.DefaultRetention, "how far behind the newest arrival to keep per-shred scoring state; see README")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -145,7 +155,54 @@ func run(args []string) error {
 	if healthMaxAge <= 0 {
 		return fmt.Errorf("--health-max-age must be positive, got %s", healthMaxAge)
 	}
-	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON, mode, sourceLabel, rightsBasis)
+	// A non-positive window would evict each shred as it was written, so every
+	// arrival would read as new and duplicate suppression would stop working.
+	if *retention <= 0 {
+		return fmt.Errorf("--retain must be positive, got %s", *retention)
+	}
+	// An early hint only, and deliberately not the guarantee's enforcement. A
+	// window at or above the ladder's ceiling is an egregious case worth naming at
+	// startup, but its ABSENCE proves nothing: --retain does not bound a set's
+	// completion span (a set is aged on its newest arrival, so one that keeps
+	// receiving is never evicted), so completions above the ceiling occur at the
+	// default window too. The authoritative signal is the receipt's
+	// completions_above_ceiling, which counts the condition where it happens
+	// instead of predicting it from a quantity that cannot see it.
+	if warning := retentionWarning(*retention); warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
+	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON, *retention, mode, sourceLabel, rightsBasis)
+}
+
+// retentionWarning returns an early-hint warning for a retention window at or
+// above the completion histogram's ceiling, or "" otherwise.
+//
+// Read the contract carefully, because the first version of this function got it
+// wrong in a way that was worse than saying nothing. A window >= the ceiling is
+// sufficient to expect understated percentiles, but it is NOT necessary: the
+// window bounds the inter-arrival gap, not the completion span, so 32 shreds
+// 200ms apart span 6.2s at the 2s default and understate with this function
+// silent. Treating that silence as "safe" is the error — the receipt's
+// CompletionsAboveCeiling is the real signal, observed rather than predicted.
+//
+// Split out from run so it can be tested without starting a receiver. run's
+// only above-ceiling path is a VALID configuration, so a test that drove this
+// through run would parse successfully, fall through to listenAndScore, bind
+// sockets and block until the package test timeout — the same failure shape
+// TestUndefinedFlagIsRejected hit when --retain became real. A pure function
+// makes the warning assertable without ever reaching that path.
+func retentionWarning(window time.Duration) string {
+	if window < shred.CompletionCeiling {
+		return ""
+	}
+	return fmt.Sprintf(
+		"blockcast-shreds: warning: --retain %s is at or above the completion "+
+			"histogram's ceiling (%s), so completions at or above that ceiling are "+
+			"reported AS the ceiling and understate. This is a hint, not a bound: a "+
+			"narrower window understates too, because --retain does not limit how "+
+			"long a set takes to complete. Check completions_above_ceiling on the "+
+			"receipt — nonzero means the stated %.2f%% error does not apply.",
+		window, shred.CompletionCeiling, shred.CompletionRelativeError*100)
 }
 
 func selftest(args []string) error {
@@ -242,7 +299,7 @@ func gensend(args []string) error {
 	return nil
 }
 
-func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, mode, sourceLabel, rightsBasis string) error {
+func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, retention time.Duration, mode, sourceLabel, rightsBasis string) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
@@ -255,7 +312,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		// It goes to stderr so --json keeps stdout a single JSON document.
 		fmt.Fprintf(os.Stderr, "mode=generic source=%s rights=%s\n", sourceLabel, rightsBasis)
 	} else {
-		scorer = shred.NewFeedScorer(names)
+		scorer = shred.NewFeedScorerWithRetention(shred.FormatForwarder, names, retention)
 	}
 	registry := prometheus.NewRegistry()
 	metrics, err := receiver.NewReceiverMetrics(registry, names)
