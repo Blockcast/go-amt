@@ -261,3 +261,82 @@ func equalLabels(got, want map[string]string) bool {
 	}
 	return true
 }
+
+// TestReceiverMetricsExposeSlotGuardCounters proves the slot guard is visible.
+//
+// The guard's failure mode is silence: an operator whose feed is being refused
+// sees a perfect erasure score and no reason for it. Tracker.Stats() carried
+// these counters but had no caller anywhere in the receiver, so the guard could
+// reject every datagram on the wire and publish nothing at all.
+func TestReceiverMetricsExposeSlotGuardCounters(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := NewReceiverMetrics(registry, []string{"feed-a", "feed-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Zero-valued series must exist before anything is published, so an alert
+	// on the guard has a baseline rather than a missing series.
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMetric(t, families, "bcast_shred_gw_erasure_slot_rejections_total", labels("feed", "feed-a", "direction", "ahead"), 0)
+	assertMetric(t, families, "bcast_shred_gw_erasure_slot_rejections_total", labels("feed", "feed-a", "direction", "behind"), 0)
+	assertMetric(t, families, "bcast_shred_gw_erasure_frontier_resyncs_total", labels("feed", "feed-a"), 0)
+
+	if err := metrics.PublishGuard("feed-a", erasure.Stats{
+		RejectedSlotJumps: 17,
+		StaleRejections:   9,
+		FrontierResyncs:   2,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	families, err = registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMetric(t, families, "bcast_shred_gw_erasure_slot_rejections_total", labels("feed", "feed-a", "direction", "ahead"), 17)
+	assertMetric(t, families, "bcast_shred_gw_erasure_slot_rejections_total", labels("feed", "feed-a", "direction", "behind"), 9)
+	assertMetric(t, families, "bcast_shred_gw_erasure_frontier_resyncs_total", labels("feed", "feed-a"), 2)
+
+	// Publishing one feed must not disturb another.
+	assertMetric(t, families, "bcast_shred_gw_erasure_slot_rejections_total", labels("feed", "feed-b", "direction", "ahead"), 0)
+	assertMetric(t, families, "bcast_shred_gw_erasure_frontier_resyncs_total", labels("feed", "feed-b"), 0)
+
+	// Guard totals are cumulative and must survive a window drain, which is the
+	// whole reason they are not carried on Window.
+	if err := metrics.PublishWindow("feed-a", erasure.Window{Schema: 1}); err != nil {
+		t.Fatal(err)
+	}
+	families, err = registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertMetric(t, families, "bcast_shred_gw_erasure_frontier_resyncs_total", labels("feed", "feed-a"), 2)
+}
+
+func TestReceiverMetricsRejectGuardPublishForUnknownFeed(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := NewReceiverMetrics(registry, []string{"feed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := metrics.PublishGuard("attacker-controlled", erasure.Stats{}); !errors.Is(err, ErrUnknownFeed) {
+		t.Fatalf("PublishGuard() error = %v, want %v", err, ErrUnknownFeed)
+	}
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, family := range families {
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if strings.Contains(label.GetValue(), "attacker-controlled") {
+					t.Fatalf("unknown feed created series in %s", family.GetName())
+				}
+			}
+		}
+	}
+}

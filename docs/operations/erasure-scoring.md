@@ -20,6 +20,13 @@ A set is scored at `slot_boundary + erasure_grace`, where:
   `bcast_shred_gw_erasure_grace_milliseconds`.
 
 Duplicates count once. State is retained until it is scored, then reclaimed.
+Retention is therefore a **rate**, not a constant: every slot observed within the
+last `erasure_grace` is still unscorable, so retained slot state is about
+`(observed-slot arrival rate x erasure_grace) + 1`. At steady capture rates that
+is a handful of slots; during a burst or catch-up replay it rises with the
+arrival rate for the duration. `--report-interval` is bounded above for the same
+reason — the tracker holds one arrival timestamp per shred until the window
+drains, so the interval sets resident memory as well as reporting cadence.
 
 This is a **receiver-observed, comparable v1 score. It is not the validator's
 true replay deadline** and must not be quoted as one.
@@ -66,3 +73,25 @@ OR "no traffic in the last window".** Do not alert on it alone:
 
 Alert on feed liveness first and the erasure fraction second. An erasure gauge
 read on its own reports a stopped feed as a perfect one.
+
+### Slot-guard counters
+
+Slot arrives from the wire unvalidated, so the tracker refuses observations whose
+slot is implausible relative to the frontier. Those refusals are **cumulative
+counters**, not windowed gauges — they survive a window drain, because a frontier
+resync is a discontinuity you must still be able to see afterwards.
+
+* `bcast_shred_gw_erasure_slot_rejections_total{direction="ahead"}` — refused for
+  jumping further forward than the frontier bound allows.
+* `bcast_shred_gw_erasure_slot_rejections_total{direction="behind"}` — refused for
+  sitting too far behind the frontier. **Sustained growth here means the frontier
+  itself is suspect**: real traffic is being refused because an earlier advance
+  moved it too far. The tracker self-heals after a sustained coherent run, and
+  each recovery shows up as a resync.
+* `bcast_shred_gw_erasure_frontier_resyncs_total` — the frontier was abandoned and
+  re-adopted. Sets in flight were dropped unscored, so treat every increment as a
+  gap in the erasure series rather than as a data point in it.
+
+A resync is rare on a healthy feed. `increase(...frontier_resyncs_total[1h]) > 0`
+alongside a flat erasure fraction is the signature of a feed whose SLA series is
+being interrupted rather than one that is clean.

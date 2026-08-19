@@ -509,3 +509,128 @@ func TestTrackerResyncsOnSustainedSlotJump(t *testing.T) {
 		t.Fatalf("FrontierResyncs = %d, want 1", got.FrontierResyncs)
 	}
 }
+
+// TestTrackerRejectsIncoherentSlotJumps pins the difference between "16 in a
+// row" and "16 that agree".
+//
+// TestTrackerResyncsOnSustainedSlotJump drives one constant slot value, so it
+// exercises only the coherent case. Sixteen MUTUALLY UNRELATED out-of-range
+// slots are noise, not a feed that moved somewhere; adopting the last of them
+// would let whichever datagram arrived 16th choose the frontier and black out
+// the erasure SLA for the life of the process.
+func TestTrackerRejectsIncoherentSlotJumps(t *testing.T) {
+	tracker, err := erasure.NewTracker(400*time.Millisecond, time.Unix(100, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Unix(100, 0)
+	if !tracker.Observe(header(10, 64, 0), at) {
+		t.Fatal("first shred rejected")
+	}
+
+	// Well past slotResyncThreshold, each far out of range and far from every
+	// other, so no run of coherent evidence ever forms.
+	for i := 0; i < 64; i++ {
+		slot := uint64(1<<40) + uint64(i)*(erasure.MaxSlotJumpForTest*97)
+		if tracker.Observe(header(slot, 64, uint8(i%64)), at.Add(time.Duration(i)*time.Millisecond)) {
+			t.Fatalf("incoherent jump %d (slot %d) was accepted", i, slot)
+		}
+	}
+
+	got := tracker.Stats()
+	if got.FrontierResyncs != 0 {
+		t.Fatalf("FrontierResyncs = %d after 64 incoherent jumps, want 0", got.FrontierResyncs)
+	}
+	if got.NewestSlot != 10 {
+		t.Fatalf("NewestSlot = %d after 64 incoherent jumps, want 10 (frontier must not move)", got.NewestSlot)
+	}
+	// The frontier is intact, so real traffic still scores.
+	if !tracker.Observe(header(10, 64, 1), at.Add(time.Second)) {
+		t.Fatal("real shred rejected after incoherent jumps: frontier was poisoned")
+	}
+}
+
+// TestTrackerRecoversFromPoisonedFrontier proves the guard is two-way.
+//
+// Before the self-heal, a frontier that reached a far-future slot was terminal:
+// every real shred sat more than two slots behind it, took the stale branch, and
+// returned without accumulating toward anything. Ingress and delivery stayed
+// green while the erasure SLA read a permanent zero -- the failure this package
+// exists to remove, reached through the guard rather than around it.
+func TestTrackerRecoversFromPoisonedFrontier(t *testing.T) {
+	tracker, err := erasure.NewTracker(400*time.Millisecond, time.Unix(100, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Unix(100, 0)
+	if !tracker.Observe(header(1_000, 64, 0), at) {
+		t.Fatal("first shred rejected")
+	}
+
+	// Drive a coherent run to a far-future slot: the frontier is now wrong.
+	poison := uint64(1) << 40
+	for i := 0; i < erasure.SlotResyncThresholdForTest; i++ {
+		tracker.Observe(header(poison, 64, uint8(i)), at.Add(time.Duration(i)*time.Millisecond))
+	}
+	if got := tracker.Stats(); got.NewestSlot != poison {
+		t.Fatalf("setup failed: NewestSlot = %d, want the poisoned %d", got.NewestSlot, poison)
+	}
+
+	// Real traffic resumes at real slots. It must claw the frontier back.
+	base := at.Add(time.Second)
+	real := uint64(1_100)
+	var accepted bool
+	for i := 0; i < erasure.FrontierDistrustThresholdForTest; i++ {
+		// Slots advance the way a real feed's do -- non-contiguous but coherent.
+		accepted = tracker.Observe(header(real+uint64(i)*137, 64, uint8(i)), base.Add(time.Duration(i)*time.Millisecond))
+	}
+	if !accepted {
+		t.Fatal("real traffic never re-accepted: frontier poisoning is still terminal")
+	}
+	got := tracker.Stats()
+	if got.NewestSlot >= poison {
+		t.Fatalf("NewestSlot = %d, want the frontier clawed back near %d", got.NewestSlot, real)
+	}
+	if got.FrontierResyncs != 2 {
+		t.Fatalf("FrontierResyncs = %d, want 2 (one to poison, one to recover)", got.FrontierResyncs)
+	}
+
+	// And scoring genuinely works again, rather than merely not rejecting.
+	// Advance plausibly from the recovered frontier: re-observing the frontier
+	// slot itself would be refused as already-scored once grace has elapsed,
+	// which would prove nothing about recovery.
+	next := got.NewestSlot + 137
+	if !tracker.Observe(header(next, 65, 0), base.Add(20*time.Millisecond)) {
+		t.Fatal("plausible advance from the recovered frontier rejected")
+	}
+	if tracker.Stats().TrackedSets == 0 {
+		t.Fatal("recovered frontier accepts shreds but tracks no sets")
+	}
+}
+
+// TestTrackerStaleRunDoesNotTripOnInterleavedTraffic guards the self-heal from
+// becoming its own resync vector: ordinary reordering behind a HEALTHY frontier
+// must never reach frontierDistrustThreshold, because accepted traffic keeps
+// clearing the run.
+func TestTrackerStaleRunDoesNotTripOnInterleavedTraffic(t *testing.T) {
+	tracker, err := erasure.NewTracker(400*time.Millisecond, time.Unix(100, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Unix(100, 0)
+	if !tracker.Observe(header(10_000, 63, 0), at) {
+		t.Fatal("first shred rejected")
+	}
+	for i := 0; i < 64; i++ {
+		// One late straggler far behind, then real in-window traffic. Distinct
+		// indices throughout, so a refusal means the run tripped rather than
+		// that the observation was a duplicate.
+		tracker.Observe(header(9_000, 64, uint8(i)), at.Add(time.Duration(2*i)*time.Millisecond))
+		if !tracker.Observe(header(10_000, 64, uint8(i)), at.Add(time.Duration(2*i+1)*time.Millisecond)) {
+			t.Fatalf("in-window shred %d rejected", i)
+		}
+	}
+	if got := tracker.Stats(); got.FrontierResyncs != 0 {
+		t.Fatalf("FrontierResyncs = %d on interleaved stragglers, want 0", got.FrontierResyncs)
+	}
+}

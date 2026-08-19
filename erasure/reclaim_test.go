@@ -127,3 +127,100 @@ func TestRetentionStaysBoundedWhileSlotsAreUnscored(t *testing.T) {
 		t.Fatalf("TrackedSlots = %d after 500 slots, want <= 2; unscored state is accumulating", stats.TrackedSlots)
 	}
 }
+
+// TestRetentionScalesWithArrivalRateNotSlotCount covers the geometry the
+// bounded-retention test above cannot reach.
+//
+// That test steps 500ms per slot against a 400ms grace, so every slot is past
+// its deadline before the next arrives and retention collapses to the newest
+// one. Its `TrackedSlots > 2` assertion therefore proves only that the
+// gap-exceeds-grace case is bounded -- it would hold just as well if the real
+// bound were ten times higher, and it is what let the docstring claim "only the
+// newest slot is held indefinitely" go unchallenged.
+//
+// When the slot gap is well UNDER grace -- a burst, a post-hiccup replay, a
+// backfill -- every slot observed within the last grace period is still
+// unscorable, so retention sits at arrival-rate x grace. That is bounded, but it
+// is not small, and nothing in the suite would have noticed it growing.
+func TestRetentionScalesWithArrivalRateNotSlotCount(t *testing.T) {
+	const grace = 400 * time.Millisecond
+	const slotPeriod = 20 * time.Millisecond // deliberately << grace
+	const slotCount = 500
+
+	base := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
+	tracker, err := erasure.NewTracker(grace, base.Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	at := base
+	var peak int
+	for slotIndex := range slotCount {
+		slot := uint64(1000) + uint64(slotIndex)*159
+		tracker.Observe(shred.Header{Slot: slot, IndexWithinSet: 0}, at)
+		at = at.Add(slotPeriod)
+		if tracked := tracker.Stats().TrackedSlots; tracked > peak {
+			peak = tracked
+		}
+	}
+
+	// Slots in flight: those whose boundary+grace has not yet passed. The
+	// boundary of a slot is set by the arrival of the NEXT one, so a slot stays
+	// unscorable for grace after its successor, hence the +1 for the newest
+	// slot that no successor has closed yet.
+	inFlight := int(grace/slotPeriod) + 1
+	upperBound := inFlight + 2 // reclaim keeps the 2 slots behind the frontier
+
+	if peak > upperBound {
+		t.Fatalf("peak TrackedSlots = %d over %d slots, want <= %d (rate x grace); retention is not rate-bounded",
+			peak, slotCount, upperBound)
+	}
+	// The point of the case: this geometry genuinely retains more than the
+	// gap-exceeds-grace one, so a bound stated as a small constant is wrong.
+	if peak <= 2 {
+		t.Fatalf("peak TrackedSlots = %d, want > 2: this test is not exercising the sub-grace-gap geometry it exists for", peak)
+	}
+	// Retention must track the RATE, not the number of slots ever observed.
+	if peak >= slotCount/2 {
+		t.Fatalf("peak TrackedSlots = %d over %d slots: retention is scaling with slot count, not arrival rate", peak, slotCount)
+	}
+}
+
+// TestDrainReleasesBurstArrivalBuffer pins resident memory to the CURRENT feed
+// rather than to the worst burst the process ever saw.
+//
+// DrainWindow filters arrivals in place via s[:0], which reuses -- and therefore
+// retains -- the backing array. On a long-running validator that means one
+// catch-up replay sets the high-water mark and the memory is never returned,
+// even across hours of idle feed. A test asserting only len() would pass
+// against exactly that bug, so this asserts capacity.
+func TestDrainReleasesBurstArrivalBuffer(t *testing.T) {
+	base := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
+	tracker, err := erasure.NewTracker(0, base.Add(-time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A burst well past the shrink floor, so the backing array is forced to grow.
+	const burst = 40 * erasure.MinRetainedCapacityForTest
+	at := base
+	for i := range burst {
+		tracker.Observe(shred.Header{Slot: uint64(1000 + i/16), IndexWithinSet: uint8(i % 16)}, at)
+		at = at.Add(time.Microsecond)
+	}
+	peakCap := tracker.ArrivalsCapForTest()
+	if peakCap < burst/2 {
+		t.Fatalf("arrivals cap = %d after a %d-shred burst; the burst did not grow the buffer, so this test proves nothing", peakCap, burst)
+	}
+
+	// Drain past every arrival: the window keeps nothing.
+	if _, err := tracker.DrainWindow(at.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	drainedCap := tracker.ArrivalsCapForTest()
+	if drainedCap > erasure.MinRetainedCapacityForTest {
+		t.Fatalf("arrivals cap = %d after draining a %d-shred burst, want <= %d; the burst high-water mark is still pinned",
+			drainedCap, burst, erasure.MinRetainedCapacityForTest)
+	}
+}

@@ -26,6 +26,9 @@ type ReceiverMetrics struct {
 	feedIDs []string
 	feeds   map[string]feedMetrics
 	windows map[string]erasure.Window
+	// guards holds cumulative slot-guard state, kept separate from windows
+	// because it is process-lifetime totals rather than a per-window snapshot.
+	guards map[string]erasure.Stats
 
 	ingress     *prometheus.CounterVec
 	egress      *prometheus.CounterVec
@@ -33,12 +36,14 @@ type ReceiverMetrics struct {
 	writeErrors *prometheus.CounterVec
 	unparsed    *prometheus.CounterVec
 
-	setsDesc     *prometheus.Desc
-	fractionDesc *prometheus.Desc
-	rateDesc     *prometheus.Desc
-	gapsDesc     *prometheus.Desc
-	graceDesc    *prometheus.Desc
-	schemaDesc   *prometheus.Desc
+	setsDesc      *prometheus.Desc
+	fractionDesc  *prometheus.Desc
+	rateDesc      *prometheus.Desc
+	gapsDesc      *prometheus.Desc
+	graceDesc     *prometheus.Desc
+	slotGuardDesc *prometheus.Desc
+	resyncsDesc   *prometheus.Desc
+	schemaDesc    *prometheus.Desc
 }
 
 type feedMetrics struct {
@@ -73,6 +78,7 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string) (*Re
 		feedIDs: append([]string(nil), feedIDs...),
 		feeds:   make(map[string]feedMetrics, len(feedIDs)),
 		windows: make(map[string]erasure.Window, len(feedIDs)),
+		guards:  make(map[string]erasure.Stats, len(feedIDs)),
 	}
 	metrics.ingress = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: receiverMetricsNamespace,
@@ -119,6 +125,19 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string) (*Re
 		prometheus.BuildFQName(receiverMetricsNamespace, "", "erasure_grace_milliseconds"),
 		"Configured delay after a slot boundary before FEC sets are scored.", []string{"feed"}, nil,
 	)
+	metrics.slotGuardDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(receiverMetricsNamespace, "", "erasure_slot_rejections_total"),
+		"Observations refused by the slot-plausibility guard, by direction. "+
+			"'ahead' is beyond the forward jump bound; 'behind' is too far behind the frontier. "+
+			"A sustained 'behind' rate means the frontier itself is suspect.",
+		[]string{"feed", "direction"}, nil,
+	)
+	metrics.resyncsDesc = prometheus.NewDesc(
+		prometheus.BuildFQName(receiverMetricsNamespace, "", "erasure_frontier_resyncs_total"),
+		"Times the slot frontier was abandoned and re-adopted. Each one is a "+
+			"discontinuity in the erasure series: sets in flight were dropped unscored.",
+		[]string{"feed"}, nil,
+	)
 	metrics.schemaDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(receiverMetricsNamespace, "", "report_schema"),
 		"Schema version of the receiver delivery report.", []string{"feed"}, nil,
@@ -133,6 +152,7 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string) (*Re
 			unparsed:    metrics.unparsed.WithLabelValues(feedID),
 		}
 		metrics.windows[feedID] = erasure.Window{}
+		metrics.guards[feedID] = erasure.Stats{}
 	}
 	if err := registerer.Register(metrics); err != nil {
 		return nil, fmt.Errorf("register receiver metrics: %w", err)
@@ -153,6 +173,8 @@ func (m *ReceiverMetrics) Describe(ch chan<- *prometheus.Desc) {
 	ch <- m.gapsDesc
 	ch <- m.graceDesc
 	ch <- m.schemaDesc
+	ch <- m.slotGuardDesc
+	ch <- m.resyncsDesc
 }
 
 // Collect implements prometheus.Collector. Every report series for a feed is
@@ -185,6 +207,10 @@ func (m *ReceiverMetrics) Collect(ch chan<- prometheus.Metric) {
 		}
 		ch <- prometheus.MustNewConstMetric(m.graceDesc, prometheus.GaugeValue, float64(window.GraceMS), feedID)
 		ch <- prometheus.MustNewConstMetric(m.schemaDesc, prometheus.GaugeValue, float64(window.Schema), feedID)
+		guard := m.guards[feedID]
+		ch <- prometheus.MustNewConstMetric(m.slotGuardDesc, prometheus.CounterValue, float64(guard.RejectedSlotJumps), feedID, "ahead")
+		ch <- prometheus.MustNewConstMetric(m.slotGuardDesc, prometheus.CounterValue, float64(guard.StaleRejections), feedID, "behind")
+		ch <- prometheus.MustNewConstMetric(m.resyncsDesc, prometheus.CounterValue, float64(guard.FrontierResyncs), feedID)
 	}
 }
 
@@ -247,6 +273,22 @@ func (m *ReceiverMetrics) PublishWindow(feedID string, window erasure.Window) er
 	}
 	m.mu.Lock()
 	m.windows[feedID] = window
+	m.mu.Unlock()
+	return nil
+}
+
+// PublishGuard records the tracker's cumulative slot-guard state for a feed.
+//
+// Kept separate from PublishWindow because these are process-lifetime totals,
+// not per-window figures: a frontier resync is a discontinuity in the erasure
+// series, and an operator needs to see it as one rather than have it reset to
+// zero with the next window.
+func (m *ReceiverMetrics) PublishGuard(feedID string, stats erasure.Stats) error {
+	if _, err := m.feed(feedID); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.guards[feedID] = stats
 	m.mu.Unlock()
 	return nil
 }

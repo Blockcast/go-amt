@@ -28,6 +28,17 @@ import (
 // the scrape shows the last drained window rather than a live partial count.
 const defaultReportInterval = 30 * time.Second
 
+// maxReportInterval bounds --report-interval from above.
+//
+// The tracker retains one arrival timestamp per accepted shred until the window
+// is drained, so the flag sets resident memory as much as reporting cadence:
+// retention is shred-rate x interval x 24 bytes. At 30k shred/s the 30s default
+// holds ~21 MiB, while an unbounded flag would let --report-interval 1h ask for
+// ~2.5 GiB on validator hardware -- an OOM reachable through a plausible
+// operator setting. 5 minutes is well past any broker heartbeat cadence and
+// caps the same feed near 210 MiB.
+const maxReportInterval = 5 * time.Minute
+
 const help = `blockcast-shreds demo mode
 
 Usage:
@@ -127,6 +138,9 @@ func run(args []string) error {
 	}
 	if *reportInterval <= 0 {
 		return errors.New("--report-interval must be positive")
+	}
+	if *reportInterval > maxReportInterval {
+		return fmt.Errorf("--report-interval must not exceed %s: the tracker retains one arrival timestamp per shred until the window is drained, so a longer interval is a resident-memory setting rather than only a reporting one", maxReportInterval)
 	}
 	switch mode {
 	case "shred":
@@ -439,6 +453,7 @@ func publishWindows(trackers map[string]*erasure.Tracker, metrics *receiver.Rece
 			continue
 		}
 		_ = metrics.PublishWindow(feedID, window)
+		_ = metrics.PublishGuard(feedID, tracker.Stats())
 	}
 }
 

@@ -344,6 +344,11 @@ func TestErasureGraceFlagIsAcceptedAndValidated(t *testing.T) {
 		{name: "zero grace", args: []string{"--erasure-grace-ms", "0", "--http-addr", ""}, want: "--erasure-grace-ms must be positive"},
 		{name: "negative grace", args: []string{"--erasure-grace-ms", "-1", "--http-addr", ""}, want: "--erasure-grace-ms must be positive"},
 		{name: "zero report interval", args: []string{"--report-interval", "0s", "--http-addr", ""}, want: "--report-interval must be positive"},
+		{name: "negative report interval", args: []string{"--report-interval", "-1s", "--http-addr", ""}, want: "--report-interval must be positive"},
+		// Bounded from above as well: the tracker holds one arrival timestamp
+		// per shred until the window drains, so an unbounded interval is an OOM
+		// knob reachable through a plausible operator setting.
+		{name: "report interval past the cap", args: []string{"--report-interval", "1h", "--http-addr", ""}, want: "--report-interval must not exceed"},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
 			err := run(testCase.args)

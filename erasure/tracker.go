@@ -64,9 +64,37 @@ const maxSlotJump = 4096
 // no longer advance. A single poisoned datagram does not repeat -- the next real
 // shred is within the bound and clears the counter -- whereas a genuine jump
 // arrives as a continuous stream, so sustained evidence resyncs the frontier.
+//
+// Counting alone is not enough: 16 MUTUALLY UNRELATED out-of-range slots are
+// evidence of noise, not of a feed that moved, and adopting the last of them
+// would hand the frontier to whichever datagram happened to arrive 16th. A run
+// therefore only extends while each observation stays within maxSlotJump of the
+// one that opened it -- "16 that agree", not "16 in a row".
 const slotResyncThreshold = 16
 
-// Stats describes the currently retained scoring state.
+// frontierDistrustThreshold is how many consecutive too-far-BEHIND rejections
+// are treated as evidence that the FRONTIER is wrong rather than the traffic.
+//
+// Without it the forward guard is one-way and its failure is terminal: once
+// newestSlot holds a far-future value, every real shred is more than two slots
+// behind it, takes the stale branch, and returns without accumulating toward
+// anything. Delivery and ingress accounting are untouched, so the operator sees
+// a live feed with a permanently perfect erasure score -- the same failure this
+// package exists to remove, reached through the guard instead of around it.
+//
+// The same coherence rule applies as for forward jumps, and any accepted
+// observation clears the run, so ordinary reordering behind a healthy frontier
+// cannot reach the threshold while real in-window traffic is interleaved.
+const frontierDistrustThreshold = 16
+
+// Stats describes the currently retained scoring state, plus the cumulative
+// slot-guard totals.
+//
+// The guard counters reach /metrics via ReceiverMetrics.PublishGuard, which
+// publishWindows calls with this value on every report tick. They are deliberately
+// not carried on Window: Window is drained and reset per reporting window, and a
+// frontier resync is a discontinuity an operator must still be able to see after
+// the window that contained it has rolled.
 type Stats struct {
 	NewestSlot   uint64
 	TrackedSlots int
@@ -75,6 +103,10 @@ type Stats struct {
 	// advance. A silent guard replaces one invisible failure with another, so
 	// this is exported for the same reason the erasure gauge is.
 	RejectedSlotJumps uint64
+	// StaleRejections counts observations refused for sitting too far BEHIND
+	// the frontier. Sustained growth here means the frontier is suspect: real
+	// traffic is being refused because a prior advance moved it too far.
+	StaleRejections uint64
 	// FrontierResyncs counts how often sustained implausible slots were accepted
 	// as a genuine feed jump.
 	FrontierResyncs uint64
@@ -105,10 +137,17 @@ type Tracker struct {
 	newestSlot  uint64
 	// pendingJumps counts CONSECUTIVE implausible advances; any plausible
 	// observation clears it, which is what separates one bad datagram from a
-	// feed that genuinely moved.
-	pendingJumps      int
-	pendingJumpSlot   uint64
+	// feed that genuinely moved. pendingJumpSlot anchors the run so that only
+	// mutually coherent jumps accumulate toward slotResyncThreshold.
+	pendingJumps    int
+	pendingJumpSlot uint64
+	// staleRun is the mirror of pendingJumps for observations too far BEHIND
+	// the frontier, anchored by staleRunSlot on the same coherence rule. It is
+	// the only way out of a frontier that was resynced to a wrong slot.
+	staleRun          int
+	staleRunSlot      uint64
 	rejectedSlotJumps uint64
+	staleRejections   uint64
 	frontierResyncs   uint64
 	boundaries        map[uint64]time.Time
 	slots             map[uint64]*slotState
@@ -154,27 +193,14 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 	} else if header.Slot > t.newestSlot {
 		if header.Slot-t.newestSlot > maxSlotJump {
 			t.rejectedSlotJumps++
-			t.pendingJumps++
-			t.pendingJumpSlot = header.Slot
-			if t.pendingJumps < slotResyncThreshold {
+			if extendRun(&t.pendingJumps, &t.pendingJumpSlot, header.Slot) < slotResyncThreshold {
 				return false
 			}
-			// Sustained: the feed moved. Resync rather than stay blacked out.
-			t.frontierResyncs++
-			t.pendingJumps = 0
-			t.slots = make(map[uint64]*slotState)
-			t.boundaries = make(map[uint64]time.Time)
-			t.newestSlot = header.Slot
-			t.recordPriorBoundaries(header.Slot, receivedAt)
-			t.scoreDue(receivedAt)
-			t.reclaimOldSlots()
-			state := &slotState{sets: make(map[setKey]uint64), boundary: receivedAt}
-			t.slots[header.Slot] = state
-			state.sets[setKey{fecSetIndex: header.FECSetIndex}] |= 1 << header.IndexWithinSet
-			t.observeDelivery(receivedAt)
-			return true
+			// Sustained AND self-consistent: the feed moved. Resync rather
+			// than stay blacked out.
+			return t.resyncFrontier(header, receivedAt)
 		}
-		t.pendingJumps = 0
+		t.clearRuns()
 		for slot, state := range t.slots {
 			if slot < header.Slot && state.boundary.IsZero() {
 				state.boundary = receivedAt
@@ -184,11 +210,18 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 		t.newestSlot = header.Slot
 		t.recordPriorBoundaries(header.Slot, receivedAt)
 	} else if t.newestSlot-header.Slot > 2 {
-		return false
+		t.staleRejections++
+		if extendRun(&t.staleRun, &t.staleRunSlot, header.Slot) < frontierDistrustThreshold {
+			return false
+		}
+		// A sustained, self-consistent run of traffic behind the frontier is
+		// evidence the FRONTIER is wrong, not the traffic. Adopt it; this is
+		// the only exit from a frontier poisoned by a forged advance.
+		return t.resyncFrontier(header, receivedAt)
 	} else {
 		// A plausible in-window observation is evidence the frontier is still
 		// real, so a lone poisoned datagram cannot accumulate toward a resync.
-		t.pendingJumps = 0
+		t.clearRuns()
 	}
 	t.scoreDue(receivedAt)
 	t.reclaimOldSlots()
@@ -250,7 +283,7 @@ func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 		}
 		retainedScores = append(retainedScores, event)
 	}
-	t.scores = retainedScores
+	t.scores = releaseUnused(retainedScores)
 	window.ErasureFraction = fraction(window.SetsErased, window.SetsTotal)
 
 	retainedArrivals := t.arrivals[:0]
@@ -272,7 +305,7 @@ func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 		}
 		lastArrival = arrival
 	}
-	t.arrivals = retainedArrivals
+	t.arrivals = releaseUnused(retainedArrivals)
 	window.RMean /= cutoff.Sub(t.windowStart).Seconds()
 	t.windowStart = cutoff
 	return window, nil
@@ -287,6 +320,7 @@ func (t *Tracker) Stats() Stats {
 		NewestSlot:        t.newestSlot,
 		TrackedSlots:      len(t.slots),
 		RejectedSlotJumps: t.rejectedSlotJumps,
+		StaleRejections:   t.staleRejections,
 		FrontierResyncs:   t.frontierResyncs,
 	}
 	for _, state := range t.slots {
@@ -310,8 +344,84 @@ func (t *Tracker) scoreDue(now time.Time) {
 	}
 }
 
+// minRetainedCapacity is the slice capacity below which shrinking is not worth
+// the copy: a steady feed refills a small backing array immediately.
+const minRetainedCapacity = 1024
+
+// releaseUnused right-sizes a drained slice so a burst does not pin resident
+// memory for the process lifetime.
+//
+// The drain filters in place via s[:0], which reuses -- and therefore retains --
+// the backing array at its high-water mark. On a long-running validator that
+// mark is set by the worst burst the process ever saw, so a single catch-up at
+// 30k shred/s leaves tens of MiB pinned across an otherwise idle feed forever.
+// Copying only when the array is mostly empty keeps the steady-state path
+// allocation-free.
+func releaseUnused[T any](s []T) []T {
+	if cap(s) <= minRetainedCapacity || cap(s) <= 4*len(s) {
+		return s
+	}
+	return append(make([]T, 0, max(len(s), minRetainedCapacity)), s...)
+}
+
 func (t *Tracker) observeDelivery(receivedAt time.Time) {
 	t.arrivals = append(t.arrivals, receivedAt)
+}
+
+// extendRun advances a coherence-gated run of rejected observations.
+//
+// The run extends only while each new slot stays within maxSlotJump of the one
+// that opened it, and restarts at length 1 otherwise. That is what makes a run
+// evidence of a feed that moved to a specific place, rather than evidence that
+// some number of unrelated datagrams arrived: scattered noise perpetually
+// restarts its own run and never reaches a threshold.
+func extendRun(count *int, anchor *uint64, slot uint64) int {
+	if *count > 0 && slotDistance(slot, *anchor) <= maxSlotJump {
+		*count++
+	} else {
+		*count = 1
+	}
+	*anchor = slot
+	return *count
+}
+
+func slotDistance(a, b uint64) uint64 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+// clearRuns discards both rejection runs. Any observation the tracker accepts
+// is evidence the current frontier is real, which is what keeps a lone forged
+// datagram -- in either direction -- from accumulating toward a resync.
+func (t *Tracker) clearRuns() {
+	t.pendingJumps = 0
+	t.staleRun = 0
+}
+
+// resyncFrontier abandons scoring state and adopts header.Slot as the frontier.
+//
+// Reached from both directions: a sustained coherent run of advances beyond
+// maxSlotJump (the feed moved forward), or a sustained coherent run of traffic
+// behind the frontier (the frontier itself is wrong). Retained state describes
+// a slot range that no longer exists either way, so it is dropped rather than
+// scored -- scoring it would charge sets to an erasure figure they never had a
+// chance to complete under.
+func (t *Tracker) resyncFrontier(header shred.Header, receivedAt time.Time) bool {
+	t.frontierResyncs++
+	t.clearRuns()
+	t.slots = make(map[uint64]*slotState)
+	t.boundaries = make(map[uint64]time.Time)
+	t.newestSlot = header.Slot
+	t.recordPriorBoundaries(header.Slot, receivedAt)
+	t.scoreDue(receivedAt)
+	t.reclaimOldSlots()
+	state := &slotState{sets: make(map[setKey]uint64), boundary: receivedAt}
+	t.slots[header.Slot] = state
+	state.sets[setKey{fecSetIndex: header.FECSetIndex}] |= 1 << header.IndexWithinSet
+	t.observeDelivery(receivedAt)
+	return true
 }
 
 func (h *GapHistogram) observe(gap time.Duration) {
@@ -348,10 +458,17 @@ func fraction(numerator, denominator uint64) float64 {
 // arbitrary real loss. The same race fires on contiguous slots whenever three
 // slots arrive within one grace period.
 //
-// Retention stays bounded: scoreDue runs on every Observe and Advance, so a
-// slot is scored once its deadline passes and reclaimed on the next pass. Only
-// the newest slot is held indefinitely, and only because a slot cannot be
-// scored until a later slot proves it ended.
+// Retention stays bounded, but the bound is a RATE, not a constant: scoreDue
+// runs on every Observe and Advance, so a slot is scored once boundary+grace has
+// passed and reclaimed on the next pass. Slots observed within the last grace
+// period cannot be scored yet, so retained slot state is
+// (observed-slot arrival rate x grace) + 1, the trailing term being the newest
+// slot -- which is held indefinitely, and only because a slot cannot be scored
+// until a later slot proves it ended.
+//
+// At steady capture rates that product is small, but it is NOT "only the newest
+// slot": a burst or catch-up -- post-hiccup replay, backfill -- raises the
+// arrival rate and the retained set grows with it for the duration.
 func (t *Tracker) reclaimOldSlots() {
 	for slot, state := range t.slots {
 		if slot < t.newestSlot && t.newestSlot-slot > 2 && state.scored {
