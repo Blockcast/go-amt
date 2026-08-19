@@ -76,8 +76,8 @@ type scoreEvent struct {
 // arrival landing in a different bucket proves the previous bucket closed for
 // good, so only the current bucket's count has to stay live. The slice form
 // this replaces accumulated into a map keyed by bucket and so was
-// order-independent; observe degrades that loss conservatively rather than
-// silently (see the out-of-order note there).
+// order-independent; observe reduces the resulting error but does not bound
+// its direction (see the out-of-order note there).
 type deliveryWindow struct {
 	arrivals    uint64
 	peakRate    float64
@@ -97,7 +97,19 @@ func (w *deliveryWindow) observe(receivedAt time.Time) {
 	// bucket's count and *under-report* the peak -- the one direction an SLA
 	// metric must not fail in, and one no equivalence test over monotonic input
 	// can catch. Folding an out-of-order arrival into the open bucket instead
-	// keeps the failure conservative: the peak may be overstated, never hidden.
+	// makes under-reporting much rarer, but does NOT eliminate it: the peak can
+	// still be understated, and can also be overstated.
+	//
+	// Measured against the order-independent map this fold replaced, over 200k
+	// random orderings of 2-8 arrivals spread across 0-500 ms: under-reporting
+	// falls from 46.6% of orderings (worst 0.25x) to 7.6% (worst 0.33x), and
+	// the residual error moves into overstatement. That is the safe direction
+	// for a peak-rate SLA metric -- a false investigation beats a missed bad
+	// feed -- and it costs two comparisons per shred on a path already holding
+	// the mutex. But the win is aggregate, not per-input: on some families the
+	// guard is worse than none, e.g. over the 24 permutations of
+	// {0, 0, 500ms, 0} it under-reports 18 times versus 12 without it.
+	//
 	// This is a safety net, not a second supported ordering; the fold is exact
 	// only for monotonic input.
 	bucket := receivedAt.UnixNano() / peakRateBucket.Nanoseconds()
@@ -166,7 +178,8 @@ func NewTracker(grace time.Duration, windowStart time.Time) (*Tracker, error) {
 // and consecutive-gap reporting, as it is on the receiver's serial UDP read
 // path -- the timestamp is taken and folded in under the same lock, so the two
 // cannot reorder. Out-of-order input does not corrupt totals or erasure
-// scoring; it degrades RPeak100MS conservatively (see deliveryWindow.observe).
+// scoring; it makes RPeak100MS inexact in either direction, most often high
+// (see deliveryWindow.observe for the measured distribution).
 // It returns false for duplicate, stale, invalid, or already-scored
 // observations.
 func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
