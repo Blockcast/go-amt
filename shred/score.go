@@ -295,9 +295,9 @@ func (s *FeedScorer) evict() {
 	if len(keys) != 0 && len(s.names) > 1 {
 		s.rescuedSets += s.rescuedAmong(keys)
 	}
-	dropped := s.union.evict(floor, keys)
+	dropped := s.union.evictAgainst(floor, keys)
 	for _, scorer := range s.feeds {
-		scorer.evict(floor, keys)
+		scorer.evictAgainst(floor, keys)
 	}
 	for _, key := range dropped {
 		delete(s.firstBy, key)
@@ -427,7 +427,7 @@ func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
 	// feed and the union. The earlier wording said only the union bypassed it,
 	// which was true of the code and untrue of the requirement.
 	if s.scheduleSweep(s.lastArrival) {
-		s.evict(s.retentionFloor(), nil)
+		s.evictSelf(s.retentionFloor())
 	}
 	return accepted, err
 }
@@ -472,7 +472,6 @@ func (s *Scorer) observe(packet []byte, receivedAt time.Time) (key dedupKey, acc
 		return key, false, first, nil
 	}
 	s.dedup[key] = receivedAt
-	s.uniqueShreds++
 
 	// receivedAt is a true arrival timestamp, captured at the read before any
 	// per-packet work, so it is NOT guaranteed to be nondecreasing across calls:
@@ -501,9 +500,13 @@ func (s *Scorer) observe(packet []byte, receivedAt time.Time) (key dedupKey, acc
 	}
 	bit := uint64(1) << header.IndexWithinSet
 	if set.seen&bit != 0 {
-		// Unreachable while the dedup key and the set bitmap carry the same
-		// (slot, fec_set_index, index_within_set) identity — the dedup miss above
-		// implies a clear bit. The shift is in range for the same reason: Parse
+		// Reached only when reclamation has decoupled the dedup key from the set
+		// bitmap, which is precisely what eviction does: dedup entries age by
+		// first < floor while sets age by set.last < floor, so a set whose arrival
+		// extent straddles the floor keeps its bitmap after its early shreds have
+		// lost their dedup entries. Absent reclamation the two carry the same
+		// (slot, fec_set_index, index_within_set) identity and the dedup miss above
+		// implies a clear bit. The shift is in range regardless: Parse
 		// rejects a data index outside 0..31 and a coding index outside 32..63
 		// before the header is built, so IndexWithinSet is always < 64 and the
 		// shift can never widen to zero and quietly disable this guard.
@@ -511,15 +514,21 @@ func (s *Scorer) observe(packet []byte, receivedAt time.Time) (key dedupKey, acc
 		// Kept as a belt-and-braces guard so the bitmap can never double-count.
 		// There is no incumbent timestamp to report here: the zero value cannot
 		// precede any real arrival, so it withholds credit rather than
-		// mis-assigning it. Worth naming what reaching this line would mean,
-		// because it is not mis-attribution: s.dedup[key] is already written
-		// above, so the shred counts toward UniqueShreds while no feed is
-		// credited for it, and firstBy never records a holder — so no later copy
-		// can repair it either. That is a silent breach of the partition
-		// invariant sum(UniqueFirst) == UniqueShreds, not a rounding error.
+		// mis-assigning it. s.dedup[key] is already written above and no later
+		// copy can repair that, so this shred is credited to nobody — but it is
+		// also not counted into UniqueShreds, because that increment now sits
+		// below this guard. Both sides of sum(UniqueFirst) == UniqueShreds omit
+		// it, so the partition invariant holds exactly instead of drifting by one
+		// per occurrence.
 		return key, false, time.Time{}, nil
 	}
 	set.seen |= bit
+	// Counted here, not at the dedup write above, so it increments on exactly the
+	// paths that return accepted=true. Above the bitmap guard it could count a
+	// shred that the guard then refused, which credits no feed and breaks
+	// sum(UniqueFirst) == UniqueShreds by one, cumulatively, with nothing to
+	// reconcile it.
+	s.uniqueShreds++
 	// Widen the extent to this arrival before testing completion, so first is a
 	// true minimum and last a true maximum over the shreds counted into seen.
 	// This is what keeps completed from going negative — a negative duration
@@ -595,15 +604,23 @@ func (s *Scorer) finalize(keys []SetKey) {
 // frontier stops advancing. It must not be conflated with lastArrival, which is
 // the gap histogram's frontier and has to stay this feed's own.
 //
-// keys, when non-nil, is the set universe to finalize against — a FeedScorer
-// passes the union's so that a set a feed never saw still counts against that
-// feed as erased. dropped collects the dedup keys released, which is how
-// FeedScorer keeps firstBy in lockstep with the union's identities rather than
-// ageing it separately.
-func (s *Scorer) evict(floor time.Time, keys []SetKey) (dropped []dedupKey) {
-	if keys == nil {
-		keys = s.expiredKeys(floor)
-	}
+// keys is the set universe to finalize against — a FeedScorer passes the
+// union's so that a set a feed never saw still counts against that feed as
+// erased. dropped collects the dedup keys released, which is how FeedScorer
+// keeps firstBy in lockstep with the union's identities rather than ageing it
+// separately.
+//
+// There is deliberately no "derive the universe yourself" sentinel here. It
+// used to be keys == nil, which collided with expiredKeys returning a nil
+// slice whenever nothing had expired: a feed then silently finalized against
+// its OWN universe at the union's floor, counting a set once for itself and
+// again when the union later expired it. "The union expired nothing while a
+// feed did" is routine rather than exotic, because the union's set.last is the
+// max across feeds — one feed's late shred keeps the union's copy live while
+// another feed's copy sits below the floor. A caller that genuinely wants its
+// own universe now says so by name through evictSelf, which makes the
+// wrong-universe fallback unrepresentable rather than merely absent.
+func (s *Scorer) evictAgainst(floor time.Time, keys []SetKey) (dropped []dedupKey) {
 	s.finalize(keys)
 	for _, key := range keys {
 		delete(s.sets, key)
@@ -615,6 +632,13 @@ func (s *Scorer) evict(floor time.Time, keys []SetKey) (dropped []dedupKey) {
 		}
 	}
 	return dropped
+}
+
+// evictSelf ages a standalone Scorer against its own set universe. Inside a
+// FeedScorer this is never the right call — every scorer there must age against
+// the union's universe at one common frontier; see evictAgainst.
+func (s *Scorer) evictSelf(floor time.Time) (dropped []dedupKey) {
+	return s.evictAgainst(floor, s.expiredKeys(floor))
 }
 
 func (s *Scorer) Receipt() Receipt {

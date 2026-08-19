@@ -89,19 +89,39 @@ func (s *Scorer) Retention() Retention {
 const (
 	completionSubBucketBits = 7
 	completionSubBuckets    = 1 << completionSubBucketBits
-	// completionOctaves covers 2^7µs through 2^20µs, so any completion under
-	// ~1.05s is bucketed and anything at or above it lands in the overflow
+	// completionOctaves covers 2^7µs through 2^22µs, so any completion under
+	// ~4.19s is bucketed and anything at or above it lands in the overflow
 	// bucket. A set is finalized once its newest arrival falls out of the
-	// retention window, so its arrival extent cannot much exceed that window.
-	completionOctaves     = 13
+	// retention window, so its arrival extent cannot much exceed that window —
+	// but "cannot much exceed" is not "cannot exceed", and the ceiling has to
+	// clear the window itself. At 13 octaves it did not: the ladder stopped at
+	// ~1.05s while DefaultRetention is 2s, so every completion between them
+	// reported the overflow floor, i.e. UNDER the truth, while three separate
+	// docs promised the opposite. A set collecting shreds every ~100ms stays
+	// live indefinitely and can legitimately span 1.8s. Two more octaves cost
+	// 256 uint64 (2 KiB) and buy 4.19s of headroom over a user-settable window.
+	completionOctaves     = 15
 	completionBucketCount = (completionOctaves + 1) * completionSubBuckets
+	// completionCeiling is the largest duration the ladder resolves. At or above
+	// it a completion lands in the overflow bucket, whose reported value is this
+	// same number — a LOWER bound, unlike every other bucket's upper edge.
+	completionCeiling = time.Duration(uint64(1)<<(completionOctaves+completionSubBucketBits)) * time.Microsecond
 	// completionOverflow is the index of the single unbounded tail bucket.
 	completionOverflow = completionBucketCount
 	// CompletionRelativeError is the worst-case fractional overstatement of a
 	// reported completion percentile, exposed so the receipt's accuracy is a
-	// documented number rather than folklore.
+	// documented number rather than folklore. It bounds the bucketed range
+	// only: a percentile falling in the overflow bucket (at or above
+	// completionCeiling) is reported as that floor and understates instead,
+	// with no bound. See completionHistogram.
 	CompletionRelativeError = 1.0 / float64(completionSubBuckets)
 )
+
+// Compile-time proof that the ladder outreaches the default retention window.
+// A constant negative difference does not convert to uint, so raising
+// DefaultRetention past completionCeiling fails the build instead of silently
+// reintroducing the understatement this constant was widened to remove.
+const _ = uint(completionCeiling - DefaultRetention)
 
 // completionHistogram is a bounded distribution of FEC-set completion
 // durations.
@@ -111,6 +131,13 @@ const (
 // completion times are bucketed rather than retained individually, and reported
 // percentiles are the upper edge of the bucket the true value fell in: never
 // less than the truth, and over by at most CompletionRelativeError.
+//
+// One exception, and it is the only one: a completion at or above
+// completionCeiling lands in the overflow bucket, which has no upper edge and
+// reports its floor. That value is a LOWER bound, so a percentile that lands
+// there understates. completionCeiling is kept above DefaultRetention (with a
+// compile-time check) so this cannot happen at the default window, but a large
+// enough --retain can still reach it.
 type completionHistogram struct {
 	buckets [completionBucketCount + 1]uint64
 	count   uint64
@@ -128,7 +155,12 @@ func (h *completionHistogram) observe(completed time.Duration) {
 func completionBucket(completed time.Duration) int {
 	micros := int64(0)
 	if completed > 0 {
-		micros = int64(completed / time.Microsecond)
+		// Round up. Truncating reported 45.6µs as 45µs — below the truth, the
+		// one direction this histogram promises never to go. Bounded at <1µs so
+		// it does not move the ms-scale receipt numbers, but it makes the
+		// guarantee unqualified. The completed > 0 guard keeps a genuine zero
+		// exactly zero rather than rounding it up to one microsecond.
+		micros = int64((completed + time.Microsecond - 1) / time.Microsecond)
 	}
 	value := uint64(micros)
 	if value < completionSubBuckets {
@@ -147,8 +179,9 @@ func completionBucket(completed time.Duration) int {
 func completionBucketUpperEdge(index int) time.Duration {
 	if index >= completionOverflow {
 		// The overflow bucket has no upper edge; report its floor, which is the
-		// strongest statement that remains true.
-		return time.Duration(uint64(1)<<(completionOctaves+completionSubBucketBits)) * time.Microsecond
+		// strongest statement that remains true. This is the one bucket whose
+		// reported value can be BELOW the observation — see completionHistogram.
+		return completionCeiling
 	}
 	if index < completionSubBuckets {
 		return time.Duration(index) * time.Microsecond
