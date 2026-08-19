@@ -179,7 +179,7 @@ func run(args []string) error {
 	}
 	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON,
 		time.Duration(*graceMS)*time.Millisecond, *reportInterval, nil,
-		scoring{mode: mode, sourceLabel: sourceLabel, rightsBasis: rightsBasis})
+		scoring{mode: scoringMode(mode), sourceLabel: scoringSource(sourceLabel), rightsBasis: scoringRights(rightsBasis)})
 }
 
 func selftest(args []string) error {
@@ -286,10 +286,22 @@ func gensend(args []string) error {
 // stamping the wrong provenance, and the tests would go on passing. Naming
 // the fields makes that a compile error instead.
 type scoring struct {
-	mode        string
-	sourceLabel string
-	rightsBasis string
+	mode        scoringMode
+	sourceLabel scoringSource
+	rightsBasis scoringRights
 }
+
+// The three fields carry DISTINCT defined types rather than three plain
+// strings. Grouping them in a struct alone is not sufficient: an unkeyed
+// composite literal -- scoring{a, b, c} -- reassembles the original hazard,
+// because three string fields accept three strings in any order. Distinct
+// types make that swap a compile error too, which is what the acceptance
+// criterion on BLO-28993 actually asks for.
+type (
+	scoringMode   string
+	scoringSource string
+	scoringRights string
+)
 
 func (s scoring) generic() bool { return s.mode == "generic" }
 
@@ -300,7 +312,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	}
 	var scorer sessionScorer
 	if mode.generic() {
-		scorer = shred.NewGenericFeedScorer(names, mode.sourceLabel, mode.rightsBasis)
+		scorer = shred.NewGenericFeedScorer(names, string(mode.sourceLabel), string(mode.rightsBasis))
 		// The provenance is announced at start, not only in the closing
 		// receipt, so a run that is interrupted still has its input labelled.
 		// It goes to stderr so --json keeps stdout a single JSON document.
