@@ -262,6 +262,21 @@ func TestRetentionDoesNotChangeTheFixtureReceipt(t *testing.T) {
 // partition the union's unique-shred count. Eviction drops the identity that
 // lets credit move, so it must not drop the credit itself.
 func TestEvictionPreservesConservation(t *testing.T) {
+	// Parametrized over the alternation phase. With only one phase this test
+	// passed against a build whose per-feed scorers self-finalized on their own
+	// frontier, because the alternation happened to make the non-baseline feed
+	// first-observed at every round boundary, so the union's sweep always beat
+	// the baseline's. The bug it was written to catch was masked by arrival
+	// order alone -- the other phase reports RescuedSets:38 GapClosed:0.95 on a
+	// run where every feed carried every shred. Both phases must hold.
+	for _, phase := range []uint64{1, 0} {
+		t.Run(fmt.Sprintf("alternation-phase-%d", phase), func(t *testing.T) {
+			evictionConservation(t, phase)
+		})
+	}
+}
+
+func evictionConservation(t *testing.T, phase uint64) {
 	scorer := NewFeedScorerWithRetention(FormatAgave, []string{"blockcast", "external"}, testWindow)
 	started := time.Unix(5, 0)
 	const rounds, setsPerRound = 20, 2
@@ -276,7 +291,7 @@ func TestEvictionPreservesConservation(t *testing.T) {
 				// Alternate which feed carries the earlier copy so credit is
 				// split and re-attribution actually fires.
 				early, late := "blockcast", "external"
-				if index%2 == 1 {
+				if uint64(index)%2 == phase {
 					early, late = late, early
 				}
 				if _, err := scorer.Observe(late, packet, at.Add(time.Millisecond)); err != nil {
@@ -313,6 +328,21 @@ func TestEvictionPreservesConservation(t *testing.T) {
 	}
 	if got, want := receipt.Union.SetsTotal, rounds*setsPerRound; got != want {
 		t.Fatalf("union SetsTotal = %d, want %d across the whole run", got, want)
+	}
+	// Pin the invariant directly rather than leaving it to interleaving: every
+	// feed carried every shred of every set, so each feed must agree with the
+	// union and erase nothing. A feed that self-finalizes reports MORE sets than
+	// the union -- the same set counted once live and again as phantom-erased.
+	for _, feed := range receipt.Feeds {
+		if feed.Receipt.SetsTotal != receipt.Union.SetsTotal {
+			t.Errorf("feed %s SetsTotal = %d, union = %d; a feed that carried "+
+				"everything cannot see a different set universe",
+				feed.Name, feed.Receipt.SetsTotal, receipt.Union.SetsTotal)
+		}
+		if feed.Receipt.SetsErased != 0 {
+			t.Errorf("feed %s SetsErased = %d, want 0; it carried every shred",
+				feed.Name, feed.Receipt.SetsErased)
+		}
 	}
 	if retention := scorer.Retention(); retention.TrackedAttributions > 2*setsPerRound*completionThreshold {
 		t.Fatalf("first-arrival attributions unbounded: %+v", retention)

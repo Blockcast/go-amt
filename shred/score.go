@@ -228,7 +228,17 @@ func (s *FeedScorer) Observe(feed string, packet []byte, receivedAt time.Time) (
 	if scorer == nil {
 		return false, fmt.Errorf("unknown feed %q", feed)
 	}
-	if _, err := scorer.Observe(packet, receivedAt); err != nil {
+	// The UNEXPORTED observe: the exported Scorer.Observe carries a per-scorer
+	// eviction sweep, and reaching it here made each feed self-finalize on its
+	// own frontier and its own set universe. The feed's sweep runs before the
+	// union's evict below, so the feed deleted sets the union still held live;
+	// the union pass then finalized the same keys a second time as phantom
+	// erased. A feed that carried every shred of every set reported 42.9%
+	// erasure, and the false-nil baseline inflated "measured worth of a second
+	// feed" to 75% gap closed when the second feed rescued nothing.
+	// Reclamation inside a FeedScorer must run at one frontier across every feed
+	// and the union -- that is FeedScorer.evict's job, and only its job.
+	if _, _, _, err := scorer.observe(packet, receivedAt); err != nil {
 		return false, err
 	}
 	key, accepted, incumbent, err := s.union.observe(packet, receivedAt)
@@ -411,9 +421,11 @@ func NewScorerWithRetention(format Format, window time.Duration) *Scorer {
 
 func (s *Scorer) Observe(packet []byte, receivedAt time.Time) (bool, error) {
 	_, accepted, _, err := s.observe(packet, receivedAt)
-	// A bare Scorer reclaims on its own frontier. Inside a FeedScorer this method
-	// is bypassed for observe, because reclamation there must run at one frontier
-	// across every feed and the union.
+	// A bare Scorer reclaims on its own frontier. Inside a FeedScorer BOTH the
+	// union and the per-feed scorers bypass this method and call the unexported
+	// observe, because reclamation there must run at one frontier across every
+	// feed and the union. The earlier wording said only the union bypassed it,
+	// which was true of the code and untrue of the requirement.
 	if s.scheduleSweep(s.lastArrival) {
 		s.evict(s.retentionFloor(), nil)
 	}
