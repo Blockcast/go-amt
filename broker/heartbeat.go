@@ -72,8 +72,9 @@ const (
 	//
 	// Ingest bounds are declared together on this contract so a producer can
 	// discover them without reading the validator: at most MaxFeeds feed
-	// reports per heartbeat, at most MaxVersionBytes in version, and at most
-	// MaxFeedIDBytes in each feed_id.
+	// reports per heartbeat, at most MaxVersionBytes in version, at most
+	// MaxFeedIDBytes in each feed_id, and at most MaxSetsTotal in each feed's
+	// erasure.sets_total.
 	HeartbeatSchema = "blockcast.shred-gw-heartbeat.v1"
 
 	// HeartbeatInterval is the fixed v1 emission cadence.
@@ -97,18 +98,60 @@ const (
 	// digit output and rejected six-decimal producers for most ratios (1/3 and
 	// 2/7 among them).
 	//
-	// It cannot mask a wrong integer. The smallest nonzero disagreement a
-	// miscounted set can produce is 1/SetsTotal, so for 1e-6 to hide an
-	// off-by-one the window would need SetsTotal > 1e6 — over 33,000 scored FEC
-	// sets per second across a 30s window, orders of magnitude beyond the shred
-	// rate this receiver observes. See MinFractionDecimalPlaces.
+	// It cannot mask a wrong integer, but only because SetsTotal is bounded.
+	// The smallest nonzero disagreement a miscounted set can produce is
+	// 1/SetsTotal, so an off-by-one survives this check exactly when
+	// 1/SetsTotal <= erasureFractionEpsilon — that is, from SetsTotal = 1e6
+	// upward. The honest in-process producer never reaches that, but the reason
+	// this recompute exists at all is that ingest is untrusted, and an untrusted
+	// producer picks SetsTotal freely. MaxSetsTotal is what makes the claim hold
+	// for every accepted heartbeat rather than only for well-behaved ones. See
+	// MinFractionDecimalPlaces.
 	erasureFractionEpsilon = 1e-6
 
-	// MinFractionDecimalPlaces is the precision erasure_fraction must carry to
-	// survive ingest: a producer emitting fewer decimal places than this will
-	// be rejected for disagreeing with its own sets_erased / sets_total. Go
-	// producers should call erasure.Fraction and are float64-exact.
+	// MinFractionDecimalPlaces is the precision a producer should serialize
+	// erasure_fraction at so that ingest accepts it for any ratio.
+	//
+	// It is guidance, not an enforceable rule, and the distinction matters
+	// because the failure it prevents is data-dependent. Validation checks only
+	// that the reported fraction agrees with sets_erased / sets_total within
+	// erasureFractionEpsilon, so coarser output is accepted whenever the ratio
+	// happens to be exactly representable at the precision emitted: 2/50 at two
+	// decimal places (0.04) and 1/2 at one (0.5) both pass. The first window
+	// that erases 1 set in 3 is what fails a three-decimal producer, so a
+	// producer team can ship coarse output, pass every smoke test built on round
+	// ratios, and break in production.
+	//
+	// Emitting fewer places than this is therefore not rejected as such — it is
+	// rejected for the ratios it cannot represent. Nor could validation reject
+	// it as such: it operates on decoded structs, and "0.04", "0.040000" and
+	// "4e-2" decode to the same float64, so the digit count the producer wrote
+	// is not recoverable at the point the check runs. This is the same
+	// structural blindness the gap_ms_hist escaping rule has, and it has the
+	// same resolution: the broker canonicalizes the value in CanonicalBytes
+	// rather than asking the producer to match Go byte-for-byte.
+	//
+	// Go producers should call erasure.Fraction and are float64-exact.
 	MinFractionDecimalPlaces = 6
+
+	// MaxSetsTotal bounds each feed's erasure.sets_total, and exists so
+	// erasureFractionEpsilon cannot hide a miscounted set.
+	//
+	// It is derived from the tolerance rather than picked: an off-by-one erased
+	// set moves the fraction by 1/SetsTotal, which the check catches only while
+	// 1/SetsTotal > erasureFractionEpsilon. That makes 999,999 — one below
+	// 1/erasureFractionEpsilon — the largest sets_total for which the recompute
+	// still has teeth, and TestMaxSetsTotalIsTheLargestBoundThatCatchesAnOffByOne
+	// pins both sides of that boundary so widening the tolerance cannot silently
+	// unbound this.
+	//
+	// The bound is far above anything a real window reaches, so it costs an
+	// honest gateway nothing: production carries 64 shreds per FEC set — 32 data
+	// plus 32 coding, verified against 1,044,775 consecutive datagrams in the
+	// notes on shred.WireHeaderSize — so 999,999 scored sets in one
+	// HeartbeatInterval is upwards of two million shreds per second on a single
+	// feed.
+	MaxSetsTotal = 999_999
 
 	// MaxVersionBytes bounds the version string.
 	MaxVersionBytes = 128
@@ -186,6 +229,22 @@ type FeedReport struct {
 // unknown field that was never retained. W4a must persist the raw request body
 // (json.RawMessage or the untouched bytes) if it needs the object back exactly
 // as sent; CanonicalBytes is for diffing, not for archival.
+//
+// CanonicalBytes has no caller in this repository yet, so the ingest sequence
+// it belongs to is stated here rather than left to be inferred. A broker
+// receiving a heartbeat must, in this order:
+//
+//  1. Decode the request body into a Heartbeat.
+//  2. Call ValidateHeartbeat and reject on error. Canonicalization is not a
+//     substitute: it normalizes the form of a report, not its truth.
+//  3. Call CanonicalBytes and store what it returns as the ledger's diffable
+//     form, alongside the raw body if verbatim retention is needed.
+//
+// Step 2 before step 3 is enforced where it can be cheaply enforced rather than
+// only documented: CanonicalBytes recomputes erasure_fraction, so it refuses a
+// heartbeat whose fraction disagrees with its own integers instead of
+// overwriting the evidence. It does not re-run the whole validator, so every
+// other field it emits is still only as trustworthy as step 2 made it.
 type Heartbeat struct {
 	Schema  string       `json:"schema"`
 	GWUUID  string       `json:"gw_uuid"`
@@ -197,19 +256,66 @@ type Heartbeat struct {
 // CanonicalBytes renders hb in the one byte form the broker's ledger diffs
 // against, and is the single implementation both sides share.
 //
-// It exists because byte diffability cannot be a producer obligation: the
-// gap_ms_hist keys contain < and >, encoding/json escapes them by default, and
-// a producer in any other language emits the unescaped spelling. Both decode to
-// the same document and both pass ValidateHeartbeat — validation operates on
-// decoded structs and is structurally blind to escaping — so a ledger that
-// diffed raw received bytes would report two identical reports as different,
-// with nothing for the producer to have done differently and no check able to
-// warn it. Canonicalizing on ingest removes the hazard for every producer at
-// once.
+// It exists because byte diffability cannot be a producer obligation, and there
+// are two independent reasons for that, both of which it closes:
 //
-// Callers should validate before storing what this returns: it canonicalizes
-// spelling, not content.
+//   - Spelling. The gap_ms_hist keys contain < and >, encoding/json escapes
+//     them by default, and a producer in any other language emits the unescaped
+//     form. Re-encoding through Go's marshaller normalizes it.
+//   - Value. erasure_fraction is a float the producer serializes at a precision
+//     of its choosing, so a Go producer emitting 0.3333333333333333 and a
+//     six-decimal producer emitting 0.333333 describe the same 1-of-3 window
+//     and both pass ValidateHeartbeat, which only requires agreement within
+//     erasureFractionEpsilon. Marshalling as received would preserve that
+//     difference. CanonicalBytes therefore recomputes the fraction from
+//     sets_erased and sets_total, which are the authoritative integers
+//     validateErasureReport already checks it against.
+//
+// In both cases the two forms decode to the same document and both pass
+// ValidateHeartbeat — validation operates on decoded structs and is
+// structurally blind to escaping and to emitted precision alike — so a ledger
+// that diffed bytes as received would report two identical reports as
+// different, with nothing for the producer to have done differently and no
+// check able to warn it. Canonicalizing on ingest removes both hazards for
+// every producer at once.
+//
+// Recomputing is only safe if it cannot launder a wrong number, so a fraction
+// that disagrees with its integers by more than the tolerance is rejected
+// rather than replaced: a misbehaving producer must not be able to reach a
+// valid-looking ledger entry by way of this function. Beyond that field
+// CanonicalBytes canonicalizes form, not truth — see the numbered ingest
+// sequence on Heartbeat for the order it must be called in.
 func CanonicalBytes(hb Heartbeat) ([]byte, error) {
+	canonicalizeFailed := func(index int, feedID string, format string, args ...any) error {
+		return fmt.Errorf("%w: canonicalizing heartbeat: feeds[%d] (%s): %s",
+			ErrInvalidHeartbeat, index, feedID, fmt.Sprintf(format, args...))
+	}
+
+	if len(hb.Feeds) > 0 {
+		// hb arrives by value but Feeds shares the caller's backing array, so
+		// recomputing in place would rewrite the caller's heartbeat. Copying
+		// also keeps a nil Feeds nil, since the envelope's wire form for a
+		// gateway subscribed to nothing is "feeds":null rather than [].
+		feeds := make([]FeedReport, len(hb.Feeds))
+		copy(feeds, hb.Feeds)
+		for i := range feeds {
+			window := &feeds[i].Erasure
+			// Checked before the comparison below, which NaN would pass
+			// vacuously and then have the recompute silently replace.
+			if err := requireFinite("erasure.erasure_fraction", window.ErasureFraction); err != nil {
+				return nil, canonicalizeFailed(i, feeds[i].FeedID, "%s", err)
+			}
+			expected := erasure.Fraction(window.SetsErased, window.SetsTotal)
+			if math.Abs(window.ErasureFraction-expected) > erasureFractionEpsilon {
+				return nil, canonicalizeFailed(i, feeds[i].FeedID,
+					"erasure.erasure_fraction %v disagrees with sets_erased %d / sets_total %d (= %v); ValidateHeartbeat must run first",
+					window.ErasureFraction, window.SetsErased, window.SetsTotal, expected)
+			}
+			window.ErasureFraction = expected
+		}
+		hb.Feeds = feeds
+	}
+
 	encoded, err := json.Marshal(hb)
 	if err != nil {
 		return nil, fmt.Errorf("%w: canonicalizing heartbeat: %s", ErrInvalidHeartbeat, err)
@@ -279,9 +385,16 @@ func ValidateHeartbeat(hb Heartbeat) error {
 // edge happens to read would then decide the outcome. This is not reachable
 // from our own tracker — it is reachable from any other producer, which is the
 // threat model for the ingest side.
+//
+// The same threat model is why SetsTotal is bounded: an untrusted producer that
+// could name any denominator could pick one large enough for
+// erasureFractionEpsilon to swallow a miscounted set. See MaxSetsTotal.
 func validateErasureReport(window erasure.Window) error {
 	if window.Schema != erasureReportSchema {
 		return fmt.Errorf("erasure.schema must be %d", erasureReportSchema)
+	}
+	if window.SetsTotal > MaxSetsTotal {
+		return fmt.Errorf("erasure.sets_total must be at most %d, got %d", MaxSetsTotal, window.SetsTotal)
 	}
 	if window.SetsErased > window.SetsTotal {
 		return fmt.Errorf("erasure.sets_erased %d exceeds sets_total %d", window.SetsErased, window.SetsTotal)

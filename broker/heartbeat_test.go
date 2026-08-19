@@ -114,12 +114,16 @@ func TestHeartbeatSerializesTheExactContract(t *testing.T) {
 // declaration order both times. Only an external expectation catches a
 // reordered struct, a renamed tag, or a changed number format.
 //
-// Note the < and > escapes: encoding/json HTML-escapes < and > in the
-// histogram keys by default. Those escapes are part of the canonical byte form
-// this contract freezes. Any producer that emits the semantically identical
-// literal "<1" and ">=32" — including a Go producer using json.Encoder with
-// SetEscapeHTML(false) — decodes to the same document but does NOT match
-// byte-for-byte, which is what the ledger's diffability rests on.
+// Note the < and > escapes: encoding/json HTML-escapes < and > in the histogram
+// keys by default, so this is what a Go producer puts on the wire. It is NOT
+// what every producer must put on the wire. A producer emitting the
+// semantically identical literal "<1" and ">=32" — including a Go producer
+// using json.Encoder with SetEscapeHTML(false) — decodes to the same document,
+// passes validation, and is not penalized for the difference. The ledger's
+// diffability rests on the broker re-encoding through CanonicalBytes, not on
+// the producer reproducing these bytes; see HeartbeatSchema and CanonicalBytes.
+// What this literal freezes is Go's own output, which is the form
+// CanonicalBytes converges every producer onto.
 const canonicalWire = `{"schema":"blockcast.shred-gw-heartbeat.v1","gw_uuid":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","version":"v1.4.0","sent_at":"2026-08-18T06:00:00Z","feeds":[{"feed_id":"feed-a","packets":1200,"bytes":1440000,"first_packet_at":"2026-08-18T05:59:30Z","last_packet_at":"2026-08-18T05:59:59.5Z","erasure":{"sets_total":50,"sets_erased":2,"erasure_fraction":0.04,"r_mean":40,"r_peak_100ms":60,"gap_ms_hist":{"\u003c1":7,"1-2.4":5,"2.4-7":3,"7-32":1,"\u003e=32":1},"grace_ms":400,"schema":1}}]}`
 
 // TestHeartbeatMarshalsToTheCanonicalBytes pins the wire form against a
@@ -232,8 +236,15 @@ func TestValidateHeartbeatAcceptsValidInput(t *testing.T) {
 // the integers beneath it by more than rounding can explain. An earlier 1e-9
 // bound satisfied only the second half and rejected six-decimal producers for
 // any ratio not exactly representable at that precision.
+//
+// The rule is agreement within the tolerance, NOT a decimal-place count, so the
+// table pins both sides of that distinction: coarse output is accepted for a
+// ratio it can represent exactly and rejected for one it cannot. That is why
+// MinFractionDecimalPlaces is documented as guidance rather than as an
+// enforced floor — see its doc comment.
 func TestErasureFractionToleranceAdmitsRoundedProducers(t *testing.T) {
 	roundTo := func(v float64, places int) float64 {
+		t.Helper()
 		var out float64
 		if err := json.Unmarshal([]byte(fmt.Sprintf("%.*f", places, v)), &out); err != nil {
 			t.Fatalf("re-parsing a rounded fraction: %v", err)
@@ -267,9 +278,21 @@ func TestErasureFractionToleranceAdmitsRoundedProducers(t *testing.T) {
 			wantAccepted: true,
 		},
 		{
-			// One decimal place coarser than the contract requires: the
-			// producer has under-serialized and is told so. This case is also
-			// what stops the tolerance being widened without a doc change.
+			// Four places coarser than the contract asks for, and accepted
+			// anyway, because 2/50 is exactly representable at two. Pinned so
+			// the accepted-coarse case is deliberate rather than incidental:
+			// this is the whole reason MinFractionDecimalPlaces cannot be
+			// described as a floor validation enforces. A producer shipping two
+			// decimal places passes here and fails the row below.
+			name: "terminating ratio coarser than the documented precision", erased: 2, total: 50,
+			fraction:     func(exact float64) float64 { return roundTo(exact, 2) },
+			wantAccepted: true,
+		},
+		{
+			// One decimal place coarser than the contract requires, on a ratio
+			// that does not terminate there: the producer has under-serialized
+			// and is told so. This case is also what stops the tolerance being
+			// widened without a doc change.
 			name: "coarser than the documented precision", erased: 1, total: 3,
 			fraction:     func(exact float64) float64 { return roundTo(exact, MinFractionDecimalPlaces-1) },
 			wantAccepted: false,
@@ -354,26 +377,271 @@ func TestCanonicalBytesNormalizesProducerEscaping(t *testing.T) {
 	}
 }
 
-// TestCanonicalBytesRejectsUnmarshalableInput pins the one failure mode
+// TestCanonicalBytesNormalizesProducerFractionPrecision covers the second
+// convergence hazard, which the escaping fix above does not touch.
+//
+// Escaping is a spelling difference. erasure_fraction is a value difference: a
+// Go producer emits the float64-exact ratio and a producer using %.6f emits six
+// digits, both describe the same window, and both pass validation because the
+// tolerance is there precisely to admit the second one. Marshalling as received
+// would then hand the ledger two different byte strings for one report — the
+// exact failure CanonicalBytes exists to prevent, reached by a different route.
+//
+// The sibling test above cannot see this, because it re-encodes validHeartbeat()
+// whose 2/50 fraction is identical on both sides.
+func TestCanonicalBytesNormalizesProducerFractionPrecision(t *testing.T) {
+	// A window that erases 1 set in 3: a ratio no decimal precision represents.
+	const erased, total = 1, 3
+
+	withFraction := func(fraction float64) Heartbeat {
+		hb := validHeartbeat()
+		hb.Feeds[0].Erasure.SetsErased = erased
+		hb.Feeds[0].Erasure.SetsTotal = total
+		hb.Feeds[0].Erasure.ErasureFraction = fraction
+		return hb
+	}
+
+	exact := erasure.Fraction(erased, total)
+	var sixDecimals float64
+	if err := json.Unmarshal([]byte(fmt.Sprintf("%.*f", MinFractionDecimalPlaces, exact)), &sixDecimals); err != nil {
+		t.Fatal(err)
+	}
+
+	// Precondition: this really is the hazard. Both producers are accepted, and
+	// their raw encodings differ.
+	fromGo, fromSixDecimals := withFraction(exact), withFraction(sixDecimals)
+	if err := ValidateHeartbeat(fromGo); err != nil {
+		t.Fatalf("the float64-exact producer must validate: %v", err)
+	}
+	if err := ValidateHeartbeat(fromSixDecimals); err != nil {
+		t.Fatalf("the six-decimal producer must validate; that is what the tolerance is for: %v", err)
+	}
+	rawGo, err := json.Marshal(fromGo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawSixDecimals, err := json.Marshal(fromSixDecimals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(rawGo, rawSixDecimals) {
+		t.Fatal("the two producers already encode identically, so the precision hazard this " +
+			"test exists for is gone; simplify CanonicalBytes' doc accordingly")
+	}
+
+	canonicalGo, err := CanonicalBytes(fromGo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalSixDecimals, err := CanonicalBytes(fromSixDecimals)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(canonicalGo, canonicalSixDecimals) {
+		t.Fatalf("canonicalization did not converge:\n go %s\nsix %s", canonicalGo, canonicalSixDecimals)
+	}
+	// Assert the rendered value, not just that the two agree: converging on a
+	// wrongly-rounded number would also satisfy the comparison above.
+	if want := `"erasure_fraction":0.3333333333333333,`; !bytes.Contains(canonicalGo, []byte(want)) {
+		t.Fatalf("canonical form must carry the float64-exact ratio %s, got %s", want, canonicalGo)
+	}
+}
+
+// TestCanonicalBytesRefusesToLaunderADisagreeingFraction pins the guard that
+// makes the recompute above safe.
+//
+// Recomputing a field means overwriting what the producer said, and for a
+// producer whose fraction contradicts its own integers that would replace
+// evidence of a misbehaving producer with a plausible number — reachable by
+// canonicalizing before validating, which is exactly the ordering mistake the
+// numbered sequence on Heartbeat warns about. So the disagreement is an error
+// rather than a silent correction.
+func TestCanonicalBytesRefusesToLaunderADisagreeingFraction(t *testing.T) {
+	hb := validHeartbeat()
+	hb.Feeds[0].Erasure.SetsTotal = 50
+	hb.Feeds[0].Erasure.SetsErased = 25
+	hb.Feeds[0].Erasure.ErasureFraction = 0 // truthfully 0.5
+
+	// Precondition: validation rejects this, so CanonicalBytes is only ever
+	// reached with it by a caller that skipped step 2.
+	if err := ValidateHeartbeat(hb); err == nil {
+		t.Fatal("validation must already reject a fraction that contradicts its integers")
+	}
+
+	encoded, err := CanonicalBytes(hb)
+	if err == nil {
+		t.Fatalf("CanonicalBytes(disagreeing fraction) = %s, want an error", encoded)
+	}
+	if encoded != nil {
+		t.Fatalf("a failed canonicalization must not return bytes, got %s", encoded)
+	}
+	if !errors.Is(err, ErrInvalidHeartbeat) {
+		t.Fatalf("error must match ErrInvalidHeartbeat so callers can classify it, got %v", err)
+	}
+	// Assert the rendered message, including the values interpolated into it: a
+	// Contains check on a fragment that spans no verb would pass even if every
+	// %v were mis-specified.
+	const want = "feeds[0] (feed-a): erasure.erasure_fraction 0 disagrees with " +
+		"sets_erased 25 / sets_total 50 (= 0.5); ValidateHeartbeat must run first"
+	if got := err.Error(); !strings.Contains(got, want) {
+		t.Fatalf("error message must name the disagreement and the fix:\n got %s\nwant substring %s", got, want)
+	}
+	if strings.ContainsAny(err.Error(), "%") {
+		t.Fatalf("error message carries an unrendered format directive: %s", err)
+	}
+}
+
+// TestCanonicalBytesDoesNotMutateTheCallersHeartbeat guards the aliasing trap in
+// the recompute: Heartbeat is passed by value, but Feeds is a slice, so writing
+// through hb.Feeds[i] would rewrite the caller's own heartbeat. A producer that
+// canonicalized for logging would silently have its outbound report edited.
+func TestCanonicalBytesDoesNotMutateTheCallersHeartbeat(t *testing.T) {
+	hb := validHeartbeat()
+	hb.Feeds[0].Erasure.SetsErased = 1
+	hb.Feeds[0].Erasure.SetsTotal = 3
+	// A six-decimal fraction: accepted, and different from what CanonicalBytes
+	// will emit, so an in-place recompute would be visible here.
+	var sixDecimals float64
+	if err := json.Unmarshal([]byte("0.333333"), &sixDecimals); err != nil {
+		t.Fatal(err)
+	}
+	hb.Feeds[0].Erasure.ErasureFraction = sixDecimals
+
+	if _, err := CanonicalBytes(hb); err != nil {
+		t.Fatal(err)
+	}
+	if got := hb.Feeds[0].Erasure.ErasureFraction; got != sixDecimals {
+		t.Fatalf("CanonicalBytes rewrote the caller's fraction to %v, want %v left untouched", got, sixDecimals)
+	}
+}
+
+// TestCanonicalBytesPreservesTheEmptyFeedWireForm pairs with
+// TestEmptyFeedListMarshalsAsNullNotAbsent: the ledger's byte form for a
+// gateway subscribed to nothing must be the same "feeds":null the envelope
+// documents, so the feed copy in CanonicalBytes must not turn a nil slice into
+// an empty one.
+func TestCanonicalBytesPreservesTheEmptyFeedWireForm(t *testing.T) {
+	hb := validHeartbeat()
+	hb.Feeds = nil
+
+	encoded, err := CanonicalBytes(hb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"feeds":null`) {
+		t.Fatalf("expected feeds to canonicalize as null, got %s", encoded)
+	}
+}
+
+// TestCanonicalBytesRejectsUnmarshalableInput pins the failure modes
 // CanonicalBytes has, and the reason its doc tells callers to validate first.
 //
 // encoding/json cannot represent NaN or ±Inf, and both are reachable in-process
 // on the producer side where a float is assigned directly rather than decoded.
 // A caller that canonicalizes before validating gets an ErrInvalidHeartbeat
 // rather than a partial buffer or a silently dropped field.
+//
+// The two rows are not redundant. A non-finite erasure_fraction is caught by an
+// explicit guard before the recompute, because NaN passes the disagreement
+// comparison vacuously — every comparison against NaN is false — and would then
+// have the recompute quietly replace it with a finite number, marshal cleanly,
+// and land in the ledger. A non-finite r_mean is not recomputed at all and is
+// caught by json.Marshal itself, which is the branch that keeps the error wrap
+// on the marshal call live.
 func TestCanonicalBytesRejectsUnmarshalableInput(t *testing.T) {
-	hb := validHeartbeat()
-	hb.Feeds[0].Erasure.ErasureFraction = math.NaN()
+	tests := []struct {
+		name   string
+		mutate func(*Heartbeat)
+	}{
+		{"NaN erasure fraction", func(h *Heartbeat) { h.Feeds[0].Erasure.ErasureFraction = math.NaN() }},
+		{"infinite erasure fraction", func(h *Heartbeat) { h.Feeds[0].Erasure.ErasureFraction = math.Inf(1) }},
+		{"NaN r_mean", func(h *Heartbeat) { h.Feeds[0].Erasure.RMean = math.NaN() }},
+		{"infinite r_peak", func(h *Heartbeat) { h.Feeds[0].Erasure.RPeak100MS = math.Inf(-1) }},
+	}
 
-	encoded, err := CanonicalBytes(hb)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hb := validHeartbeat()
+			test.mutate(&hb)
+
+			encoded, err := CanonicalBytes(hb)
+			if err == nil {
+				t.Fatalf("CanonicalBytes(%s) = %s, want an error", test.name, encoded)
+			}
+			if !errors.Is(err, ErrInvalidHeartbeat) {
+				t.Fatalf("error must match ErrInvalidHeartbeat so callers can classify it, got %v", err)
+			}
+			if encoded != nil {
+				t.Fatalf("a failed canonicalization must not return bytes, got %s", encoded)
+			}
+		})
+	}
+}
+
+// TestMaxSetsTotalIsTheLargestBoundThatCatchesAnOffByOne pins the derivation
+// MaxSetsTotal's doc claims, which is the whole reason the bound exists.
+//
+// erasureFractionEpsilon's rationale asserts the tolerance "cannot mask a wrong
+// integer". That is only true while the smallest disagreement a miscounted set
+// can produce, 1/sets_total, still exceeds the tolerance. So the two constants
+// are coupled, and a future widening of the tolerance must either move the
+// bound or retract the claim — this test is what forces that choice instead of
+// letting the claim quietly become false.
+//
+// The behavioural half asserts the REASON for each rejection, not just that one
+// happened. Without that, the bound would confound the measurement: past
+// MaxSetsTotal every heartbeat is rejected by the bound, so a test that only
+// checked "rejected" would stay green even if the fraction recompute had been
+// deleted outright.
+func TestMaxSetsTotalIsTheLargestBoundThatCatchesAnOffByOne(t *testing.T) {
+	// The arithmetic the doc derives the constant from.
+	if smallest := 1 / float64(MaxSetsTotal); smallest <= erasureFractionEpsilon {
+		t.Fatalf("an off-by-one at sets_total=%d moves the fraction by %v, which the %v tolerance "+
+			"already swallows: MaxSetsTotal is too large for erasureFractionEpsilon",
+			MaxSetsTotal, smallest, erasureFractionEpsilon)
+	}
+	if next := 1 / float64(uint64(MaxSetsTotal)+1); next > erasureFractionEpsilon {
+		t.Fatalf("sets_total=%d would still catch an off-by-one (%v > %v), so MaxSetsTotal is "+
+			"lower than it needs to be and the doc's derivation is wrong",
+			uint64(MaxSetsTotal)+1, next, erasureFractionEpsilon)
+	}
+
+	// At the bound, a miscounted set is still caught, and caught by the
+	// recompute rather than by the bound.
+	atBound := validHeartbeat()
+	atBound.Feeds[0].Erasure.SetsTotal = MaxSetsTotal
+	atBound.Feeds[0].Erasure.SetsErased = 1
+	atBound.Feeds[0].Erasure.ErasureFraction = erasure.Fraction(2, MaxSetsTotal)
+
+	err := ValidateHeartbeat(atBound)
 	if err == nil {
-		t.Fatalf("CanonicalBytes(NaN fraction) = %s, want an error", encoded)
+		t.Fatalf("an off-by-one erased set at sets_total=%d must be rejected", MaxSetsTotal)
 	}
-	if !errors.Is(err, ErrInvalidHeartbeat) {
-		t.Fatalf("error must match ErrInvalidHeartbeat so callers can classify it, got %v", err)
+	if !strings.Contains(err.Error(), "disagrees with sets_erased") {
+		t.Fatalf("rejected for the wrong reason; the recompute must be what fires: %v", err)
 	}
-	if encoded != nil {
-		t.Fatalf("a failed canonicalization must not return bytes, got %s", encoded)
+
+	// An honest report at the bound is still accepted, so the bound is a cap on
+	// untrusted input and not a cap on legitimate traffic.
+	honest := atBound
+	honest.Feeds[0].Erasure.ErasureFraction = erasure.Fraction(1, MaxSetsTotal)
+	if err := ValidateHeartbeat(honest); err != nil {
+		t.Fatalf("a correct report at exactly sets_total=%d must validate: %v", MaxSetsTotal, err)
+	}
+
+	// One past the bound, the report is refused outright rather than accepted
+	// with a fraction the tolerance can no longer police.
+	overBound := validHeartbeat()
+	overBound.Feeds[0].Erasure.SetsTotal = MaxSetsTotal + 1
+	overBound.Feeds[0].Erasure.SetsErased = 1
+	overBound.Feeds[0].Erasure.ErasureFraction = erasure.Fraction(2, MaxSetsTotal+1)
+
+	err = ValidateHeartbeat(overBound)
+	if err == nil {
+		t.Fatalf("sets_total=%d exceeds MaxSetsTotal and must be rejected", MaxSetsTotal+1)
+	}
+	if want := fmt.Sprintf("erasure.sets_total must be at most %d, got %d", MaxSetsTotal, MaxSetsTotal+1); !strings.Contains(err.Error(), want) {
+		t.Fatalf("error must name the bound a rejected producer is being held to:\n got %s\nwant substring %s", err, want)
 	}
 }
 
@@ -399,6 +667,15 @@ func TestValidateHeartbeatRejects(t *testing.T) {
 		{"oversized feed id", func(h *Heartbeat) { h.Feeds[0].FeedID = strings.Repeat("f", MaxFeedIDBytes+1) }},
 		{"wrong erasure schema", func(h *Heartbeat) { h.Feeds[0].Erasure.Schema = 2 }},
 		{"erased exceeds total", func(h *Heartbeat) { h.Feeds[0].Erasure.SetsErased = h.Feeds[0].Erasure.SetsTotal + 1 }},
+		// sets_total is the denominator the fraction recompute polices against,
+		// so an unbounded one lets an untrusted producer choose a denominator
+		// large enough for the tolerance to swallow a miscounted set. See
+		// TestMaxSetsTotalIsTheLargestBoundThatCatchesAnOffByOne.
+		{"oversized sets_total", func(h *Heartbeat) {
+			h.Feeds[0].Erasure.SetsTotal = MaxSetsTotal + 1
+			h.Feeds[0].Erasure.SetsErased = 1
+			h.Feeds[0].Erasure.ErasureFraction = erasure.Fraction(1, MaxSetsTotal+1)
+		}},
 		{"first packet time without last", func(h *Heartbeat) { h.Feeds[0].LastPacketAt = "" }},
 		{"last packet time without first", func(h *Heartbeat) { h.Feeds[0].FirstPacketAt = "" }},
 		{"last packet precedes first", func(h *Heartbeat) {
