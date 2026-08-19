@@ -109,16 +109,14 @@ func run(args []string) error {
 	flags.SetOutput(os.Stderr)
 	flags.Usage = func() { fmt.Fprintln(flags.Output(), help) }
 	var configuredFeeds feeds
-	var listen, destinations, httpAddress, mode, sourceLabel, rightsBasis string
+	var listen, destinations, httpAddress string
 	var healthMaxAge time.Duration
 	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed")
 	flags.StringVar(&listen, "listen", "0.0.0.0:20000", "unicast UDP listen address")
 	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated UDP forward destinations")
 	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	flags.StringVar(&httpAddress, "http-addr", "127.0.0.1:8080", "metrics and health HTTP address; empty disables HTTP")
-	flags.StringVar(&mode, "mode", "shred", "scoring mode: shred or generic")
-	flags.StringVar(&sourceLabel, "source-label", "", "generic mode: provenance of the input, e.g. synthetic")
-	flags.StringVar(&rightsBasis, "rights-basis", "", "generic mode: recorded rights basis for the input")
+	score := scoringFlags(flags)
 	flags.DurationVar(&healthMaxAge, "health-max-age", 30*time.Second, "/healthz ingress freshness window; readiness-shaped, see README")
 	graceMS := flags.Int("erasure-grace-ms", int(config.DefaultErasureGrace/time.Millisecond),
 		"receiver-observed FEC-set scoring grace in milliseconds; a set still below 32 of 64 shreds at slot_boundary plus this grace scores erased")
@@ -142,21 +140,8 @@ func run(args []string) error {
 	if *reportInterval > maxReportInterval {
 		return fmt.Errorf("--report-interval must not exceed %s: the tracker retains one arrival timestamp per shred until the window is drained, so a longer interval is a resident-memory setting rather than only a reporting one", maxReportInterval)
 	}
-	switch mode {
-	case "shred":
-		if sourceLabel != "" || rightsBasis != "" {
-			return errors.New("--source-label and --rights-basis apply to --mode generic only")
-		}
-	case "generic":
-		// Both labels are mandatory rather than defaulted. A generic receipt
-		// whose input provenance is unstated is the artifact the rights
-		// guardrail exists to prevent, and defaulting to "synthetic" would let
-		// a real capture be scored under a synthetic label by omission.
-		if sourceLabel == "" || rightsBasis == "" {
-			return errors.New("--mode generic requires --source-label and --rights-basis")
-		}
-	default:
-		return fmt.Errorf("--mode %q must be shred or generic", mode)
+	if err := score.validate(); err != nil {
+		return err
 	}
 	configured := []feed{{name: "default", address: listen}}
 	if len(configuredFeeds) != 0 {
@@ -178,8 +163,7 @@ func run(args []string) error {
 		return fmt.Errorf("--health-max-age must be positive, got %s", healthMaxAge)
 	}
 	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON,
-		time.Duration(*graceMS)*time.Millisecond, *reportInterval, nil,
-		scoring{mode: scoringMode(mode), sourceLabel: scoringSource(sourceLabel), rightsBasis: scoringRights(rightsBasis)})
+		time.Duration(*graceMS)*time.Millisecond, *reportInterval, nil, *score)
 }
 
 func selftest(args []string) error {
@@ -302,6 +286,59 @@ type (
 	scoringSource string
 	scoringRights string
 )
+
+// Distinct types are still not enough on their own. An explicit conversion
+// accepts ANY string, so building the struct from three plain string locals --
+// scoring{sourceLabel: scoringSource(rightsBasis), ...} -- launders the swap
+// back through the type system and compiles cleanly. The conversion has to
+// happen somewhere, so it happens exactly once per field, here, keyed by flag
+// name, and never again at a construction site.
+type stringFlag[T ~string] struct{ target *T }
+
+func (f stringFlag[T]) String() string {
+	if f.target == nil {
+		return ""
+	}
+	return string(*f.target)
+}
+
+func (f stringFlag[T]) Set(value string) error {
+	*f.target = T(value)
+	return nil
+}
+
+// scoringFlags registers the three scoring flags, each bound straight to its
+// own typed field. Because no caller ever writes a conversion, no caller can
+// write the wrong one.
+func scoringFlags(flags *flag.FlagSet) *scoring {
+	score := &scoring{mode: "shred"}
+	flags.Var(stringFlag[scoringMode]{&score.mode}, "mode", "scoring mode: shred or generic")
+	flags.Var(stringFlag[scoringSource]{&score.sourceLabel}, "source-label", "generic mode: provenance of the input, e.g. synthetic")
+	flags.Var(stringFlag[scoringRights]{&score.rightsBasis}, "rights-basis", "generic mode: recorded rights basis for the input")
+	return score
+}
+
+// validate rejects mode/label combinations that would produce a receipt whose
+// provenance is unstated or misattributed.
+func (s scoring) validate() error {
+	switch s.mode {
+	case "shred":
+		if s.sourceLabel != "" || s.rightsBasis != "" {
+			return errors.New("--source-label and --rights-basis apply to --mode generic only")
+		}
+	case "generic":
+		// Both labels are mandatory rather than defaulted. A generic receipt
+		// whose input provenance is unstated is the artifact the rights
+		// guardrail exists to prevent, and defaulting to "synthetic" would let
+		// a real capture be scored under a synthetic label by omission.
+		if s.sourceLabel == "" || s.rightsBasis == "" {
+			return errors.New("--mode generic requires --source-label and --rights-basis")
+		}
+	default:
+		return fmt.Errorf("--mode %q must be shred or generic", s.mode)
+	}
+	return nil
+}
 
 func (s scoring) generic() bool { return s.mode == "generic" }
 
