@@ -30,7 +30,7 @@ const peakBucket = 100 * time.Millisecond
 //   - It accumulates into a map keyed by bucket, so it is order-independent
 //     where the streaming fold is not. It cannot be used to reason about
 //     out-of-order input; see
-//     TestTrackerPeakDoesNotUnderReportOnOutOfOrderArrival for that.
+//     TestTrackerPeakDoesNotHalveOnSingleStepBackArrival for that.
 func referenceDelivery(arrivals []time.Time, windowStart, cutoff time.Time) (rMean, rPeak float64, gaps erasure.GapHistogram) {
 	buckets := make(map[int64]uint64)
 	var lastArrival time.Time
@@ -187,15 +187,17 @@ func TestTrackerPeakIsIndependentOfWindowPhase(t *testing.T) {
 // risk that creates is specifically a SILENT UNDER-REPORT: a stale bucket index
 // would reset the open bucket's count, so an out-of-order arrival could shrink
 // an SLA metric with nothing to show for it. deliveryWindow.observe folds such
-// an arrival into the open bucket instead, which bounds the degradation to the
-// safe direction.
+// an arrival into the open bucket instead, which makes under-reporting much
+// rarer (~47% of random orderings down to 7.6%) without eliminating it, at the
+// cost of overstating instead -- see deliveryWindow.observe for the measured
+// tradeoff and why it is a trade rather than a strict improvement.
 //
-// This pins that bound, not order independence -- the fold does not claim to
-// reproduce the map oracle for arbitrary orderings, and does not. It asserts
-// only that the documented regression no longer reproduces: the sequence below
-// (a 100 ms forward jump, then a step back into the first bucket) reported 10
-// against the oracle's 20 before the guard, a 2x under-report on RPeak100MS.
-func TestTrackerPeakDoesNotUnderReportOnOutOfOrderArrival(t *testing.T) {
+// This pins one concrete regression, not that bound and not order independence
+// -- the fold does not claim to reproduce the map oracle for arbitrary
+// orderings, and does not. The sequence below (a 100 ms forward jump, then a
+// step back into the first bucket) reported 10 against the oracle's 20 before
+// the guard, a 2x under-report on RPeak100MS.
+func TestTrackerPeakDoesNotHalveOnSingleStepBackArrival(t *testing.T) {
 	start := time.Unix(2000, 0)
 	arrivals := []time.Time{
 		start,
@@ -211,17 +213,21 @@ func TestTrackerPeakDoesNotUnderReportOnOutOfOrderArrival(t *testing.T) {
 	observeSequence(t, tracker, arrivals)
 	got := drain(t, tracker, cutoff).RPeak100MS
 
-	// Two arrivals share one 100 ms bucket, so no correct reading is below 20/s.
-	// A bucket reset on the third arrival yields 10.
-	const underReport = 10.0
-	if got <= underReport {
-		t.Errorf("RPeak100MS = %v after an out-of-order arrival, want > %v: the open bucket's count was reset, silently halving the reported peak", got, underReport)
+	// This input is deterministic, so pin the exact value rather than a lower
+	// bound: a `> 10` assertion would let any regression landing above 10 pass
+	// silently. Two arrivals share the first 100 ms bucket, so 20/s is the only
+	// correct reading; a bucket reset on the third arrival yields 10.
+	const want = 20.0
+	if got != want {
+		t.Errorf("RPeak100MS = %v after a single step-back arrival, want %v (10 means the open bucket's count was reset, silently halving the reported peak)", got, want)
 	}
 
-	// Totals and gap accounting must be untouched by the guard -- it only
-	// affects which bucket a misordered arrival is counted in, never whether.
-	if _, oraclePeak, _ := referenceDelivery(arrivals, start, cutoff); got != oraclePeak {
-		t.Logf("streamed peak %v vs order-independent oracle %v (exactness is not claimed for out-of-order input)", got, oraclePeak)
+	// For THIS input the fold agrees with the order-independent oracle. That
+	// agreement is a property of the input, not of the fold, and must not be
+	// generalized: 7.6% of random orderings still disagree. Checked here only
+	// to keep the constant above honest if the oracle ever changes.
+	if _, oraclePeak, _ := referenceDelivery(arrivals, start, cutoff); oraclePeak != want {
+		t.Fatalf("test premise broken: oracle peak = %v, want %v", oraclePeak, want)
 	}
 }
 
