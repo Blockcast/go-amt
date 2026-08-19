@@ -178,7 +178,8 @@ func run(args []string) error {
 		return fmt.Errorf("--health-max-age must be positive, got %s", healthMaxAge)
 	}
 	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON,
-		time.Duration(*graceMS)*time.Millisecond, *reportInterval, nil, mode, sourceLabel, rightsBasis)
+		time.Duration(*graceMS)*time.Millisecond, *reportInterval, nil,
+		scoring{mode: mode, sourceLabel: sourceLabel, rightsBasis: rightsBasis})
 }
 
 func selftest(args []string) error {
@@ -277,18 +278,33 @@ func gensend(args []string) error {
 
 // listenAndScore serves every configured feed until stop is closed or a socket
 // fails. stop may be nil, in which case only a signal or a socket error ends it.
-func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, grace, reportInterval time.Duration, stop <-chan struct{}, mode, sourceLabel, rightsBasis string) error {
+// scoring names the scoring mode and its generic-mode provenance.
+//
+// These three travelled as adjacent positional strings at the tail of an
+// already-long signature. Reordering them -- or adding a fourth label --
+// would still compile at every call site while scoring the wrong thing and
+// stamping the wrong provenance, and the tests would go on passing. Naming
+// the fields makes that a compile error instead.
+type scoring struct {
+	mode        string
+	sourceLabel string
+	rightsBasis string
+}
+
+func (s scoring) generic() bool { return s.mode == "generic" }
+
+func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, grace, reportInterval time.Duration, stop <-chan struct{}, mode scoring) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
 	}
 	var scorer sessionScorer
-	if mode == "generic" {
-		scorer = shred.NewGenericFeedScorer(names, sourceLabel, rightsBasis)
+	if mode.generic() {
+		scorer = shred.NewGenericFeedScorer(names, mode.sourceLabel, mode.rightsBasis)
 		// The provenance is announced at start, not only in the closing
 		// receipt, so a run that is interrupted still has its input labelled.
 		// It goes to stderr so --json keeps stdout a single JSON document.
-		fmt.Fprintf(os.Stderr, "mode=generic source=%s rights=%s\n", sourceLabel, rightsBasis)
+		fmt.Fprintf(os.Stderr, "mode=generic source=%s rights=%s\n", mode.sourceLabel, mode.rightsBasis)
 	} else {
 		scorer = shred.NewFeedScorer(names)
 	}
@@ -309,7 +325,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	// the map empty makes trackers[feed] nil, which processPacket treats as
 	// "erasure scoring disabled" without touching delivery.
 	trackers := make(map[string]*erasure.Tracker, len(names))
-	if mode != "generic" {
+	if !mode.generic() {
 		for _, name := range names {
 			tracker, err := erasure.NewTracker(grace, windowStart)
 			if err != nil {
