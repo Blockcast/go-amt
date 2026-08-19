@@ -341,3 +341,5 @@ func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {
 	}
 	return 0, fmt.Errorf("writebatch not implemented for amt gatway")
 }
+
+var _ int = "deliberate type error: BLO-28739 negative control"
