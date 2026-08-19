@@ -8,6 +8,19 @@ on:
 permissions:
   contents: read
 
+# Build-selection coverage map. conn.go, gateway.go and protocol_cgo.go are
+# tagged `cgo && !purego`, so which job compiles them is not obvious:
+#
+#   job       | CGO_ENABLED | tags   | conn/gateway/protocol_cgo | race
+#   ----------|-------------|--------|---------------------------|-----
+#   test      | 0           | -      | NO (conn_nocgo.go instead)| no
+#   race      | 1           | purego | NO (protocol_pure.go)     | yes
+#   cgo-test  | 1           | -      | YES                       | no
+#
+# Only cgo-test builds and exercises the native selection. Keep this table
+# honest when adding a job — BLO-28640 (a probe window that made native
+# multicast structurally unreachable) reached production while `test` and
+# `race` between them compiled that code path zero times.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -19,6 +32,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+      # Covers the pure-Go selection: conn_nocgo.go and protocol_pure.go stand
+      # in for conn.go and protocol_cgo.go, which CGO_ENABLED=0 deselects.
       - run: go test ./...
       - run: go vet ./...
 
@@ -43,4 +58,107 @@ jobs:
       # of the package are untagged and are covered. e2e_test.go is selected,
       # but skips unless AMT_E2E_RELAY is set, so it contributes no coverage
       # here either.
+      #
+      # This is a race-coverage gap only. It used to be a total build-coverage
+      # gap — nothing on CI compiled those three files — which is how BLO-28640
+      # shipped. The cgo-test job below now builds and tests them; it just does
+      # not run under -race, so the caveat above still stands for that axis.
       - run: go test -race -tags purego ./...
+
+  # Build libamt_protocol and run the cgo-tagged tests for real.
+  #
+  # `test` (CGO_ENABLED=0) and `race` (-tags purego) both deselect conn.go,
+  # gateway.go and protocol_cgo.go, so the native multicast join, the AMT tunnel
+  # handover and the relay handshake used to be compiled by no job at all, and
+  # gateway_timeout_test.go — the regression guard for the unbounded
+  # Gateway.Open fixed in #29 — had never executed. See BLO-28739.
+  #
+  # Linking needs the native library, so this job builds it from the
+  # amt-protocol submodule via that repo's own `make ffi` target
+  # (cargo build --release --features ffi --no-default-features) and points the
+  # linker and loader at target/release. The C header comes from the go-amt
+  # tree via `#cgo CFLAGS: -I${SRCDIR}`, not from the submodule, so no header
+  # generation step is needed.
+  cgo-test:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "1"
+      CGO_LDFLAGS: -L${{ github.workspace }}/amt-protocol/target/release
+      LD_LIBRARY_PATH: ${{ github.workspace }}/amt-protocol/target/release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # amt-protocol carries the FFI crate. Without it there is no library
+          # to link, and this job must fail rather than silently skip.
+          submodules: true
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build libamt_protocol
+        working-directory: amt-protocol
+        run: |
+          set -euo pipefail
+          # Rust is preinstalled on GitHub-hosted ubuntu runners. Assert it
+          # rather than letting `make ffi` fail with a bare "cargo: not found".
+          command -v cargo >/dev/null || {
+            echo "::error::cargo not found; this job needs a Rust toolchain to build libamt_protocol"
+            exit 1
+          }
+          cargo --version
+          make ffi
+
+      - name: Assert the native library was produced
+        run: |
+          set -euo pipefail
+          lib=amt-protocol/target/release/libamt_protocol.so
+          test -f "$lib" || { echo "::error::$lib missing after 'make ffi'"; exit 1; }
+          ls -l "$lib"
+
+      # A green tick must not be reachable while the cgo files are deselected.
+      # This is a structural check on purpose: `go test -run TestGatewayOpen...`
+      # under CGO_ENABLED=0 prints "testing: warning: no tests to run" and still
+      # exits 0, so a -run filter alone cannot tell "passed" from "never built".
+      #
+      # Check .GoFiles *and* .CgoFiles: go list puts any file that imports "C"
+      # in .CgoFiles, so gateway.go and protocol_cgo.go never appear in .GoFiles
+      # even when correctly selected, while conn.go (no import "C") only ever
+      # appears in .GoFiles. Testing either list alone gives a false answer.
+      - name: Assert the cgo selection is live
+        run: |
+          set -euo pipefail
+          sel=$(go list -f '{{join .GoFiles "\n"}}{{"\n"}}{{join .CgoFiles "\n"}}' .)
+          tst=$(go list -f '{{join .TestGoFiles "\n"}}{{"\n"}}{{join .XTestGoFiles "\n"}}' .)
+          echo "selected sources: $(printf '%s\n' "$sel" | tr '\n' ' ')"
+          rc=0
+          for f in conn.go gateway.go protocol_cgo.go; do
+            printf '%s\n' "$sel" | grep -qxF "$f" || {
+              echo "::error::$f is not in the build selection; the cgo tests would pass vacuously"
+              rc=1
+            }
+          done
+          printf '%s\n' "$tst" | grep -qxF gateway_timeout_test.go || {
+            echo "::error::gateway_timeout_test.go is not in the test selection; the Gateway.Open guard is not running"
+            rc=1
+          }
+          exit $rc
+
+      - name: Test
+        run: go test ./...
+
+      # Run the Gateway.Open guards by name so the log carries positive proof
+      # they executed, rather than a bare "ok" that is also what a fully
+      # deselected package prints.
+      - name: Prove the Gateway.Open guards ran
+        run: |
+          set -euo pipefail
+          go test -v -count=1 \
+            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault' \
+            . 2>&1 | tee /tmp/cgo-test.log
+          for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault; do
+            grep -qF -- "--- PASS: $t" /tmp/cgo-test.log || {
+              echo "::error::$t did not report a PASS line; it was skipped or deselected"
+              exit 1
+            }
+          done
