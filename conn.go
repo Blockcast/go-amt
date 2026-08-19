@@ -59,32 +59,6 @@ type MulticastConn struct {
 	amtGw *Gateway
 }
 
-// probeNativeTraffic waits up to window for the native join to deliver a packet
-// and reports whether it did.
-//
-// A timeout is not an error here: it is the answer the caller asked for. Any
-// other error is real and is returned. On success the probe deadline is cleared
-// so it cannot bound subsequent reads.
-//
-// The packet consumed by a successful probe is discarded. That costs one
-// signalling interval of startup latency on the native path and is tracked
-// separately; it is not new behaviour.
-func probeNativeTraffic(conn nativeConn, window time.Duration, mtu int, read func([]byte) error) (bool, error) {
-	if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
-		return false, err
-	}
-
-	discard := make([]byte, mtu)
-	err := read(discard)
-	if err == nil {
-		return true, conn.SetReadDeadline(time.Time{})
-	}
-	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		return false, nil
-	}
-	return false, err
-}
-
 // activeConn returns the version-agnostic view of whichever native PacketConn
 // is currently open (v4 or v6), or nil when neither is set (e.g. AMT tunnel).
 func (mc *MulticastConn) activeConn() nativeConn {
