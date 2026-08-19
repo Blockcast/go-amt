@@ -120,6 +120,7 @@ func TestDocumentedFlagsAreAccepted(t *testing.T) {
 		"source-label":   {"--source-label"},
 		"rights-basis":   {"--rights-basis"},
 		"health-max-age": {"--health-max-age"},
+		"retain":         {"--retain"},
 	}
 
 	for _, name := range docTableFlags(t) {
@@ -141,10 +142,19 @@ func TestDocumentedFlagsAreAccepted(t *testing.T) {
 }
 
 // TestUndefinedFlagIsRejected pins the premise the tests above rely on: an
-// unknown flag is a hard error, not a warning. `--retain` is used as the probe
-// precisely because it is the flag the document used to advertise.
+// unknown flag is a hard error, not a warning.
+//
+// The probe must be a name that can never become a real flag. It used to be
+// `--retain`, chosen because the document once advertised a `--retain` that did
+// not exist — but BLO-28422 made `--retain` real, and the failure mode was not a
+// clean assertion failure. A defined flag parses, `run` falls through to
+// listenAndScore, the receiver binds its sockets and blocks on its signal
+// channel, and the package dies on the 10-minute test timeout with this test
+// named as the one still running. So picking a plausible-but-currently-absent
+// flag here converts a future feature into a CI hang, which is why the probe is
+// now a name nobody would ship.
 func TestUndefinedFlagIsRejected(t *testing.T) {
-	err := run([]string{"--retain", "4s"})
+	err := run([]string{"--not-a-real-flag-and-never-will-be", "4s"})
 	if err == nil {
 		t.Fatal("expected an unknown flag to be rejected")
 	}
