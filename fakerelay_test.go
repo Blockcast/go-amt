@@ -165,8 +165,12 @@ func (fr *fakeRelay) handleDiscovery(msg []byte, addr *net.UDPAddr) {
 	adv = append(adv, msg[4:8]...)
 	adv = append(adv, 127, 0, 0, 1) // relay address
 
-	_, _ = fr.conn.WriteToUDP(adv, addr)
+	// Counted before the reply is sent, not after. The client observes the
+	// packet, so a counter bumped afterwards can still read stale to a test that
+	// asserts on it once the handshake has completed -- the relay goroutine may
+	// not have run yet. Race instrumentation widens that window enough to fail.
 	fr.advertised.Add(1)
+	_, _ = fr.conn.WriteToUDP(adv, addr)
 }
 
 // handleRequest answers a Request with a Membership Query.
@@ -175,8 +179,14 @@ func (fr *fakeRelay) handleRequest(msg []byte, addr *net.UDPAddr) {
 		return
 	}
 	nonce := msg[4:8]
-	_, _ = fr.conn.WriteToUDP(fr.buildQuery(nonce), addr)
+	// Counted before the reply is sent; see handleDiscovery. The counter
+	// therefore attests "the relay received a Request and is about to reply",
+	// not "the client received the Query". A consumer reasoning about the
+	// client-side effect of the Query -- e.g. that it refreshed lastAnyMessage
+	// -- is relying on the send that follows, which over loopback UDP is
+	// effectively immediate but is not what the count itself proves.
 	fr.queried.Add(1)
+	_, _ = fr.conn.WriteToUDP(fr.buildQuery(nonce), addr)
 }
 
 func (fr *fakeRelay) handleUpdate(msg []byte) {
@@ -307,10 +317,14 @@ func (fr *fakeRelay) DrainUpdates() {
 // Update carrying a leave, i.e. CHANGE_TO_INCLUDE_MODE (group-wide) or
 // BLOCK_OLD_SOURCES (source-specific).
 //
-// Update layout is 12 bytes (header, response MAC, nonce) followed by the
-// encapsulated IGMPv3 report, whose record type sits at report offset 28.
+// Update layout is 12 bytes (header, response MAC, nonce), then the IPv4 header
+// encapsulating the report, then the 8-byte IGMPv3 report header, and the first
+// group record's type byte sits immediately after. The IPv4 length is taken from
+// igmpIPHeaderLen rather than written out, so adding an IPv4 option shifts this
+// offset with it.
 func (fr *fakeRelay) WaitForLeaveRecord(timeout time.Duration) (byte, error) {
-	const recordTypeOffset = 12 + 28
+	const igmpv3ReportHeaderLen = 8
+	const recordTypeOffset = 12 + igmpIPHeaderLen + igmpv3ReportHeaderLen
 
 	deadline := time.After(timeout)
 	for {

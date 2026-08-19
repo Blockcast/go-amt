@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 )
 
@@ -97,21 +98,21 @@ func AppendGenericHeader(dst []byte, header GenericHeader) []byte {
 // completeness — with FEC erasure deliberately absent, because no erasure coding
 // exists in this mode and reporting one would be a fabricated number.
 type GenericReceipt struct {
-	Source            string
-	RightsBasis       string
-	Windows           int
-	WindowsComplete   int
-	RecordsExpected   int
-	RecordsReceived   int
-	RecordsDuplicate  int
-	RecordsOutOfOrder int
-	InteriorMissing   int
-	TrailingMissing   int
-	Completeness      float64
-	WindowP50         time.Duration
-	WindowP95         time.Duration
-	WindowP99         time.Duration
-	Gaps              GapHistogram
+	Source            string        `json:"source"`
+	RightsBasis       string        `json:"rights_basis"`
+	Windows           int           `json:"windows"`
+	WindowsComplete   int           `json:"windows_complete"`
+	RecordsExpected   int           `json:"records_expected"`
+	RecordsReceived   int           `json:"records_received"`
+	RecordsDuplicate  int           `json:"records_duplicate"`
+	RecordsOutOfOrder int           `json:"records_out_of_order"`
+	InteriorMissing   int           `json:"interior_missing"`
+	TrailingMissing   int           `json:"trailing_missing"`
+	Completeness      float64       `json:"completeness"`
+	WindowP50         time.Duration `json:"window_p50_ns"`
+	WindowP95         time.Duration `json:"window_p95_ns"`
+	WindowP99         time.Duration `json:"window_p99_ns"`
+	Gaps              GapHistogram  `json:"gap_histogram"`
 }
 
 type genericWindow struct {
@@ -126,7 +127,15 @@ type genericWindow struct {
 // GenericScorer scores generic framed records. It reuses the same GapHistogram
 // and percentile primitives as the shred scorer rather than copying them, so the
 // two modes cannot drift into reporting differently-computed numbers.
+//
+// Like Scorer, it serializes its own state: the demo command runs one reader
+// goroutine per feed and prints the receipt while a late Observe may still be in
+// flight, so the lock lives here rather than being a caller obligation. Making
+// it internal keeps both halves of the session-scorer seam honest about the same
+// contract — a caller-held lock on one mode and not the other is the shape that
+// produces a race the moment the two are used interchangeably.
 type GenericScorer struct {
+	mu          sync.Mutex
 	source      string
 	rightsBasis string
 	windows     map[uint64]*genericWindow
@@ -160,6 +169,11 @@ func (s *GenericScorer) Observe(record []byte, receivedAt time.Time) (bool, erro
 	if err != nil {
 		return false, err
 	}
+
+	// Parsing is pure, so it stays outside the lock; everything below mutates
+	// scorer state shared with the other feeds' goroutines.
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	window := s.windows[header.Window]
 	if window == nil {
@@ -224,6 +238,9 @@ func (s *GenericScorer) Observe(record []byte, receivedAt time.Time) (bool, erro
 // result. Windows are closed by the declared terminal count, not by a timer, so
 // the receipt is a deterministic function of the observed records.
 func (s *GenericScorer) Receipt() GenericReceipt {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	receipt := GenericReceipt{
 		Source:            s.source,
 		RightsBasis:       s.rightsBasis,

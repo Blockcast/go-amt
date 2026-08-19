@@ -21,13 +21,22 @@ var fixturePCAP []byte
 //
 // FeedScorer deliberately does not satisfy it: its Observe takes the feed name
 // first, because per-feed accounting is a different contract from single-stream
-// scoring.
+// scoring. Callers routing one capture into several feeds use ReplayPCAPFunc.
 type Observer interface {
 	Observe(packet []byte, receivedAt time.Time) (bool, error)
 }
 
 // ReplayPCAP sends UDP payloads from a pcap through the supplied scorer.
 func ReplayPCAP(reader io.Reader, scorer Observer) error {
+	return ReplayPCAPFunc(reader, func(payload []byte, at time.Time) error {
+		_, err := scorer.Observe(payload, at)
+		return err
+	})
+}
+
+// ReplayPCAPFunc calls observe with each UDP payload and its capture timestamp,
+// letting callers route the same capture into multiple feeds of a FeedScorer.
+func ReplayPCAPFunc(reader io.Reader, observe func(payload []byte, at time.Time) error) error {
 	pcap, err := pcapgo.NewReader(reader)
 	if err != nil {
 		return fmt.Errorf("read pcap header: %w", err)
@@ -46,7 +55,7 @@ func ReplayPCAP(reader io.Reader, scorer Observer) error {
 			continue
 		}
 		udp := udpLayer.(*layers.UDP)
-		if _, err := scorer.Observe(udp.Payload, info.Timestamp); err != nil {
+		if err := observe(udp.Payload, info.Timestamp); err != nil {
 			return fmt.Errorf("score packet at %s: %w", info.Timestamp.Format(time.RFC3339Nano), err)
 		}
 	}
@@ -54,4 +63,9 @@ func ReplayPCAP(reader io.Reader, scorer Observer) error {
 
 func ReplayFixture(scorer *Scorer) error {
 	return ReplayPCAP(bytes.NewReader(fixturePCAP), scorer)
+}
+
+// ReplayFixtureFunc replays the bundled deterministic capture through observe.
+func ReplayFixtureFunc(observe func(payload []byte, at time.Time) error) error {
+	return ReplayPCAPFunc(bytes.NewReader(fixturePCAP), observe)
 }

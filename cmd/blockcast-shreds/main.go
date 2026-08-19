@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
@@ -23,25 +23,40 @@ import (
 const help = `blockcast-shreds demo mode
 
 Usage:
-  blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT]
-  blockcast-shreds selftest --fixture
-  blockcast-shreds selftest --generic
+  blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--json]
+  blockcast-shreds selftest --fixture [--json]
+  blockcast-shreds selftest --generic [--json]
   blockcast-shreds gensend --to IP:PORT [--iface IP]
 
 Demo mode has no broker, certificates, accounts, or heartbeats. --feed is
 repeatable for first-arrival-wins scoring across multiple unicast UDP feeds.
+With two or more feeds the receipt reports the measured worth of a second
+feed: each feed's own erasure fraction, the union's, and the FEC sets the
+extra feeds rescued. It measures this run only — it cannot tell whether the
+inputs are independently operated or share one tap.
 
 --mode generic scores generic framed records instead of shreds: the same
 delivery receipt, on a payload that isn't shreds. It reports no FEC erasure,
-because this mode does no erasure coding. gensend emits the synthetic framed
-feed so the receipt can be driven end-to-end through the demo tap.`
+because this mode does no erasure coding, and no cross-feed union, because
+nothing in this mode establishes that two feeds carry the same stream.
+gensend emits the synthetic framed feed so the receipt can be driven
+end-to-end through the demo tap.
+
+/healthz is readiness-shaped: it reports unhealthy until the first packet
+arrives, so it is not a safe liveness probe. --health-max-age sets the
+ingress freshness window.`
 
 // sessionScorer is the seam that keeps shred mode and generic mode one client.
 // Both modes are selected once at construction; the packet loop below has no
 // mode switch in it.
+//
+// SessionReceipt returns fmt.Stringer so both modes render through the same
+// printReceipt, which is what makes --json compose with --mode rather than being
+// a shred-only flag. Each scorer supplies it in the shred package, so call sites
+// pass the concrete scorer with no wrapper.
 type sessionScorer interface {
 	Observe(feed string, packet []byte, receivedAt time.Time) (bool, error)
-	ReceiptString() string
+	SessionReceipt() fmt.Stringer
 }
 
 type feeds []string
@@ -76,13 +91,16 @@ func run(args []string) error {
 	flags.Usage = func() { fmt.Fprintln(flags.Output(), help) }
 	var configuredFeeds feeds
 	var listen, destinations, httpAddress, mode, sourceLabel, rightsBasis string
+	var healthMaxAge time.Duration
 	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed")
 	flags.StringVar(&listen, "listen", "0.0.0.0:20000", "unicast UDP listen address")
 	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated UDP forward destinations")
+	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	flags.StringVar(&httpAddress, "http-addr", "127.0.0.1:8080", "metrics and health HTTP address; empty disables HTTP")
 	flags.StringVar(&mode, "mode", "shred", "scoring mode: shred or generic")
 	flags.StringVar(&sourceLabel, "source-label", "", "generic mode: provenance of the input, e.g. synthetic")
 	flags.StringVar(&rightsBasis, "rights-basis", "", "generic mode: recorded rights basis for the input")
+	flags.DurationVar(&healthMaxAge, "health-max-age", 30*time.Second, "/healthz ingress freshness window; readiness-shaped, see README")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -124,7 +142,10 @@ func run(args []string) error {
 			configured = append(configured, feed{name: name, address: address})
 		}
 	}
-	return listenAndScore(configured, splitNonempty(destinations), httpAddress, mode, sourceLabel, rightsBasis)
+	if healthMaxAge <= 0 {
+		return fmt.Errorf("--health-max-age must be positive, got %s", healthMaxAge)
+	}
+	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON, mode, sourceLabel, rightsBasis)
 }
 
 func selftest(args []string) error {
@@ -132,25 +153,41 @@ func selftest(args []string) error {
 	flags.SetOutput(os.Stderr)
 	fixture := flags.Bool("fixture", false, "replay the bundled deterministic pcap")
 	generic := flags.Bool("generic", false, "replay the deterministic synthetic generic feed")
+	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	// Exactly one mode: *fixture == *generic rejects both "neither" and "both",
+	// so the selftest can never silently pick a mode the caller did not name.
 	if flags.NArg() != 0 || *fixture == *generic {
-		return errors.New("usage: blockcast-shreds selftest --fixture | --generic")
+		return errors.New("usage: blockcast-shreds selftest --fixture | --generic [--json]")
 	}
 	if *generic {
 		scorer := shred.NewGenericScorer(shred.GenericSyntheticSource, shred.GenericSyntheticRightsBasis)
 		if err := shred.ReplayGenericFixture(scorer); err != nil {
 			return err
 		}
-		fmt.Println(scorer.Receipt())
-		return nil
+		return printReceipt(scorer.Receipt(), *asJSON)
 	}
 	scorer := shred.NewScorer()
 	if err := shred.ReplayFixture(scorer); err != nil {
 		return err
 	}
-	fmt.Println(scorer.Receipt())
+	return printReceipt(scorer.Receipt(), *asJSON)
+}
+
+// printReceipt writes either the human table (the receipt's String form) or an
+// indented JSON document for machine consumption.
+func printReceipt(receipt fmt.Stringer, asJSON bool) error {
+	if !asJSON {
+		fmt.Println(receipt)
+		return nil
+	}
+	encoded, err := json.MarshalIndent(receipt, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(encoded))
 	return nil
 }
 
@@ -205,7 +242,7 @@ func gensend(args []string) error {
 	return nil
 }
 
-func listenAndScore(feeds []feed, destinations []string, httpAddress, mode, sourceLabel, rightsBasis string) error {
+func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, mode, sourceLabel, rightsBasis string) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
@@ -215,7 +252,8 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress, mode, sour
 		scorer = shred.NewGenericFeedScorer(names, sourceLabel, rightsBasis)
 		// The provenance is announced at start, not only in the closing
 		// receipt, so a run that is interrupted still has its input labelled.
-		fmt.Printf("mode=generic source=%s rights=%s\n", sourceLabel, rightsBasis)
+		// It goes to stderr so --json keeps stdout a single JSON document.
+		fmt.Fprintf(os.Stderr, "mode=generic source=%s rights=%s\n", sourceLabel, rightsBasis)
 	} else {
 		scorer = shred.NewFeedScorer(names)
 	}
@@ -236,7 +274,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress, mode, sour
 		defer fanout.Close()
 	}
 
-	health, err := receiver.NewHealth(30 * time.Second)
+	health, err := receiver.NewHealth(healthMaxAge)
 	if err != nil {
 		return err
 	}
@@ -252,7 +290,6 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress, mode, sour
 	defer signal.Stop(stop)
 	errCh := make(chan error, len(feeds))
 	var sockets []*net.UDPConn
-	var mu sync.Mutex
 	for _, feed := range feeds {
 		udpAddress, err := net.ResolveUDPAddr("udp", feed.address)
 		if err != nil {
@@ -271,12 +308,13 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress, mode, sour
 					errCh <- err
 					return
 				}
-				mu.Lock()
+				// receivedAt is captured here, before any per-packet work, so it
+				// is a true arrival timestamp rather than a lock-ordered one.
+				// Every consumer below synchronizes itself.
 				receivedAt := time.Now()
 				health.MarkReceived(receivedAt)
 				_ = metrics.IncIngress(feedName)
 				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics)
-				mu.Unlock()
 			}
 		}(feed.name, conn)
 	}
@@ -292,20 +330,36 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress, mode, sour
 	for _, conn := range sockets {
 		_ = conn.Close()
 	}
-	mu.Lock()
-	fmt.Println(scorer.ReceiptString())
-	mu.Unlock()
-	return nil
+	// Sockets are closed, but a reader goroutine can still be mid-packet: it may
+	// be blocked in Enqueue or between the read and Observe. Both scorers behind
+	// sessionScorer take their own lock in Receipt, so the receipt is a
+	// consistent snapshot even if a late Observe lands after it.
+	return printReceipt(scorer.SessionReceipt(), asJSON)
 }
 
+// processPacket delivers a packet and then scores it.
+//
+// Delivery runs first and is never held up by scoring: malformed and duplicate
+// packets must still reach every configured validator destination unchanged.
+// Every value used here is internally synchronized — Fanout copies the packet
+// under its own lock, both sessionScorer implementations serialize their own
+// state, and Health and ReceiverMetrics each carry their own — so feed
+// goroutines do not serialize behind a caller-held lock on the ingress hot path.
+//
+// receivedAt is captured at the socket read, so concurrent feeds can present it
+// out of order. That is the scorer's problem to absorb, and it does: see
+// Scorer.Observe on why the gap frontier and per-set extent advance
+// monotonically rather than assuming call order matches timestamp order.
+//
+// Only EnqueueOverflow counts as a drop. A closed fan-out also refuses the
+// packet, but that is a shutdown artifact rather than receiver overload, and
+// charging it to the ring-overflow counter would let shutdown inflate a metric
+// the README defines as ring-full only.
 func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer sessionScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics) {
-	_, parseErr := scorer.Observe(feedName, packet, receivedAt)
-	// Delivery is independent of scoring: malformed and duplicate packets must
-	// still reach every configured validator destination unchanged.
-	if fanout != nil && !fanout.Enqueue(feedName, packet) {
+	if fanout != nil && fanout.Enqueue(feedName, packet) == receiver.EnqueueOverflow {
 		_ = metrics.IncFanoutDrop(feedName)
 	}
-	if parseErr != nil {
+	if _, parseErr := scorer.Observe(feedName, packet, receivedAt); parseErr != nil {
 		_ = metrics.IncUnparsed(feedName)
 	}
 }

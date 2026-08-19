@@ -38,7 +38,9 @@ jobs:
       # race detector can run without that dependency. It does not alter the
       # default (cgo) or CGO_ENABLED=0 build selections.
       #
-      # Coverage caveat: because purego deselects them, gateway.go, conn.go,
-      # protocol_cgo.go and e2e_test.go get NO race coverage here. relay_manager.go
-      # and the rest of the package are untagged and are covered.
+      # Coverage caveat: because purego deselects them, gateway.go, conn.go and
+      # protocol_cgo.go get NO race coverage here. relay_manager.go and the rest
+      # of the package are untagged and are covered. e2e_test.go is selected,
+      # but skips unless AMT_E2E_RELAY is set, so it contributes no coverage
+      # here either.
       - run: go test -race -tags purego ./...

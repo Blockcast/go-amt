@@ -30,7 +30,7 @@ func TestUDPFanoutWritesByteIdenticalPacketsToEveryDestination(t *testing.T) {
 	defer fanout.Close()
 
 	packet := []byte{0xde, 0xad, 0xbe, 0xef}
-	if !fanout.Enqueue("feed", packet) {
+	if fanout.Enqueue("feed", packet) != EnqueueAccepted {
 		t.Fatal("Enqueue() dropped packet with an empty ring")
 	}
 	packet[0] = 0
@@ -57,7 +57,7 @@ func TestFanoutCountsOverflowAtEnqueue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !fanout.Enqueue("feed", []byte("first")) {
+	if fanout.Enqueue("feed", []byte("first")) != EnqueueAccepted {
 		t.Fatal("first packet dropped")
 	}
 	select {
@@ -65,10 +65,10 @@ func TestFanoutCountsOverflowAtEnqueue(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("fan-out worker did not enter writer")
 	}
-	if !fanout.Enqueue("feed", []byte("second")) {
+	if fanout.Enqueue("feed", []byte("second")) != EnqueueAccepted {
 		t.Fatal("second packet did not fill ring")
 	}
-	if fanout.Enqueue("feed", []byte("overflow")) {
+	if fanout.Enqueue("feed", []byte("overflow")) != EnqueueOverflow {
 		t.Fatal("overflow packet was accepted")
 	}
 
@@ -95,7 +95,7 @@ func TestFanoutCountsWriteErrorsPerDestination(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fanout.Enqueue("feed", []byte("packet")) {
+	if fanout.Enqueue("feed", []byte("packet")) != EnqueueAccepted {
 		t.Fatal("packet dropped")
 	}
 	if err := fanout.Close(); err != nil {
@@ -121,13 +121,13 @@ func TestFanoutAttributesDeliveryToTheOriginatingFeed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if !fanout.Enqueue("feed-a", []byte("first")) {
+	if fanout.Enqueue("feed-a", []byte("first")) != EnqueueAccepted {
 		t.Fatal("feed-a packet dropped")
 	}
-	if !fanout.Enqueue("feed-b", []byte("second")) {
+	if fanout.Enqueue("feed-b", []byte("second")) != EnqueueAccepted {
 		t.Fatal("feed-b packet dropped")
 	}
-	if !fanout.Enqueue("feed-b", []byte("third")) {
+	if fanout.Enqueue("feed-b", []byte("third")) != EnqueueAccepted {
 		t.Fatal("second feed-b packet dropped")
 	}
 	if err := fanout.Close(); err != nil {
@@ -157,7 +157,7 @@ func TestFanoutSurvivesAnObserverThatRejectsTheFeed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fanout.Enqueue("unconfigured", []byte("packet")) {
+	if fanout.Enqueue("unconfigured", []byte("packet")) != EnqueueAccepted {
 		t.Fatal("packet dropped")
 	}
 	if err := fanout.Close(); err != nil {
@@ -288,4 +288,136 @@ func equalPackets(a, b [][]byte) bool {
 		}
 	}
 	return true
+}
+
+// TestFanoutRotatesDestinationOrder pins the ordering-fairness rule. An
+// unrotated send loop hands a persistent ~4 microsecond-per-position latency
+// advantage to whichever subscriber sits early in the destination list, which
+// an auditable-SLA product cannot ship. Rotation must change the ORDER of each
+// batch without ever changing its membership.
+func TestFanoutRotatesDestinationOrder(t *testing.T) {
+	const count = 4
+	fanout := &Fanout{udpDest: make([]*net.UDPAddr, count)}
+	for i := range fanout.udpDest {
+		fanout.udpDest[i] = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20000 + i}
+	}
+
+	packet := []byte{0x01, 0x02}
+	leadCounts := make(map[int]int, count)
+	for round := 0; round < count*3; round++ {
+		messages := fanout.rotatedMessages(packet)
+		if len(messages) != count {
+			t.Fatalf("round %d produced %d messages, want %d", round, len(messages), count)
+		}
+
+		// Membership must be exactly the configured set, every time.
+		seen := make(map[string]int, count)
+		for _, message := range messages {
+			seen[message.Addr.String()]++
+		}
+		if len(seen) != count {
+			t.Fatalf("round %d addressed %d distinct destinations, want %d", round, len(seen), count)
+		}
+		for address, times := range seen {
+			if times != 1 {
+				t.Fatalf("round %d addressed %s %d times, want exactly 1", round, address, times)
+			}
+		}
+
+		leadCounts[messages[0].Addr.(*net.UDPAddr).Port-20000]++
+	}
+
+	// Over 3 full cycles every destination should have led exactly 3 times.
+	for index := 0; index < count; index++ {
+		if leadCounts[index] != 3 {
+			t.Fatalf("destination %d led %d times over 3 cycles, want 3; order is not rotating fairly (%v)",
+				index, leadCounts[index], leadCounts)
+		}
+	}
+}
+
+// TestUDPFanoutDeliversEveryPacketExactlyOnceToEveryDestination is the
+// acceptance criterion for the fan-out itself: N destinations each receive
+// every shred exactly once. Rotation must not cause a drop or a duplicate.
+func TestUDPFanoutDeliversEveryPacketExactlyOnceToEveryDestination(t *testing.T) {
+	const destinations, packets = 5, 40
+
+	listeners := make([]*net.UDPConn, destinations)
+	addresses := make([]string, destinations)
+	for i := range listeners {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.SetReadBuffer(1 << 20); err != nil {
+			t.Logf("SetReadBuffer: %v", err)
+		}
+		listeners[i] = conn
+		addresses[i] = conn.LocalAddr().String()
+		defer conn.Close()
+	}
+
+	fanout, err := NewUDPFanout(addresses, packets*2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	for sequence := 0; sequence < packets; sequence++ {
+		if fanout.Enqueue("feed", []byte{byte(sequence)}) != EnqueueAccepted {
+			t.Fatalf("Enqueue dropped packet %d with a sized ring", sequence)
+		}
+	}
+
+	for index, listener := range listeners {
+		received := make(map[byte]int, packets)
+		for count := 0; count < packets; count++ {
+			if err := listener.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			buffer := make([]byte, 16)
+			n, _, err := listener.ReadFromUDP(buffer)
+			if err != nil {
+				t.Fatalf("destination %d received %d of %d packets: %v", index, count, packets, err)
+			}
+			if n != 1 {
+				t.Fatalf("destination %d received a %d-byte packet, want 1", index, n)
+			}
+			received[buffer[0]]++
+		}
+		if len(received) != packets {
+			t.Fatalf("destination %d received %d distinct packets, want %d", index, len(received), packets)
+		}
+		for sequence, times := range received {
+			if times != 1 {
+				t.Fatalf("destination %d received packet %d %d times, want exactly once", index, sequence, times)
+			}
+		}
+	}
+
+	if stats := fanout.Stats(); stats.EgressPackets != destinations*packets {
+		t.Fatalf("EgressPackets = %d, want %d", stats.EgressPackets, destinations*packets)
+	}
+}
+
+// TestEnqueueAfterCloseIsNotCountedAsOverflow separates the two rejection
+// reasons. Both refuse the packet, but only a full ring means the receiver
+// could not keep up; a closed fan-out means the process is shutting down while
+// an ingress goroutine is still reading. Folding them together lets shutdown
+// inflate DroppedPackets, which is documented as ring-full only.
+func TestEnqueueAfterCloseIsNotCountedAsOverflow(t *testing.T) {
+	fanout, err := NewFanout([]io.WriteCloser{&recordingWriter{}}, 4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := fanout.Enqueue("feed", []byte("after close")); got != EnqueueClosed {
+		t.Fatalf("Enqueue() after Close = %v, want %v", got, EnqueueClosed)
+	}
+	if got := fanout.Stats().DroppedPackets; got != 0 {
+		t.Fatalf("DroppedPackets = %d after a post-close Enqueue, want 0; shutdown must not read as ring overflow", got)
+	}
 }

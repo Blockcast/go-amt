@@ -434,7 +434,7 @@ func TestGenericFeedScorerKeepsFeedsSeparate(t *testing.T) {
 	if _, err := scorer.Observe("missing", genericRecord(0, 0, 2, 0), time.Unix(1, 0)); err == nil {
 		t.Error("an unknown feed must be rejected, not silently scored")
 	}
-	rendered := scorer.ReceiptString()
+	rendered := scorer.Receipt().String()
 	// Each feed saw one of the two records, so neither window is complete. A
 	// union across feeds would report completeness 1 — that is D4's claim, and
 	// this mode must not make it.
@@ -455,5 +455,46 @@ func TestAppendGenericHeaderRoundTrips(t *testing.T) {
 	}
 	if got != want {
 		t.Errorf("round trip = %+v, want %+v", got, want)
+	}
+}
+
+// TestGenericScorerReceiptIsRaceFreeAgainstLateObserve pins the lock that lets
+// the demo command drop its caller-held mutex.
+//
+// The command closes its sockets and then prints the receipt while a reader
+// goroutine may still be mid-packet, so Receipt can run concurrently with
+// Observe. FeedScorer has always been safe there because it takes its own lock;
+// GenericScorer originally was not, and relied on a mutex held by the caller.
+// That asymmetry is invisible behind the session-scorer seam and becomes a race
+// the moment the two modes are used interchangeably, so the lock lives here.
+//
+// Run under -race: without GenericScorer.mu this fails on the windows map.
+func TestGenericScorerReceiptIsRaceFreeAgainstLateObserve(t *testing.T) {
+	scorer := NewGenericFeedScorer([]string{"a"}, "synthetic", "test")
+	const records = 200
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < records; i++ {
+			// One window of `records` entries, so the scorer is still
+			// accumulating while the reader below snapshots it.
+			if _, err := scorer.Observe("a", genericRecord(0, uint16(i), records, uint64(i)), time.Unix(1, int64(i)*1e6)); err != nil {
+				t.Errorf("observe %d: %v", i, err)
+				return
+			}
+		}
+	}()
+
+	// Snapshot repeatedly while the writer runs. Any value is legal — this
+	// asserts only that concurrent access is defined, which is what the demo
+	// command depends on at shutdown.
+	for i := 0; i < records; i++ {
+		_ = scorer.Receipt()
+	}
+	<-done
+
+	if got := scorer.Receipt().Feeds[0].Receipt.RecordsReceived; got != records {
+		t.Errorf("every record should be counted once the writer is done, got %d want %d", got, records)
 	}
 }

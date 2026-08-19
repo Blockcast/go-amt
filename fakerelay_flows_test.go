@@ -459,3 +459,110 @@ func TestV4MappedSubscriptionCompletesFullLifecycle(t *testing.T) {
 			"the relay would keep forwarding this (S,G) for the session lifetime", err)
 	}
 }
+
+// TestDataStarvationReconnectsDespiteControlTraffic pins the *read* side of
+// defect 3. TestControlTrafficDoesNotRefreshDataLiveness proves a Membership
+// Query cannot write the data-delivery stamp; this proves the keepalive health
+// decision reads that stamp rather than the control-plane one.
+//
+// Both halves are needed. Splitting lastData into lastAnyMessage /
+// lastDataMessage only fixes defect 3 if the starvation check at
+// relay_manager.go:950 consults the data stamp. Point it at lastAnyMessage and
+// every other test in this package still passes, while the original failure
+// mode returns in full: reader and keepalive alive, state Active, liveness
+// perpetually fresh, zero shreds, forever.
+//
+// The scenario makes that substitution fatal. The fake relay answers every
+// keepalive Request with a Membership Query, so control traffic keeps arriving
+// for the whole test while no Multicast Data ever does. lastAnyMessage is
+// therefore refreshed on every tick and a health check reading it would never
+// fire. Reading lastDataMessage, starvation is detected after intervalTime*2
+// and reconnectWithBackoff runs, observable as a loop-generation bump.
+func TestDataStarvationReconnectsDespiteControlTraffic(t *testing.T) {
+	// QQIC is decoded in units of 100ms (gopacket igmpTimeDecode), so code 1 is
+	// a 100ms keepalive interval and starvation is declared at >200ms.
+	fr := newFakeRelay(t, withQueryIntervalCode(1))
+	rm := newTestManager(t, fr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := rm.Open(ctx); err != nil {
+		t.Fatalf("Open against fake relay: %v", err)
+	}
+
+	// Safe to read for the same reason receive_serialization_test.go documents:
+	// performHandshake wrote it on this goroutine inside Open.
+	interval := rm.intervalTime
+	if interval != 100*time.Millisecond {
+		t.Fatalf("relay-advertised keepalive interval = %v, want 100ms: the test's "+
+			"timing budget is derived from it", interval)
+	}
+
+	rm.loopsMu.Lock()
+	genBefore := rm.loopGeneration
+	rm.loopsMu.Unlock()
+	queriesBefore := fr.queried.Load()
+
+	// Sampled inside the poll below, while the generation is still unchanged.
+	// Reading it after the bump instead would count the reconnect's *own*
+	// handshake Request -- reconnectWithBackoff runs performHandshake
+	// (relay_manager.go:1011), which sends a Request that fakeRelay.handleRequest
+	// counts (fakerelay_test.go:188), and only then calls startLoops
+	// (relay_manager.go:1039) to bump the generation. A post-bump count is
+	// therefore unconditionally greater and the guard below could never fail.
+	var queriesDuringStarvation int64
+
+	// Never send data. Starvation is expected at ~3*interval (the tick at
+	// 1*interval is within intervalTime*2); allow generous headroom for a
+	// loaded runner.
+	start := time.Now()
+	waitFor(t, 100*interval, func() bool {
+		rm.loopsMu.Lock()
+		defer rm.loopsMu.Unlock()
+		if rm.loopGeneration > genBefore {
+			return true
+		}
+		queriesDuringStarvation = fr.queried.Load()
+		return false
+	}, "keepaliveLoop to detect data starvation and reconnect while control traffic flows")
+	elapsed := time.Since(start)
+
+	// Guards the premise rather than the conclusion: if no Membership Query
+	// arrived between the handshake and the reconnect, lastAnyMessage was never
+	// refreshed either, so the reconnect above would have happened even from a
+	// control-plane liveness read and this run would prove nothing.
+	//
+	// Counting only keepalive-driven queries is what lets this fail. The
+	// starvation branch (relay_manager.go:950) returns *without* sending a
+	// keepalive Request, so if the ticker's first tick lands after intervalTime*2
+	// has already elapsed on a loaded runner, no control traffic ever flows --
+	// exactly the degenerate run this guards.
+	if queriesDuringStarvation <= queriesBefore {
+		t.Errorf("relay sent no Membership Query between the handshake and the "+
+			"reconnect (%d -> %d): control traffic never flowed, so this run does "+
+			"not distinguish a data-liveness read from a control-plane one",
+			queriesBefore, queriesDuringStarvation)
+	}
+
+	// readLoop also reconnects on any transport.Receive error
+	// (relay_manager.go:813), producing an identical generation bump, so a
+	// spurious one would otherwise read as a pass. Starvation cannot be declared
+	// until intervalTime*2 after the stamp Open seeded just before startLoops
+	// (relay_manager.go:380 -- lastDataMessage; :379 is lastAnyMessage, and it is
+	// the data stamp that governs here), so requiring a single interval is a
+	// conservative floor that an early transport-error reconnect misses.
+	//
+	// The bound is not unconditional: elapsed runs from start (:518), taken
+	// *after* Open seeded, so with skew d = start - seed the real guarantee is
+	// elapsed > 2*interval - d. A loaded runner delaying the reconnect only makes
+	// elapsed larger; the one direction that shrinks it is descheduling inside d.
+	// Requiring interval therefore tolerates d < interval, i.e. 100ms of headroom
+	// against the two field reads and one mutex pair that separate Open from
+	// :518 -- microseconds of real work. Ample, but a margin, not a certainty.
+	if elapsed < interval {
+		t.Errorf("reconnect came %v after the generation was sampled, sooner than "+
+			"data starvation can be declared (>%v after Open seeds "+
+			"lastDataMessage): this bump is more likely a spurious transport-error "+
+			"reconnect than the path under test", elapsed, 2*interval)
+	}
+}
