@@ -14,8 +14,18 @@ permissions:
 #   job       | CGO_ENABLED | tags   | conn/gateway/protocol_cgo | race
 #   ----------|-------------|--------|---------------------------|-----
 #   test      | 0           | -      | NO (conn_nocgo.go instead)| no
-#   race      | 1           | purego | NO (protocol_pure.go)     | yes
+#   race      | 1           | purego | NO (conn_nocgo.go instead)| yes
 #   cgo-test  | 1           | -      | YES                       | no
+#
+# Only conn.go has a tagged counterpart: conn_nocgo.go is `(!cgo || purego)`,
+# a genuine either/or with conn.go. protocol_pure.go is UNTAGGED and compiles
+# in all three jobs — it is not a purego-only stand-in, and removing the purego
+# tag would not remove it. It declares PureGoProtocol while protocol_cgo.go
+# declares CGOProtocol, so the two coexist under cgo rather than replacing one
+# another, and the implementation is chosen at runtime by init() registration,
+# not by build tags. Confirm with:
+#   CGO_ENABLED=1 go list -f '{{.GoFiles}} {{.CgoFiles}}' .
+# which lists protocol_pure.go and protocol_cgo.go together.
 #
 # Only cgo-test builds and exercises the native selection. Keep this table
 # honest when adding a job — BLO-28640 (a probe window that made native
@@ -32,8 +42,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      # Covers the pure-Go selection: conn_nocgo.go and protocol_pure.go stand
-      # in for conn.go and protocol_cgo.go, which CGO_ENABLED=0 deselects.
+      # Covers the pure-Go selection: conn_nocgo.go stands in for conn.go, which
+      # CGO_ENABLED=0 deselects. protocol_cgo.go is deselected too, leaving
+      # protocol_pure.go as the only registered AMTProtocol implementation —
+      # note that protocol_pure.go is untagged and is compiled here and in the
+      # cgo job alike; what changes between jobs is which implementations are
+      # available to register, not whether this file is built.
       - run: go test ./...
       - run: go vet ./...
 
@@ -144,12 +158,37 @@ jobs:
           }
           exit $rc
 
-      # Known-failing on the cgo path only, tracked in BLO-28805: the Rust FFI
-      # send_update requires GatewayState::Querying and consumes it by moving to
-      # Active, so CreateMembershipUpdate is single-shot per Membership Query and
-      # every leave/unsubscribe returns InvalidState (error code 2). The pure-Go
-      # implementation allows it, so these four untagged tests pass in `test` and
-      # fail here — a real implementation divergence, not a flake.
+      # Known-failing on the cgo path only, tracked in BLO-28805. Two distinct
+      # confidence levels here — do not collapse them into one claim.
+      #
+      # CONFIRMED implementation divergence (2 tests):
+      #   TestUnsubscribeDuringPendingJoinPreservesOtherSource
+      #   TestV4MappedSubscriptionCompletesFullLifecycle
+      # amt-protocol/src/gateway.rs:252 guards send_update with a single-state
+      # check, `if self.state != GatewayState::Querying`, and :259 then assigns
+      # GatewayState::Active — so the Querying state is consumed and
+      # CreateMembershipUpdate is single-shot per Membership Query. Every later
+      # leave/unsubscribe re-enters at :252 with state Active, fails the guard,
+      # and returns InvalidState (= 2, ffi.rs:40). The failure text naming state
+      # `Active` is what confirms this: Active is rejected by that guard, not
+      # accepted, so the nonce lookup at :256 is never reached. The pure-Go
+      # implementation permits the call from Active, which is why the same
+      # untagged tests pass in `test`.
+      #
+      # UNVERIFIED, grouped here only because they fail on this path (2 tests):
+      #   TestQueuedPacketsOwnPayloadAndSourceAddress   — fails on "never became
+      #     active (state Suspended)", not on error code 2. This is the buffer
+      #     aliasing / gopacket.NoCopy guard, so skipping it drops shared-read-
+      #     buffer coverage exactly where that buffer crosses the FFI boundary.
+      #   TestDataStarvationReconnectsDespiteControlTraffic — fails on its own
+      #     premise guard ("relay sent no Membership Query ... 1 -> 1") with no
+      #     InvalidState in the message. fakerelay_flows_test.go:536-541
+      #     documents that exact failure as a possible loaded-runner timing
+      #     artifact, so it may be a flake rather than a divergence.
+      # If either proves to be a flake it has nothing to fix under BLO-28805 and
+      # must not stay skipped under a ticket that can never retire it. Both are
+      # untagged, so a genuine flake will also surface in `test` and `race`
+      # while being masked in this job alone — treat a red there as signal.
       #
       # This list is narrow and named on purpose. It does not weaken the gate:
       # the selection assertion above still fails if the cgo files are not
@@ -165,12 +204,19 @@ jobs:
       - name: Prove the Gateway.Open guards ran
         run: |
           set -euo pipefail
+          # Capture the status rather than letting `set -e` abort here. With a
+          # bare pipeline a non-zero `go test` would exit the step before the
+          # loop below, so the "did not report a PASS line" diagnostic would be
+          # reachable only for a skip (exit 0) and never for a failure. We want
+          # the loop to run either way, then fail on the captured status.
+          rc=0
           go test -v -count=1 \
             -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault' \
-            . 2>&1 | tee /tmp/cgo-test.log
+            . 2>&1 | tee /tmp/cgo-test.log || rc=$?
           for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault; do
             grep -qF -- "--- PASS: $t" /tmp/cgo-test.log || {
-              echo "::error::$t did not report a PASS line; it was skipped or deselected"
-              exit 1
+              echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
+              rc=1
             }
           done
+          exit $rc
