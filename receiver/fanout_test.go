@@ -562,6 +562,20 @@ func TestUDPFanoutLedgerIsExactUnderRotation(t *testing.T) {
 // Here destination 2 is the broken one. Correct attribution charges every
 // write error to destination 2 whatever slot it occupied; the slot-charging
 // bug spreads those errors across all four.
+//
+// The two subtests model the two DIFFERENT contracts a partial send can
+// present, because they disagree on the error and only one of them is
+// production on Linux:
+//
+//   - sendmmsg reports the count with errno 0, so ipv4.WriteBatch returns
+//     (slot, nil). This is the Linux path. A blame rule that requires a
+//     non-nil error is dead here — which is the defect this pair pins.
+//   - the non-Linux writeUDPPacketBatch loop returns (slot, err) with the
+//     failing message at index slot.
+//
+// Blame must localise to destination 2 under BOTH. Covering only the
+// error-returning shape passes green while the Linux path silently records
+// nothing.
 func TestUDPFanoutLedgerLocalisesTheBrokenDestination(t *testing.T) {
 	const (
 		count  = 4
@@ -569,59 +583,70 @@ func TestUDPFanoutLedgerLocalisesTheBrokenDestination(t *testing.T) {
 		rounds = count * 3
 	)
 
-	fanout := &Fanout{udpDest: make([]*net.UDPAddr, count)}
-	// deliver branches on udpConn, so the UDP path needs a real socket even
-	// though the stubbed sendBatch never writes to it.
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	fanout.udpConn = ipv4.NewPacketConn(conn)
-
-	names := make([]string, count)
-	for i := range fanout.udpDest {
-		fanout.udpDest[i] = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20000 + i}
-		names[i] = fanout.udpDest[i].String()
-	}
-	// Stop the batch at whichever slot carries the broken destination, which
-	// is what sendmmsg does on the first failing message.
-	fanout.sendBatch = func(_ *ipv4.PacketConn, messages []ipv4.Message, _ bool) (int, error) {
-		for slot, message := range messages {
-			if message.Addr.(*net.UDPAddr).Port-20000 == broken {
-				return slot, errors.New("destination unavailable")
+	for _, contract := range []struct {
+		name string
+		// err is what the batch writer returns alongside the short count.
+		err error
+	}{
+		{name: "linux_sendmmsg_reports_count_with_no_error", err: nil},
+		{name: "non_linux_loop_reports_count_with_error", err: errors.New("destination unavailable")},
+	} {
+		t.Run(contract.name, func(t *testing.T) {
+			fanout := &Fanout{udpDest: make([]*net.UDPAddr, count)}
+			// deliver branches on udpConn, so the UDP path needs a real socket
+			// even though the stubbed sendBatch never writes to it.
+			conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+			if err != nil {
+				t.Fatal(err)
 			}
-		}
-		return len(messages), nil
-	}
-	fanout.initDestinations(names)
+			defer conn.Close()
+			fanout.udpConn = ipv4.NewPacketConn(conn)
 
-	for round := 0; round < rounds; round++ {
-		fanout.deliver([]byte("shred"))
-	}
-
-	for index, stat := range fanout.DestinationStats() {
-		if index == broken {
-			if stat.WriteErrors != rounds {
-				t.Errorf("broken destination %d took %d write errors over %d packets, want %d (%+v)",
-					index, stat.WriteErrors, rounds, rounds, stat)
+			names := make([]string, count)
+			for i := range fanout.udpDest {
+				fanout.udpDest[i] = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20000 + i}
+				names[i] = fanout.udpDest[i].String()
 			}
-			if stat.Packets != 0 {
-				t.Errorf("broken destination %d was credited %d deliveries, want 0", index, stat.Packets)
+			// Stop the batch at whichever slot carries the broken destination,
+			// which is where both contracts agree the first failure lands.
+			fanout.sendBatch = func(_ *ipv4.PacketConn, messages []ipv4.Message, _ bool) (int, error) {
+				for slot, message := range messages {
+					if message.Addr.(*net.UDPAddr).Port-20000 == broken {
+						return slot, contract.err
+					}
+				}
+				return len(messages), nil
 			}
-			continue
-		}
-		if stat.WriteErrors != 0 {
-			t.Errorf("healthy destination %d took %d write errors; blame is following batch position, not destination (%+v)",
-				index, stat.WriteErrors, stat)
-		}
-	}
+			fanout.initDestinations(names)
 
-	// The invariant still holds on the partial-send path: unattempted
-	// destinations are dropped, just not blamed.
-	for index, stat := range fanout.DestinationStats() {
-		if total := stat.Packets + stat.Drops; total != rounds {
-			t.Errorf("destination %d: packets+drops = %d, want %d (%+v)", index, total, rounds, stat)
-		}
+			for round := 0; round < rounds; round++ {
+				fanout.deliver([]byte("shred"))
+			}
+
+			for index, stat := range fanout.DestinationStats() {
+				if index == broken {
+					if stat.WriteErrors != rounds {
+						t.Errorf("broken destination %d took %d write errors over %d packets, want %d (%+v)",
+							index, stat.WriteErrors, rounds, rounds, stat)
+					}
+					if stat.Packets != 0 {
+						t.Errorf("broken destination %d was credited %d deliveries, want 0", index, stat.Packets)
+					}
+					continue
+				}
+				if stat.WriteErrors != 0 {
+					t.Errorf("healthy destination %d took %d write errors; blame is following batch position, not destination (%+v)",
+						index, stat.WriteErrors, stat)
+				}
+			}
+
+			// The invariant still holds on the partial-send path: unattempted
+			// destinations are dropped, just not blamed.
+			for index, stat := range fanout.DestinationStats() {
+				if total := stat.Packets + stat.Drops; total != rounds {
+					t.Errorf("destination %d: packets+drops = %d, want %d (%+v)", index, total, rounds, stat)
+				}
+			}
+		})
 	}
 }

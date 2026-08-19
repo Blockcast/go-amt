@@ -130,10 +130,18 @@ type Fanout struct {
 
 // DestinationStat is one destination's entry in the delivery ledger.
 //
-// Packets+Drops is invariant across destinations: it equals the number of
-// packets the worker has processed, whatever each destination's outcome was.
-// That invariant is what makes the ledger auditable — a per-destination
-// shortfall cannot hide as a process-wide average.
+// Packets+Drops equals the number of packets the worker has processed,
+// whatever each destination's outcome was. That is what makes the ledger
+// auditable — a per-destination shortfall cannot hide as a process-wide
+// average.
+//
+// The equality is exact per destination at any instant, but across
+// destinations only once the worker is quiesced. DestinationStats loads each
+// counter independently while deliver may be mid-batch, and deliver charges
+// its delivered destinations before its dropped ones, so a live snapshot can
+// catch some destinations charged for the current packet and others not. A
+// reader sampling a running worker is eventually consistent and must not
+// alert on a transient cross-destination mismatch.
 //
 // WriteErrors is a subset of Drops. A drop is "this destination did not get
 // this packet"; a write error is the narrower "the write for this destination
@@ -372,7 +380,17 @@ func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
 	// sendmmsg stops at the first failure and abandons the rest of the batch,
 	// so exactly one destination earns the write error; the rest were never
 	// attempted and are dropped without blame.
-	if written < count && err != nil {
+	//
+	// written < count is itself the failure signal, and err is not. A partial
+	// sendmmsg reports the count with errno 0, so the kernel's error is nil:
+	// sendmmsg returns errnoErr(errno) (x/net internal/socket/sys_linux.go),
+	// errnoErr(0) is nil (internal/socket/error_unix.go), and ipv4.WriteBatch
+	// wraps in an OpError only when that error is non-nil. Gating this on err
+	// left WriteErrors permanently zero on Linux — dead for exactly the fault
+	// the ledger exists to localise. The clamp above keeps slot written in
+	// range, and the non-Linux loop below also leaves the failing message at
+	// index written, so this holds on both paths.
+	if written < count {
 		f.destErrors[(offset+written)%count].Add(1)
 	}
 
