@@ -1,6 +1,7 @@
 package shred
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -122,8 +123,15 @@ func TestUniqueFirstPartitionsUniqueShredsAcrossEviction(t *testing.T) {
 	}
 }
 
-// TestCompletionWithinTheRetentionWindowIsNeverUnderstated pins the histogram's
-// stated direction of error across the whole range the window permits.
+// TestCompletionBelowTheLadderCeilingIsNeverUnderstated pins the histogram's
+// stated direction of error BELOW the ladder's ceiling.
+//
+// The name is deliberate. This used to be called ...WithinTheRetentionWindow...
+// and its doc claimed to cover "the whole range the window permits", which is
+// false and hid a real defect: --retain does not bound a set's completion span,
+// so completions above the ceiling occur at the default window (see
+// TestDefaultWindowStillProducesCompletionsAboveTheCeiling). What this test
+// actually pins is the bucketed range, which is the guarantee that holds.
 //
 // Every bucket but one reports its upper edge, so a percentile is at or above
 // the truth. The overflow bucket is the exception: it has no upper edge and
@@ -131,7 +139,7 @@ func TestUniqueFirstPartitionsUniqueShredsAcrossEviction(t *testing.T) {
 // because the ladder stopped at ~1.05s while DefaultRetention is 2s, so a
 // completion of 1.8s reported 1.048576s — understated by 42%, against three
 // separate docs promising "never below the truth".
-func TestCompletionWithinTheRetentionWindowIsNeverUnderstated(t *testing.T) {
+func TestCompletionBelowTheLadderCeilingIsNeverUnderstated(t *testing.T) {
 	if CompletionCeiling <= DefaultRetention {
 		t.Fatalf("CompletionCeiling %s must exceed DefaultRetention %s, or completions "+
 			"inside the permitted window land in the overflow bucket and understate",
@@ -206,5 +214,86 @@ func TestSubMicrosecondCompletionIsNotReportedBelowTheTruth(t *testing.T) {
 	zero.observe(0)
 	if got := zero.percentile(100); got != 0 {
 		t.Errorf("zero completion reported as %s, want exactly 0", got)
+	}
+}
+
+// TestDefaultWindowStillProducesCompletionsAboveTheCeiling is the test whose
+// absence let a false claim ship.
+//
+// The PR that widened the ladder asserted, in the README and in a startup
+// warning, that the default window could not reach the overflow bucket because
+// CompletionCeiling exceeds DefaultRetention. That reasoning bounds the wrong
+// quantity. --retain ages a set on its NEWEST arrival (Scorer.expiredKeys), so a
+// set that keeps receiving is never evicted and its first-to-32nd span is
+// bounded only by the inter-arrival gap staying inside the window — not by the
+// window. 32 shreds 200ms apart is 6.2s of span with every gap 200ms, well
+// inside a 2s window.
+//
+// Nothing in the suite caught it because every completion test drove the
+// histogram directly with hand-picked durations instead of driving a Scorer with
+// arrivals. This one uses a real Scorer so the span is produced rather than
+// asserted.
+func TestDefaultWindowStillProducesCompletionsAboveTheCeiling(t *testing.T) {
+	const gap = 200 * time.Millisecond
+	scorer := NewScorerWithRetention(FormatAgave, DefaultRetention)
+	start := time.Unix(1000, 0)
+	for index := uint32(0); index < completionThreshold; index++ {
+		if _, err := scorer.Observe(dataPacket(7, 0, index), start.Add(time.Duration(index)*gap)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	span := time.Duration(completionThreshold-1) * gap
+	if gap >= DefaultRetention {
+		t.Fatalf("fixture is wrong: gap %s must stay inside the %s window or the set "+
+			"is evicted and the scenario is not the one under test", gap, DefaultRetention)
+	}
+	if span <= CompletionCeiling {
+		t.Fatalf("fixture is wrong: span %s must exceed the ceiling %s", span, CompletionCeiling)
+	}
+
+	receipt := scorer.Receipt()
+	if receipt.CompletionsAboveCeiling == 0 {
+		t.Errorf("a %s completion at the %s default window did not register above the "+
+			"%s ceiling: the receipt cannot flag an understatement it does not count",
+			span, DefaultRetention, CompletionCeiling)
+	}
+	if receipt.CompletionP50 >= span {
+		t.Errorf("p50 = %s for a true span of %s: this test exists because the default "+
+			"window DOES understate, so if it no longer does, the README caveat and "+
+			"Receipt.CompletionsAboveCeiling are both describing a condition that can "+
+			"no longer arise", receipt.CompletionP50, span)
+	}
+	// The caveat must reach the human table, not just the JSON field.
+	rendered := receipt.String()
+	if !strings.Contains(rendered, "UNDERSTATE") {
+		t.Errorf("receipt understates but its rendering does not say so:\n%s", rendered)
+	}
+	// Guards the exact bug this caveat introduced on first attempt: the rendered
+	// caveat contains a literal "0.78%", and splicing it into a format string
+	// turns that into a verb, shifting every later argument.
+	if strings.Contains(rendered, "%!") {
+		t.Errorf("receipt rendering contains a format-verb error, so pre-rendered text "+
+			"reached a format string:\n%s", rendered)
+	}
+}
+
+// TestCleanReceiptCarriesNoCompletionCaveat is the paired negative: a run whose
+// completions all fit the ladder must not carry the warning, or the caveat
+// becomes noise that is ignored on the run where it matters.
+func TestCleanReceiptCarriesNoCompletionCaveat(t *testing.T) {
+	scorer := NewScorerWithRetention(FormatAgave, DefaultRetention)
+	start := time.Unix(2000, 0)
+	for index := uint32(0); index < completionThreshold; index++ {
+		if _, err := scorer.Observe(dataPacket(11, 0, index), start.Add(time.Duration(index)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	receipt := scorer.Receipt()
+	if receipt.CompletionsAboveCeiling != 0 {
+		t.Fatalf("a 31ms span counted %d completions above the %s ceiling",
+			receipt.CompletionsAboveCeiling, CompletionCeiling)
+	}
+	if rendered := receipt.String(); strings.Contains(rendered, "UNDERSTATE") {
+		t.Errorf("a receipt with no above-ceiling completion still carries the caveat:\n%s", rendered)
 	}
 }

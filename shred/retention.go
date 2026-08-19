@@ -122,10 +122,15 @@ const (
 	CompletionRelativeError = 1.0 / float64(completionSubBuckets)
 )
 
-// Compile-time proof that the ladder outreaches the default retention window.
-// A constant negative difference does not convert to uint, so raising
-// DefaultRetention past CompletionCeiling fails the build instead of silently
-// reintroducing the understatement this constant was widened to remove.
+// Compile-time floor on the ladder's reach relative to the default window.
+//
+// This is a weaker statement than it looks, and the comment it replaced
+// overclaimed: keeping the ceiling above DefaultRetention does NOT prevent
+// understatement, because the window does not bound a set's completion span
+// (see completionHistogram). It only stops the ladder being narrower than the
+// window itself, which was the specific regression that widening the octaves
+// fixed. The general condition is reported by Receipt.CompletionsAboveCeiling,
+// not prevented here.
 //
 // Named rather than blank so that the thing it protects is legible at the point
 // anyone would delete it: a bare `const _` reads as leftover scaffolding.
@@ -143,12 +148,28 @@ const _completionCeilingCoversDefaultRetention = uint(CompletionCeiling - Defaul
 // One exception, and it is the only one: a completion at or above
 // CompletionCeiling lands in the overflow bucket, which has no upper edge and
 // reports its floor. That value is a LOWER bound, so a percentile that lands
-// there understates. CompletionCeiling is kept above DefaultRetention (with a
-// compile-time check) so this cannot happen at the default window, but a large
-// enough --retain can still reach it.
+// there understates.
+//
+// --retain does NOT bound this. The window ages a set on its NEWEST arrival
+// (see Scorer.expiredKeys), so a set that keeps receiving shreds is never
+// evicted and its first-to-32nd span is bounded only by the inter-arrival gap
+// staying inside the window, not by the window itself. 32 shreds arriving 200ms
+// apart span 6.2s at the 2s default — above the ceiling, with every gap well
+// inside the window. Measured, not hypothetical.
+//
+// So no startup-time comparison against the window can predict this, and
+// overflowed() exists to report it after the fact instead: it is the exact
+// condition, observed rather than guessed.
 type completionHistogram struct {
 	buckets [completionBucketCount + 1]uint64
 	count   uint64
+}
+
+// overflowed reports how many completions landed at or above CompletionCeiling
+// and were therefore reported as that floor. Any nonzero value means this
+// receipt's completion percentiles UNDERSTATE, by an unbounded amount.
+func (h *completionHistogram) overflowed() uint64 {
+	return h.buckets[completionOverflow]
 }
 
 func (h *completionHistogram) observe(completed time.Duration) {

@@ -47,7 +47,11 @@ func TestRetentionWarningFiresExactlyAboveTheLadder(t *testing.T) {
 		}
 		// A warning an operator cannot act on is noise. It has to name the knob,
 		// the ceiling it crossed, and which direction the error now runs.
-		for _, needed := range []string{"--retain", "understates", shred.CompletionCeiling.String()} {
+		for _, needed := range []string{"--retain", "understate", shred.CompletionCeiling.String(),
+			// The hint must say it is a hint. Without this the operator reads a
+			// silent startup as proof the percentiles are bounded, which is the
+			// false-reassurance this warning previously created.
+			"not a bound", "completions_above_ceiling"} {
 			if !strings.Contains(warning, needed) {
 				t.Errorf("warning for %s omits %q, so the operator cannot tell what "+
 					"crossed which bound: %s", testCase.window, needed, warning)
@@ -68,11 +72,17 @@ func TestRetentionWarningFiresExactlyAboveTheLadder(t *testing.T) {
 	}
 }
 
-// TestRetentionWarningIsSilentAtEveryDefaultWindowCompletion is the paired
-// negative: the default configuration must never emit this warning, or it
-// becomes background noise that operators learn to ignore before the one run
-// where it matters.
-func TestRetentionWarningIsSilentAtEveryDefaultWindowCompletion(t *testing.T) {
+// TestRetentionWarningIsSilentAtTheDefaultWindow is the paired negative: the
+// default configuration must never emit this warning, or it becomes background
+// noise that operators learn to ignore before the one run where it matters.
+//
+// The old name said "...AtEveryDefaultWindowCompletion", which asserted a
+// property this function does not have and cannot have. Silence here does NOT
+// mean the default window's completions all fit the ladder — they need not, and
+// TestDefaultWindowStillProducesCompletionsAboveTheCeiling in the shred package
+// shows a 6.2s span at the 2s default. All this pins is the warning's boundary
+// against the window; the understatement signal itself is on the receipt.
+func TestRetentionWarningIsSilentAtTheDefaultWindow(t *testing.T) {
 	if warning := retentionWarning(shred.DefaultRetention); warning != "" {
 		t.Fatalf("the default --retain warns, which would train operators to ignore "+
 			"it: %s", warning)

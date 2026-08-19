@@ -50,9 +50,10 @@ ingress freshness window.
 past each arrival, so the receiver reaches a steady state instead of growing
 for as long as it runs. The receipt still covers the whole run; the window is
 how long a second copy of a shred can still be recognised as a duplicate.
-Widening it past the completion histogram's ceiling makes completion
-percentiles at or above that ceiling understate with no bound, and warns at
-startup; every other figure stays exact at any window. See the README.`
+It does not bound completion percentiles: a set that keeps receiving is never
+evicted, so its span can exceed the histogram's ceiling at any window. The
+receipt reports completions_above_ceiling when that happened; a nonzero value
+means time_to_32nd_shred understates. See the README.`
 
 // sessionScorer is the seam that keeps shred mode and generic mode one client.
 // Both modes are selected once at construction; the packet loop below has no
@@ -159,24 +160,30 @@ func run(args []string) error {
 	if *retention <= 0 {
 		return fmt.Errorf("--retain must be positive, got %s", *retention)
 	}
-	// Warn rather than reject above the histogram's ceiling. Widening the window
-	// past it degrades exactly one number — completion percentiles, which stop
-	// being bounded above and report the overflow floor instead, understating
-	// with no bound. Everything else the receipt carries (dedup, erasure, gaps,
-	// means) stays exact at any window, and recognising cross-feed duplicates is
-	// what --retain is primarily for, so refusing to run would trade a
-	// percentile caveat for a service that will not start. The operator who
-	// followed "widen --retain if your inputs can be seconds apart" learns the
-	// cost here, at the point of use, rather than from shred/retention.go.
+	// An early hint only, and deliberately not the guarantee's enforcement. A
+	// window at or above the ladder's ceiling is an egregious case worth naming at
+	// startup, but its ABSENCE proves nothing: --retain does not bound a set's
+	// completion span (a set is aged on its newest arrival, so one that keeps
+	// receiving is never evicted), so completions above the ceiling occur at the
+	// default window too. The authoritative signal is the receipt's
+	// completions_above_ceiling, which counts the condition where it happens
+	// instead of predicting it from a quantity that cannot see it.
 	if warning := retentionWarning(*retention); warning != "" {
 		fmt.Fprintln(os.Stderr, warning)
 	}
 	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON, *retention, mode, sourceLabel, rightsBasis)
 }
 
-// retentionWarning returns the operator warning for a retention window that
-// outreaches the completion histogram's ladder, or "" when the window is inside
-// it.
+// retentionWarning returns an early-hint warning for a retention window at or
+// above the completion histogram's ceiling, or "" otherwise.
+//
+// Read the contract carefully, because the first version of this function got it
+// wrong in a way that was worse than saying nothing. A window >= the ceiling is
+// sufficient to expect understated percentiles, but it is NOT necessary: the
+// window bounds the inter-arrival gap, not the completion span, so 32 shreds
+// 200ms apart span 6.2s at the 2s default and understate with this function
+// silent. Treating that silence as "safe" is the error — the receipt's
+// CompletionsAboveCeiling is the real signal, observed rather than predicted.
 //
 // Split out from run so it can be tested without starting a receiver. run's
 // only above-ceiling path is a VALID configuration, so a test that drove this
@@ -190,10 +197,11 @@ func retentionWarning(window time.Duration) string {
 	}
 	return fmt.Sprintf(
 		"blockcast-shreds: warning: --retain %s is at or above the completion "+
-			"histogram's ceiling (%s), so a completion at or above that ceiling is "+
-			"reported AS the ceiling and understates, with no bound. The receipt's "+
-			"stated %.2f%% error applies below the ceiling only; every other figure "+
-			"is exact at any window.",
+			"histogram's ceiling (%s), so completions at or above that ceiling are "+
+			"reported AS the ceiling and understate. This is a hint, not a bound: a "+
+			"narrower window understates too, because --retain does not limit how "+
+			"long a set takes to complete. Check completions_above_ceiling on the "+
+			"receipt — nonzero means the stated %.2f%% error does not apply.",
 		window, shred.CompletionCeiling, shred.CompletionRelativeError*100)
 }
 

@@ -40,7 +40,20 @@ type Receipt struct {
 	CompletionP50    time.Duration `json:"completion_p50_ns"`
 	CompletionP95    time.Duration `json:"completion_p95_ns"`
 	CompletionP99    time.Duration `json:"completion_p99_ns"`
-	Gaps             GapHistogram  `json:"gap_histogram"`
+	// CompletionsAboveCeiling counts completions at or above CompletionCeiling.
+	// Those land in the histogram's single unbounded bucket and are reported as
+	// its floor, so ANY nonzero value here means the three percentiles above
+	// UNDERSTATE, by an unbounded amount, and the documented
+	// CompletionRelativeError does not apply to this receipt.
+	//
+	// This is reported rather than predicted because it cannot be predicted:
+	// --retain does not bound a set's completion span (a set is aged on its
+	// newest arrival, so one that keeps receiving is never evicted), and 32
+	// shreds arriving 200ms apart span 6.2s at the 2s default. A startup-time
+	// comparison against the window is blind to exactly those cases, so the
+	// condition is counted where it actually occurs.
+	CompletionsAboveCeiling uint64       `json:"completions_above_ceiling"`
+	Gaps                    GapHistogram `json:"gap_histogram"`
 }
 
 type setScore struct {
@@ -684,12 +697,32 @@ func (s *Scorer) receiptFor(keys []SetKey) Receipt {
 	receipt.CompletionP50 = completions.percentile(50)
 	receipt.CompletionP95 = completions.percentile(95)
 	receipt.CompletionP99 = completions.percentile(99)
+	receipt.CompletionsAboveCeiling = completions.overflowed()
 	return receipt
+}
+
+// completionCaveat renders the one line that has to appear beside a completion
+// percentile that understates, or "" when every completion fit the ladder.
+//
+// It is printed rather than left to the JSON field because the human table is
+// what an operator reads in a dispute, and a percentile whose stated error bar
+// does not apply is worse than no percentile at all.
+func completionCaveat(aboveCeiling uint64) string {
+	if aboveCeiling == 0 {
+		return ""
+	}
+	return fmt.Sprintf("time_to_32nd_shred WARNING: %d completion(s) at or above %s "+
+		"were recorded as that value, so the percentiles above UNDERSTATE by an "+
+		"unbounded amount and the documented %.2f%% error does not apply",
+		aboveCeiling, CompletionCeiling, CompletionRelativeError*100)
 }
 
 func (r UnionReceipt) String() string {
 	var output strings.Builder
 	fmt.Fprintf(&output, "time_to_32nd_shred union p50=%s p95=%s p99=%s\n", r.Union.CompletionP50, r.Union.CompletionP95, r.Union.CompletionP99)
+	if line := completionCaveat(r.Union.CompletionsAboveCeiling); line != "" {
+		fmt.Fprintf(&output, "%s\n", line)
+	}
 	fmt.Fprintf(&output, "union erasure sets=%d erased=%d fraction=%.6f mean_shreds_per_set=%.2f\n", r.Union.SetsTotal, r.Union.SetsErased, r.Union.ErasureFraction, r.Union.MeanShredsPerSet)
 	fmt.Fprintf(&output, "gap_ms union <1=%d 1-2.4=%d 2.4-7=%d 7-32=%d >=32=%d reordered=%d\n",
 		r.Union.Gaps.LT1, r.Union.Gaps.From1To2_4, r.Union.Gaps.From2_4To7, r.Union.Gaps.From7To32, r.Union.Gaps.GTE32, r.Union.Gaps.Reordered)
@@ -705,9 +738,19 @@ func (r UnionReceipt) String() string {
 }
 
 func (r Receipt) String() string {
-	return fmt.Sprintf("time_to_32nd_shred p50=%s p95=%s p99=%s\nerasure sets=%d erased=%d fraction=%.6f mean_shreds_per_set=%.2f\ngap_ms <1=%d 1-2.4=%d 2.4-7=%d 7-32=%d >=32=%d reordered=%d",
+	// The caveat is APPENDED, never concatenated into the format string below.
+	// It contains a rendered "0.78%", and splicing that into a format string
+	// turns the percent into a verb: every argument after it shifts by one and
+	// the receipt renders as `erased=%!d(float64=0) fraction=32.000000`. That is
+	// the same failure that produced the `%%` bug this PR already fixed once, so
+	// pre-rendered text stays out of format strings here.
+	out := fmt.Sprintf("time_to_32nd_shred p50=%s p95=%s p99=%s\nerasure sets=%d erased=%d fraction=%.6f mean_shreds_per_set=%.2f\ngap_ms <1=%d 1-2.4=%d 2.4-7=%d 7-32=%d >=32=%d reordered=%d",
 		r.CompletionP50, r.CompletionP95, r.CompletionP99, r.SetsTotal, r.SetsErased, r.ErasureFraction, r.MeanShredsPerSet,
 		r.Gaps.LT1, r.Gaps.From1To2_4, r.Gaps.From2_4To7, r.Gaps.From7To32, r.Gaps.GTE32, r.Gaps.Reordered)
+	if caveat := completionCaveat(r.CompletionsAboveCeiling); caveat != "" {
+		out += "\n" + caveat
+	}
+	return out
 }
 
 func (h *GapHistogram) observe(gap time.Duration) {
