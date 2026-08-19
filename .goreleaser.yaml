@@ -1,0 +1,64 @@
+# goreleaser configuration for the customer-facing receiver binary.
+#
+# Verify locally with `goreleaser check` and `goreleaser build --snapshot --clean`.
+# CI runs both on every push (.github/workflows/packaging.yml), because this file
+# cannot be validated by `go test` and would otherwise rot silently.
+version: 2
+
+project_name: blockcast-shreds
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: blockcast-shreds
+    main: ./cmd/blockcast-shreds
+    binary: blockcast-shreds
+    env:
+      # The deliverable is one static pure-Go binary. If cgo ever creeps back
+      # in, the release build must fail rather than ship something dynamically
+      # linked against the build host's libc.
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+    flags:
+      # -trimpath keeps build-host paths out of the binary, so two builds of the
+      # same commit on different machines are byte-identical.
+      - -trimpath
+    # goreleaser's default ldflags inject -X main.version/-X main.commit.
+    # Package main declares none of those symbols, and the Go linker discards an
+    # -X for an unknown symbol *silently* — the release would advertise a
+    # version it has no way to report. The version string is the deployed
+    # binary's only field-rollback lever (W4 enforces a minimum supported
+    # version at the billing edge), so a silently-dropped stamp is worse than an
+    # absent one. It lands with the broker lane, go-amt#45, which owns that
+    # field; wire the -X here in the same change.
+    ldflags:
+      - -s -w
+
+archives:
+  - id: blockcast-shreds
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - docs/operations/install.md
+      - packaging/systemd/blockcast-shreds.service
+      - packaging/smoke-test.sh
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
