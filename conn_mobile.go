@@ -27,6 +27,10 @@ type MulticastConn struct {
 	Timestamp   bool
 	RcvBufBytes int
 	SndBufBytes int
+	// Mode mirrors the cgo build's field so callers can set it under any build
+	// configuration without tag-specific code. It is forwarded to ManagedConn
+	// below, which is where this build makes the native-vs-tunnel decision.
+	Mode AMTMode
 
 	managed *ManagedConn
 }
@@ -43,6 +47,7 @@ func (mc *MulticastConn) Open() error {
 		Timestamp:   mc.Timestamp,
 		RcvBufBytes: mc.RcvBufBytes,
 		SndBufBytes: mc.SndBufBytes,
+		Mode:        mc.Mode,
 	}
 	if err := managed.Open(); err != nil {
 		return err

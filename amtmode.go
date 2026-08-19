@@ -121,3 +121,45 @@ func planProbe(mode AMTMode, relayConfigured bool, timeout time.Duration) probeP
 		return probePlan{Probe: true, Window: window, TunnelOnFailure: true}
 	}
 }
+
+// managedPlan is the decision ManagedConn.Open acts on. ManagedConn reaches the
+// AMT tunnel through RelayManager rather than Gateway directly, so it needs one
+// extra branch MulticastConn does not have (DRIAD discovery) — but the
+// native-vs-tunnel policy underneath is the same planProbe.
+type managedPlan struct {
+	// UseDRIAD reports whether the relay address must be discovered via DNS
+	// (RFC 8777) instead of being taken from RelayAddr.
+	UseDRIAD bool
+
+	// AttemptNative reports whether to bind the native socket at all. Only a
+	// deliberate AMTModeTunnel skips it: an operator who has already decided to
+	// tunnel should not pay a probe window to be told so.
+	AttemptNative bool
+
+	// Probe carries the native-join policy, and is meaningful only when
+	// AttemptNative is true.
+	Probe probePlan
+}
+
+// planManagedOpen decides how ManagedConn.Open should approach a group.
+//
+// Extracted as a pure function for the same reason planProbe was: ManagedConn's
+// native path needs a multicast-capable host to exercise, so the decision has to
+// be separable from the act to be testable at all. It was untested when it
+// carried the BLO-28640 defect (Ally review on go-amt#49).
+func planManagedOpen(mode AMTMode, hasRelay, enableDRIAD bool, timeout time.Duration) managedPlan {
+	// DRIAD means the relay address is not known yet. Discovery is the whole
+	// point of the mode, so there is no local native-vs-tunnel decision to make
+	// and the native socket is not attempted. Preserved as-is; the BLO-28640
+	// defect was never on this branch.
+	if enableDRIAD && !hasRelay {
+		return managedPlan{UseDRIAD: true}
+	}
+
+	plan := planProbe(mode, hasRelay, timeout)
+
+	return managedPlan{
+		AttemptNative: plan.Probe || !plan.TunnelOnFailure,
+		Probe:         plan,
+	}
+}

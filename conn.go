@@ -17,16 +17,8 @@ import (
 
 var _ net.PacketConn = (*MulticastConn)(nil)
 
-// nativeConn is the subset of methods shared by *ipv4.PacketConn and
-// *ipv6.PacketConn that the non-data-plane bookkeeping (Close, deadlines,
-// local address) needs, independent of the IP version's control-message type.
-type nativeConn interface {
-	Close() error
-	LocalAddr() net.Addr
-	SetDeadline(t time.Time) error
-	SetReadDeadline(t time.Time) error
-	SetWriteDeadline(t time.Time) error
-}
+// nativeConn and probeNativeTraffic live in probe.go, which carries no build
+// tags so ManagedConn can share them; see the note there.
 
 type MulticastConn struct {
 	RelayAddr net.UDPAddr
@@ -35,6 +27,16 @@ type MulticastConn struct {
 	GroupPort uint16
 	TTL       int
 	IFace     *net.Interface
+	// Timeout is the operator's relay timeout, and it sizes two unrelated things:
+	// the native probe window (floored at MinUsefulProbeWindow, because a shorter
+	// window is not evidence) and the AMT handshake bound (dropped below
+	// MinRelayHandshakeTimeout, so Gateway.Open applies DefaultOpenTimeout
+	// instead of failing every handshake).
+	//
+	// That overloading is what let one bad value break both paths at once in
+	// BLO-28640. This is the seam a split into two explicit config keys lands on;
+	// multicast-api has since done so (probeWindow + relayHandshakeTimeout, with
+	// timeout kept as a deprecated alias seeding both).
 	Timeout   time.Duration
 	Timestamp bool
 

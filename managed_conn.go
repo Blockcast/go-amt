@@ -37,6 +37,13 @@ type ManagedConn struct {
 	RcvBufBytes int
 	SndBufBytes int
 
+	// Mode selects native-vs-tunnel, and mirrors MulticastConn.Mode field for
+	// field. The zero value (AMTModeAuto) keeps the historical inference, where a
+	// configured RelayAddr makes the native join provisional. Set it explicitly
+	// to stop a relay address that was inherited by configuration clone from
+	// deciding the delivery path (BLO-28640).
+	Mode AMTMode
+
 	// DRIAD discovery configuration (RFC 8777)
 	// When EnableDRIAD is true and RelayAddr is empty, discovers relay via DNS
 	EnableDRIAD bool
@@ -73,18 +80,26 @@ func (mc *ManagedConn) Open() error {
 	}
 
 	hasRelay := len(mc.RelayAddr.IP) > 0
-	useDRIAD := mc.EnableDRIAD && !hasRelay
+	plan := planManagedOpen(mc.Mode, hasRelay, mc.EnableDRIAD, mc.Timeout)
+	useDRIAD := plan.UseDRIAD
 
-	// Try native multicast first (if relay timeout is configured)
-	if hasRelay && mc.Timeout > 0 {
-		if err := mc.tryNativeMulticast(); err == nil {
+	// Try native multicast first unless the operator asked outright for the
+	// tunnel. An unset or absurdly short Timeout used to skip the native attempt
+	// entirely (hasRelay && mc.Timeout > 0), which meant a missing configuration
+	// value silently removed native multicast — the BLO-28640 defect, in this
+	// file rather than conn.go.
+	if plan.AttemptNative {
+		err := mc.tryNativeMulticast(plan.Probe)
+		if err == nil {
 			mc.usingTunnel = false
 			return nil
 		}
-		// Native multicast failed or timed out, use AMT relay
-	} else if !hasRelay && !useDRIAD {
-		// No relay or DRIAD discovery configured, use native multicast only.
-		return mc.tryNativeMulticast()
+		if !plan.Probe.TunnelOnFailure {
+			// No relay to fall back to, or AMTModeNative: the native failure is
+			// the outcome, not a reason to tunnel.
+			return err
+		}
+		// Native multicast failed or the probe timed out, so use the AMT relay.
 	}
 
 	// Use RelayManager for AMT tunnel
@@ -92,8 +107,12 @@ func (mc *ManagedConn) Open() error {
 
 	// Build transport config
 	transportCfg := TransportConfig{
-		RelayAddr:       mc.RelayAddr,
-		Timeout:         mc.Timeout,
+		RelayAddr: mc.RelayAddr,
+		// gatewayOpenTimeout, not mc.Timeout: the operator's relay timeout is
+		// also the probe window, and a value too short to complete a round trip
+		// to the relay must not become the handshake bound. Production's 50ms did
+		// exactly that, so the tunnel replacing native could not come up either.
+		Timeout:         gatewayOpenTimeout(mc.Timeout),
 		EnableTimestamp: mc.Timestamp,
 		MTU:             1500,
 		RcvBufBytes:     mc.RcvBufBytes,
