@@ -111,11 +111,15 @@ func TestDocumentedFlagsAreAccepted(t *testing.T) {
 	// A probe whose parse must fail, so no receiver is ever started. Value-taking
 	// flags are probed with no value; the bool flag is probed with a bad value.
 	probes := map[string][]string{
-		"feed":          {"--feed"},
-		"listen":        {"--listen"},
-		"dest-ip-ports": {"--dest-ip-ports"},
-		"http-addr":     {"--http-addr"},
-		"json":          {"--json=not-a-bool"},
+		"feed":           {"--feed"},
+		"listen":         {"--listen"},
+		"dest-ip-ports":  {"--dest-ip-ports"},
+		"http-addr":      {"--http-addr"},
+		"json":           {"--json=not-a-bool"},
+		"mode":           {"--mode"},
+		"source-label":   {"--source-label"},
+		"rights-basis":   {"--rights-basis"},
+		"health-max-age": {"--health-max-age"},
 	}
 
 	for _, name := range docTableFlags(t) {
