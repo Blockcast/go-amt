@@ -432,3 +432,80 @@ func header(slot uint64, fecSetIndex uint32, index uint8) shred.Header {
 		IndexWithinSet: index,
 	}
 }
+
+// One wire-valid datagram carrying an out-of-range slot used to advance the
+// frontier arbitrarily and, because every real shred then sat more than two
+// slots behind it, permanently zero the erasure SLA -- while delivery and
+// ingress accounting stayed green, so the operator saw a live feed with a
+// perfect score. Slot is the one header field ParseWireHeader does not bound,
+// and the receiver listens on 0.0.0.0 with no source filtering.
+func TestTrackerRejectsImplausibleSlotJump(t *testing.T) {
+	const grace = 400 * time.Millisecond
+	tracker, err := erasure.NewTracker(grace, time.Unix(100, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Unix(100, 0)
+
+	for index := uint8(0); index < 32; index++ {
+		if !tracker.Observe(header(10, 64, index), started) {
+			t.Fatalf("real shred %d rejected", index)
+		}
+	}
+
+	poison := header(1<<40, 64, 0)
+	if tracker.Observe(poison, started) {
+		t.Fatal("implausible slot advanced the frontier")
+	}
+	if got := tracker.Stats(); got.NewestSlot != 10 {
+		t.Fatalf("newestSlot = %d after poison, want 10 (frontier moved)", got.NewestSlot)
+	} else if got.RejectedSlotJumps != 1 {
+		t.Fatalf("RejectedSlotJumps = %d, want 1", got.RejectedSlotJumps)
+	}
+
+	// The feed must keep scoring: this is the whole point of the guard.
+	for index := uint8(0); index < 32; index++ {
+		if !tracker.Observe(header(11, 64, index), started.Add(time.Millisecond)) {
+			t.Fatalf("real shred %d rejected after poison -- SLA is blacked out", index)
+		}
+	}
+}
+
+// The naive guard trades one blackout for another: a receiver that misses a
+// genuine multi-minute gap sees every subsequent packet beyond the bound of a
+// frontier that can no longer advance. A lone poisoned datagram does not
+// repeat, so a plausible observation clears the counter; a real jump arrives as
+// a continuous stream and must resync.
+func TestTrackerResyncsOnSustainedSlotJump(t *testing.T) {
+	tracker, err := erasure.NewTracker(400*time.Millisecond, time.Unix(100, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	at := time.Unix(100, 0)
+	if !tracker.Observe(header(10, 64, 0), at) {
+		t.Fatal("first shred rejected")
+	}
+
+	// A single outlier followed by real traffic must NOT accumulate to a resync.
+	tracker.Observe(header(1<<40, 64, 0), at)
+	if !tracker.Observe(header(10, 64, 1), at) {
+		t.Fatal("real shred rejected after a lone outlier")
+	}
+	if got := tracker.Stats(); got.FrontierResyncs != 0 {
+		t.Fatalf("FrontierResyncs = %d after an isolated outlier, want 0", got.FrontierResyncs)
+	}
+
+	// A genuine jump arrives as a stream and must be adopted.
+	newSlot := uint64(10 + 100_000)
+	var accepted bool
+	for i := 0; i < 32; i++ {
+		accepted = tracker.Observe(header(newSlot, 64, uint8(i)), at.Add(time.Duration(i)*time.Millisecond))
+	}
+	got := tracker.Stats()
+	if !accepted || got.NewestSlot != newSlot {
+		t.Fatalf("sustained jump not adopted: accepted=%v newestSlot=%d want %d", accepted, got.NewestSlot, newSlot)
+	}
+	if got.FrontierResyncs != 1 {
+		t.Fatalf("FrontierResyncs = %d, want 1", got.FrontierResyncs)
+	}
+}

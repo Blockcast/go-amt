@@ -38,11 +38,46 @@ type Window struct {
 	Schema          uint8        `json:"schema"`
 }
 
+// maxSlotJump bounds how far a single observation may advance the frontier.
+//
+// Slot arrives from the wire as a raw little-endian uint64 and, unlike version,
+// geometry and local index, is not validated by ParseWireHeader. The receiver
+// listens on 0.0.0.0 with no source filtering, so one wire-valid datagram
+// carrying an out-of-range slot used to advance newestSlot arbitrarily; every
+// real shred then sat more than 2 slots behind the frontier and was rejected
+// for the life of the process. Delivery and ingress accounting are untouched by
+// that, so /healthz and ingress_packets_total stay green and the operator sees a
+// live feed with a perfect erasure score -- the exact "confidently clean feed
+// under arbitrary real loss" failure this package exists to remove.
+//
+// Sized from capture data: consecutive slots differ by 69 to 364, so a few
+// thousand is generous for real reordering while still making one bad datagram
+// non-permanent.
+const maxSlotJump = 4096
+
+// slotResyncThreshold is how many consecutive implausible observations are
+// treated as evidence that the FEED moved rather than that one datagram lied.
+//
+// Rejecting a large jump outright would trade one permanent blackout for
+// another: a receiver that misses a genuine multi-minute gap would reject every
+// subsequent packet, since they are all beyond the bound of a frontier that can
+// no longer advance. A single poisoned datagram does not repeat -- the next real
+// shred is within the bound and clears the counter -- whereas a genuine jump
+// arrives as a continuous stream, so sustained evidence resyncs the frontier.
+const slotResyncThreshold = 16
+
 // Stats describes the currently retained scoring state.
 type Stats struct {
 	NewestSlot   uint64
 	TrackedSlots int
 	TrackedSets  int
+	// RejectedSlotJumps counts observations refused for an implausible slot
+	// advance. A silent guard replaces one invisible failure with another, so
+	// this is exported for the same reason the erasure gauge is.
+	RejectedSlotJumps uint64
+	// FrontierResyncs counts how often sustained implausible slots were accepted
+	// as a genuine feed jump.
+	FrontierResyncs uint64
 }
 
 type setKey struct {
@@ -68,11 +103,18 @@ type Tracker struct {
 	grace       time.Duration
 	initialized bool
 	newestSlot  uint64
-	boundaries  map[uint64]time.Time
-	slots       map[uint64]*slotState
-	windowStart time.Time
-	arrivals    []time.Time
-	scores      []scoreEvent
+	// pendingJumps counts CONSECUTIVE implausible advances; any plausible
+	// observation clears it, which is what separates one bad datagram from a
+	// feed that genuinely moved.
+	pendingJumps      int
+	pendingJumpSlot   uint64
+	rejectedSlotJumps uint64
+	frontierResyncs   uint64
+	boundaries        map[uint64]time.Time
+	slots             map[uint64]*slotState
+	windowStart       time.Time
+	arrivals          []time.Time
+	scores            []scoreEvent
 }
 
 // NewTracker constructs a tracker whose first report begins at windowStart. A
@@ -110,6 +152,29 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 		t.newestSlot = header.Slot
 		t.recordPriorBoundaries(header.Slot, receivedAt)
 	} else if header.Slot > t.newestSlot {
+		if header.Slot-t.newestSlot > maxSlotJump {
+			t.rejectedSlotJumps++
+			t.pendingJumps++
+			t.pendingJumpSlot = header.Slot
+			if t.pendingJumps < slotResyncThreshold {
+				return false
+			}
+			// Sustained: the feed moved. Resync rather than stay blacked out.
+			t.frontierResyncs++
+			t.pendingJumps = 0
+			t.slots = make(map[uint64]*slotState)
+			t.boundaries = make(map[uint64]time.Time)
+			t.newestSlot = header.Slot
+			t.recordPriorBoundaries(header.Slot, receivedAt)
+			t.scoreDue(receivedAt)
+			t.reclaimOldSlots()
+			state := &slotState{sets: make(map[setKey]uint64), boundary: receivedAt}
+			t.slots[header.Slot] = state
+			state.sets[setKey{fecSetIndex: header.FECSetIndex}] |= 1 << header.IndexWithinSet
+			t.observeDelivery(receivedAt)
+			return true
+		}
+		t.pendingJumps = 0
 		for slot, state := range t.slots {
 			if slot < header.Slot && state.boundary.IsZero() {
 				state.boundary = receivedAt
@@ -120,6 +185,10 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 		t.recordPriorBoundaries(header.Slot, receivedAt)
 	} else if t.newestSlot-header.Slot > 2 {
 		return false
+	} else {
+		// A plausible in-window observation is evidence the frontier is still
+		// real, so a lone poisoned datagram cannot accumulate toward a resync.
+		t.pendingJumps = 0
 	}
 	t.scoreDue(receivedAt)
 	t.reclaimOldSlots()
@@ -214,7 +283,12 @@ func (t *Tracker) Stats() Stats {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	stats := Stats{NewestSlot: t.newestSlot, TrackedSlots: len(t.slots)}
+	stats := Stats{
+		NewestSlot:        t.newestSlot,
+		TrackedSlots:      len(t.slots),
+		RejectedSlotJumps: t.rejectedSlotJumps,
+		FrontierResyncs:   t.frontierResyncs,
+	}
 	for _, state := range t.slots {
 		stats.TrackedSets += len(state.sets)
 	}
