@@ -397,6 +397,17 @@ func TestUDPFanoutDeliversEveryPacketExactlyOnceToEveryDestination(t *testing.T)
 		}
 	}
 
+	// Quiesce before sampling. egressPackets is added AFTER the socket writes
+	// (see Fanout.deliver's caller), so the kernel can hand a datagram to the
+	// listener above before the worker has charged it — the reads completing is
+	// not evidence the counter caught up. Sampling live made this assert flake
+	// on CI as "EgressPackets = 195, want 200" while every destination had in
+	// fact received all 200: a counter lag, not packet loss. Close waits on the
+	// worker's WaitGroup, and it is closeOnce-guarded, so the deferred Close
+	// above stays correct.
+	if err := fanout.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 	if stats := fanout.Stats(); stats.EgressPackets != destinations*packets {
 		t.Fatalf("EgressPackets = %d, want %d", stats.EgressPackets, destinations*packets)
 	}
