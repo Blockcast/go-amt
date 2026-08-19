@@ -89,9 +89,10 @@ func TestScorerDeduplicatesFirstArrivalAcrossTwoFeeds(t *testing.T) {
 		}
 	}
 	got := scorer.Receipt()
-	if got.SetsTotal != 1 || got.CompletionP50 != 31*time.Millisecond || got.Gaps.From1To2_4 != 31 {
+	if got.SetsTotal != 1 || got.Gaps.From1To2_4 != 31 {
 		t.Fatalf("duplicates changed first-arrival receipt: %+v", got)
 	}
+	assertCompletionNear(t, "CompletionP50", got.CompletionP50, 31*time.Millisecond)
 	if !strings.HasPrefix(got.String(), "time_to_32nd_shred") {
 		t.Fatalf("receipt does not lead with latency: %q", got.String())
 	}
@@ -127,7 +128,11 @@ func TestFeedScorerReportsPerFeedAndUnionBenefit(t *testing.T) {
 	if got.SecondFeed.Label != "measured worth of a second feed" {
 		t.Fatalf("second-feed label = %q", got.SecondFeed.Label)
 	}
-	want := "time_to_32nd_shred union p50=31ms p95=31ms p99=31ms\n" +
+	// p50/p95/p99 read 31.103ms rather than a round 31ms because completion times
+	// go through the bounded histogram, which reports its bucket's upper edge.
+	// TestCompletionHistogramGeometry pins that rounding; this test pins the line
+	// the customer actually reads.
+	want := "time_to_32nd_shred union p50=31.103ms p95=31.103ms p99=31.103ms\n" +
 		"union erasure sets=1 erased=0 fraction=0.000000 mean_shreds_per_set=63.00\n" +
 		"gap_ms union <1=0 1-2.4=62 2.4-7=0 7-32=0 >=32=0 reordered=0\n" +
 		"feed name=blockcast erasure sets=1 erased=1 fraction=1.000000 mean_shreds_per_set=31.00 unique_first=31 first_arrival_fraction=0.492063\n" +
@@ -256,7 +261,23 @@ func TestFeedScorerCompletionLatencyIgnoresDuplicateProcessingOrder(t *testing.T
 
 	// The floor is the early copy at t=4s and the 32nd shred lands at t=5.031s,
 	// so the set's extent is 1.031s whichever copy was processed first.
-	const want = 1031 * time.Millisecond
+	//
+	// Completion percentiles are now reported from the bounded log-linear
+	// histogram in retention.go, so the value read back is the upper edge of the
+	// bucket holding that extent rather than the extent itself -- the intended
+	// cost of not retaining every completion for the life of the run. What this
+	// test exists to pin is unaffected and is asserted directly below: the extent
+	// must not depend on which copy of the raced shred was processed first, so
+	// both orders must land in the SAME bucket.
+	const extent = 1031 * time.Millisecond
+	want := completionBucketUpperEdge(completionBucket(extent))
+	if want < extent {
+		t.Fatalf("bucket upper edge %v precedes the extent %v", want, extent)
+	}
+	if inOrder.Union.CompletionP50 != reversed.Union.CompletionP50 {
+		t.Errorf("processing order changed completion p50: %v vs %v",
+			inOrder.Union.CompletionP50, reversed.Union.CompletionP50)
+	}
 	for _, test := range []struct {
 		name    string
 		receipt UnionReceipt
@@ -597,10 +618,11 @@ func TestScorerToleratesOutOfOrderArrivalTimestamps(t *testing.T) {
 	if got.SetsTotal != 1 || got.SetsErased != 0 {
 		t.Fatalf("Receipt() = %+v, want 1 complete set", got)
 	}
-	// Extent is min..max over the 32 arrivals: 0ms .. 62ms.
-	if want := 62 * time.Millisecond; got.CompletionP50 != want {
-		t.Fatalf("CompletionP50 = %s, want %s; completion must measure the set's arrival extent, not the timestamp of whichever shred was processed 32nd", got.CompletionP50, want)
-	}
+	// Extent is min..max over the 32 arrivals: 0ms .. 62ms. The bucketing that
+	// bounds the histogram rounds up, but only to within CompletionRelativeError
+	// — far tighter than the 31ms error the bug this test guards against
+	// produced, so the assertion still discriminates.
+	assertCompletionNear(t, "CompletionP50", got.CompletionP50, 62*time.Millisecond)
 	if got.CompletionP50 < 0 {
 		t.Fatalf("CompletionP50 = %s is negative; a negative latency understates time_to_32nd_shred", got.CompletionP50)
 	}

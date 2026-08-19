@@ -186,15 +186,23 @@ func TestRetentionScalesWithArrivalRateNotSlotCount(t *testing.T) {
 	}
 }
 
-// TestDrainReleasesBurstArrivalBuffer pins resident memory to the CURRENT feed
+// TestDrainReleasesBurstScoreBuffer pins resident memory to the CURRENT feed
 // rather than to the worst burst the process ever saw.
 //
-// DrainWindow filters arrivals in place via s[:0], which reuses -- and therefore
-// retains -- the backing array. On a long-running validator that means one
-// catch-up replay sets the high-water mark and the memory is never returned,
-// even across hours of idle feed. A test asserting only len() would pass
-// against exactly that bug, so this asserts capacity.
-func TestDrainReleasesBurstArrivalBuffer(t *testing.T) {
+// DrainWindow filters the score slice in place via s[:0], which reuses -- and
+// therefore retains -- the backing array. On a long-running validator that means
+// one catch-up replay sets the high-water mark and the memory is never returned,
+// even across hours of idle feed. A test asserting only len() would pass against
+// exactly that bug, so this asserts capacity.
+//
+// This test was written against the arrival slice, which held one timestamp per
+// shred. BLO-28451 replaced that slice with the fixed-size deliveryWindow fold,
+// removing the retention outright, so there is nothing left to right-size there.
+// The score slice has the same in-place-filter shape and is still unbounded
+// between drains -- one event per completed FEC set -- so it is what
+// releaseUnused now guards and what this test now measures. Retargeted rather
+// than deleted: dropping it would leave releaseUnused with no coverage at all.
+func TestDrainReleasesBurstScoreBuffer(t *testing.T) {
 	base := time.Date(2026, 8, 18, 0, 0, 0, 0, time.UTC)
 	tracker, err := erasure.NewTracker(0, base.Add(-time.Second))
 	if err != nil {
@@ -202,25 +210,32 @@ func TestDrainReleasesBurstArrivalBuffer(t *testing.T) {
 	}
 
 	// A burst well past the shrink floor, so the backing array is forced to grow.
+	// One score event lands per completed set, i.e. per slot here, so the shred
+	// count has to exceed the floor by the shreds-per-slot factor below.
 	const burst = 40 * erasure.MinRetainedCapacityForTest
 	at := base
 	for i := range burst {
 		tracker.Observe(shred.Header{Slot: uint64(1000 + i/16), IndexWithinSet: uint8(i % 16)}, at)
 		at = at.Add(time.Microsecond)
 	}
-	peakCap := tracker.ArrivalsCapForTest()
-	if peakCap < burst/2 {
-		t.Fatalf("arrivals cap = %d after a %d-shred burst; the burst did not grow the buffer, so this test proves nothing", peakCap, burst)
+	peakCap := tracker.ScoresCapForTest()
+	// The premise, stated against the shrink floor rather than the shred count:
+	// scores accumulate per set, not per shred, so a burst/2 bound would be
+	// measuring the wrong quantity. What matters is that the array grew past the
+	// point where releaseUnused is willing to shrink it at all.
+	if peakCap <= erasure.MinRetainedCapacityForTest {
+		t.Fatalf("scores cap = %d after a %d-shred burst; the burst did not grow the buffer past the %d shrink floor, so this test proves nothing",
+			peakCap, burst, erasure.MinRetainedCapacityForTest)
 	}
 
-	// Drain past every arrival: the window keeps nothing.
+	// Drain past every score deadline: the window keeps nothing.
 	if _, err := tracker.DrainWindow(at.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 
-	drainedCap := tracker.ArrivalsCapForTest()
+	drainedCap := tracker.ScoresCapForTest()
 	if drainedCap > erasure.MinRetainedCapacityForTest {
-		t.Fatalf("arrivals cap = %d after draining a %d-shred burst, want <= %d; the burst high-water mark is still pinned",
+		t.Fatalf("scores cap = %d after draining a %d-shred burst, want <= %d; the burst high-water mark is still pinned",
 			drainedCap, burst, erasure.MinRetainedCapacityForTest)
 	}
 }

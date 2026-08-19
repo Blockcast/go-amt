@@ -543,8 +543,13 @@ func TestConcurrentProcessPacketIsRaceFreeAndOrderTolerant(t *testing.T) {
 			t.Fatalf("feed %s scored %d sets with %d erased, want %d/%d", feed.Name, feed.Receipt.SetsTotal, feed.Receipt.SetsErased, feedCount, feedCount-1)
 		}
 		// Extent is 1ms..32ms regardless of the order the shreds were presented.
-		if want := 31 * time.Millisecond; feed.Receipt.CompletionP50 != want {
-			t.Fatalf("feed %s CompletionP50 = %s, want %s; completion must measure the set's arrival extent", feed.Name, feed.Receipt.CompletionP50, want)
+		// Completion percentiles come from a bounded histogram, so the reported
+		// value is the extent rounded up to its bucket's upper edge — never
+		// below the truth, and over by at most shred.CompletionRelativeError.
+		want := 31 * time.Millisecond
+		ceiling := want + time.Duration(float64(want)*shred.CompletionRelativeError) + time.Microsecond
+		if got := feed.Receipt.CompletionP50; got < want || got > ceiling {
+			t.Fatalf("feed %s CompletionP50 = %s, want within [%s, %s]; completion must measure the set's arrival extent", feed.Name, got, want, ceiling)
 		}
 		if got := feed.Receipt.Gaps.LT1; got != 0 {
 			t.Fatalf("feed %s Gaps.LT1 = %d, want 0; regressing arrivals must not be charged to the sub-millisecond bucket", feed.Name, got)

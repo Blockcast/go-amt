@@ -105,6 +105,77 @@ first. The repair reaches only sets that are still incomplete — a set's latenc
 is frozen when its 32nd distinct shred lands — and it lowers the floor only, so
 a set whose newest counted shred was itself raced keeps a slightly wide extent.
 
+### Retention: what the receipt is exact about
+
+The receiver is a long-running process, so the scorer cannot keep per-shred state
+for the life of the run — at mainnet shred rates that is hundreds of megabytes
+per hour and no steady state. It keeps that state for a **window** past each
+arrival (`--retain`, default `2s`) and folds anything older into counters.
+
+What the window bounds is not what the receipt *counts* but what can still be
+recognised as a *repeat*:
+
+- **Exact for the whole run**, however long it runs: `sets_total`, `sets_erased`,
+  `erasure_fraction`, `mean_shreds_per_set`, `unique_shreds_total`,
+  `unique_first`, `first_arrival_fraction`, `rescued_sets`, and the `gap_ms`
+  histogram. These are counters; reclamation advances them, it does not reset
+  them. `sum(unique_first) == unique_shreds_total` holds exactly, always.
+- **Exact within the window**: which feed gets first-arrival credit for a given
+  shred. A copy arriving on a second feed with an earlier timestamp moves the
+  credit — that is what makes `first_arrival_fraction` a function of the arrivals
+  rather than of goroutine scheduling — but only while the shred's identity is
+  still retained.
+- **Given up beyond the window**: a second copy of a shred arriving more than
+  `--retain` after the first has no surviving identity to match against, so it is
+  counted as a new unique shred rather than as a duplicate. The duplicates this
+  exists to recognise are the same shred on a second feed, milliseconds apart, so
+  the default clears that by three orders of magnitude. Widen `--retain` if your
+  inputs can be seconds apart; it costs memory, and it does not affect the
+  completion-percentile ceiling below in either direction.
+
+The window is measured on the **arrival clock**, not in slots.
+`erasure/tracker.go` bounds comparable state by slot distance (two slots behind
+its frontier), which is correct for the dense live feed it scores. It is not
+correct here: in the bundled capture the observed slots are 438757867, 438758026,
+438758296, 438758365, 438758729 and 438758936 — gaps of 69 to 364 — and two of
+them arrive with slot numbers several hundred *below* their neighbours' while
+their timestamps are the newest yet seen. Scoring that capture with a
+slot-distance window discards both and moves `erasure_fraction` from 0.286 to
+0.000. A slot number is a property of the shred; "how long ago did this arrive"
+is a property of the arrival.
+
+Completion percentiles (`time_to_32nd_shred`) are the one approximation. Exact
+quantiles cannot be computed in bounded memory over an unbounded stream, so
+completions go into a fixed-size log-linear histogram and the reported value is
+the upper edge of the bucket the true value fell in: **never below the truth, and
+over by at most 0.78%** — for completions below the ladder's ceiling of
+**4.194304s**. At or above the ceiling a completion lands in a single overflow
+bucket that has no upper edge and reports its floor, so it understates instead,
+by an unbounded amount.
+
+**`--retain` does not bound this, and no window setting makes it impossible.**
+The window ages a set on its *newest* arrival, so a set that keeps receiving
+shreds is never evicted, and its first-to-32nd span is limited only by the
+inter-arrival gap staying inside the window — not by the window itself. 32
+shreds arriving 200ms apart span 6.2s at the 2s default, with every gap well
+inside it. Measured, not hypothetical.
+
+So the receipt reports the condition instead of predicting it:
+`completions_above_ceiling` counts completions that landed in the overflow
+bucket, out of `completions_total`. Any nonzero value means a percentile that
+fell among them understates and the 0.78% figure does not apply to it — the
+count and its denominator are both reported because one overflow in a million is
+a different run from half of them. The human table prints the same warning
+inline. Check it before quoting a percentile in a dispute.
+
+Every other figure on the receipt is an exact counter rather than an
+approximation — `selftest --fixture` reports the same sets, erasures, means and
+gap buckets it did before the bound existed. That is not the same as saying they
+are independent of `--retain`: as the third bullet above says, a duplicate
+arriving beyond the window is counted as a new unique shred, so the window
+decides what *counts* as a repeat even though nothing about the counting is
+approximate.
+
 `unique_first` and `first_arrival_fraction` are decided by the same arrival
 timestamps, not by which feed's goroutine reached the scorer first. When a shred
 already counted for one feed shows up on another with an earlier timestamp, the

@@ -18,6 +18,7 @@ import (
 	"github.com/google/gopacket/layers"
 	"go.uber.org/atomic"
 	"golang.org/x/net/ipv4"
+	"log/slog"
 	"net"
 	"os"
 	"syscall"
@@ -220,6 +221,21 @@ func (g *Gateway) sendTeardown(membershipQuery m.MembershipQueryMessage) error {
 
 // Open initializes the AMT gateway and performs the handshake.
 func (g *Gateway) Open() (err error) {
+	relay := relayAddrString(g.RelayAddr)
+	started := time.Now()
+
+	// Report every failure path from one place. Open's error used to be
+	// invisible in two different ways: against a silent relay it never returned
+	// at all, and when it did return, the caller was the only thing that logged
+	// it. An operator had no way to tell "AMT was never attempted" from "AMT is
+	// wedged mid-handshake" — both looked like a healthy process. See BLO-28641.
+	defer func() {
+		if err != nil {
+			slog.Warn("amt: relay handshake failed",
+				"relay", relay, "elapsed", time.Since(started), "error", err)
+		}
+	}()
+
 	g.cm = &ipv4.ControlMessage{}
 	g.conn, err = g.setupSocket()
 	if err != nil {
@@ -239,6 +255,15 @@ func (g *Gateway) Open() (err error) {
 		openTimeout = DefaultOpenTimeout
 	}
 
+	// Announce the attempt before blocking on it. Until this line existed,
+	// tcpdump was the only way to observe that AMT was being tried at all: the
+	// discovery datagram left the socket with nothing written to the log.
+	slog.Info("amt: starting relay handshake",
+		"relay", relay,
+		"group", g.GroupAddr.String(),
+		"source", g.SourceAddr.String(),
+		"timeout", openTimeout)
+
 	// Send discovery
 	if err = g.sendDiscovery(); err != nil {
 		return err
@@ -248,19 +273,35 @@ func (g *Gateway) Open() (err error) {
 	// `err` is written concurrently by the read loop below, so assigning to it
 	// from here is a data race.
 	go func() {
+		// stalled tracks whether the previous iteration already saw the relay as
+		// silent, so entering and leaving that state logs once each rather than
+		// every interval. A permanently unreachable relay would otherwise emit a
+		// line every intervalTime forever, which is the kind of noise that gets
+		// logging filtered out precisely when it is needed.
+		var stalled bool
 		for {
 			if g.leave {
 				return
 			}
 			var loopErr error
-			if time.Since(g.lastData.Load()) > g.intervalTime {
+			if idle := time.Since(g.lastData.Load()); idle > g.intervalTime {
+				if !stalled {
+					stalled = true
+					slog.Warn("amt: no data from relay, re-sending discovery",
+						"relay", relay, "idle", idle)
+				}
 				// Reset and rediscover
 				C.amt_gateway_reset(g.handle)
 				loopErr = g.sendDiscovery()
 			} else {
+				if stalled {
+					stalled = false
+					slog.Info("amt: relay data resumed", "relay", relay)
+				}
 				loopErr = g.sendRequest()
 			}
 			if loopErr != nil {
+				slog.Warn("amt: keepalive send failed", "relay", relay, "error", loopErr)
 				g.loopErr.Store(loopErr)
 			}
 			time.Sleep(g.intervalTime)
@@ -285,6 +326,7 @@ func (g *Gateway) Open() (err error) {
 		amtMessageType := determineAMTmessageType(buffer[:])
 		switch amtMessageType {
 		case m.RelayAdvertisementType:
+			slog.Debug("amt: relay advertisement received", "relay", relay)
 			err = g.handleRelayAdvertisement(buffer[:])
 		case m.MembershipQueryType:
 			// Handshake done: clear the deadline so steady-state reads are not
@@ -297,12 +339,24 @@ func (g *Gateway) Open() (err error) {
 				g.stopKeepalive()
 				return queryErr
 			}
+			slog.Info("amt: relay handshake complete",
+				"relay", relay, "elapsed", time.Since(started))
 			return nil
 		default:
 			g.stopKeepalive()
 			return fmt.Errorf("invalid response: %d", amtMessageType)
 		}
 	}
+}
+
+// relayAddrString renders the relay endpoint for log output. RelayAddr is an
+// interface and may be unset on a misconfigured gateway, so this tolerates nil
+// rather than letting a log line panic a path that is already failing.
+func relayAddrString(a net.Addr) string {
+	if a == nil {
+		return "<unset>"
+	}
+	return a.String()
 }
 
 // DefaultOpenTimeout bounds the relay handshake when Gateway.Timeout is unset.
