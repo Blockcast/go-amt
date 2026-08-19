@@ -143,6 +143,10 @@ remaining checks and reports the delivery assertion as `UNVERIFIED`.
 | `--dest-ip-ports` | *(none)* | Comma-separated validator TVU targets. Empty means score-only, no forwarding. |
 | `--http-addr` | `127.0.0.1:8080` | `/metrics` and `/healthz`. Empty disables HTTP. |
 | `--json` | off | Emit the shutdown receipt as JSON instead of a table. |
+| `--mode` | `shred` | Scoring mode. `shred` parses Solana shred headers; `generic` scores framed records by size and arrival instead — see [the D5 note](../demo/d5-payload-agnostic-receipt.md). |
+| `--source-label` | *(none)* | Required with `--mode generic`; rejected in `shred` mode. Provenance of the input, e.g. `synthetic`. Deliberately not defaulted, so a real capture cannot be scored under a synthetic label by omission. |
+| `--rights-basis` | *(none)* | Required with `--mode generic`; rejected in `shred` mode. The rights basis recorded on the receipt for the input being scored. |
+| `--health-max-age` | `30s` | `/healthz` ingress freshness window — how stale the newest arrival may be before readiness fails. Must be positive. |
 
 These are all of them. The binary parses flags with `flag.ContinueOnError`, so any
 flag not in this table is a parse error that exits non-zero — under the systemd
