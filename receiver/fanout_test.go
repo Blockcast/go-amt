@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 func TestUDPFanoutWritesByteIdenticalPacketsToEveryDestination(t *testing.T) {
@@ -305,7 +307,7 @@ func TestFanoutRotatesDestinationOrder(t *testing.T) {
 	packet := []byte{0x01, 0x02}
 	leadCounts := make(map[int]int, count)
 	for round := 0; round < count*3; round++ {
-		messages := fanout.rotatedMessages(packet)
+		messages, _ := fanout.rotatedMessages(packet)
 		if len(messages) != count {
 			t.Fatalf("round %d produced %d messages, want %d", round, len(messages), count)
 		}
@@ -419,5 +421,232 @@ func TestEnqueueAfterCloseIsNotCountedAsOverflow(t *testing.T) {
 	}
 	if got := fanout.Stats().DroppedPackets; got != 0 {
 		t.Fatalf("DroppedPackets = %d after a post-close Enqueue, want 0; shutdown must not read as ring overflow", got)
+	}
+}
+
+// TestFanoutLedgerChargesEachDestinationSeparately is the per-destination
+// accounting criterion: packets, bytes, and a counted drop site at every drop.
+//
+// The pre-existing TestFanoutCountsWriteErrorsPerDestination asserts only the
+// process-wide Stats aggregate despite its name, so nothing pinned that a
+// shortfall is attributable to the destination that caused it. A per-feed
+// EgressObserver cannot close that gap either: one feed fans out to every
+// subscriber, so feed-level counters are identical whichever destination broke.
+func TestFanoutLedgerChargesEachDestinationSeparately(t *testing.T) {
+	const packets = 5
+	good := &recordingWriter{}
+	bad := &errorWriter{err: errors.New("destination unavailable")}
+	fanout, err := NewFanout([]io.WriteCloser{good, bad}, packets, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packet := []byte("shred-payload")
+	for i := 0; i < packets; i++ {
+		if fanout.Enqueue("feed", packet) != EnqueueAccepted {
+			t.Fatalf("packet %d dropped with a sized ring", i)
+		}
+	}
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ledger := fanout.DestinationStats()
+	if len(ledger) != 2 {
+		t.Fatalf("ledger has %d entries, want 2", len(ledger))
+	}
+
+	wantBytes := uint64(packets * len(packet))
+	if got := ledger[0]; got.Packets != packets || got.Bytes != wantBytes || got.Drops != 0 || got.WriteErrors != 0 {
+		t.Errorf("healthy destination = %+v, want packets=%d bytes=%d drops=0 errors=0", got, packets, wantBytes)
+	}
+	if got := ledger[1]; got.Packets != 0 || got.Bytes != 0 || got.Drops != packets || got.WriteErrors != packets {
+		t.Errorf("broken destination = %+v, want packets=0 bytes=0 drops=%d errors=%d", got, packets, packets)
+	}
+}
+
+// TestFanoutLedgerHoldsThePacketsPlusDropsInvariant pins the property that
+// makes the ledger auditable: every destination accounts for every packet the
+// worker processed, as either a delivery or a drop. A per-destination
+// shortfall therefore cannot hide as a process-wide average.
+func TestFanoutLedgerHoldsThePacketsPlusDropsInvariant(t *testing.T) {
+	const packets = 7
+	writers := []io.WriteCloser{
+		&recordingWriter{},
+		&errorWriter{err: errors.New("down")},
+		&recordingWriter{},
+	}
+	fanout, err := NewFanout(writers, packets, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < packets; i++ {
+		if fanout.Enqueue("feed", []byte("x")) != EnqueueAccepted {
+			t.Fatalf("packet %d dropped", i)
+		}
+	}
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for index, stat := range fanout.DestinationStats() {
+		if total := stat.Packets + stat.Drops; total != packets {
+			t.Errorf("destination %d: packets+drops = %d, want %d (%+v)", index, total, packets, stat)
+		}
+		if stat.WriteErrors > stat.Drops {
+			t.Errorf("destination %d: write errors %d exceed drops %d", index, stat.WriteErrors, stat.Drops)
+		}
+	}
+}
+
+// TestUDPFanoutLedgerIsExactUnderRotation is the regression guard for the
+// batch-slot-versus-destination-index mapping. rotatedMessages reorders each
+// batch, so charging the ledger by batch slot would walk a destination's
+// counts onto its neighbours one position per packet. With every destination
+// healthy the smearing bug and the correct mapping differ only in that the
+// buggy version misattributes, so exact equal counts are the assertion.
+func TestUDPFanoutLedgerIsExactUnderRotation(t *testing.T) {
+	const (
+		destinations = 4
+		packets      = destinations * 3
+	)
+	listeners := make([]*net.UDPConn, destinations)
+	addresses := make([]string, destinations)
+	for i := range listeners {
+		conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		listeners[i] = conn
+		addresses[i] = conn.LocalAddr().String()
+		defer conn.Close()
+	}
+
+	fanout, err := NewUDPFanout(addresses, packets, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	packet := []byte{0xde, 0xad, 0xbe, 0xef}
+	for i := 0; i < packets; i++ {
+		if fanout.Enqueue("feed", packet) != EnqueueAccepted {
+			t.Fatalf("packet %d dropped with a sized ring", i)
+		}
+	}
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantBytes := uint64(packets * len(packet))
+	for index, stat := range fanout.DestinationStats() {
+		if stat.Destination != addresses[index] {
+			t.Errorf("ledger entry %d names %q, want %q", index, stat.Destination, addresses[index])
+		}
+		if stat.Packets != packets || stat.Bytes != wantBytes || stat.Drops != 0 {
+			t.Errorf("destination %d = %+v, want packets=%d bytes=%d drops=0", index, stat, packets, wantBytes)
+		}
+	}
+}
+
+// TestUDPFanoutLedgerLocalisesTheBrokenDestination is the real regression
+// guard for the batch-slot-versus-destination-index mapping.
+//
+// It needs a PARTIAL send to bite. With every destination healthy each slot is
+// charged once per batch and each destination appears once per batch, so
+// slot-charging and destination-charging produce identical totals and a
+// healthy-path test proves nothing. Only when sendmmsg stops early do the two
+// diverge: charging by slot would report that the first slots always succeed
+// and the last always drop — pinning blame to a fixed POSITION while rotation
+// walks a different subscriber through that position every packet.
+//
+// Here destination 2 is the broken one. Correct attribution charges every
+// write error to destination 2 whatever slot it occupied; the slot-charging
+// bug spreads those errors across all four.
+//
+// The two subtests model the two DIFFERENT contracts a partial send can
+// present, because they disagree on the error and only one of them is
+// production on Linux:
+//
+//   - sendmmsg reports the count with errno 0, so ipv4.WriteBatch returns
+//     (slot, nil). This is the Linux path. A blame rule that requires a
+//     non-nil error is dead here — which is the defect this pair pins.
+//   - the non-Linux writeUDPPacketBatch loop returns (slot, err) with the
+//     failing message at index slot.
+//
+// Blame must localise to destination 2 under BOTH. Covering only the
+// error-returning shape passes green while the Linux path silently records
+// nothing.
+func TestUDPFanoutLedgerLocalisesTheBrokenDestination(t *testing.T) {
+	const (
+		count  = 4
+		broken = 2
+		rounds = count * 3
+	)
+
+	for _, contract := range []struct {
+		name string
+		// err is what the batch writer returns alongside the short count.
+		err error
+	}{
+		{name: "linux_sendmmsg_reports_count_with_no_error", err: nil},
+		{name: "non_linux_loop_reports_count_with_error", err: errors.New("destination unavailable")},
+	} {
+		t.Run(contract.name, func(t *testing.T) {
+			fanout := &Fanout{udpDest: make([]*net.UDPAddr, count)}
+			// deliver branches on udpConn, so the UDP path needs a real socket
+			// even though the stubbed sendBatch never writes to it.
+			conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			fanout.udpConn = ipv4.NewPacketConn(conn)
+
+			names := make([]string, count)
+			for i := range fanout.udpDest {
+				fanout.udpDest[i] = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20000 + i}
+				names[i] = fanout.udpDest[i].String()
+			}
+			// Stop the batch at whichever slot carries the broken destination,
+			// which is where both contracts agree the first failure lands.
+			fanout.sendBatch = func(_ *ipv4.PacketConn, messages []ipv4.Message, _ bool) (int, error) {
+				for slot, message := range messages {
+					if message.Addr.(*net.UDPAddr).Port-20000 == broken {
+						return slot, contract.err
+					}
+				}
+				return len(messages), nil
+			}
+			fanout.initDestinations(names)
+
+			for round := 0; round < rounds; round++ {
+				fanout.deliver([]byte("shred"))
+			}
+
+			for index, stat := range fanout.DestinationStats() {
+				if index == broken {
+					if stat.WriteErrors != rounds {
+						t.Errorf("broken destination %d took %d write errors over %d packets, want %d (%+v)",
+							index, stat.WriteErrors, rounds, rounds, stat)
+					}
+					if stat.Packets != 0 {
+						t.Errorf("broken destination %d was credited %d deliveries, want 0", index, stat.Packets)
+					}
+					continue
+				}
+				if stat.WriteErrors != 0 {
+					t.Errorf("healthy destination %d took %d write errors; blame is following batch position, not destination (%+v)",
+						index, stat.WriteErrors, stat)
+				}
+			}
+
+			// The invariant still holds on the partial-send path: unattempted
+			// destinations are dropped, just not blamed.
+			for index, stat := range fanout.DestinationStats() {
+				if total := stat.Packets + stat.Drops; total != rounds {
+					t.Errorf("destination %d: packets+drops = %d, want %d (%+v)", index, total, rounds, stat)
+				}
+			}
+		})
 	}
 }
