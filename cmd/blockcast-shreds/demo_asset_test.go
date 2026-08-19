@@ -77,6 +77,14 @@ func TestDemoAssetMakesNoProhibitedClaim(t *testing.T) {
 
 // The receipt quoted in the asset must be the one the code actually produces.
 // A demo asset whose numbers have drifted from the binary is worse than none.
+//
+// Caveat this test cannot close on its own: the literals below are a second
+// copy of the golden, not a derivation of it. This asserts asset-vs-literal;
+// literal-vs-code is asserted by TestGenericFixtureReceiptIsDeterministic in
+// the shred package. So a spec change has to move three things in lockstep —
+// that golden, the asset, and these strings — and nothing here will catch it if
+// only two of the three move. Deriving these from a ReplayGenericFixture receipt
+// would collapse them to one.
 func TestDemoAssetQuotesTheFixtureReceipt(t *testing.T) {
 	asset := readDemoAsset(t)
 	for _, line := range []string{

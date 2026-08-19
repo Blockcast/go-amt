@@ -4,7 +4,10 @@
 
 **"the same delivery receipt, on a payload that isn't shreds"**
 
-That sentence is the whole claim. Everything below either supports it or bounds it.
+The payload is a synthetic feed we generate ourselves; it contains no
+third-party content. The claim is about the receipt, not about any feed we
+hold or could obtain. That sentence is the whole claim — everything below
+either supports it or bounds it.
 
 ## Three modes of one prototype
 
@@ -22,8 +25,11 @@ The point of showing all three together is the *sameness*, not the variety. The
 gap histogram and percentile code paths are shared source, not
 reimplementations — the two scorers call the same `GapHistogram.observe` and
 `percentile`, so the modes cannot drift into reporting differently-computed
-numbers. D5 exists to show that the measurement is a property of the rail, not
-of the payload.
+numbers. D5 exists to show that the measurement depends on the framing a feed
+carries — a monotonic sequence, a declared window length, a receive-side arrival
+instant — and not on that payload being shreds. The scorer never interprets the
+record body. Any feed carrying that framing can be scored; a feed without it
+cannot.
 
 ## What was run
 
@@ -57,15 +63,18 @@ The loss figures — `expected=192 received=186`, `interior=3 trailing=3
 duplicates=2 out_of_order=2` — are identical to the in-process fixture replay
 (`selftest --generic`). That identity is the useful part: the anomalies are
 baked into the synthetic feed, the transport delivered every datagram it was
-given (`send_errors=0`, `packets_in == packets_out`), and the scoring is
-therefore transport-independent. The timing lines differ between the two runs,
+given (`send_errors=0`, `packets_in == packets_out`), and the loss figures are
+therefore attributable to the feed rather than to the path. The timing lines
+differ between the two runs,
 and should: those are real wire arrivals rather than fixture timestamps.
 
 > **Note on the `gap_ms` line above.** This receipt was captured before the
 > duplicate-gap correction: at the time, a duplicate arrival did not advance the
 > scorer's last-arrival mark, so the next distinct record's gap spanned two
 > intervals. The histogram therefore accounts for 185 gaps across 188 arrivals
-> rather than 187, with two entries pushed one bucket high. The correction
+> rather than 187, with the two gaps that follow a duplicate each reported at
+> roughly twice their true length — enough to place an entry one bucket high,
+> depending on where in its bucket the true gap fell. The correction
 > touches only the arrival-gap distribution — every loss and completeness figure
 > quoted above is unaffected, which is why they still match the fixture replay
 > exactly. The line is left as captured rather than rewritten, because it is a
