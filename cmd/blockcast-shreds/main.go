@@ -50,7 +50,9 @@ ingress freshness window.
 past each arrival, so the receiver reaches a steady state instead of growing
 for as long as it runs. The receipt still covers the whole run; the window is
 how long a second copy of a shred can still be recognised as a duplicate.
-See the README.`
+Widening it past the completion histogram's ceiling makes completion
+percentiles at or above that ceiling understate with no bound, and warns at
+startup; every other figure stays exact at any window. See the README.`
 
 // sessionScorer is the seam that keeps shred mode and generic mode one client.
 // Both modes are selected once at construction; the packet loop below has no
@@ -157,7 +159,42 @@ func run(args []string) error {
 	if *retention <= 0 {
 		return fmt.Errorf("--retain must be positive, got %s", *retention)
 	}
+	// Warn rather than reject above the histogram's ceiling. Widening the window
+	// past it degrades exactly one number — completion percentiles, which stop
+	// being bounded above and report the overflow floor instead, understating
+	// with no bound. Everything else the receipt carries (dedup, erasure, gaps,
+	// means) stays exact at any window, and recognising cross-feed duplicates is
+	// what --retain is primarily for, so refusing to run would trade a
+	// percentile caveat for a service that will not start. The operator who
+	// followed "widen --retain if your inputs can be seconds apart" learns the
+	// cost here, at the point of use, rather than from shred/retention.go.
+	if warning := retentionWarning(*retention); warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
 	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON, *retention, mode, sourceLabel, rightsBasis)
+}
+
+// retentionWarning returns the operator warning for a retention window that
+// outreaches the completion histogram's ladder, or "" when the window is inside
+// it.
+//
+// Split out from run so it can be tested without starting a receiver. run's
+// only above-ceiling path is a VALID configuration, so a test that drove this
+// through run would parse successfully, fall through to listenAndScore, bind
+// sockets and block until the package test timeout — the same failure shape
+// TestUndefinedFlagIsRejected hit when --retain became real. A pure function
+// makes the warning assertable without ever reaching that path.
+func retentionWarning(window time.Duration) string {
+	if window < shred.CompletionCeiling {
+		return ""
+	}
+	return fmt.Sprintf(
+		"blockcast-shreds: warning: --retain %s is at or above the completion "+
+			"histogram's ceiling (%s), so a completion at or above that ceiling is "+
+			"reported AS the ceiling and understates, with no bound. The receipt's "+
+			"stated %.2f%% error applies below the ceiling only; every other figure "+
+			"is exact at any window.",
+		window, shred.CompletionCeiling, shred.CompletionRelativeError*100)
 }
 
 func selftest(args []string) error {

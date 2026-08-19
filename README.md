@@ -130,7 +130,8 @@ recognised as a *repeat*:
   counted as a new unique shred rather than as a duplicate. The duplicates this
   exists to recognise are the same shred on a second feed, milliseconds apart, so
   the default clears that by three orders of magnitude. Widen `--retain` if your
-  inputs can be seconds apart.
+  inputs can be seconds apart — but see the completion-percentile ceiling below
+  before widening past ~4.19s.
 
 The window is measured on the **arrival clock**, not in slots.
 `erasure/tracker.go` bounds comparable state by slot distance (two slots behind
@@ -147,7 +148,14 @@ Completion percentiles (`time_to_32nd_shred`) are the one approximation. Exact
 quantiles cannot be computed in bounded memory over an unbounded stream, so
 completions go into a fixed-size log-linear histogram and the reported value is
 the upper edge of the bucket the true value fell in: **never below the truth, and
-over by at most 0.78%**. Everything else is unchanged by retention — `selftest
+over by at most 0.78%** — for completions below the ladder's ceiling of
+**4.194304s**. That ceiling is above the 2s default with a compile-time check, so
+the default window cannot reach it. A widened `--retain` can: at or above the
+ceiling a completion lands in a single overflow bucket that has no upper edge and
+reports its floor, so it understates, and by an unbounded amount rather than
+0.78% — at `--retain 8s` a 6s completion reports 4.194304s. The binary warns at
+startup when the window outreaches the ladder. Everything else the receipt
+carries is exact at any window, and is unchanged by retention — `selftest
 --fixture` reports the same sets, erasures, means and gap buckets it did before
 the bound existed.
 

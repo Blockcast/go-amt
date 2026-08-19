@@ -102,26 +102,34 @@ const (
 	// 256 uint64 (2 KiB) and buy 4.19s of headroom over a user-settable window.
 	completionOctaves     = 15
 	completionBucketCount = (completionOctaves + 1) * completionSubBuckets
-	// completionCeiling is the largest duration the ladder resolves. At or above
+	// CompletionCeiling is the largest duration the ladder resolves. At or above
 	// it a completion lands in the overflow bucket, whose reported value is this
 	// same number — a LOWER bound, unlike every other bucket's upper edge.
-	completionCeiling = time.Duration(uint64(1)<<(completionOctaves+completionSubBucketBits)) * time.Microsecond
+	//
+	// Exported for the same reason as CompletionRelativeError: the accuracy
+	// claim has a boundary, and a caller that lets an operator widen the
+	// retention window past it needs to be able to say so. See the --retain
+	// check in cmd/blockcast-shreds.
+	CompletionCeiling = time.Duration(uint64(1)<<(completionOctaves+completionSubBucketBits)) * time.Microsecond
 	// completionOverflow is the index of the single unbounded tail bucket.
 	completionOverflow = completionBucketCount
 	// CompletionRelativeError is the worst-case fractional overstatement of a
 	// reported completion percentile, exposed so the receipt's accuracy is a
 	// documented number rather than folklore. It bounds the bucketed range
 	// only: a percentile falling in the overflow bucket (at or above
-	// completionCeiling) is reported as that floor and understates instead,
+	// CompletionCeiling) is reported as that floor and understates instead,
 	// with no bound. See completionHistogram.
 	CompletionRelativeError = 1.0 / float64(completionSubBuckets)
 )
 
 // Compile-time proof that the ladder outreaches the default retention window.
 // A constant negative difference does not convert to uint, so raising
-// DefaultRetention past completionCeiling fails the build instead of silently
+// DefaultRetention past CompletionCeiling fails the build instead of silently
 // reintroducing the understatement this constant was widened to remove.
-const _ = uint(completionCeiling - DefaultRetention)
+//
+// Named rather than blank so that the thing it protects is legible at the point
+// anyone would delete it: a bare `const _` reads as leftover scaffolding.
+const _completionCeilingCoversDefaultRetention = uint(CompletionCeiling - DefaultRetention)
 
 // completionHistogram is a bounded distribution of FEC-set completion
 // durations.
@@ -133,9 +141,9 @@ const _ = uint(completionCeiling - DefaultRetention)
 // less than the truth, and over by at most CompletionRelativeError.
 //
 // One exception, and it is the only one: a completion at or above
-// completionCeiling lands in the overflow bucket, which has no upper edge and
+// CompletionCeiling lands in the overflow bucket, which has no upper edge and
 // reports its floor. That value is a LOWER bound, so a percentile that lands
-// there understates. completionCeiling is kept above DefaultRetention (with a
+// there understates. CompletionCeiling is kept above DefaultRetention (with a
 // compile-time check) so this cannot happen at the default window, but a large
 // enough --retain can still reach it.
 type completionHistogram struct {
@@ -181,7 +189,7 @@ func completionBucketUpperEdge(index int) time.Duration {
 		// The overflow bucket has no upper edge; report its floor, which is the
 		// strongest statement that remains true. This is the one bucket whose
 		// reported value can be BELOW the observation — see completionHistogram.
-		return completionCeiling
+		return CompletionCeiling
 	}
 	if index < completionSubBuckets {
 		return time.Duration(index) * time.Microsecond

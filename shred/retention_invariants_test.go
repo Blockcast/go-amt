@@ -49,6 +49,31 @@ func TestNoFeedCountsMoreSetsThanTheUnion(t *testing.T) {
 				"universe is a subset of the union's, so this means a set was counted twice",
 				feed.Name, feed.Receipt.SetsTotal, receipt.Union.SetsTotal)
 		}
+		// The other half of the same invariant. Containment on SetsTotal catches a
+		// feed knowing more sets than the union, but not its erasure count drifting
+		// within that bound — and erasure is the number the SLA is argued over. A
+		// feed sees a subset of the union's shreds for every set, so its distinct
+		// count per set can only be lower, so a set the union calls erased cannot
+		// be complete on a feed: erasures are monotone the other way from totals.
+		// A feed reporting FEWER erasures than the union would mean a feed saw a
+		// shred the union did not.
+		if feed.Receipt.SetsErased < receipt.Union.SetsErased {
+			t.Errorf("feed %q SetsErased = %d but the union erased %d: a feed sees a "+
+				"subset of each set's shreds, so it cannot complete a set the union "+
+				"could not", feed.Name, feed.Receipt.SetsErased, receipt.Union.SetsErased)
+		}
+		if feed.Receipt.ErasureFraction < receipt.Union.ErasureFraction {
+			t.Errorf("feed %q ErasureFraction = %.6f, below the union's %.6f: "+
+				"GapClosed is defined as feed-minus-union, so this would report a "+
+				"negative gap and read as multicast having lost ground",
+				feed.Name, feed.Receipt.ErasureFraction, receipt.Union.ErasureFraction)
+		}
+		if feed.Receipt.MeanShredsPerSet > receipt.Union.MeanShredsPerSet {
+			t.Errorf("feed %q MeanShredsPerSet = %.4f above the union's %.4f over the "+
+				"same set universe, so the feed is credited with shreds the union "+
+				"never counted", feed.Name, feed.Receipt.MeanShredsPerSet,
+				receipt.Union.MeanShredsPerSet)
+		}
 	}
 }
 
@@ -107,10 +132,10 @@ func TestUniqueFirstPartitionsUniqueShredsAcrossEviction(t *testing.T) {
 // completion of 1.8s reported 1.048576s — understated by 42%, against three
 // separate docs promising "never below the truth".
 func TestCompletionWithinTheRetentionWindowIsNeverUnderstated(t *testing.T) {
-	if completionCeiling <= DefaultRetention {
-		t.Fatalf("completionCeiling %s must exceed DefaultRetention %s, or completions "+
+	if CompletionCeiling <= DefaultRetention {
+		t.Fatalf("CompletionCeiling %s must exceed DefaultRetention %s, or completions "+
 			"inside the permitted window land in the overflow bucket and understate",
-			completionCeiling, DefaultRetention)
+			CompletionCeiling, DefaultRetention)
 	}
 	for _, completed := range []time.Duration{
 		1500 * time.Millisecond,
@@ -122,6 +147,42 @@ func TestCompletionWithinTheRetentionWindowIsNeverUnderstated(t *testing.T) {
 		histogram.observe(completed)
 		if got := histogram.percentile(100); got < completed {
 			t.Errorf("completion %s reported as %s, which is BELOW the truth", completed, got)
+		}
+	}
+}
+
+// TestCompletionAboveTheCeilingUnderstatesAndIsDocumented is the other side of
+// the guarantee above, and exists because the guarantee is conditional while the
+// docs once stated it flat.
+//
+// --retain is validated for positivity only, so an operator can widen the window
+// past CompletionCeiling — and the README explicitly advises widening it when
+// feeds can be seconds apart. Above the ceiling every completion collapses into
+// the overflow bucket, which reports its floor, so the error flips direction and
+// loses its bound: a 6s completion reports 4.194304s, a ~30% understatement
+// against a documented 0.78% overstatement. That is intended behaviour for a
+// bounded histogram; what is not acceptable is claiming otherwise, so this test
+// pins the direction of the error rather than pretending it cannot happen.
+func TestCompletionAboveTheCeilingUnderstatesAndIsDocumented(t *testing.T) {
+	for _, completed := range []time.Duration{
+		CompletionCeiling,
+		CompletionCeiling + time.Microsecond,
+		6 * time.Second,
+		30 * time.Second,
+	} {
+		var histogram completionHistogram
+		histogram.observe(completed)
+		got := histogram.percentile(100)
+		if got != CompletionCeiling {
+			t.Errorf("completion %s reported as %s, want the overflow floor %s: the "+
+				"overflow bucket is the documented exception and must report the "+
+				"ceiling, not an invented upper edge", completed, got, CompletionCeiling)
+		}
+		if completed > CompletionCeiling && got >= completed {
+			t.Errorf("completion %s reported as %s, which is not below the truth: this "+
+				"test exists to pin that the overflow bucket understates, so if it now "+
+				"holds the never-understate guarantee the docs and the --retain warning "+
+				"in cmd/blockcast-shreds are both stale", completed, got)
 		}
 	}
 }
