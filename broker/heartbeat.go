@@ -20,6 +20,7 @@
 package broker
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -50,6 +51,29 @@ const (
 	// use their default ISO-8601 output — JavaScript's toISOString() emits
 	// ".000Z" and Python's isoformat() emits "+00:00", and both are rejected.
 	// Go producers should call FormatTimestamp instead of formatting inline.
+	//
+	// The gap_ms_hist keys are the second Go-specific spelling, and unlike the
+	// timestamp rule this one CANNOT be enforced by validation. Two of the five
+	// fixed bucket names contain < and >, which encoding/json escapes by
+	// default, so they appear on the wire as "\u003c1" and "\u003e=32" — never
+	// as the raw characters. A producer that emits the semantically identical
+	// "<1" and ">=32" (the default byte form for JavaScript, Python, Rust, and
+	// for a Go producer using json.Encoder with SetEscapeHTML(false)) decodes
+	// to exactly the same document and passes every check here, yet is not
+	// byte-identical.
+	//
+	// Because validation operates on decoded structs, it is structurally blind
+	// to this: there is no check that could reject the unescaped form. Byte
+	// diffability is therefore a BROKER obligation, not a producer one — the
+	// ledger canonicalizes on ingest by re-encoding through CanonicalBytes
+	// rather than diffing the bytes as received. Producers are not required to
+	// match Go's escaping, and are not penalized for failing to. See
+	// CanonicalBytes for the single implementation both sides share.
+	//
+	// Ingest bounds are declared together on this contract so a producer can
+	// discover them without reading the validator: at most MaxFeeds feed
+	// reports per heartbeat, at most MaxVersionBytes in version, and at most
+	// MaxFeedIDBytes in each feed_id.
 	HeartbeatSchema = "blockcast.shred-gw-heartbeat.v1"
 
 	// HeartbeatInterval is the fixed v1 emission cadence.
@@ -62,19 +86,45 @@ const (
 
 	// erasureFractionEpsilon bounds the disagreement tolerated between a
 	// reported ErasureFraction and the ratio recomputed from the two integers
-	// it derives from. A Go producer using erasure.Fraction agrees exactly;
-	// the tolerance exists for producers that serialise fewer significant
-	// digits than a float64 round-trips.
-	erasureFractionEpsilon = 1e-9
+	// it derives from.
+	//
+	// A Go producer using erasure.Fraction agrees exactly. The tolerance exists
+	// for producers that serialize the ratio at fixed decimal precision, whose
+	// worst-case rounding error is half an ulp of the last place they emit:
+	// 5e-7 for the %.6f / toFixed(6) / round(x, 6) that a non-Go producer
+	// reaches for by default. At 1e-6 that case is admitted, which is what the
+	// rationale above claims; the previous 1e-9 admitted only ~10-significant-
+	// digit output and rejected six-decimal producers for most ratios (1/3 and
+	// 2/7 among them).
+	//
+	// It cannot mask a wrong integer. The smallest nonzero disagreement a
+	// miscounted set can produce is 1/SetsTotal, so for 1e-6 to hide an
+	// off-by-one the window would need SetsTotal > 1e6 — over 33,000 scored FEC
+	// sets per second across a 30s window, orders of magnitude beyond the shred
+	// rate this receiver observes. See MinFractionDecimalPlaces.
+	erasureFractionEpsilon = 1e-6
 
-	maxVersionBytes = 128
-	maxFeedIDBytes  = 128
+	// MinFractionDecimalPlaces is the precision erasure_fraction must carry to
+	// survive ingest: a producer emitting fewer decimal places than this will
+	// be rejected for disagreeing with its own sets_erased / sets_total. Go
+	// producers should call erasure.Fraction and are float64-exact.
+	MinFractionDecimalPlaces = 6
 
-	// maxFeeds bounds the per-heartbeat fan-out. The real defence against an
+	// MaxVersionBytes bounds the version string.
+	MaxVersionBytes = 128
+
+	// MaxFeedIDBytes bounds each feed_id.
+	MaxFeedIDBytes = 128
+
+	// MaxFeeds bounds the per-heartbeat fan-out. The real defence against an
 	// oversized body is a transport-level limit, which does not exist yet on
 	// the ingest side; this keeps every ingest bound declared in one place and
 	// documents the expected order of magnitude.
-	maxFeeds = 4096
+	//
+	// Exported because a gateway with more feeds than this is rejected, and a
+	// non-Go producer has no other way to discover the bound it is being held
+	// to.
+	MaxFeeds = 4096
 )
 
 // ErrInvalidHeartbeat wraps every validation failure so callers can match the
@@ -127,12 +177,44 @@ type FeedReport struct {
 // a pure function of the payload and cannot see the receive time, so deciding
 // how stale a heartbeat may be — and how far a gateway's clock may drift — is
 // the broker's policy call at ingest, not this contract's.
+//
+// Decoding into this struct is NOT verbatim retention. The decode is
+// deliberately permissive — a field a newer gateway adds is dropped silently
+// rather than rejected, because refusing to parse would stop a v2 gateway
+// heartbeating to a v1 broker at all, a worse failure for a liveness message.
+// The consequence is that re-encoding a decoded Heartbeat cannot reproduce an
+// unknown field that was never retained. W4a must persist the raw request body
+// (json.RawMessage or the untouched bytes) if it needs the object back exactly
+// as sent; CanonicalBytes is for diffing, not for archival.
 type Heartbeat struct {
 	Schema  string       `json:"schema"`
 	GWUUID  string       `json:"gw_uuid"`
 	Version string       `json:"version"`
 	SentAt  string       `json:"sent_at"`
 	Feeds   []FeedReport `json:"feeds"`
+}
+
+// CanonicalBytes renders hb in the one byte form the broker's ledger diffs
+// against, and is the single implementation both sides share.
+//
+// It exists because byte diffability cannot be a producer obligation: the
+// gap_ms_hist keys contain < and >, encoding/json escapes them by default, and
+// a producer in any other language emits the unescaped spelling. Both decode to
+// the same document and both pass ValidateHeartbeat — validation operates on
+// decoded structs and is structurally blind to escaping — so a ledger that
+// diffed raw received bytes would report two identical reports as different,
+// with nothing for the producer to have done differently and no check able to
+// warn it. Canonicalizing on ingest removes the hazard for every producer at
+// once.
+//
+// Callers should validate before storing what this returns: it canonicalizes
+// spelling, not content.
+func CanonicalBytes(hb Heartbeat) ([]byte, error) {
+	encoded, err := json.Marshal(hb)
+	if err != nil {
+		return nil, fmt.Errorf("%w: canonicalizing heartbeat: %s", ErrInvalidHeartbeat, err)
+	}
+	return encoded, nil
 }
 
 // ValidateHeartbeat rejects non-canonical or incomplete wire data.
@@ -153,20 +235,20 @@ func ValidateHeartbeat(hb Heartbeat) error {
 		return invalid("gw_uuid must be a canonical, non-nil, lowercase UUID: %s", err)
 	}
 	// An empty version is not a degraded heartbeat, it is an unrecallable one.
-	if hb.Version == "" || !utf8.ValidString(hb.Version) || len(hb.Version) > maxVersionBytes {
-		return invalid("version must be non-empty, valid UTF-8, and at most %d bytes", maxVersionBytes)
+	if hb.Version == "" || !utf8.ValidString(hb.Version) || len(hb.Version) > MaxVersionBytes {
+		return invalid("version must be non-empty, valid UTF-8, and at most %d bytes", MaxVersionBytes)
 	}
 	if _, err := parseCanonicalUTCTimestamp(hb.SentAt); err != nil {
 		return invalid("sent_at must be a canonical UTC timestamp: %s", canonicalTimestampRule)
 	}
-	if len(hb.Feeds) > maxFeeds {
-		return invalid("feeds must contain at most %d entries, got %d", maxFeeds, len(hb.Feeds))
+	if len(hb.Feeds) > MaxFeeds {
+		return invalid("feeds must contain at most %d entries, got %d", MaxFeeds, len(hb.Feeds))
 	}
 
 	var previousFeedID string
 	for i, feed := range hb.Feeds {
-		if feed.FeedID == "" || !utf8.ValidString(feed.FeedID) || len(feed.FeedID) > maxFeedIDBytes {
-			return invalid("feeds[%d].feed_id must be non-empty, valid UTF-8, and at most %d bytes", i, maxFeedIDBytes)
+		if feed.FeedID == "" || !utf8.ValidString(feed.FeedID) || len(feed.FeedID) > MaxFeedIDBytes {
+			return invalid("feeds[%d].feed_id must be non-empty, valid UTF-8, and at most %d bytes", i, MaxFeedIDBytes)
 		}
 		// Sorted-and-strictly-increasing rejects duplicates and unsorted input
 		// in one comparison. Duplicates matter independently of ordering: two
