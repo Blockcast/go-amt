@@ -152,10 +152,12 @@ jobs:
               rc=1
             }
           done
-          printf '%s\n' "$tst" | grep -qxF gateway_timeout_test.go || {
-            echo "::error::gateway_timeout_test.go is not in the test selection; the Gateway.Open guard is not running"
-            rc=1
-          }
+          for t in gateway_timeout_test.go gateway_logging_test.go; do
+            printf '%s\n' "$tst" | grep -qxF "$t" || {
+              echo "::error::$t is not in the test selection; the Gateway.Open guards are not running"
+              rc=1
+            }
+          done
           exit $rc
 
       # Known-failing on the cgo path only, tracked in BLO-28805. Two distinct
@@ -211,9 +213,10 @@ jobs:
           # the loop to run either way, then fail on the captured status.
           rc=0
           go test -v -count=1 \
-            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault' \
+            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress' \
             . 2>&1 | tee /tmp/cgo-test.log || rc=$?
-          for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault; do
+          for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault \
+                   TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress; do
             grep -qF -- "--- PASS: $t" /tmp/cgo-test.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
