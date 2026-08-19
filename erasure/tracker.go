@@ -182,7 +182,7 @@ func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 		retainedScores = append(retainedScores, event)
 	}
 	t.scores = retainedScores
-	window.ErasureFraction = fraction(window.SetsErased, window.SetsTotal)
+	window.ErasureFraction = Fraction(window.SetsErased, window.SetsTotal)
 
 	retainedArrivals := t.arrivals[:0]
 	rateBuckets := make(map[int64]uint64)
@@ -255,7 +255,14 @@ func (h *GapHistogram) observe(gap time.Duration) {
 	}
 }
 
-func fraction(numerator, denominator uint64) float64 {
+// Fraction is the erased-set ratio carried in Window.ErasureFraction.
+//
+// It is exported so that a consumer validating an untrusted Window recomputes
+// the ratio with the same implementation that produced it, rather than a second
+// spelling that could disagree at the edges. A zero denominator yields 0: a
+// window that scored no sets has no erasure, which is distinct from a window
+// that scored sets and erased none only in SetsTotal.
+func Fraction(numerator, denominator uint64) float64 {
 	if denominator == 0 {
 		return 0
 	}

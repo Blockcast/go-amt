@@ -3,6 +3,7 @@ package broker
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"reflect"
 	"strings"
 	"testing"
@@ -103,29 +104,94 @@ func TestHeartbeatSerializesTheExactContract(t *testing.T) {
 	}
 }
 
-// TestHeartbeatRoundTripsThroughTheWire guards the consumer half: a broker
-// that decodes and re-encodes must get the same bytes back, which is what lets
-// W4a retain the object verbatim in a JSONB column.
-func TestHeartbeatRoundTripsThroughTheWire(t *testing.T) {
-	original, err := json.Marshal(validHeartbeat())
+// canonicalWire is the exact serialization of validHeartbeat(), written out by
+// hand rather than produced by json.Marshal.
+//
+// Pinning the literal bytes is the point: a test that marshals and compares
+// against its own output cannot fail, because encoding/json emits fields in
+// declaration order both times. Only an external expectation catches a
+// reordered struct, a renamed tag, or a changed number format.
+//
+// Note the < and > escapes: encoding/json HTML-escapes < and > in the
+// histogram keys by default. Those escapes are part of the canonical byte form
+// this contract freezes. Any producer that emits the semantically identical
+// literal "<1" and ">=32" — including a Go producer using json.Encoder with
+// SetEscapeHTML(false) — decodes to the same document but does NOT match
+// byte-for-byte, which is what the ledger's diffability rests on.
+const canonicalWire = `{"schema":"blockcast.shred-gw-heartbeat.v1","gw_uuid":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","version":"v1.4.0","sent_at":"2026-08-18T06:00:00Z","feeds":[{"feed_id":"feed-a","packets":1200,"bytes":1440000,"first_packet_at":"2026-08-18T05:59:30Z","last_packet_at":"2026-08-18T05:59:59.5Z","erasure":{"sets_total":50,"sets_erased":2,"erasure_fraction":0.04,"r_mean":40,"r_peak_100ms":60,"gap_ms_hist":{"\u003c1":7,"1-2.4":5,"2.4-7":3,"7-32":1,"\u003e=32":1},"grace_ms":400,"schema":1}}]}`
+
+// TestHeartbeatMarshalsToTheCanonicalBytes pins the wire form against a
+// hand-written literal, so a change to field order, tag spelling, or escaping
+// fails here rather than silently redefining the contract.
+func TestHeartbeatMarshalsToTheCanonicalBytes(t *testing.T) {
+	encoded, err := json.Marshal(validHeartbeat())
 	if err != nil {
 		t.Fatal(err)
 	}
+	if string(encoded) != canonicalWire {
+		t.Fatalf("wire form changed:\n got %s\nwant %s", encoded, canonicalWire)
+	}
+}
 
+// TestCanonicalWireSurvivesDecodeAndReEncode is the useful half of the old
+// round-trip test, made able to fail: the input is the hand-written literal
+// above rather than the encoder's own output, so this asserts that a broker
+// re-encoding a *known-canonical* payload reproduces it exactly.
+func TestCanonicalWireSurvivesDecodeAndReEncode(t *testing.T) {
 	var decoded Heartbeat
-	if err := json.Unmarshal(original, &decoded); err != nil {
+	if err := json.Unmarshal([]byte(canonicalWire), &decoded); err != nil {
 		t.Fatal(err)
 	}
 	if err := ValidateHeartbeat(decoded); err != nil {
-		t.Fatalf("decoded heartbeat failed validation: %v", err)
+		t.Fatalf("canonical wire failed validation: %v", err)
 	}
 
 	reencoded, err := json.Marshal(decoded)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(reencoded) != string(original) {
-		t.Fatalf("round trip changed the wire form:\n got %s\nwant %s", reencoded, original)
+	if string(reencoded) != canonicalWire {
+		t.Fatalf("round trip changed the wire form:\n got %s\nwant %s", reencoded, canonicalWire)
+	}
+}
+
+// TestDecodeAndReEncodeSilentlyDropsUnknownFields pins the forward-compat
+// behaviour, and exists to correct a claim this package previously made.
+//
+// An earlier version of this test asserted that decode-then-re-encode is what
+// "lets W4a retain the heartbeat verbatim in a JSONB column". That is false. A
+// plain decode drops fields the struct does not know about, and does so without
+// an error, so a v1 broker persisting the re-encoded form silently truncates a
+// v2 gateway's heartbeat and nothing surfaces it.
+//
+// The permissive decode is deliberate — hard-rejecting unknown fields would
+// stop a newer gateway from heartbeating to an older broker at all, which is a
+// worse failure for a liveness message. The consequence is simply that
+// re-encoding is NOT verbatim retention: W4a must persist the raw request
+// bytes (json.RawMessage or the untouched body) if it wants the object back
+// exactly as sent.
+func TestDecodeAndReEncodeSilentlyDropsUnknownFields(t *testing.T) {
+	// A v2 gateway sends everything v1 knows, plus one field it does not.
+	const fromNewerGateway = `{"schema":"blockcast.shred-gw-heartbeat.v1","gw_uuid":"3f2504e0-4f89-41d3-9a0c-0305e82c3301","version":"v2.0.0","sent_at":"2026-08-18T06:00:00Z","feeds":[{"feed_id":"feed-a","packets":1200,"bytes":1440000,"first_packet_at":"2026-08-18T05:59:30Z","last_packet_at":"2026-08-18T05:59:59.5Z","dropped_packets":99,"erasure":{"sets_total":50,"sets_erased":2,"erasure_fraction":0.04,"r_mean":40,"r_peak_100ms":60,"gap_ms_hist":{"\u003c1":7,"1-2.4":5,"2.4-7":3,"7-32":1,"\u003e=32":1},"grace_ms":400,"schema":1}}]}`
+
+	var decoded Heartbeat
+	if err := json.Unmarshal([]byte(fromNewerGateway), &decoded); err != nil {
+		t.Fatalf("a v1 broker must still accept a v2 heartbeat: %v", err)
+	}
+	if err := ValidateHeartbeat(decoded); err != nil {
+		t.Fatalf("the known fields are still valid: %v", err)
+	}
+
+	reencoded, err := json.Marshal(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(reencoded), "dropped_packets") {
+		t.Fatal("dropped_packets survived the re-encode; update the retention guidance " +
+			"on this test and in the package doc, because verbatim retention is now possible")
+	}
+	if string(reencoded) == fromNewerGateway {
+		t.Fatal("re-encode reproduced the input byte-for-byte, so it IS verbatim retention")
 	}
 }
 
@@ -182,6 +248,37 @@ func TestValidateHeartbeatRejects(t *testing.T) {
 			h.Feeds[0].FirstPacketAt, h.Feeds[0].LastPacketAt = h.Feeds[0].LastPacketAt, h.Feeds[0].FirstPacketAt
 		}},
 		{"non-canonical packet time", func(h *Heartbeat) { h.Feeds[0].FirstPacketAt = "2026-08-18T05:59:30+00:00" }},
+		// The packet-time pair and the counters state one fact together. Both
+		// halves of the divorce are rejected: a populated pair with no packets,
+		// and a packet count with no pair.
+		{"counters zeroed but packet times populated", func(h *Heartbeat) {
+			h.Feeds[0].Packets = 0
+			h.Feeds[0].Bytes = 0
+		}},
+		{"packets counted but never received one", func(h *Heartbeat) {
+			h.Feeds[0].FirstPacketAt = ""
+			h.Feeds[0].LastPacketAt = ""
+		}},
+		{"bytes counted but never received a packet", func(h *Heartbeat) {
+			h.Feeds[0].FirstPacketAt = ""
+			h.Feeds[0].LastPacketAt = ""
+			h.Feeds[0].Packets = 0
+		}},
+		// ErasureFraction is the field the customer's SLA is audited against,
+		// and it derives from two fields that are already validated. An
+		// untrusted producer must not be able to make the two disagree.
+		{"erasure fraction contradicts its own integers", func(h *Heartbeat) {
+			h.Feeds[0].Erasure.SetsTotal = 50
+			h.Feeds[0].Erasure.SetsErased = 25
+			h.Feeds[0].Erasure.ErasureFraction = 0.0
+		}},
+		{"negative erasure fraction", func(h *Heartbeat) { h.Feeds[0].Erasure.ErasureFraction = -5 }},
+		{"erasure fraction above one", func(h *Heartbeat) { h.Feeds[0].Erasure.ErasureFraction = 1.5 }},
+		{"NaN erasure fraction", func(h *Heartbeat) { h.Feeds[0].Erasure.ErasureFraction = math.NaN() }},
+		{"infinite r_mean", func(h *Heartbeat) { h.Feeds[0].Erasure.RMean = math.Inf(1) }},
+		{"negative grace", func(h *Heartbeat) { h.Feeds[0].Erasure.GraceMS = -1000 }},
+		{"negative r_mean", func(h *Heartbeat) { h.Feeds[0].Erasure.RMean = -42 }},
+		{"negative r_peak", func(h *Heartbeat) { h.Feeds[0].Erasure.RPeak100MS = -1 }},
 		{"unsorted feeds", func(h *Heartbeat) {
 			h.Feeds = append(h.Feeds, h.Feeds[0])
 			h.Feeds[0].FeedID = "feed-z"
@@ -213,6 +310,20 @@ func TestValidateHeartbeatAcceptsAFeedThatHasReceivedNothing(t *testing.T) {
 
 	if err := ValidateHeartbeat(hb); err != nil {
 		t.Fatalf("a silent feed must still validate: %v", err)
+	}
+}
+
+// TestValidateHeartbeatAcceptsZeroLengthDatagrams covers the one asymmetry in
+// the counter contract: Bytes must be zero when Packets is, but a positive
+// Packets does not require positive Bytes. A zero-length UDP datagram is legal
+// and must not be mistaken for a malformed report.
+func TestValidateHeartbeatAcceptsZeroLengthDatagrams(t *testing.T) {
+	hb := validHeartbeat()
+	hb.Feeds[0].Packets = 3
+	hb.Feeds[0].Bytes = 0
+
+	if err := ValidateHeartbeat(hb); err != nil {
+		t.Fatalf("a feed carrying only zero-length datagrams must validate: %v", err)
 	}
 }
 
