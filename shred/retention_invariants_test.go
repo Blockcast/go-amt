@@ -297,3 +297,85 @@ func TestCleanReceiptCarriesNoCompletionCaveat(t *testing.T) {
 		t.Errorf("a receipt with no above-ceiling completion still carries the caveat:\n%s", rendered)
 	}
 }
+
+// TestCompletionsTotalIsTheCompletedSetCount pins the relationship Receipt
+// documents between three of its fields, so the caveat's denominator cannot
+// quietly stop being the thing it claims to count.
+//
+// A set is either completed into the histogram or counted erased, never both,
+// so CompletionsTotal == SetsTotal-SetsErased. The fixture spans an eviction
+// boundary because that is where the two paths diverge: finalize folds evicted
+// sets into cumulative counters while receiptFor scores still-live sets into a
+// copy of the histogram, and a completion counted in one but not the other
+// would break the identity without either number looking wrong alone.
+func TestCompletionsTotalIsTheCompletedSetCount(t *testing.T) {
+	scorer := NewScorerWithRetention(FormatAgave, 500*time.Millisecond)
+	start := time.Unix(1, 0)
+	// One set completes and is then evicted by the far-future arrivals below.
+	for index := uint32(0); index < completionThreshold; index++ {
+		if _, err := scorer.Observe(dataPacket(1, 0, index), start.Add(time.Duration(index)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One set never completes, so it must land in SetsErased and not the histogram.
+	for index := uint32(0); index < 5; index++ {
+		if _, err := scorer.Observe(dataPacket(2, 0, index), start.Add(time.Duration(100+index)*time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// One set completes and is still live when the receipt is taken.
+	for index := uint32(0); index < completionThreshold; index++ {
+		at := start.Add(5*time.Second + time.Duration(index)*time.Millisecond)
+		if _, err := scorer.Observe(dataPacket(3, 0, index), at); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	receipt := scorer.Receipt()
+	completed := receipt.SetsTotal - receipt.SetsErased
+	if completed <= 0 {
+		t.Fatalf("fixture is wrong: expected completed sets, got SetsTotal=%d SetsErased=%d",
+			receipt.SetsTotal, receipt.SetsErased)
+	}
+	if receipt.CompletionsTotal != uint64(completed) {
+		t.Errorf("CompletionsTotal = %d but SetsTotal-SetsErased = %d: the caveat's "+
+			"denominator is no longer the number of completed sets, so \"N of M\" "+
+			"misstates how much of the run is affected",
+			receipt.CompletionsTotal, completed)
+	}
+}
+
+// TestPartialOverflowDoesNotClaimEveryPercentileUnderstates is the honesty test
+// for the caveat itself.
+//
+// Overflow is per-completion. A run where one completion in a hundred overflows
+// leaves every reported percentile accurate, so a caveat asserting "the
+// percentiles UNDERSTATE" would be false exactly where the rest of this change
+// is about not making false statements.
+func TestPartialOverflowDoesNotClaimEveryPercentileUnderstates(t *testing.T) {
+	var histogram completionHistogram
+	for i := 0; i < 99; i++ {
+		histogram.observe(10 * time.Millisecond)
+	}
+	histogram.observe(30 * time.Second)
+
+	if got := histogram.overflowed(); got != 1 {
+		t.Fatalf("fixture is wrong: overflowed = %d, want 1", got)
+	}
+	// Every percentile here is accurate; only the one 30s completion is affected.
+	for _, p := range []int{50, 95, 99} {
+		if got := histogram.percentile(p); got > time.Second {
+			t.Fatalf("fixture is wrong: p%d = %s, expected an unaffected percentile", p, got)
+		}
+	}
+
+	caveat := completionCaveat(histogram.overflowed(), histogram.count)
+	if !strings.Contains(caveat, "1 of 100") {
+		t.Errorf("caveat does not state the affected fraction, so a reader cannot tell "+
+			"a one-in-a-hundred run from a wholly-overflowed one: %s", caveat)
+	}
+	if strings.Contains(caveat, "the percentiles above UNDERSTATE") {
+		t.Errorf("caveat asserts every percentile understates, which is false here — "+
+			"p50/p95/p99 are all accurate and only one completion overflowed: %s", caveat)
+	}
+}

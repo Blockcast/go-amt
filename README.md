@@ -162,12 +162,19 @@ inside it. Measured, not hypothetical.
 
 So the receipt reports the condition instead of predicting it:
 `completions_above_ceiling` counts completions that landed in the overflow
-bucket, and any nonzero value means the three percentiles beside it understate
-and the 0.78% figure does not apply to that run. The human table prints the same
-warning inline. Check it before quoting a percentile in a dispute; everything
-else the receipt carries is exact and is unchanged by retention — `selftest
---fixture` reports the same sets, erasures, means and gap buckets it did before
-the bound existed.
+bucket, out of `completions_total`. Any nonzero value means a percentile that
+fell among them understates and the 0.78% figure does not apply to it — the
+count and its denominator are both reported because one overflow in a million is
+a different run from half of them. The human table prints the same warning
+inline. Check it before quoting a percentile in a dispute.
+
+Every other figure on the receipt is an exact counter rather than an
+approximation — `selftest --fixture` reports the same sets, erasures, means and
+gap buckets it did before the bound existed. That is not the same as saying they
+are independent of `--retain`: as the third bullet above says, a duplicate
+arriving beyond the window is counted as a new unique shred, so the window
+decides what *counts* as a repeat even though nothing about the counting is
+approximate.
 
 `unique_first` and `first_arrival_fraction` are decided by the same arrival
 timestamps, not by which feed's goroutine reached the scorer first. When a shred

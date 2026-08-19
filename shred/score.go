@@ -52,8 +52,19 @@ type Receipt struct {
 	// shreds arriving 200ms apart span 6.2s at the 2s default. A startup-time
 	// comparison against the window is blind to exactly those cases, so the
 	// condition is counted where it actually occurs.
-	CompletionsAboveCeiling uint64       `json:"completions_above_ceiling"`
-	Gaps                    GapHistogram `json:"gap_histogram"`
+	CompletionsAboveCeiling uint64 `json:"completions_above_ceiling"`
+	// CompletionsTotal is how many completions the percentiles above summarise,
+	// i.e. the sets that reached 32 distinct shreds. It is the denominator for
+	// CompletionsAboveCeiling: one-in-a-million overflowing and half-of-two are
+	// very different runs, and without this a reader cannot tell them apart.
+	//
+	// It equals SetsTotal-SetsErased by construction — a set is either completed
+	// into the histogram or counted erased, never both — which
+	// TestCompletionsTotalIsTheCompletedSetCount pins. Reported rather than left
+	// to the reader to derive, because that relationship is not evident from the
+	// two field names.
+	CompletionsTotal uint64       `json:"completions_total"`
+	Gaps             GapHistogram `json:"gap_histogram"`
 }
 
 type setScore struct {
@@ -698,29 +709,38 @@ func (s *Scorer) receiptFor(keys []SetKey) Receipt {
 	receipt.CompletionP95 = completions.percentile(95)
 	receipt.CompletionP99 = completions.percentile(99)
 	receipt.CompletionsAboveCeiling = completions.overflowed()
+	receipt.CompletionsTotal = completions.count
 	return receipt
 }
 
-// completionCaveat renders the one line that has to appear beside a completion
-// percentile that understates, or "" when every completion fit the ladder.
+// completionCaveat renders the line that has to appear beside completion
+// percentiles when any completion overflowed the ladder, or "" otherwise.
+//
+// It says "a percentile that fell among them" rather than "the percentiles",
+// because overflow is per-completion, not per-run: 99 completions at 10ms plus
+// one at 30s leaves p50, p95 and p99 all accurate at 10.047ms while one
+// completion overflowed. Asserting that all three understate there would be the
+// same species of overclaim this change set out to remove, so the count and its
+// denominator are stated and the reader is left to weigh them.
 //
 // It is printed rather than left to the JSON field because the human table is
 // what an operator reads in a dispute, and a percentile whose stated error bar
-// does not apply is worse than no percentile at all.
-func completionCaveat(aboveCeiling uint64) string {
+// may not apply is worse than no percentile at all.
+func completionCaveat(aboveCeiling, total uint64) string {
 	if aboveCeiling == 0 {
 		return ""
 	}
-	return fmt.Sprintf("time_to_32nd_shred WARNING: %d completion(s) at or above %s "+
-		"were recorded as that value, so the percentiles above UNDERSTATE by an "+
-		"unbounded amount and the documented %.2f%% error does not apply",
-		aboveCeiling, CompletionCeiling, CompletionRelativeError*100)
+	return fmt.Sprintf("time_to_32nd_shred WARNING: %d of %d completion(s) were at or "+
+		"above %s and recorded as that value, so a percentile that fell among them "+
+		"UNDERSTATES by an unbounded amount and the documented %.2f%% error does not "+
+		"apply to it. Percentiles below that point are unaffected.",
+		aboveCeiling, total, CompletionCeiling, CompletionRelativeError*100)
 }
 
 func (r UnionReceipt) String() string {
 	var output strings.Builder
 	fmt.Fprintf(&output, "time_to_32nd_shred union p50=%s p95=%s p99=%s\n", r.Union.CompletionP50, r.Union.CompletionP95, r.Union.CompletionP99)
-	if line := completionCaveat(r.Union.CompletionsAboveCeiling); line != "" {
+	if line := completionCaveat(r.Union.CompletionsAboveCeiling, r.Union.CompletionsTotal); line != "" {
 		fmt.Fprintf(&output, "%s\n", line)
 	}
 	fmt.Fprintf(&output, "union erasure sets=%d erased=%d fraction=%.6f mean_shreds_per_set=%.2f\n", r.Union.SetsTotal, r.Union.SetsErased, r.Union.ErasureFraction, r.Union.MeanShredsPerSet)
@@ -747,7 +767,7 @@ func (r Receipt) String() string {
 	out := fmt.Sprintf("time_to_32nd_shred p50=%s p95=%s p99=%s\nerasure sets=%d erased=%d fraction=%.6f mean_shreds_per_set=%.2f\ngap_ms <1=%d 1-2.4=%d 2.4-7=%d 7-32=%d >=32=%d reordered=%d",
 		r.CompletionP50, r.CompletionP95, r.CompletionP99, r.SetsTotal, r.SetsErased, r.ErasureFraction, r.MeanShredsPerSet,
 		r.Gaps.LT1, r.Gaps.From1To2_4, r.Gaps.From2_4To7, r.Gaps.From7To32, r.Gaps.GTE32, r.Gaps.Reordered)
-	if caveat := completionCaveat(r.CompletionsAboveCeiling); caveat != "" {
+	if caveat := completionCaveat(r.CompletionsAboveCeiling, r.CompletionsTotal); caveat != "" {
 		out += "\n" + caveat
 	}
 	return out
