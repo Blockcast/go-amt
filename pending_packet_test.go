@@ -270,6 +270,85 @@ func TestReadBatchWithNoRoomKeepsPendingPacket(t *testing.T) {
 	}
 }
 
+// TestNoRoomReadBatchNeverHidesThePendingPacket is the ordering half of the
+// no-room path, and it is the reason that path peeks instead of taking.
+//
+// The obvious implementation — take the packet, notice there is nowhere to put
+// it, put it back — is not atomic. Between the take and the put the store is
+// empty, and an empty store is exactly the condition under which a concurrent
+// reader falls through to the socket. So:
+//
+//	reader A (zero-length batch) takes packet #1   -> store empty
+//	reader B takes nil, reads the socket           -> delivers packet #2
+//	reader A puts #1 back                          -> #1 delivered later
+//
+// Net: #2 ahead of #1, the precise reordering the pending-first check exists to
+// prevent (Ally review on go-amt#58). peek() cannot produce that window because
+// it never mutates the store.
+//
+// The assertion is one-sided and therefore not flaky: observing the packet is
+// always legal, so a pass is never spurious, while a single nil observation is a
+// definite regression. Under -race this also pins that peek and the concurrent
+// readers are properly synchronised.
+func TestNoRoomReadBatchNeverHidesThePendingPacket(t *testing.T) {
+	const iterations = 2000
+	mc := openedConn()
+	mc.pending.put(&pendingPacket{buf: probePayload, src: probeSrc})
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// Observer stands in for a concurrent reader deciding whether it is owed a
+	// buffered packet. Every nil it sees is a read that would have gone to the
+	// socket and delivered a later packet first.
+	var mu sync.Mutex
+	vanished := 0
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if mc.pending.peek() == nil {
+				mu.Lock()
+				vanished++
+				mu.Unlock()
+			}
+		}
+	}()
+
+	for i := 0; i < iterations; i++ {
+		n, err := mc.ReadBatch(nil, 0)
+		if err != nil {
+			t.Fatalf("ReadBatch(nil) iteration %d: %v", i, err)
+		}
+		if n != 0 {
+			t.Fatalf("ReadBatch(nil) iteration %d returned %d, want 0", i, n)
+		}
+	}
+	close(stop)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if vanished != 0 {
+		t.Errorf("a no-room ReadBatch made the pending packet invisible %d times; a concurrent reader would read the socket and deliver a later packet ahead of it", vanished)
+	}
+
+	// And it is still deliverable afterwards.
+	ms := []ipv4.Message{{Buffers: [][]byte{make([]byte, 1500)}}}
+	got, err := mc.ReadBatch(ms, 0)
+	if err != nil {
+		t.Fatalf("ReadBatch: %v", err)
+	}
+	if got != 1 || !bytes.Equal(ms[0].Buffers[0][:ms[0].N], probePayload) {
+		t.Errorf("the packet did not survive %d no-room calls: n=%d payload=%q", iterations, got, ms[0].Buffers[0][:ms[0].N])
+	}
+}
+
 // TestProbeReturnsThePacketItRead asserts the producer half at the shared
 // implementation, so it holds for all three call sites at once — both conn.go
 // branches and managed_conn_native.go.

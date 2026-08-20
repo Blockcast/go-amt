@@ -353,12 +353,15 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	nativeConn := mc.nativeConn
 	readBuffer := mc.readBuffer
 	done := mc.done
+	// Drained inside the read lock, so the closed check above is exact rather
+	// than advisory: Close takes the write lock, so it cannot interleave between
+	// the two and leave a closed connection serving a packet it still holds. A
+	// closed connection owes the caller an error, not a packet.
+	pending := mc.pending.take()
 	mc.mu.RUnlock()
 
-	// Drained after the closed check, never before: a closed connection owes the
-	// caller an error, not a packet it happens to still be holding.
-	if pkt := mc.pending.take(); pkt != nil {
-		return copy(p, pkt.buf), pkt.src, nil
+	if pending != nil {
+		return copy(p, pending.buf), pending.src, nil
 	}
 
 	if !usingTunnel && nativeConn != nil {
@@ -391,11 +394,12 @@ func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.C
 	nativeConn := mc.nativeConn
 	readBuffer := mc.readBuffer
 	done := mc.done
+	// See ReadFrom: taken inside the read lock so the closed check is exact.
+	pending := mc.pending.take()
 	mc.mu.RUnlock()
 
-	// See ReadFrom: drained after the closed check, never before.
-	if pkt := mc.pending.take(); pkt != nil {
-		return copy(buf, pkt.buf), pkt.cm, pkt.src, nil
+	if pending != nil {
+		return copy(buf, pending.buf), pending.cm, pending.src, nil
 	}
 
 	if !usingTunnel && nativeConn != nil {
@@ -427,17 +431,26 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	nativeConn := mc.nativeConn
 	readBuffer := mc.readBuffer
 	done := mc.done
+	// See ReadFrom for why the store is touched inside the read lock. Room is
+	// checked first, and a no-room batch only ever peeks: take-then-put-back
+	// leaves the store momentarily empty, which lets a concurrent reader fall
+	// through to the socket and deliver a later packet ahead of this one.
+	var pending *pendingPacket
+	pendingWaiting := false
+	if len(ms) == 0 || len(ms[0].Buffers) == 0 {
+		pendingWaiting = mc.pending.peek() != nil
+	} else {
+		pending = mc.pending.take()
+	}
 	mc.mu.RUnlock()
 
-	// See ReadFrom. Checked before len(ms) so a zero-length batch cannot
-	// silently discard the packet instead of leaving it for the next call.
-	if pkt := mc.pending.take(); pkt != nil {
-		if len(ms) == 0 || len(ms[0].Buffers) == 0 {
-			mc.pending.put(pkt)
-			return 0, nil
-		}
-		ms[0].N = copy(ms[0].Buffers[0], pkt.buf)
-		ms[0].Addr = pkt.src
+	if pendingWaiting {
+		// Nowhere to put it. Leave it for the next call rather than drop it.
+		return 0, nil
+	}
+	if pending != nil {
+		ms[0].N = copy(ms[0].Buffers[0], pending.buf)
+		ms[0].Addr = pending.src
 		return 1, nil
 	}
 

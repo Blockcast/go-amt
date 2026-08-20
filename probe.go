@@ -74,6 +74,20 @@ func (s *pendingStore) put(pkt *pendingPacket) { s.p.Store(pkt) }
 // any number of goroutines; at most one ever sees a given packet.
 func (s *pendingStore) take() *pendingPacket { return s.p.Swap(nil) }
 
+// peek reports the held packet without removing it, for callers that must decide
+// whether a packet is owed *before* they can commit to delivering it.
+//
+// This exists so no read path ever mutates the store on a branch that cannot
+// deliver. take-then-put-back looks harmless but is not atomic: between the two,
+// the store is empty, so a concurrent reader takes nil, falls through to the
+// socket, and delivers a *later* packet first. That reorders the stream the
+// pending-first check exists to keep ordered (Ally review on go-amt#58).
+//
+// A peek result is advisory — another reader may take the packet immediately
+// after. That is safe for its only use: reporting "0 packets read, nothing lost"
+// on a batch with no room, which claims nothing about who eventually delivers it.
+func (s *pendingStore) peek() *pendingPacket { return s.p.Load() }
+
 // probeNativeTraffic waits up to window for the native join to deliver a packet
 // and reports whether it did.
 //

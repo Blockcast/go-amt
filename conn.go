@@ -216,14 +216,18 @@ func (mc *MulticastConn) IsUsingTunnel() bool {
 }
 func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	// A packet the probe consumed is owed to the caller before anything read
-	// from the socket, or the stream would be delivered out of order. Checked
-	// before len(ms) so a zero-length batch cannot silently discard it.
-	if pkt := mc.pending.take(); pkt != nil {
-		if len(ms) == 0 || len(ms[0].Buffers) == 0 {
-			// Nowhere to put it. Put it back rather than drop it.
-			mc.pending.put(pkt)
+	// from the socket, or the stream would be delivered out of order.
+	//
+	// Room is checked first, and a no-room batch only ever peeks: taking the
+	// packet just to put it back leaves the store empty in between, which lets a
+	// concurrent reader fall through to the socket and deliver a later packet
+	// ahead of this one — the reordering this check exists to prevent.
+	if len(ms) == 0 || len(ms[0].Buffers) == 0 {
+		if mc.pending.peek() != nil {
+			// Nowhere to put it. Leave it for the next call rather than drop it.
 			return 0, nil
 		}
+	} else if pkt := mc.pending.take(); pkt != nil {
 		n := copy(ms[0].Buffers[0], pkt.buf)
 		ms[0].N = n
 		ms[0].Addr = pkt.src

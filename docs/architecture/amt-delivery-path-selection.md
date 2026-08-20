@@ -1,8 +1,7 @@
 # AMT delivery-path selection: from a startup guess to a reversible decision
 
-Status: **proposed**. Item 2 (deliver the probe packet) is implemented in
-go-amt#49's follow-up; item 1 (reversible path selection) is specified here and
-not yet built.
+Status: **proposed**. Item 2 (deliver the probe packet) is implemented in this
+change; item 1 (reversible path selection) is specified here and not yet built.
 
 Tracking: [BLO-28740]. Background: [BLO-28640] (the 2026-08-18 outage),
 go-amt#49 (the window-sizing fix this builds on).
@@ -38,17 +37,26 @@ has a cost that is easy to state and easy to get wrong, because it is
 | Native joined, **group is silent** | Membership reports only. Effectively free: by definition no data is arriving | — |
 | AMT up, **group is flowing** | — | Full group bitrate inside the unicast tunnel, plus Membership Update refresh at the relay's advertised interval (QQIC, decoded into `RelayManager.intervalTime`) |
 | AMT up, **group is silent** | — | Refresh traffic only |
+| AMT up, **unsubscribed from group** | — | Keepalive/refresh only. No group data at any bitrate, and re-subscribing costs one Membership Update rather than a cold DRIAD + discovery + handshake |
 
 The consequence: **keeping both joined while both deliver doubles ingress
 bandwidth per channel.** On a Tier-1 multicast video path with many content
 groups that is not a rounding error — it is the thing that makes "just leave both
 up" unshippable as a steady state.
 
-But the asymmetry rescues the design. The case we actually need reversibility for
-is *native is dead, we are on AMT*. In that state the native join costs
-**membership reports and nothing else**, because no data is flowing on it — that
-is precisely what "native is dead" means. So the expensive combination and the
-useful combination are not the same combination.
+The last row is the one the decision below turns on, and it is why "tear down the
+standby" is the wrong primitive: membership is what costs bandwidth, path state is
+what costs latency to rebuild, and they can be dropped independently.
+
+The asymmetry does not by itself rescue the design, though the first version of
+this doc claimed it did. It is true that when *native is dead and we are on AMT*
+the native join costs membership reports and nothing else — that is precisely
+what "native is dead" means, and reversibility in that direction is nearly free.
+But that is the cheap direction and also the non-urgent one; traffic is already
+flowing. The direction that actually hurts is the reverse — native was carrying
+the channel and dies — and there the standby we need is the AMT one, whose
+useful and expensive states *are* the same state. Only separating membership from
+path state makes both directions cheap at once.
 
 ## Decision
 
@@ -63,22 +71,62 @@ Concretely:
 - Exactly one path is **active** at a time. The data plane reads from the active
   path only. This is what makes "no duplicates" true by construction rather than
   by deduplication (AC 4).
-- The **standby** path is drained by a cheap liveness watcher, not by the data
-  plane. Its packets are discarded — they are duplicates of the active path's, or
-  the active path is dead and we are about to switch.
+- The **standby** path is watched by a cheap liveness sampler, not read by the
+  data plane. Anything it does deliver is discarded — those packets are
+  duplicates of the active path's, or the active path is dead and we are about to
+  switch. "Watched" means its socket counters are sampled, not that it is drained
+  at line rate; see *Why not multiplex the data plane* for why that distinction
+  is load-bearing.
 - Native is preferred on a tie: it is the cheaper path and the one the AMT tunnel
   exists to substitute for.
-- **Teardown is conditional on both paths delivering.** Once the standby has been
-  observed carrying traffic for a settling period, it is torn down — that is the
-  doubled-bandwidth state and it must not persist. If the standby is *silent*, it
-  stays joined indefinitely, because it costs almost nothing and it is the only
-  thing that makes recovery possible without a restart (AC 1).
+- **Teardown drops the standby's group membership, never its path state.** Once
+  the standby has been observed carrying traffic for a settling period, it is
+  *unsubscribed* from the group — that is the doubled-bandwidth state and it must
+  not persist. What it is not is deconstructed: an AMT standby keeps its relay,
+  its gateway handle and its keepalive, so re-activating it costs one membership
+  update rather than a cold handshake. If the standby is *silent*, even the
+  membership stays, because a silent standby carries no traffic to save and its
+  membership is the only thing that makes recovery possible without a restart
+  (AC 1).
 
 That last bullet is the whole decision in one line, and it is why this is not
 simply "option 2 as described". Option 2 — both paths up for the process
-lifetime — is right about reversibility and wrong about cost. Making teardown
-conditional on *observed duplicate delivery* keeps the reversibility where it is
-free and drops it where it is expensive.
+lifetime — is right about reversibility and wrong about cost. But the naive
+repair of it is wrong in a way worth writing down, because it was the first
+version of this section and a review caught it (Ally on go-amt#58).
+
+**Why teardown cannot key on observed delivery alone.** An AMT standby is joined
+to the same group through a relay that unicasts it to us, so it is *by
+construction* always delivering — it can only fall silent if the tunnel breaks.
+Native, meanwhile, is preferred on a tie (above), so it is the active path
+whenever it works. Compose those two and "tear down the standby that is
+delivering" reduces on the real topology to *always tear down AMT, always keep
+native* — which removes reversibility in precisely the direction we need it. The
+steady state becomes native-active with no AMT standby at all; then native dies,
+the BLO-28640 direction, and there is nothing to fail over to.
+
+That direction is also the expensive one to rebuild. A cold AMT re-establish pays
+DRIAD (`driad.go`, RFC 8777) plus relay discovery, advertisement, membership
+query and update — bounded by `DefaultOpenTimeout`, which is **10s**
+(`gateway.go`). That is the same 10s as `MinUsefulProbeWindow`, i.e. exactly the
+latency AC 2 exists to delete from startup, silently reintroduced and now paid
+*during an outage* instead of at boot. Recovering the other way — back to native
+— is a single IGMP join and is not urgent, because traffic is already flowing
+over AMT.
+
+So the asymmetry is real, but it is an asymmetry in **what silence means**, not
+in which path is cheap to keep: native-silent is evidence the path is dead, while
+AMT-silent is evidence the tunnel is broken. Neither maps onto "cheap to keep".
+Splitting membership from path state is what dissolves it — `sendMembershipLeave`
+and `sendTeardown` are already separate operations (`gateway.go`), so dropping a
+subscription while retaining the tunnel needs no new protocol work. The bandwidth
+cost goes away, the reversibility does not, and no path is ever abandoned on the
+strength of a decision that only looked correct in the direction that never
+fails.
+
+Making teardown conditional on *observed duplicate delivery*, and scoping it to
+the membership rather than the path, keeps the reversibility everywhere and drops
+only the bandwidth.
 
 ### Why not multiplex the data plane
 
@@ -95,6 +143,23 @@ occurs at most twice in a process lifetime.
 Arbitration avoids all of it: the active path is read directly, exactly as today,
 with no copy and no channel. Only the standby — whose packets are thrown away —
 pays anything, and it can be sampled cheaply rather than drained at line rate.
+
+Sampling and draining are not the same claim, and the difference has to be named
+or the design contradicts itself. A standby delivering at line rate but read only
+occasionally will overrun its socket buffer continuously — which is fine for the
+liveness question and misleading for everything else, because the kernel drop
+counters it produces are indistinguishable from an incident, and the
+pre-activation drain below becomes unbounded.
+
+So the liveness signal is **not** "did we read a packet". It is the socket's own
+counters: `SO_RXQ_OVFL` (overflow count) together with the byte/packet counters,
+which move whether or not userspace reads. A standby whose counters advance is
+delivering, at a cost of one `recvmsg` with `MSG_DONTWAIT` per interval rather
+than per packet. Two consequences follow and are deliberate: standby overflow is
+expected and must be excluded from the drop alerting that watches the active
+path, and the pre-activation drain is bounded by the socket buffer, not by the
+silence duration — it is a fixed-size discard, which is what makes "drop
+seconds-old packets" below a bounded operation.
 
 ### Switchover mechanics
 
@@ -136,7 +201,11 @@ it stops being load-bearing for correctness inside the package.
    reused by the switchover drain in item 1.
 2. **Arbiter, native-vs-AMT, no teardown.** Both paths up, one active, standby
    watched. Ship with the conditional teardown disabled so the steady state is
-   observable before it is optimised.
+   observable before it is optimised. Note what that configuration *is*: both
+   paths subscribed and both delivering — the doubled-ingress state *What "both
+   paths" actually costs* calls unshippable as a steady state. So phase 2 is **lab and
+   canary only**, bounded to a named set of groups, and is not a fleet rollout
+   step. Its purpose is to produce the telemetry phase 3 needs, not to run.
 3. **Conditional teardown after the settling period.** Only once step 2's
    telemetry shows how often both paths genuinely deliver at once.
 
@@ -146,11 +215,14 @@ is real work and is called out here so it is not discovered mid-implementation.
 
 ## Open questions
 
-- **Re-probe cadence when native is torn down.** Step 3 tears down a native join
-  that was observed delivering. If it later goes silent *and* AMT is also silent,
-  there is nothing left to detect recovery with. A periodic re-join is the
-  fallback; its cadence trades an IGMP join/leave pair against detection latency
-  and is not yet chosen.
+- **Re-subscribe cadence for an unsubscribed standby.** Step 3 drops the group
+  membership of a standby that was observed delivering. While it is
+  unsubscribed it carries no traffic, so its counters cannot report liveness —
+  and if the active path then goes silent, the arbiter is choosing blind. A
+  periodic re-subscribe is the fallback; its cadence trades a membership
+  update (IGMP join/leave, or an AMT membership update on the tunnel) against
+  detection latency and is not yet chosen. Retaining the path state makes each
+  probe cheap, which is what makes a short cadence affordable at all.
 - **Per-group or per-process arbitration.** Every group on a host almost always
   shares a verdict. Arbitrating per process would collapse N probe windows into
   one, but couples unrelated channels — a decision worth making deliberately
