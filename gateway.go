@@ -49,9 +49,22 @@ type Gateway struct {
 	loopErr  atomic.Error
 
 	// Internal fields
-	handle       C.amt_gateway_handle_t
-	cm           *ipv4.ControlMessage
-	leave        bool
+	handle C.amt_gateway_handle_t
+	cm     *ipv4.ControlMessage
+	// leave signals the keepalive goroutine to exit and switches
+	// handleMembershipQuery from renewing the membership to tearing it down.
+	//
+	// Atomic because it is genuinely cross-goroutine in both directions: the
+	// keepalive goroutine started by Open reads it every interval while
+	// stopKeepalive writes it from Open's failure paths, and
+	// handleMembershipQuery reads it from the read loop while Close writes it.
+	// As a plain bool that was a data race — and worse than the detector
+	// complaining, because the read sits in a bare for loop with no
+	// synchronisation, so nothing obliges the goroutine to ever observe the
+	// write. stopKeepalive exists to prevent a leaked goroutine reconnecting to
+	// a relay nobody is listening to, and unsynchronised it could fail to do
+	// exactly that.
+	leave        atomic.Bool
 	intervalTime time.Duration
 	responseMac  [6]byte
 	requestNonce uint32
@@ -280,7 +293,7 @@ func (g *Gateway) Open() (err error) {
 		// logging filtered out precisely when it is needed.
 		var stalled bool
 		for {
-			if g.leave {
+			if g.leave.Load() {
 				return
 			}
 			var loopErr error
@@ -366,7 +379,7 @@ const DefaultOpenTimeout = 10 * time.Second
 // failure path so a failed Open does not leak a goroutine that reconnects to a
 // relay nobody is listening to.
 func (g *Gateway) stopKeepalive() {
-	g.leave = true
+	g.leave.Store(true)
 }
 
 // handleRelayAdvertisement processes AMT Relay Advertisement.
@@ -419,7 +432,7 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 		return fmt.Errorf("error decoding membership query: %w", err)
 	}
 
-	if g.leave {
+	if g.leave.Load() {
 		if err = g.sendTeardown(*membershipQuery); err != nil {
 			return fmt.Errorf("error in sendTeardown: %w", err)
 		}
@@ -439,7 +452,7 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 
 // Close gracefully closes the AMT gateway.
 func (g *Gateway) Close() error {
-	g.leave = true
+	g.leave.Store(true)
 	buffer := make([]byte, g.MTU)
 	errc := make(chan error, 1)
 

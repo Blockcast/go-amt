@@ -203,7 +203,17 @@ jobs:
       # Run the Gateway.Open guards by name so the log carries positive proof
       # they executed, rather than a bare "ok" that is also what a fully
       # deselected package prints.
-      - name: Prove the Gateway.Open guards ran
+      #
+      # Under -race, deliberately. gateway.go had ZERO race coverage on CI: the
+      # only -race job runs -tags purego, which deselects this file, and this job
+      # compiled it without the detector. That gap is documented in the coverage
+      # table at the top of this file, and it was not hypothetical — it hid an
+      # unsynchronised Gateway.leave, written by stopKeepalive and read by the
+      # keepalive goroutine, which reproduced 3/3 locally while CI stayed green
+      # (BLO-29064). Running the whole package under -race here would roughly
+      # double the job; these named tests are the ones that actually exercise
+      # gateway.go's concurrency, so the detector is pointed at them.
+      - name: Prove the Gateway.Open guards ran (under -race)
         run: |
           set -euo pipefail
           # Capture the status rather than letting `set -e` abort here. With a
@@ -212,11 +222,12 @@ jobs:
           # reachable only for a skip (exit 0) and never for a failure. We want
           # the loop to run either way, then fail on the captured status.
           rc=0
-          go test -v -count=1 \
-            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress' \
+          go test -v -count=1 -race \
+            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine|TestCloseSignalsLeaveForTheReadLoop' \
             . 2>&1 | tee /tmp/cgo-test.log || rc=$?
           for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault \
-                   TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress; do
+                   TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress \
+                   TestStopKeepaliveIsObservedByTheKeepaliveGoroutine TestCloseSignalsLeaveForTheReadLoop; do
             grep -qF -- "--- PASS: $t" /tmp/cgo-test.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
