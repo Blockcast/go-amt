@@ -66,9 +66,12 @@ func TestTunnelModeSkipsTheNativeBindAtTheCallSite(t *testing.T) {
 // the guard above from being satisfied by an Open that never binds at all.
 //
 // AMTModeTunnel without a relay is documented to degrade to native, so the bind
-// must still happen — and against a non-existent interface it must fail with
-// conn.go's bind error rather than a gateway error. A mutation that skipped the
-// bind unconditionally would pass the first test and fail this one.
+// must still be attempted. It deliberately accepts EITHER outcome of that
+// attempt, because whether a bogus interface makes ListenMulticastUDP4 fail is
+// host-dependent: on darwin it fails, on linux an unspecified index binds
+// successfully. An earlier version of this test asserted the failure and was
+// green on darwin while red on CI. Both outcomes prove the same thing — that the
+// call site did not skip the bind — so assert that, not the errno.
 func TestTunnelModeWithoutARelayStillBinds(t *testing.T) {
 	mc := &MulticastConn{
 		GroupAddr: netip.MustParseAddr("232.0.0.1"),
@@ -81,11 +84,21 @@ func TestTunnelModeWithoutARelayStillBinds(t *testing.T) {
 	}
 
 	err := mc.Open()
+
 	if err == nil {
-		t.Fatal("Open against a non-existent interface must fail")
+		// The bind succeeded on this host, which is itself proof it was
+		// attempted: nothing else in Open creates conn4.
+		if mc.conn4 == nil {
+			t.Error("Open succeeded with no native socket bound; AMTModeTunnel without " +
+				"a relay must degrade to native rather than skipping the bind")
+		} else {
+			mc.conn4.Close()
+		}
+		return
 	}
+
 	if !strings.Contains(err.Error(), "failed to create conn") {
 		t.Fatalf("AMTModeTunnel without a relay must degrade to native and attempt the "+
-			"bind, so the failure should come from ListenMulticastUDP4; got: %v", err)
+			"bind, so a failure here should come from ListenMulticastUDP4; got: %v", err)
 	}
 }
