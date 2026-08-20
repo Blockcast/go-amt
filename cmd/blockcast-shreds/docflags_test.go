@@ -43,23 +43,61 @@ func docTableFlags(t *testing.T) []string {
 // The selftest sub-command builds its own FlagSet with its own --json and a
 // --fixture that the config table deliberately does not cover, so the scan is
 // scoped to run()'s body: from its NewFlagSet to the start of func selftest.
+//
+// run() is no longer the only place registration happens. BLO-28993 moved the
+// three scoring flags into scoringFlags, a helper that sits AFTER func selftest
+// and so falls outside the window above. That made this scan report --mode,
+// --source-label and --rights-basis as documented-but-unregistered while
+// TestDocumentedFlagsAreAccepted simultaneously proved the parser accepts all
+// three ("flag needs an argument", not "not defined") -- a false failure in the
+// doc-drift direction and, worse, a blind spot in the other: a flag registered
+// only in the helper could go undocumented without this test noticing. So every
+// registrar run() delegates to is scanned as well, and a registrar this list
+// cannot find is a hard failure rather than a silent under-count.
 func registeredFlags(t *testing.T) []string {
 	t.Helper()
 	source, err := os.ReadFile("main.go")
 	if err != nil {
 		t.Fatalf("read main.go: %v", err)
 	}
-	body := string(source)
-	start := strings.Index(body, `flag.NewFlagSet("blockcast-shreds"`)
-	end := strings.Index(body, "func selftest(")
+	full := string(source)
+	start := strings.Index(full, `flag.NewFlagSet("blockcast-shreds"`)
+	end := strings.Index(full, "func selftest(")
 	if start < 0 || end < 0 || end <= start {
 		t.Fatalf("could not isolate run()'s flag set in main.go (start=%d end=%d); "+
 			"the file was restructured and this scan is no longer reliable", start, end)
 	}
-	body = body[start:end]
+	body := full[start:end]
+
+	// Helpers run() hands the flag set to. Scanned in full, because the names
+	// they register are indistinguishable from run()'s own to an operator.
+	for _, registrar := range []string{"func scoringFlags("} {
+		at := strings.Index(full, registrar)
+		if at < 0 {
+			t.Fatalf("main.go no longer contains %q, which registeredFlags scans for "+
+				"delegated flag registrations. If it was renamed or inlined, update "+
+				"this list: dropping it silently hides every flag it registers from "+
+				"both directions of TestHelpDocumentsEveryFlag.", registrar)
+		}
+		rest := full[at+len(registrar):]
+		stop := strings.Index(rest, "\nfunc ")
+		if stop < 0 {
+			stop = len(rest)
+		}
+		body += rest[:stop]
+	}
 
 	// flags.StringVar(&x, "name", ...) / flags.Bool("name", ...) / flags.Var(&x, "name", ...)
-	call := regexp.MustCompile(`flags\.(?:[A-Za-z0-9]*Var|Bool|String|Int|Int64|Uint|Uint64|Float64|Duration)\(\s*(?:&[^,]+,\s*)?"([a-z0-9-]+)"`)
+	//
+	// The leading-argument group is deliberately "any run of non-comma,
+	// non-quote characters" rather than "&something". BLO-28993 registers the
+	// scoring flags as flags.Var(stringFlag[T]{&field}, "name", ...), whose
+	// first argument is a composite literal and not an address-of expression, so
+	// an &-anchored pattern silently skipped all three: they matched nothing and
+	// were reported as documented-but-unregistered. Verified across all ten
+	// registration forms in this file -- the seven &-style and Bool/Int/Duration
+	// ones still yield the same names.
+	call := regexp.MustCompile(`flags\.(?:[A-Za-z0-9]*Var|Bool|String|Int|Int64|Uint|Uint64|Float64|Duration)\(\s*(?:[^,"]+,\s*)?"([a-z0-9-]+)"`)
 	var names []string
 	for _, m := range call.FindAllStringSubmatch(body, -1) {
 		names = append(names, m[1])
@@ -111,16 +149,18 @@ func TestDocumentedFlagsAreAccepted(t *testing.T) {
 	// A probe whose parse must fail, so no receiver is ever started. Value-taking
 	// flags are probed with no value; the bool flag is probed with a bad value.
 	probes := map[string][]string{
-		"feed":           {"--feed"},
-		"listen":         {"--listen"},
-		"dest-ip-ports":  {"--dest-ip-ports"},
-		"http-addr":      {"--http-addr"},
-		"json":           {"--json=not-a-bool"},
-		"mode":           {"--mode"},
-		"source-label":   {"--source-label"},
-		"rights-basis":   {"--rights-basis"},
-		"health-max-age": {"--health-max-age"},
-		"retain":         {"--retain"},
+		"feed":             {"--feed"},
+		"listen":           {"--listen"},
+		"dest-ip-ports":    {"--dest-ip-ports"},
+		"http-addr":        {"--http-addr"},
+		"json":             {"--json=not-a-bool"},
+		"mode":             {"--mode"},
+		"source-label":     {"--source-label"},
+		"rights-basis":     {"--rights-basis"},
+		"health-max-age":   {"--health-max-age"},
+		"retain":           {"--retain"},
+		"erasure-grace-ms": {"--erasure-grace-ms"},
+		"report-interval":  {"--report-interval"},
 	}
 
 	for _, name := range docTableFlags(t) {
