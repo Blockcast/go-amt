@@ -222,7 +222,15 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	// packet just to put it back leaves the store empty in between, which lets a
 	// concurrent reader fall through to the socket and deliver a later packet
 	// ahead of this one — the reordering this check exists to prevent.
-	if len(ms) == 0 || len(ms[0].Buffers) == 0 {
+	//
+	// "Room" must include a non-empty *first buffer*, not merely a non-empty
+	// Buffers slice: copy into a zero-length buffer moves no bytes, so taking
+	// the packet there would return (1, nil) with N=0 and an emptied store — a
+	// loss reported as success, and indistinguishable from a legitimately
+	// received zero-length datagram. That coupling of "did the path deliver?"
+	// to "how big was the payload?" is exactly what the ([]byte, bool, error)
+	// probe signature exists to make unrepresentable.
+	if len(ms) == 0 || len(ms[0].Buffers) == 0 || len(ms[0].Buffers[0]) == 0 {
 		if mc.pending.peek() != nil {
 			// Nowhere to put it. Leave it for the next call rather than drop it.
 			return 0, nil

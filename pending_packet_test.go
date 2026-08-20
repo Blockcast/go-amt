@@ -3,6 +3,7 @@ package amt
 import (
 	"bytes"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -244,29 +245,57 @@ func TestClosedConnDoesNotServePendingPacket(t *testing.T) {
 	}
 }
 
-// TestReadBatchWithNoRoomKeepsPendingPacket covers the one path that could drop
-// the packet silently: a caller passing a zero-length batch. Returning (0, nil)
-// having consumed it would lose a datagram with nothing to show for it, so the
-// packet is put back and the next call gets it.
+// TestReadBatchWithNoRoomKeepsPendingPacket covers the paths that could drop the
+// packet silently: a caller passing a batch with nowhere to put a datagram.
+// Returning having consumed it would lose one with nothing to show for it, so
+// the packet is left in the store and the next call with real room gets it.
+//
+// "No room" has three distinct shapes and they are NOT interchangeable. The
+// zero-length-first-buffer case is the one that actually regressed (Ally review
+// on go-amt#58): the guard tested len(Buffers) but not len(Buffers[0]), so a
+// batch of one empty buffer took the "there is room" branch, copied 0 bytes,
+// emptied the store, and returned (1, nil). That is worse than a plain drop —
+// n=1, N=0 is indistinguishable from a legitimately received zero-length
+// datagram, so the caller cannot even detect the loss. Each shape is asserted
+// separately because covering only `nil` is what let that through.
 func TestReadBatchWithNoRoomKeepsPendingPacket(t *testing.T) {
-	mc := openedConn()
-	mc.pending.put(&pendingPacket{buf: probePayload, src: probeSrc})
+	noRoom := []struct {
+		name string
+		ms   []ipv4.Message
+	}{
+		{"nil batch", nil},
+		{"empty batch", []ipv4.Message{}},
+		{"no buffers", []ipv4.Message{{Buffers: [][]byte{}}}},
+		{"zero-length first buffer", []ipv4.Message{{Buffers: [][]byte{make([]byte, 0)}}}},
+	}
 
-	n, err := mc.ReadBatch(nil, 0)
-	if err != nil {
-		t.Fatalf("ReadBatch(nil): %v", err)
-	}
-	if n != 0 {
-		t.Fatalf("ReadBatch(nil) returned %d, want 0", n)
-	}
+	for _, tc := range noRoom {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := openedConn()
+			mc.pending.put(&pendingPacket{buf: probePayload, src: probeSrc})
 
-	ms := []ipv4.Message{{Buffers: [][]byte{make([]byte, 1500)}}}
-	got, err := mc.ReadBatch(ms, 0)
-	if err != nil {
-		t.Fatalf("ReadBatch: %v", err)
-	}
-	if got != 1 || !bytes.Equal(ms[0].Buffers[0][:ms[0].N], probePayload) {
-		t.Errorf("the packet was dropped by the zero-length batch: n=%d payload=%q", got, ms[0].Buffers[0][:ms[0].N])
+			n, err := mc.ReadBatch(tc.ms, 0)
+			if err != nil {
+				t.Fatalf("ReadBatch(%s): %v", tc.name, err)
+			}
+			if n != 0 {
+				t.Errorf("ReadBatch(%s) returned n=%d, want 0: a batch with no room delivered nothing, so reporting a message arrived is a loss disguised as success", tc.name, n)
+			}
+
+			// The store, not the return value, is the thing that must survive.
+			if mc.pending.peek() == nil {
+				t.Fatalf("ReadBatch(%s) consumed the pending packet with nowhere to put it: the datagram is gone", tc.name)
+			}
+
+			ms := []ipv4.Message{{Buffers: [][]byte{make([]byte, 1500)}}}
+			got, err := mc.ReadBatch(ms, 0)
+			if err != nil {
+				t.Fatalf("ReadBatch after %s: %v", tc.name, err)
+			}
+			if got != 1 || !bytes.Equal(ms[0].Buffers[0][:ms[0].N], probePayload) {
+				t.Errorf("the packet was dropped by the %s: n=%d payload=%q", tc.name, got, ms[0].Buffers[0][:ms[0].N])
+			}
+		})
 	}
 }
 
@@ -317,6 +346,11 @@ func TestNoRoomReadBatchNeverHidesThePendingPacket(t *testing.T) {
 				vanished++
 				mu.Unlock()
 			}
+			// The intent is "sample often", not "spin hot". Without this the
+			// loop burns a core for the whole run of ReadBatch calls; yielding
+			// costs nothing and still samples far more often than the reader
+			// mutates the store.
+			runtime.Gosched()
 		}
 	}()
 

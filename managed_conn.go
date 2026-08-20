@@ -357,6 +357,17 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	// than advisory: Close takes the write lock, so it cannot interleave between
 	// the two and leave a closed connection serving a packet it still holds. A
 	// closed connection owes the caller an error, not a packet.
+	//
+	// Unlike ReadBatch this takes unconditionally, even when p is too short or
+	// empty, and that asymmetry is deliberate. A short buffer truncating a
+	// datagram is what the underlying socket does and what net.PacketConn
+	// documents, so matching it keeps the pending path and the socket path
+	// indistinguishable to the caller. ReadBatch can do better only because it
+	// has a way to say "no room, nothing consumed" — zero messages returned.
+	// ReadFrom has none: (0, addr, nil) with the packet retained is
+	// indistinguishable from a zero-length datagram, so a caller looping on a
+	// short buffer would spin forever instead of making progress. Do not
+	// "align" this with ReadBatch.
 	pending := mc.pending.take()
 	mc.mu.RUnlock()
 
@@ -435,9 +446,16 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	// checked first, and a no-room batch only ever peeks: take-then-put-back
 	// leaves the store momentarily empty, which lets a concurrent reader fall
 	// through to the socket and deliver a later packet ahead of this one.
+	//
+	// "Room" must include a non-empty *first buffer*, not merely a non-empty
+	// Buffers slice: copy into a zero-length buffer moves no bytes, so taking
+	// the packet there would return (1, nil) with N=0 and an emptied store —
+	// a loss reported as success, and indistinguishable from a legitimately
+	// received zero-length datagram. This is the same predicate the
+	// subscription path below uses (see the len(ms[i].Buffers[0]) checks).
 	var pending *pendingPacket
 	pendingWaiting := false
-	if len(ms) == 0 || len(ms[0].Buffers) == 0 {
+	if len(ms) == 0 || len(ms[0].Buffers) == 0 || len(ms[0].Buffers[0]) == 0 {
 		pendingWaiting = mc.pending.peek() != nil
 	} else {
 		pending = mc.pending.take()
