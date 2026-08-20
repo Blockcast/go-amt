@@ -502,12 +502,33 @@ func releaseUnused[T any](s []T) []T {
 //
 // That is deliberate and the tighter opener-anchored rule is NOT available.
 // Anchoring on the opener would cap the per-observation step at
-// maxSlotJump/(threshold-1) = 273 slots, and real capture data advances 69–364
-// slots between consecutive observations, so a feed in the upper half of its own
-// normal range could never assemble a run and would never recover — which is the
-// permanent blackout this guard exists to prevent, reintroduced. Measured, not
-// assumed: TestRampingFeedAtRealisticSlotSpacingStillResyncs fails if the anchor
-// is hoisted into the else branch.
+// maxSlotJump/(threshold-1) = 273 slots, and the observed step range is 69–364,
+// so a feed in the upper half of its own normal range could never assemble a run
+// and would never recover — which is the permanent blackout this guard exists to
+// prevent, reintroduced. Measured, not assumed:
+// TestRampingFeedAtRealisticSlotSpacingStillResyncs fails if the anchor is
+// hoisted into the else branch.
+//
+// Where 69–364 comes from, since that number decides the rule: it is the five
+// gaps between the six slots of the bundled capture fixture, quoted verbatim in
+// README.md and shred/retention.go — 159, 270, 69, 364, 207. Two consequences
+// are easy to get backwards. 364 is a floor on the top of the range, not a
+// candidate ceiling: it was observed, so the true maximum is >= 364 and cannot
+// turn out to be lower. And the cliff sits INSIDE that five-sample set rather
+// than out in its tail — the second-largest gap, 270, is three slots under the
+// 273 cap — so under opener anchoring the feed that never recovers is an
+// ordinary one, not a pathological one.
+//
+// One caveat, recorded so it is not later mistaken for an argument to switch:
+// those same two files describe the slot-distance window as correct "for the
+// dense live feed it scores", where slots advance one at a time. So 69–364
+// characterises the capture regime, not the live feed. It is still the regime
+// that decides this, because blockcast-shreds scores captures too — and the
+// asymmetry settles it either way. Predecessor anchoring costs a looser reach:
+// 61,440 slots, bounded, and self-healing once real traffic resumes. Opener
+// anchoring costs a frontier that never recovers for the life of the process.
+// Under uncertainty about the real step distribution, the loose rule is the
+// right trade even where the tight one would probably have worked.
 //
 // What the chain still buys is the property the counting alone lacks: scattered
 // noise perpetually restarts its own run and never reaches a threshold, because

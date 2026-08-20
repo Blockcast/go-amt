@@ -592,6 +592,18 @@ func TestTrackerRejectsIncoherentSlotJumps(t *testing.T) {
 	}
 }
 
+// realisticSlotStep is the top of the step range observed in the bundled capture
+// fixture (gaps of 159, 270, 69, 364, 207 — see the maxSlotJump docstring).
+//
+// The recovery path below drives this rather than a comfortable mid-range value
+// so that this test is a second, independent guard on the anchor rule, at the
+// integration layer instead of on extendRun directly. Under opener anchoring the
+// per-observation step is capped at maxSlotJump/(threshold-1) = 273, so 15 steps
+// of 364 never assemble a run, the frontier never resyncs, and `accepted` stays
+// false. At the previous step of 137 both anchorings passed, so the end-to-end
+// path proved nothing about which one was implemented.
+const realisticSlotStep = 364
+
 // TestTrackerRecoversFromPoisonedFrontier proves the guard is two-way.
 //
 // Before the self-heal, a frontier that reached a far-future slot was terminal:
@@ -623,8 +635,9 @@ func TestTrackerRecoversFromPoisonedFrontier(t *testing.T) {
 	real := uint64(1_100)
 	var accepted bool
 	for i := 0; i < erasure.FrontierDistrustThresholdForTest; i++ {
-		// Slots advance the way a real feed's do -- non-contiguous but coherent.
-		accepted = tracker.Observe(header(real+uint64(i)*137, 64, uint8(i)), base.Add(time.Duration(i)*time.Millisecond))
+		// Slots advance the way a real feed's do -- non-contiguous but coherent,
+		// and at the top of the observed range so the anchor rule is exercised.
+		accepted = tracker.Observe(header(real+uint64(i)*realisticSlotStep, 64, uint8(i)), base.Add(time.Duration(i)*time.Millisecond))
 	}
 	if !accepted {
 		t.Fatal("real traffic never re-accepted: frontier poisoning is still terminal")
@@ -641,7 +654,7 @@ func TestTrackerRecoversFromPoisonedFrontier(t *testing.T) {
 	// Advance plausibly from the recovered frontier: re-observing the frontier
 	// slot itself would be refused as already-scored once grace has elapsed,
 	// which would prove nothing about recovery.
-	next := got.NewestSlot + 137
+	next := got.NewestSlot + realisticSlotStep
 	if !tracker.Observe(header(next, 65, 0), base.Add(20*time.Millisecond)) {
 		t.Fatal("plausible advance from the recovered frontier rejected")
 	}
