@@ -91,6 +91,18 @@ type ManagedConn struct {
 // that treatment; they call waitOpen first, because a reader that snapshots a
 // half-built connection can park forever rather than merely read a stale field.
 //
+// The deadline setters — SetDeadline, SetReadDeadline, SetWriteDeadline — wait
+// too. They look like small setters but they belong with the data plane, not the
+// observers, because they MUTATE the connection and no provisional answer is
+// available to them: racing Open they would find nativeConn nil, fall through to
+// the tunnel branch, and return nil having set nothing. Open then installs the
+// native socket with no deadline on it, so a caller that opened in a goroutine
+// and set a deadline on the main path gets a socket that blocks forever on a
+// group that goes idle — and a nil error, so there is nothing to retry on. On
+// the tunnel branch returning nil without setting anything remains a documented
+// limitation; on the native branch it used to work, because mu was held for the
+// whole of Open, and narrowing it exposed these three alongside the six.
+//
 // Close does not *cancel* an in-flight Open, it marks the connection. The probe
 // has no cancellation path plumbed into it, so after Close returns, a concurrent
 // Open can still hold the native socket and its IGMP join for the remainder of
@@ -539,8 +551,13 @@ func (mc *ManagedConn) LocalAddr() net.Addr {
 	return mc.localAddr
 }
 
-// SetDeadline sets the read and write deadlines
+// SetDeadline sets the read and write deadlines.
+//
+// Waits for Open for the reason given on Open: racing it, this would find
+// nativeConn nil, fall through, and return nil having set nothing.
 func (mc *ManagedConn) SetDeadline(t time.Time) error {
+	mc.waitOpen()
+
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
@@ -552,8 +569,10 @@ func (mc *ManagedConn) SetDeadline(t time.Time) error {
 	return nil
 }
 
-// SetReadDeadline sets the read deadline
+// SetReadDeadline sets the read deadline. Waits for Open; see SetDeadline.
 func (mc *ManagedConn) SetReadDeadline(t time.Time) error {
+	mc.waitOpen()
+
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
@@ -564,8 +583,10 @@ func (mc *ManagedConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-// SetWriteDeadline sets the write deadline
+// SetWriteDeadline sets the write deadline. Waits for Open; see SetDeadline.
 func (mc *ManagedConn) SetWriteDeadline(t time.Time) error {
+	mc.waitOpen()
+
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
