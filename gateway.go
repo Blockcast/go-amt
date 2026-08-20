@@ -49,10 +49,28 @@ type Gateway struct {
 	loopErr  atomic.Error
 
 	// Internal fields
-	handle       C.amt_gateway_handle_t
-	cm           *ipv4.ControlMessage
-	leave        bool
-	intervalTime time.Duration
+	handle C.amt_gateway_handle_t
+	cm     *ipv4.ControlMessage
+	// leave signals the keepalive goroutine to exit and switches
+	// handleMembershipQuery from renewing the membership to tearing it down.
+	//
+	// Atomic because it is genuinely cross-goroutine in both directions: the
+	// keepalive goroutine started by Open reads it every interval while
+	// stopKeepalive writes it from Open's failure paths, and
+	// handleMembershipQuery reads it from the read loop while Close writes it.
+	// As a plain bool that was a data race — and worse than the detector
+	// complaining, because the read sits in a bare for loop with no
+	// synchronisation, so nothing obliges the goroutine to ever observe the
+	// write. stopKeepalive exists to prevent a leaked goroutine reconnecting to
+	// a relay nobody is listening to, and unsynchronised it could fail to do
+	// exactly that.
+	leave atomic.Bool
+	// intervalTime is atomic for the same reason leave is, and between the same
+	// two goroutines: handleMembershipQuery writes it from the read loop and from
+	// Close's goroutine, while the keepalive goroutine reads it every iteration to
+	// decide staleness and to size its sleep. As a plain time.Duration that was the
+	// identical race, two lines below the one this change set out to fix.
+	intervalTime atomic.Duration
 	responseMac  [6]byte
 	requestNonce uint32
 }
@@ -247,7 +265,7 @@ func (g *Gateway) Open() (err error) {
 		return fmt.Errorf("error creating Rust gateway: %w", err)
 	}
 
-	g.intervalTime = time.Second * 10
+	g.intervalTime.Store(time.Second * 10)
 	g.lastData.Store(time.Now())
 
 	openTimeout := g.Timeout
@@ -280,11 +298,11 @@ func (g *Gateway) Open() (err error) {
 		// logging filtered out precisely when it is needed.
 		var stalled bool
 		for {
-			if g.leave {
+			if g.leave.Load() {
 				return
 			}
 			var loopErr error
-			if idle := time.Since(g.lastData.Load()); idle > g.intervalTime {
+			if idle := time.Since(g.lastData.Load()); idle > g.intervalTime.Load() {
 				if !stalled {
 					stalled = true
 					slog.Warn("amt: no data from relay, re-sending discovery",
@@ -304,7 +322,7 @@ func (g *Gateway) Open() (err error) {
 				slog.Warn("amt: keepalive send failed", "relay", relay, "error", loopErr)
 				g.loopErr.Store(loopErr)
 			}
-			time.Sleep(g.intervalTime)
+			time.Sleep(g.intervalTime.Load())
 		}
 	}()
 
@@ -366,7 +384,7 @@ const DefaultOpenTimeout = 10 * time.Second
 // failure path so a failed Open does not leak a goroutine that reconnects to a
 // relay nobody is listening to.
 func (g *Gateway) stopKeepalive() {
-	g.leave = true
+	g.leave.Store(true)
 }
 
 // handleRelayAdvertisement processes AMT Relay Advertisement.
@@ -408,7 +426,7 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 		igmp, ok := p.Layer(layers.LayerTypeIGMP).(*layers.IGMP)
 		if ok && igmp.Type == layers.IGMPMembershipQuery {
 			if igmp.IntervalTime > 0 {
-				g.intervalTime = igmp.IntervalTime
+				g.intervalTime.Store(igmp.IntervalTime)
 			}
 		}
 	}
@@ -419,7 +437,7 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 		return fmt.Errorf("error decoding membership query: %w", err)
 	}
 
-	if g.leave {
+	if g.leave.Load() {
 		if err = g.sendTeardown(*membershipQuery); err != nil {
 			return fmt.Errorf("error in sendTeardown: %w", err)
 		}
@@ -439,7 +457,7 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 
 // Close gracefully closes the AMT gateway.
 func (g *Gateway) Close() error {
-	g.leave = true
+	g.leave.Store(true)
 	buffer := make([]byte, g.MTU)
 	errc := make(chan error, 1)
 

@@ -15,7 +15,7 @@ permissions:
 #   -----------------|-------------|--------|---------------------------|-----
 #   test             | 0           | -      | NO (conn_nocgo.go instead)| no
 #   race             | 1           | purego | NO (conn_nocgo.go instead)| yes
-#   cgo-test         | 1           | -      | YES                       | no
+#   cgo-test         | 1           | -      | YES                       | named tests only
 #   mobile-typecheck | 0           | -      | NO (conn_mobile.go instead)| no
 #
 # mobile-typecheck is the fourth selection, not a variant of the first three:
@@ -81,10 +81,13 @@ jobs:
       # but skips unless AMT_E2E_RELAY is set, so it contributes no coverage
       # here either.
       #
-      # This is a race-coverage gap only. It used to be a total build-coverage
+      # This is a NARROWED race-coverage gap. It used to be a total build-coverage
       # gap — nothing on CI compiled those three files — which is how BLO-28640
-      # shipped. The cgo-test job below now builds and tests them; it just does
-      # not run under -race, so the caveat above still stands for that axis.
+      # shipped. The cgo-test job below builds and tests them, and now runs the
+      # named Gateway.Open tests under -race (BLO-29064), so those specific tests
+      # ARE race-covered. The rest of the package there still is not: anything
+      # those tests do not reach — handleMembershipQuery, for one — has no race
+      # coverage on any job.
       - run: go test -race -tags purego ./...
 
   # Build libamt_protocol and run the cgo-tagged tests for real.
@@ -168,6 +171,33 @@ jobs:
           done
           exit $rc
 
+      # Full `go vet` over the cgo selection, which no other job covers.
+      #
+      # `go test` below runs only vet's test-relevant subset (printf, atomic,
+      # errorsas, ifaceassert, bool, stringintconv, buildtags, nilfunc, tests).
+      # The analyzer that matters most here is not in it: cgocall — the one that
+      # flags passing Go pointers into C — can ONLY ever fire on the
+      # `cgo && !purego` selection, and copylocks, lostcancel and unusedresult
+      # are likewise dropped over conn.go and gateway.go, which the other two
+      # jobs do not compile at all.
+      #
+      # loopclosure is deliberately NOT in that list even though it looks like it
+      # belongs: it only reports when the module's language version is below
+      # go1.22, and go.mod declares go 1.24.0, so it cannot fire here at all.
+      # Naming it would be the same overstated-coverage error this step exists to
+      # correct, in the one file whose header says to keep the table honest.
+      #
+      # This is a step rather than a job on purpose: the env here already carries
+      # CGO_LDFLAGS/LD_LIBRARY_PATH and the library is already built, so it costs
+      # no second submodule checkout and no second Rust build.
+      #
+      # Ordering: after the selection assertion above, so a vacuous pass trips
+      # that gate before vet can report clean over nothing; and before the
+      # BLO-28805 block below, so that block stays adjacent to the `Test` step it
+      # documents rather than reading as this step's preamble.
+      - name: Vet the cgo selection
+        run: go vet ./...
+
       # Known-failing on the cgo path only, tracked in BLO-28805. Two distinct
       # confidence levels here — do not collapse them into one claim.
       #
@@ -211,7 +241,17 @@ jobs:
       # Run the Gateway.Open guards by name so the log carries positive proof
       # they executed, rather than a bare "ok" that is also what a fully
       # deselected package prints.
-      - name: Prove the Gateway.Open guards ran
+      #
+      # Under -race, deliberately. gateway.go had ZERO race coverage on CI: the
+      # only -race job runs -tags purego, which deselects this file, and this job
+      # compiled it without the detector. That gap is documented in the coverage
+      # table at the top of this file, and it was not hypothetical — it hid an
+      # unsynchronised Gateway.leave, written by stopKeepalive and read by the
+      # keepalive goroutine, which reproduced 3/3 locally while CI stayed green
+      # (BLO-29064). Running the whole package under -race here would roughly
+      # double the job; these named tests are the ones that actually exercise
+      # gateway.go's concurrency, so the detector is pointed at them.
+      - name: Prove the Gateway.Open guards ran (under -race)
         run: |
           set -euo pipefail
           # Capture the status rather than letting `set -e` abort here. With a
@@ -220,11 +260,12 @@ jobs:
           # reachable only for a skip (exit 0) and never for a failure. We want
           # the loop to run either way, then fail on the captured status.
           rc=0
-          go test -v -count=1 \
-            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress' \
+          go test -v -count=1 -race \
+            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine' \
             . 2>&1 | tee /tmp/cgo-test.log || rc=$?
           for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault \
-                   TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress; do
+                   TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress \
+                   TestStopKeepaliveIsObservedByTheKeepaliveGoroutine; do
             grep -qF -- "--- PASS: $t" /tmp/cgo-test.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
