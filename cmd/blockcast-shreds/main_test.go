@@ -619,8 +619,17 @@ func TestScoringFlagsBindEachFlagToItsOwnField(t *testing.T) {
 // before the guard, scoring{"", "", "shred"} -- mode and rightsBasis
 // transposed -- type-checked clean, and `go vet` stayed silent because its
 // composites check only flags unkeyed literals for imported structs, never
-// same-package ones. The guard breaks the arity so no unkeyed literal of any
-// ordering can be written at all.
+// same-package ones. The guard breaks the arity of that bare-constant form,
+// which is the one a call site would plausibly write. It does not close the
+// unkeyed class outright: scoring{struct{}{}, "", "", "shred"} fills the blank
+// field and still compiles, an accepted residual documented on the field.
+//
+// Field(0) is the demand, not merely "a blank field exists somewhere", for two
+// reasons. Only a LEADING blank breaks the arity in a way that rejects the
+// 3-value form. And a trailing zero-size field takes tail padding: measured on
+// this struct, guard-first is 48 bytes and guard-last is 56. So "tidying" the
+// guard to the end of the struct would compile, keep something that looks like
+// the guard, defend nothing, and quietly grow the type by 8 bytes.
 //
 // This asserts the guard's presence rather than the compile failure, because a
 // test cannot observe a build it prevents. The compile failure itself is
@@ -633,7 +642,8 @@ func TestScoringRejectsUnkeyedLiterals(t *testing.T) {
 			"mode and rightsBasis transposed (BLO-28993)", got, "_")
 	}
 	if got := scoringType.Field(0).Type.Size(); got != 0 {
-		t.Errorf("guard field size = %d, want 0: the guard must stay zero-width", got)
+		t.Errorf("guard field size = %d, want 0: the guard must stay zero-width so "+
+			"it costs nothing at position 0 (BLO-28993)", got)
 	}
 }
 

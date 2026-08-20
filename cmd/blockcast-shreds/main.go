@@ -370,8 +370,6 @@ func gensend(args []string) error {
 	return nil
 }
 
-// listenAndScore serves every configured feed until stop is closed or a socket
-// fails. stop may be nil, in which case only a signal or a socket error ends it.
 // scoring names the scoring mode and its generic-mode provenance.
 //
 // These three travelled as adjacent positional strings at the tail of an
@@ -380,13 +378,25 @@ func gensend(args []string) error {
 // stamping the wrong provenance, and the tests would go on passing. Naming
 // the fields makes that a compile error instead.
 type scoring struct {
-	// _ forces every literal to be keyed. Without it an unkeyed literal is
-	// still writable, and the distinct types below do NOT save it: untyped
-	// string CONSTANTS convert to any ~string type, so scoring{"", "",
-	// "shred"} -- mode and rightsBasis transposed -- compiled clean and
-	// passed `go vet` (which only flags unkeyed literals for imported
-	// structs, never same-package ones). The blank field makes the arity
-	// wrong, so the only way to build a scoring is by naming fields.
+	// _ forces every literal a call site would plausibly write to be keyed.
+	// Without it an unkeyed literal is writable, and the distinct types
+	// below do NOT save it: untyped string CONSTANTS convert to any ~string
+	// type, so scoring{"", "", "shred"} -- mode and rightsBasis transposed
+	// -- compiled clean and passed `go vet` (which only flags unkeyed
+	// literals for imported structs, never same-package ones). The blank
+	// field makes the arity wrong, so that bare-constant form no longer
+	// builds.
+	//
+	// KNOWN RESIDUAL, accepted: the guard breaks the arity of the natural
+	// 3-value form, not the unkeyed class as a whole. A blank field is
+	// fillable, so the 4-value form scoring{struct{}{}, "", "", "shred"}
+	// carries the same transposition and still compiles clean under `go
+	// vet`. Nothing rejects it -- not the arity, not the types. It survives
+	// only because nobody writes struct{}{} by accident; every real
+	// construction site here is keyed. Closing it properly would mean
+	// moving scoring to its own package so vet's composites check sees an
+	// imported struct, which trades a compile error for a lint and is a
+	// far wider change than the hazard warrants.
 	_ struct{}
 
 	mode        scoringMode
@@ -401,7 +411,9 @@ type scoring struct {
 // reject it.
 //
 // The two guards are complementary, not redundant -- each catches a swap the
-// other admits. Neither alone satisfies BLO-28993; both together do.
+// other admits. Neither alone satisfies BLO-28993; both together do. One class
+// escapes both, and is documented as an accepted residual on the guard field
+// above: an unkeyed literal that fills the blank field explicitly.
 type (
 	scoringMode   string
 	scoringSource string
@@ -463,6 +475,8 @@ func (s scoring) validate() error {
 
 func (s scoring) generic() bool { return s.mode == "generic" }
 
+// listenAndScore serves every configured feed until stop is closed or a socket
+// fails. stop may be nil, in which case only a signal or a socket error ends it.
 func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, grace, reportInterval, retention time.Duration, stop <-chan struct{}, mode scoring, bill billing) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
