@@ -1,0 +1,71 @@
+name: packaging
+
+# The Dockerfile, goreleaser config and install smoke test cannot be validated
+# by `go test`, so without this workflow they rot silently until a release fails.
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  # The load-bearing job: builds the static binary exactly as shipped and runs
+  # the same smoke test an operator runs after installing it.
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build the shipped static binary
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o blockcast-shreds ./cmd/blockcast-shreds
+      - name: Install smoke test
+        run: packaging/smoke-test.sh ./blockcast-shreds
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: blockcast-shreds:ci
+      # An image that builds but cannot execute its entrypoint is not a
+      # verified image. selftest exits non-zero on a scoring mismatch, so this
+      # also proves the embedded capture survived the build.
+      - name: Entrypoint runs inside the image
+        run: docker run --rm blockcast-shreds:ci selftest --fixture --json
+
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: check
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: build --snapshot --clean
+      # Guards the deliverable itself: a dynamically linked release binary
+      # would still build and still pass tests, and would fail on a customer
+      # validator with a different libc.
+      - name: Release binary is static
+        run: |
+          binary="$(find dist -type f -name blockcast-shreds | head -1)"
+          test -n "$binary" || { echo "no release binary produced"; exit 1; }
+          file "$binary"
+          file "$binary" | grep -q "statically linked" \
+            || { echo "release binary is not statically linked"; exit 1; }

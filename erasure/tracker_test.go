@@ -348,7 +348,12 @@ func TestTrackerRejectsBackwardDrainWithoutReset(t *testing.T) {
 	}
 }
 
-func TestTrackerDrainPreservesArrivalsAtAndAfterCutoff(t *testing.T) {
+// The shipped receiver drains from a ticker goroutine that does not hold the
+// read-path mutex and passes the ticker's fire time as the cutoff, so arrivals
+// stamped at or after that cutoff are routine rather than exceptional. This
+// pins what happens to them: they belong to the window being drained, they are
+// not double counted, and no arrival is lost.
+func TestTrackerDrainAttributesArrivalsObservedBeforeTheCall(t *testing.T) {
 	started := time.Unix(1300, 0)
 	tracker, err := erasure.NewTracker(0, started)
 	if err != nil {
@@ -357,11 +362,48 @@ func TestTrackerDrainPreservesArrivalsAtAndAfterCutoff(t *testing.T) {
 	tracker.Observe(header(100, 0, 0), started.Add(30*time.Second))
 	tracker.Observe(header(100, 0, 1), started.Add(31*time.Second))
 
-	if got := drain(t, tracker, started.Add(30*time.Second)); got.RMean != 0 {
-		t.Fatalf("first window included cutoff arrival: mean = %v", got.RMean)
+	if got := drain(t, tracker, started.Add(30*time.Second)); got.RMean != 2.0/30.0 {
+		t.Fatalf("arrivals at and after cutoff were withheld: mean = %v, want %v", got.RMean, 2.0/30.0)
 	}
-	if got := drain(t, tracker, started.Add(60*time.Second)); got.RMean != 2.0/30.0 {
-		t.Fatalf("future arrivals were lost: mean = %v, want %v", got.RMean, 2.0/30.0)
+	if got := drain(t, tracker, started.Add(60*time.Second)); got.RMean != 0 {
+		t.Fatalf("arrivals were counted twice: mean = %v, want 0", got.RMean)
+	}
+}
+
+// A drain that lands mid-burst must not lose the gap or peak contribution of
+// the arrivals it sweeps in, and must not carry either across the boundary.
+func TestTrackerDrainAttributesGapAndPeakForArrivalsAfterCutoff(t *testing.T) {
+	started := time.Unix(1350, 0)
+	tracker, err := erasure.NewTracker(0, started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Offset from a whole second so the cutoff does not itself land on a 100 ms
+	// bucket edge, which would split the burst for reasons unrelated to the
+	// drain.
+	cutoff := started.Add(10*time.Second + 50*time.Millisecond)
+	// Two arrivals before the cutoff and two at or after it, all inside one
+	// 100 ms bucket, 3 ms apart.
+	for index := uint8(0); index < 4; index++ {
+		at := cutoff.Add(time.Duration(index)*3*time.Millisecond - 6*time.Millisecond)
+		if !tracker.Observe(header(101, 0, index), at) {
+			t.Fatalf("observation %d was rejected", index)
+		}
+	}
+
+	got := drain(t, tracker, cutoff)
+	if want := 4.0 / cutoff.Sub(started).Seconds(); math.Abs(got.RMean-want) > 1e-12 {
+		t.Fatalf("mean = %v, want %v", got.RMean, want)
+	}
+	// One whole bucket of four, not a bucket split across two windows.
+	if got.RPeak100MS != 40 {
+		t.Fatalf("peak = %v, want 40", got.RPeak100MS)
+	}
+	if want := (erasure.GapHistogram{From2_4To7: 3}); got.GapMSHist != want {
+		t.Fatalf("gaps = %+v, want %+v", got.GapMSHist, want)
+	}
+	if next := drain(t, tracker, cutoff.Add(30*time.Second)); next.RMean != 0 || next.RPeak100MS != 0 || next.GapMSHist != (erasure.GapHistogram{}) {
+		t.Fatalf("delivery state leaked past the drain: %+v", next)
 	}
 }
 
