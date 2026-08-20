@@ -48,6 +48,21 @@ type AMTProtocol interface {
 	// on it (BLO-28805): the Rust FFI path guarded on Querying and consumed it,
 	// making the call single-shot per Query, so every leave and every second
 	// join failed with InvalidState while the pure-Go path succeeded.
+	//
+	// "The same for both implementations" is a claim about this precondition,
+	// not blanket parity. The IGMP encapsulation is not fully in agreement: a
+	// join report's IPv4 destination is the multicast group on the Rust path
+	// and 224.0.0.22 on the pure-Go one (BLO-29419). Everything else in that
+	// envelope is pinned across implementations by
+	// TestIGMPEnvelopeParityAcrossImplementations.
+	//
+	// igmpReport must be non-empty. The implementations diverge on an empty
+	// slice rather than agreeing on an error: the cgo path takes
+	// &igmpReport[0] (protocol_cgo.go:279) and panics, where pure-Go marshals
+	// it into an empty Encapsulated field. No caller can reach it today —
+	// every CreateIGMP*Report builder returns a non-empty slice on success —
+	// so this is a documented precondition rather than a latent panic, and a
+	// new caller should treat it as one.
 	CreateMembershipUpdate(igmpReport []byte) ([]byte, error)
 
 	// CreateTeardownMessage creates an AMT Teardown message
