@@ -163,6 +163,33 @@ jobs:
           done
           exit $rc
 
+      # Full `go vet` over the cgo selection, which no other job covers.
+      #
+      # `go test` below runs only vet's test-relevant subset (printf, atomic,
+      # errorsas, ifaceassert, bool, stringintconv, buildtags, nilfunc, tests).
+      # The analyzer that matters most here is not in it: cgocall — the one that
+      # flags passing Go pointers into C — can ONLY ever fire on the
+      # `cgo && !purego` selection, and copylocks, lostcancel and unusedresult
+      # are likewise dropped over conn.go and gateway.go, which the other two
+      # jobs do not compile at all.
+      #
+      # loopclosure is deliberately NOT in that list even though it looks like it
+      # belongs: it only reports when the module's language version is below
+      # go1.22, and go.mod declares go 1.24.0, so it cannot fire here at all.
+      # Naming it would be the same overstated-coverage error this step exists to
+      # correct, in the one file whose header says to keep the table honest.
+      #
+      # This is a step rather than a job on purpose: the env here already carries
+      # CGO_LDFLAGS/LD_LIBRARY_PATH and the library is already built, so it costs
+      # no second submodule checkout and no second Rust build.
+      #
+      # Ordering: after the selection assertion above, so a vacuous pass trips
+      # that gate before vet can report clean over nothing; and before the
+      # BLO-28805 block below, so that block stays adjacent to the `Test` step it
+      # documents rather than reading as this step's preamble.
+      - name: Vet the cgo selection
+        run: go vet ./...
+
       # Known-failing on the cgo path only, tracked in BLO-28805. Two distinct
       # confidence levels here — do not collapse them into one claim.
       #
@@ -199,22 +226,6 @@ jobs:
       # the selection assertion above still fails if the cgo files are not
       # compiled, and the Gateway.Open guards below still run. Delete the -skip
       # when BLO-28805 lands; its acceptance criteria require exactly that.
-      # Full `go vet` over the cgo selection, which no other job covers.
-      #
-      # `go test` below runs only vet's test-relevant subset (printf, atomic,
-      # errorsas, ifaceassert, bool, stringintconv, buildtags, nilfunc, tests).
-      # The analyzer that matters most here is not in it: cgocall — the one that
-      # flags passing Go pointers into C — can ONLY ever fire on the
-      # `cgo && !purego` selection, and copylocks, lostcancel, loopclosure and
-      # unusedresult are likewise dropped over conn.go and gateway.go, which the
-      # other two jobs do not compile at all.
-      #
-      # This is a step rather than a job on purpose: the env here already carries
-      # CGO_LDFLAGS/LD_LIBRARY_PATH and the library is already built, so it costs
-      # no second submodule checkout and no second Rust build.
-      - name: Vet the cgo selection
-        run: go vet ./...
-
       - name: Test
         run: |
           go test -skip 'TestQueuedPacketsOwnPayloadAndSourceAddress|TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestDataStarvationReconnectsDespiteControlTraffic' ./...
