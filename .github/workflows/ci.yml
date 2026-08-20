@@ -77,6 +77,22 @@ permissions:
 # honest when adding a job — BLO-28640 (a probe window that made native
 # multicast structurally unreachable) reached production while `test` and
 # `race` between them compiled that code path zero times.
+#
+# The native-delivery harness (BLO-29196) is tag-split along the same seam, and
+# which lane asserts which arbiter follows from the table above rather than from
+# anything about the tests:
+#
+#   file                          | tags              | asserts        | lanes
+#   ------------------------------|-------------------|----------------|--------------------
+#   fakenative_test.go            | linux \|\| darwin | (the fake)     | test, race, cgo-test
+#   fakenative_flows_test.go      | linux \|\| darwin | ManagedConn    | test, race, cgo-test
+#   fakerelay_switchover_test.go  | cgo && !purego    | MulticastConn  | cgo-test ONLY
+#
+# MulticastConn reaches AMT through Gateway, and both conn.go and gateway.go are
+# `cgo && !purego`, so the live-path arbiter can only be asserted in cgo-test.
+# ManagedConn reaches it through the untagged relay_manager.go, so its arbiter is
+# asserted everywhere. Each lane below asserts its own selection with `go list`,
+# because `go test` exits 0 whether a file was selected or not.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -96,6 +112,57 @@ jobs:
       # available to register, not whether this file is built.
       - run: go test ./...
       - run: go vet ./...
+
+      # The native-delivery harness (BLO-29196) is split across two tag sets on
+      # purpose. fakenative_test.go and fakenative_flows_test.go are
+      # `linux || darwin`, so they cover ManagedConn's native-vs-tunnel arbiter in
+      # THIS lane; fakerelay_switchover_test.go is `cgo && !purego` and covers
+      # MulticastConn's in cgo-test, because conn.go and gateway.go are not built
+      # here. Assert the split rather than trusting it: `go test` exits 0 whether
+      # a file was selected or not, so a tag mistake would silently relocate
+      # coverage between lanes — the same class of gap as BLO-28640.
+      - name: Assert the native-delivery harness is selected in this lane
+        run: |
+          set -euo pipefail
+          tst=$(go list -f '{{join .TestGoFiles "\n"}}{{"\n"}}{{join .XTestGoFiles "\n"}}' .)
+          echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
+          rc=0
+          for t in fakenative_test.go fakenative_flows_test.go; do
+            printf '%s\n' "$tst" | grep -qxF "$t" || {
+              echo "::error::$t is not in the CGO_ENABLED=0 test selection; the ManagedConn switchover tests are not running in this lane"
+              rc=1
+            }
+          done
+          # The cgo-only half must NOT be here. If it were, it would run against
+          # conn_nocgo.go's stub, whose Open returns errNoCGO unconditionally —
+          # so it could only pass by asserting nothing.
+          if printf '%s\n' "$tst" | grep -qxF fakerelay_switchover_test.go; then
+            echo "::error::fakerelay_switchover_test.go is selected under CGO_ENABLED=0; it needs the real MulticastConn, not the stub"
+            rc=1
+          fi
+          exit $rc
+
+      # By name, so the log carries positive proof these executed. A bare "ok" is
+      # also what a fully deselected package prints. Same rationale and the same
+      # rc-capture shape as the Gateway.Open guards in cgo-test below.
+      - name: Prove the native-delivery harness guards ran
+        run: |
+          set -euo pipefail
+          names='TestFakeNativeSourceDeliversOnlyWhileEnabled
+          TestFakeNativeSourceIsolatesGroups
+          TestProvenanceOfNamesEachDeliveryPath
+          TestManagedConnKeepsNativeWhenBothPathsAreLive
+          TestManagedConnSwitchesFromNativeToRelayAndBack
+          TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
+          rc=0
+          go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness.log || rc=$?
+          for t in $names; do
+            grep -qF -- "--- PASS: $t" /tmp/native-harness.log || {
+              echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
+              rc=1
+            }
+          done
+          exit $rc
 
   race:
     runs-on: ubuntu-latest
@@ -207,6 +274,18 @@ jobs:
               rc=1
             }
           done
+          # Both halves of the native-delivery harness must be here: the cgo-only
+          # MulticastConn switchover, and the shared fake it is built on. This is
+          # the ONLY lane that compiles conn.go and gateway.go, so it is the only
+          # lane where the live-path arbiter is asserted at all — if
+          # fakerelay_switchover_test.go is deselected here it is deselected
+          # everywhere, which is exactly how BLO-28640 shipped.
+          for t in fakenative_test.go fakenative_flows_test.go fakerelay_switchover_test.go; do
+            printf '%s\n' "$tst" | grep -qxF "$t" || {
+              echo "::error::$t is not in the cgo test selection; the MulticastConn switchover tests are not running anywhere"
+              rc=1
+            }
+          done
           exit $rc
 
       # Full `go vet` over the cgo selection, which no other job covers.
@@ -306,6 +385,60 @@ jobs:
                    TestStopKeepaliveIsObservedByTheKeepaliveGoroutine; do
             grep -qF -- "--- PASS: $t" /tmp/cgo-test.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
+              rc=1
+            }
+          done
+          exit $rc
+
+      # The MulticastConn switchover guards. This lane is the only one that can
+      # run them, so a silent deselection here leaves the live-path arbiter
+      # asserted by nothing at all — which is the gap BLO-29196 exists to close.
+      - name: Prove the MulticastConn switchover guards ran
+        run: |
+          set -euo pipefail
+          names='TestMulticastConnKeepsNativeWhenBothPathsAreLive
+          TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent
+          TestMulticastConnPicksNativeAgainAfterItRecovers'
+          rc=0
+          go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/switchover.log || rc=$?
+          for t in $names; do
+            grep -qF -- "--- PASS: $t" /tmp/switchover.log || {
+              echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
+              rc=1
+            }
+          done
+          exit $rc
+
+      # The shared half, in this lane too — but only the parts whose behaviour
+      # here is predictable from first principles.
+      #
+      # These three touch no protocol implementation at all: they drive the fake
+      # native source through the join seam and assert its switch and its
+      # provenance decoder. So they must pass identically in every lane, and if
+      # they do not, the harness itself is broken rather than the arbiter.
+      #
+      # The ManagedConn switchover tests are deliberately NOT re-gated by name
+      # here. They already run in the `Test` step above, and they are gated by
+      # name in the `test` job where their behaviour is verified; re-running them
+      # here would duplicate two MinUsefulProbeWindow waits for no new signal.
+      # More to the point, ManagedConn tunnels through RelayManager, which under
+      # cgo dispatches to the Rust amt_protocol implementation — the same path
+      # whose divergences are catalogued in the BLO-28805 block above, one of
+      # which is a subscription that never leaves Suspended. Whether a
+      # ManagedConn subscription reaches Active on the Rust path is an open
+      # question this lane answers; asserting it by name before it is answered
+      # would be predicting, not testing.
+      - name: Prove the native-source harness guards ran under cgo
+        run: |
+          set -euo pipefail
+          names='TestFakeNativeSourceDeliversOnlyWhileEnabled
+          TestFakeNativeSourceIsolatesGroups
+          TestProvenanceOfNamesEachDeliveryPath'
+          rc=0
+          go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness-cgo.log || rc=$?
+          for t in $names; do
+            grep -qF -- "--- PASS: $t" /tmp/native-harness-cgo.log || {
+              echo "::error::$t did not report a PASS line under cgo; it was skipped, deselected or failed"
               rc=1
             }
           done

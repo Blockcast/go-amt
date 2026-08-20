@@ -31,7 +31,11 @@ func (mc *ManagedConn) dialNativeMulticast(plan probePlan) (*ipv4.PacketConn, er
 	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
 
 	var prog []bpf.RawInstruction
-	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
+	// Through the shared seam, not ListenMulticastUDP4 directly: this call site
+	// used to be the unsubstitutable one, so a test could control what
+	// MulticastConn's join delivered and had no way to do the same here. See
+	// listen_seam.go.
+	conn, err := listenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
 	if err != nil {
 		return nil, err
 	}
