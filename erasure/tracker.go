@@ -419,7 +419,7 @@ func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 		retainedScores = append(retainedScores, event)
 	}
 	t.scores = releaseUnused(retainedScores)
-	window.ErasureFraction = fraction(window.SetsErased, window.SetsTotal)
+	window.ErasureFraction = Fraction(window.SetsErased, window.SetsTotal)
 
 	// Delivery is a fixed-size streaming fold (BLO-28451), so unlike the score
 	// slice above there is no arrival backing array to walk, filter, or
@@ -585,11 +585,23 @@ func (h *GapHistogram) observe(gap time.Duration) {
 	}
 }
 
-func fraction(numerator, denominator uint64) float64 {
-	if denominator == 0 {
+// Fraction is the erased-set ratio carried in Window.ErasureFraction.
+//
+// It is exported so that a consumer validating an untrusted Window recomputes
+// the ratio with the same implementation that produced it, rather than a second
+// spelling that could disagree at the edges. A zero denominator yields 0: a
+// window that scored no sets has no erasure, which is distinct from a window
+// that scored sets and erased none only in SetsTotal.
+//
+// The parameters are named for their meaning rather than their arithmetic role
+// because both are uint64 and transposing them compiles: Fraction(total,
+// erased) is a silent bug that returns a value above 1 for any window with a
+// non-total erasure.
+func Fraction(erased, total uint64) float64 {
+	if total == 0 {
 		return 0
 	}
-	return float64(numerator) / float64(denominator)
+	return float64(erased) / float64(total)
 }
 
 // reclaimOldSlots drops scoring state that can no longer change.
