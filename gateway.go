@@ -64,8 +64,13 @@ type Gateway struct {
 	// write. stopKeepalive exists to prevent a leaked goroutine reconnecting to
 	// a relay nobody is listening to, and unsynchronised it could fail to do
 	// exactly that.
-	leave        atomic.Bool
-	intervalTime time.Duration
+	leave atomic.Bool
+	// intervalTime is atomic for the same reason leave is, and between the same
+	// two goroutines: handleMembershipQuery writes it from the read loop and from
+	// Close's goroutine, while the keepalive goroutine reads it every iteration to
+	// decide staleness and to size its sleep. As a plain time.Duration that was the
+	// identical race, two lines below the one this change set out to fix.
+	intervalTime atomic.Duration
 	responseMac  [6]byte
 	requestNonce uint32
 }
@@ -260,7 +265,7 @@ func (g *Gateway) Open() (err error) {
 		return fmt.Errorf("error creating Rust gateway: %w", err)
 	}
 
-	g.intervalTime = time.Second * 10
+	g.intervalTime.Store(time.Second * 10)
 	g.lastData.Store(time.Now())
 
 	openTimeout := g.Timeout
@@ -297,7 +302,7 @@ func (g *Gateway) Open() (err error) {
 				return
 			}
 			var loopErr error
-			if idle := time.Since(g.lastData.Load()); idle > g.intervalTime {
+			if idle := time.Since(g.lastData.Load()); idle > g.intervalTime.Load() {
 				if !stalled {
 					stalled = true
 					slog.Warn("amt: no data from relay, re-sending discovery",
@@ -317,7 +322,7 @@ func (g *Gateway) Open() (err error) {
 				slog.Warn("amt: keepalive send failed", "relay", relay, "error", loopErr)
 				g.loopErr.Store(loopErr)
 			}
-			time.Sleep(g.intervalTime)
+			time.Sleep(g.intervalTime.Load())
 		}
 	}()
 
@@ -421,7 +426,7 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 		igmp, ok := p.Layer(layers.LayerTypeIGMP).(*layers.IGMP)
 		if ok && igmp.Type == layers.IGMPMembershipQuery {
 			if igmp.IntervalTime > 0 {
-				g.intervalTime = igmp.IntervalTime
+				g.intervalTime.Store(igmp.IntervalTime)
 			}
 		}
 	}

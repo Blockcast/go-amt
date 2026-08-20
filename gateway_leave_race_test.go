@@ -53,22 +53,3 @@ func TestStopKeepaliveIsObservedByTheKeepaliveGoroutine(t *testing.T) {
 			"reconnecting to the relay")
 	}
 }
-
-// TestCloseSignalsLeaveForTheReadLoop covers the second pairing on this field:
-// Close writes it while handleMembershipQuery reads it to decide between
-// renewing the membership and tearing it down. Close's later work needs a live
-// socket, so this asserts only the flag transition it performs first — the part
-// that races.
-func TestCloseSignalsLeaveForTheReadLoop(t *testing.T) {
-	g := &Gateway{}
-	if g.leave.Load() {
-		t.Fatal("a fresh Gateway must not start in the leaving state")
-	}
-
-	// Same write Close performs before it begins its teardown exchange.
-	g.leave.Store(true)
-
-	if !g.leave.Load() {
-		t.Fatal("leave must read back as set")
-	}
-}

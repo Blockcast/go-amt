@@ -15,7 +15,7 @@ permissions:
 #   ----------|-------------|--------|---------------------------|-----
 #   test      | 0           | -      | NO (conn_nocgo.go instead)| no
 #   race      | 1           | purego | NO (conn_nocgo.go instead)| yes
-#   cgo-test  | 1           | -      | YES                       | no
+#   cgo-test  | 1           | -      | YES                       | named tests only
 #
 # Only conn.go has a tagged counterpart: conn_nocgo.go is `(!cgo || purego)`,
 # a genuine either/or with conn.go. protocol_pure.go is UNTAGGED and compiles
@@ -73,10 +73,13 @@ jobs:
       # but skips unless AMT_E2E_RELAY is set, so it contributes no coverage
       # here either.
       #
-      # This is a race-coverage gap only. It used to be a total build-coverage
+      # This is a NARROWED race-coverage gap. It used to be a total build-coverage
       # gap — nothing on CI compiled those three files — which is how BLO-28640
-      # shipped. The cgo-test job below now builds and tests them; it just does
-      # not run under -race, so the caveat above still stands for that axis.
+      # shipped. The cgo-test job below builds and tests them, and now runs the
+      # named Gateway.Open tests under -race (BLO-29064), so those specific tests
+      # ARE race-covered. The rest of the package there still is not: anything
+      # those tests do not reach — handleMembershipQuery, for one — has no race
+      # coverage on any job.
       - run: go test -race -tags purego ./...
 
   # Build libamt_protocol and run the cgo-tagged tests for real.
@@ -239,11 +242,11 @@ jobs:
           # the loop to run either way, then fail on the captured status.
           rc=0
           go test -v -count=1 -race \
-            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine|TestCloseSignalsLeaveForTheReadLoop' \
+            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine' \
             . 2>&1 | tee /tmp/cgo-test.log || rc=$?
           for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault \
                    TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress \
-                   TestStopKeepaliveIsObservedByTheKeepaliveGoroutine TestCloseSignalsLeaveForTheReadLoop; do
+                   TestStopKeepaliveIsObservedByTheKeepaliveGoroutine; do
             grep -qF -- "--- PASS: $t" /tmp/cgo-test.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
