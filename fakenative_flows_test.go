@@ -352,14 +352,22 @@ func TestManagedConnSwitchesFromNativeToRelayAndBack(t *testing.T) {
 		}
 	})
 
-	t.Run("native recovers and a fresh open picks it again", func(t *testing.T) {
+	t.Run("native recovers and a fresh open picks it again", func(st *testing.T) {
 		nat.Enable(testHarnessGroup)
 
 		// A fresh connection, because Open is one-shot: the arbiter re-decides per
 		// Open, and Close marks the old connection permanently closed. This is the
 		// shape a reconnect actually takes.
+		//
+		// Built against the PARENT t, not st, on purpose. newManagedConnUnderTest
+		// registers CloseRelayManager(fr.Addr()) in cleanup, and the registry is
+		// keyed by relay address — so on st that cleanup would fire when this
+		// subtest ends and close the RelayManager the earlier legs are still
+		// holding through `silent`. It happens to be harmless today only because
+		// this is the last subtest; binding it to the parent means adding another
+		// one after it cannot quietly break the ones before.
 		recovered := newManagedConnUnderTest(t, fr)
-		assertNativeIsTheDeliveryPath(t, recovered, 2*time.Second)
+		assertNativeIsTheDeliveryPath(st, recovered, 2*time.Second)
 	})
 }
 
