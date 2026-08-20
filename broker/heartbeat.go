@@ -146,11 +146,27 @@ const (
 	// unbound this.
 	//
 	// The bound is far above anything a real window reaches, so it costs an
-	// honest gateway nothing: production carries 64 shreds per FEC set — 32 data
-	// plus 32 coding, verified against 1,044,775 consecutive datagrams in the
-	// notes on shred.WireHeaderSize — so 999,999 scored sets in one
-	// HeartbeatInterval is upwards of two million shreds per second on a single
-	// feed.
+	// honest gateway nothing — but the margin must be measured against the
+	// window that actually fills sets_total, which is the receiver's
+	// --report-interval drain, not HeartbeatInterval. Those are independently
+	// configured, and --report-interval is legal up to five minutes, so the
+	// worst case is the long one: production carries 64 shreds per FEC set —
+	// 32 data plus 32 coding, verified against 1,044,775 consecutive datagrams
+	// in the notes on shred.WireHeaderSize — so 999,999 sets over a five-minute
+	// window is 213,333 shreds per second on a single feed, against the 30,000
+	// shred/s the receiver sizes its buffers for. That is 7.1x of headroom, not
+	// the ~71x that measuring against a 30-second heartbeat would suggest. Put
+	// the other way: 30,000 shred/s for a full five-minute window is 140,625
+	// sets, 14% of the bound.
+	//
+	// A producer whose own window somehow exceeds this must drain and emit the
+	// report anyway, never clamp sets_total to the bound. Clamping fabricates a
+	// delivery figure — it silently rewrites the denominator an SLA is computed
+	// against — whereas an over-bound report is rejected loudly at ingest and
+	// the operator finds out. Reaching the bound at the sizing rate takes about
+	// 35 minutes of accumulation, which is a drain delayed past seven times the
+	// maximum legal interval; at that point the reporter ticker has stopped
+	// firing and the lost report is not the incident.
 	MaxSetsTotal = 999_999
 
 	// MaxVersionBytes bounds the version string.
@@ -200,6 +216,24 @@ func Version() string { return version }
 // Packets > 0. Bytes must be 0 when Packets is 0, but is *not* required to be
 // positive when Packets is — a zero-length UDP datagram is legal and counts as
 // a packet that carried no bytes.
+//
+// Erasure carries no window duration, and a v1 broker cannot recover one, so
+// its counts are comparable within a gateway and not across gateways. The
+// window is the producer's configured drain interval — operator-settable, 30
+// seconds by default and legal up to five minutes — and it is independent of
+// HeartbeatInterval, so sets_total 140,625 from one gateway and 14,062 from
+// another can describe identical delivery quality. Nothing on the wire
+// distinguishes them: FirstPacketAt and LastPacketAt bound observed traffic
+// rather than the scoring window, and while the duration is nominally
+// arrivals/r_mean, the numerator is the tracker's accepted-shred count rather
+// than Packets, so this contract does not license that division. For a feed
+// that received nothing r_mean is 0 and the duration is unrecoverable by any
+// route — precisely the silent feed an SLA dispute is about.
+//
+// A v1 broker must therefore treat sets_total and sets_erased as counts over an
+// interval it cannot observe, and keep SLA math per-gateway. Cross-gateway
+// normalization needs an explicit window_ms field and a schema bump; it is a
+// deliberate contract decision rather than something to infer at ingest.
 type FeedReport struct {
 	FeedID        string         `json:"feed_id"`
 	Packets       uint64         `json:"packets"`
@@ -240,11 +274,17 @@ type FeedReport struct {
 //  3. Call CanonicalBytes and store what it returns as the ledger's diffable
 //     form, alongside the raw body if verbatim retention is needed.
 //
-// Step 2 before step 3 is enforced where it can be cheaply enforced rather than
-// only documented: CanonicalBytes recomputes erasure_fraction, so it refuses a
-// heartbeat whose fraction disagrees with its own integers instead of
-// overwriting the evidence. It does not re-run the whole validator, so every
-// other field it emits is still only as trustworthy as step 2 made it.
+// Step 2 before step 3 is partly enforced rather than only documented, and the
+// split matters because the enforced part is narrow. CanonicalBytes recomputes
+// erasure_fraction, so it refuses a heartbeat whose fraction disagrees with its
+// own integers instead of overwriting the evidence, and it re-bounds sets_total
+// and re-checks the window's three floats for finiteness because that refusal
+// depends on both. Everything else is honour-system: sets_erased <= sets_total,
+// the [0,1] range of the fraction, the feed-activity pairing, the UUID, the
+// schema string, the field bounds — none of it is re-checked here, so every
+// field CanonicalBytes emits beyond erasure_fraction is exactly as trustworthy
+// as step 2 made it. A caller that skips step 2 gets canonical bytes, not
+// validated ones.
 type Heartbeat struct {
 	Schema  string       `json:"schema"`
 	GWUUID  string       `json:"gw_uuid"`
@@ -282,9 +322,19 @@ type Heartbeat struct {
 // Recomputing is only safe if it cannot launder a wrong number, so a fraction
 // that disagrees with its integers by more than the tolerance is rejected
 // rather than replaced: a misbehaving producer must not be able to reach a
-// valid-looking ledger entry by way of this function. Beyond that field
-// CanonicalBytes canonicalizes form, not truth — see the numbered ingest
-// sequence on Heartbeat for the order it must be called in.
+// valid-looking ledger entry by way of this function. That check is a
+// consistency check, not a validity check, and the difference is worth stating
+// because "refuses a heartbeat whose fraction disagrees with its own integers"
+// reads like the latter: a report claiming sets_erased 40 of sets_total 10 with
+// erasure_fraction 4.0 is internally consistent and canonicalizes cleanly here,
+// while ValidateHeartbeat rejects it. Agreeing with integers the producer lied
+// about in both places is the correct behaviour for a consistency check, and it
+// is the reason step 2 is not optional. The one thing this check does need is a
+// bounded denominator, which is why SetsTotal is re-bounded here rather than
+// taken on trust from a step that may have been skipped.
+//
+// Beyond that field CanonicalBytes canonicalizes form, not truth — see the
+// numbered ingest sequence on Heartbeat for the order it must be called in.
 func CanonicalBytes(hb Heartbeat) ([]byte, error) {
 	canonicalizeFailed := func(index int, feedID string, format string, args ...any) error {
 		return fmt.Errorf("%w: canonicalizing heartbeat: feeds[%d] (%s): %s",
@@ -300,9 +350,33 @@ func CanonicalBytes(hb Heartbeat) ([]byte, error) {
 		copy(feeds, hb.Feeds)
 		for i := range feeds {
 			window := &feeds[i].Erasure
-			// Checked before the comparison below, which NaN would pass
-			// vacuously and then have the recompute silently replace.
+			// The disagreement check below is only as strong as its denominator
+			// is bounded: an off-by-one moves the fraction by 1/SetsTotal, so
+			// from SetsTotal = 1e6 upward the tolerance admits a miscounted set
+			// and the recompute would overwrite the producer's wrong fraction
+			// with a valid-looking one — laundering the very evidence this
+			// function refuses to discard. ValidateHeartbeat rejects such a
+			// report at step 2, but the whole point of recomputing here is to
+			// be the cheap backstop for when step 2 was skipped, so the bound
+			// has to be repeated rather than assumed. See MaxSetsTotal.
+			if window.SetsTotal > MaxSetsTotal {
+				return nil, canonicalizeFailed(i, feeds[i].FeedID,
+					"erasure.sets_total %d exceeds MaxSetsTotal %d, so the fraction check below cannot detect an off-by-one; ValidateHeartbeat must run first",
+					window.SetsTotal, MaxSetsTotal)
+			}
+			// The three floats are checked before the comparison below, which
+			// NaN would pass vacuously and then have the recompute silently
+			// replace. r_mean and r_peak_100ms are not recomputed, but they are
+			// checked here too: encoding/json refuses them anyway, and its
+			// error names neither the field nor the feed, which is unactionable
+			// across MaxFeeds reports.
 			if err := requireFinite("erasure.erasure_fraction", window.ErasureFraction); err != nil {
+				return nil, canonicalizeFailed(i, feeds[i].FeedID, "%s", err)
+			}
+			if err := requireFinite("erasure.r_mean", window.RMean); err != nil {
+				return nil, canonicalizeFailed(i, feeds[i].FeedID, "%s", err)
+			}
+			if err := requireFinite("erasure.r_peak_100ms", window.RPeak100MS); err != nil {
 				return nil, canonicalizeFailed(i, feeds[i].FeedID, "%s", err)
 			}
 			expected := erasure.Fraction(window.SetsErased, window.SetsTotal)

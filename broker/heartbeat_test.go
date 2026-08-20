@@ -888,3 +888,150 @@ func TestHeartbeatIntervalMatchesSpec(t *testing.T) {
 		t.Fatalf("HeartbeatInterval = %v, want 30s", HeartbeatInterval)
 	}
 }
+
+// TestCanonicalBytesRebindsTheBoundItsRecomputeDependsOn pins the interaction
+// between two of this contract's guards: the recompute in CanonicalBytes only
+// detects a lie while 1/SetsTotal exceeds the tolerance, so it has to enforce
+// MaxSetsTotal itself rather than inherit it from a ValidateHeartbeat call that
+// may never have happened. Without the bound the function silently overwrites
+// an inflated fraction with a valid-looking one — laundering exactly the
+// evidence its doc says it refuses to discard.
+func TestCanonicalBytesRebindsTheBoundItsRecomputeDependsOn(t *testing.T) {
+	// sets_erased is 100; the producer claims a fraction for 101. At this
+	// denominator the difference is 2e-7, well inside erasureFractionEpsilon.
+	hb := validHeartbeat()
+	hb.Feeds[0].Erasure.SetsTotal = 5_000_000
+	hb.Feeds[0].Erasure.SetsErased = 100
+	hb.Feeds[0].Erasure.ErasureFraction = erasure.Fraction(101, 5_000_000)
+
+	if lie := math.Abs(hb.Feeds[0].Erasure.ErasureFraction - erasure.Fraction(100, 5_000_000)); lie > erasureFractionEpsilon {
+		t.Fatalf("test is not exercising the masking regime: the off-by-one moves the fraction by %v, "+
+			"which the %v tolerance already catches", lie, erasureFractionEpsilon)
+	}
+
+	if err := ValidateHeartbeat(hb); err == nil {
+		t.Fatal("ValidateHeartbeat must reject an over-bound sets_total")
+	}
+
+	encoded, err := CanonicalBytes(hb)
+	if err == nil {
+		t.Fatalf("CanonicalBytes accepted a report whose fraction its own tolerance cannot police, "+
+			"and rewrote it to a valid-looking ledger entry: %s", encoded)
+	}
+	if !strings.Contains(err.Error(), "exceeds MaxSetsTotal") {
+		t.Fatalf("rejected for the wrong reason; the bound must be what fires: %v", err)
+	}
+	if !strings.Contains(err.Error(), "feed-a") {
+		t.Fatalf("error must name the offending feed: %v", err)
+	}
+
+	// The bound is a cap on untrusted input, not on legitimate traffic: an
+	// honest report at exactly the bound still canonicalizes.
+	atBound := validHeartbeat()
+	atBound.Feeds[0].Erasure.SetsTotal = MaxSetsTotal
+	atBound.Feeds[0].Erasure.SetsErased = 1
+	atBound.Feeds[0].Erasure.ErasureFraction = erasure.Fraction(1, MaxSetsTotal)
+	if _, err := CanonicalBytes(atBound); err != nil {
+		t.Fatalf("a correct report at exactly sets_total=%d must canonicalize: %v", MaxSetsTotal, err)
+	}
+}
+
+// TestCanonicalBytesNamesTheFeedAndFieldForEveryNonFiniteFloat covers the three
+// floats in the window, not just the one the recompute reads. encoding/json
+// refuses NaN and Inf anyway, but its error names neither the field nor the
+// feed, which is unactionable when a heartbeat can carry MaxFeeds reports.
+func TestCanonicalBytesNamesTheFeedAndFieldForEveryNonFiniteFloat(t *testing.T) {
+	tests := []struct {
+		field string
+		set   func(w *erasure.Window)
+	}{
+		{"erasure.erasure_fraction", func(w *erasure.Window) { w.ErasureFraction = math.NaN() }},
+		{"erasure.r_mean", func(w *erasure.Window) { w.RMean = math.NaN() }},
+		{"erasure.r_mean", func(w *erasure.Window) { w.RMean = math.Inf(1) }},
+		{"erasure.r_peak_100ms", func(w *erasure.Window) { w.RPeak100MS = math.Inf(1) }},
+		{"erasure.r_peak_100ms", func(w *erasure.Window) { w.RPeak100MS = math.Inf(-1) }},
+	}
+
+	for _, test := range tests {
+		t.Run(test.field, func(t *testing.T) {
+			hb := validHeartbeat()
+			test.set(&hb.Feeds[0].Erasure)
+
+			_, err := CanonicalBytes(hb)
+			if err == nil {
+				t.Fatal("a non-finite float must be refused")
+			}
+			if !strings.Contains(err.Error(), test.field) {
+				t.Fatalf("error must name the offending field %q, got: %v", test.field, err)
+			}
+			if !strings.Contains(err.Error(), "feed-a") {
+				t.Fatalf("error must name the offending feed, got: %v", err)
+			}
+			if strings.Contains(err.Error(), "json: unsupported value") {
+				t.Fatalf("the generic marshal error is unactionable and must not be what surfaces: %v", err)
+			}
+			if !errors.Is(err, ErrInvalidHeartbeat) {
+				t.Fatalf("error must wrap ErrInvalidHeartbeat, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestCanonicalBytesChecksConsistencyNotValidity pins the boundary the doc on
+// CanonicalBytes now states outright. A report whose integers are themselves
+// invalid but whose fraction agrees with them canonicalizes cleanly: the
+// recompute is a consistency check, and a producer that lied consistently in
+// both places is caught by ValidateHeartbeat, not here. This is the reason step
+// 2 is not optional, so it is worth failing loudly if the behaviour ever
+// silently changes in either direction.
+func TestCanonicalBytesChecksConsistencyNotValidity(t *testing.T) {
+	hb := validHeartbeat()
+	hb.Feeds[0].Erasure.SetsTotal = 10
+	hb.Feeds[0].Erasure.SetsErased = 40
+	hb.Feeds[0].Erasure.ErasureFraction = 4.0
+
+	if err := ValidateHeartbeat(hb); err == nil {
+		t.Fatal("ValidateHeartbeat must reject sets_erased > sets_total")
+	}
+
+	encoded, err := CanonicalBytes(hb)
+	if err != nil {
+		t.Fatalf("CanonicalBytes performs a consistency check, not a validity check, so an "+
+			"internally consistent report must pass it: %v", err)
+	}
+	if !bytes.Contains(encoded, []byte(`"erasure_fraction":4`)) {
+		t.Fatalf("the consistent-but-invalid fraction must survive unchanged: %s", encoded)
+	}
+}
+
+// TestMaxSetsTotalExceedsTheLongestLegalWindow guards the *other* axis of the
+// constant's derivation: TestMaxSetsTotalIsTheLargestBoundThatCatchesAnOffByOne
+// pins it against the tolerance from below, and this pins it against real
+// traffic from above. It exists because the doc's margin was once computed
+// against HeartbeatInterval, which is not the window that fills sets_total, and
+// overstated the headroom by 10x as a result.
+func TestMaxSetsTotalExceedsTheLongestLegalWindow(t *testing.T) {
+	// Mirrors cmd/blockcast-shreds/main.go: maxReportInterval caps
+	// --report-interval, and 30k shred/s is the rate that file sizes buffers
+	// against. They live in package main and cannot be imported here, so raising
+	// either without updating this test is what this assertion is here to catch.
+	const (
+		maxReportInterval = 5 * time.Minute
+		sizingShredRate   = 30_000
+		shredsPerSet      = 64
+	)
+
+	worstCase := uint64(sizingShredRate * maxReportInterval.Seconds() / shredsPerSet)
+	if worstCase >= MaxSetsTotal {
+		t.Fatalf("a full %v window at %d shred/s accumulates %d sets, which meets or exceeds "+
+			"MaxSetsTotal %d: honest traffic would now be rejected at ingest",
+			maxReportInterval, sizingShredRate, worstCase, MaxSetsTotal)
+	}
+
+	// The margin the doc quotes. Pinned so the prose and the constant cannot
+	// drift apart again.
+	if margin := float64(MaxSetsTotal) / float64(worstCase); margin < 7.0 || margin > 7.2 {
+		t.Fatalf("headroom over the longest legal window is %.2fx, but the doc on MaxSetsTotal "+
+			"claims 7.1x; update whichever is wrong", margin)
+	}
+}
