@@ -57,7 +57,7 @@ Usage:
   blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
   blockcast-shreds selftest --fixture [--json]
   blockcast-shreds selftest --generic [--json]
-  blockcast-shreds gensend --to IP:PORT [--iface IP]
+  blockcast-shreds gensend --to IP:PORT [--iface IP] [--pace=false]
 
 Demo mode has no broker, certificates, accounts, or heartbeats. --feed is
 repeatable for first-arrival-wins scoring across multiple unicast UDP feeds.

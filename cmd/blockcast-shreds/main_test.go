@@ -97,6 +97,98 @@ func TestSelftestRequiresFixture(t *testing.T) {
 	}
 }
 
+// The selftest guard is `*fixture == *generic`, which rejects "neither" and
+// "both" with one comparison. TestSelftestRequiresFixture covers "neither"; the
+// half asserted here is the one that stops the selftest silently picking a mode
+// the caller did not name when both are passed.
+func TestSelftestRejectsBothFixtureAndGeneric(t *testing.T) {
+	if err := selftest([]string{"--fixture", "--generic"}); err == nil {
+		t.Fatal("selftest with both --fixture and --generic succeeded")
+	}
+}
+
+// The generic twin of TestSelftestFixturePrintsOrderedReceipt. The erasure
+// assertion is the load-bearing part: generic mode does no erasure coding, so a
+// receipt reporting one would be a fabricated number, and the cheapest way for
+// that to happen is the selftest falling through to the shred scorer.
+func TestSelftestGenericPrintsReceipt(t *testing.T) {
+	output := captureStdout(t, func() error { return selftest([]string{"--generic"}) })
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	want := []string{"generic ", "window_fill ", "completeness ", "loss ", "gap_ms "}
+	if len(lines) != len(want) {
+		t.Fatalf("generic receipt output = %q", output)
+	}
+	for i, prefix := range want {
+		if !strings.HasPrefix(lines[i], prefix) {
+			t.Fatalf("generic receipt line %d = %q, want prefix %q", i, lines[i], prefix)
+		}
+	}
+	if strings.Contains(output, "erasure") {
+		t.Fatalf("generic receipt reports FEC erasure: %q", output)
+	}
+}
+
+// The generic twin of TestSelftestFixtureJSONIsMachineReadable, and the reason
+// it matters more than the human-table test: a missing struct tag on
+// GenericReceipt degrades silently — --json prints a document with Go field
+// names instead of failing — which is how that defect arrived on this surface
+// the first time.
+//
+// It deliberately does NOT decode into a tagged struct. encoding/json matches
+// object keys case-insensitively and falls back to the field name, so an
+// untagged Completeness marshals as "Completeness" and still decodes into a
+// field tagged `json:"completeness"` — a struct-shaped assertion passes through
+// exactly the regression it is supposed to catch (verified by mutation: dropping
+// the tag left the struct-shaped version of this test green). Asserting on the
+// raw key set is what makes the tag load-bearing.
+func TestSelftestGenericJSONIsMachineReadable(t *testing.T) {
+	output := captureStdout(t, func() error { return selftest([]string{"--generic", "--json"}) })
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(output), &fields); err != nil {
+		t.Fatalf("selftest --generic --json output is not JSON: %v\n%s", err, output)
+	}
+	// Every tag on this receipt is lower-case snake_case, so a leading upper-case
+	// letter can only be an exported Go field name that lost its tag. This catches
+	// a dropped tag on any field, including ones added after this test was written.
+	for key := range fields {
+		if key != "" && key[0] >= 'A' && key[0] <= 'Z' {
+			t.Errorf("receipt key %q is a Go field name — its json struct tag was dropped", key)
+		}
+	}
+	for _, key := range []string{
+		"source", "rights_basis", "windows", "windows_complete",
+		"records_expected", "records_received", "records_duplicate",
+		"records_out_of_order", "interior_missing", "trailing_missing",
+		"completeness", "window_p50_ns", "window_p95_ns", "window_p99_ns",
+		"gap_histogram",
+	} {
+		if _, ok := fields[key]; !ok {
+			t.Errorf("receipt is missing key %q", key)
+		}
+	}
+	// Generic mode does no erasure coding, so reporting one would be a fabricated
+	// number. Its presence here would mean the selftest fell through to the shred
+	// scorer.
+	if _, ok := fields["erasure_fraction"]; ok {
+		t.Errorf("generic JSON receipt reports FEC erasure: %s", output)
+	}
+	if t.Failed() {
+		t.Fatalf("generic JSON receipt: %s", output)
+	}
+	// Provenance is mandatory at construction; --json must not be a way to shed it.
+	var source, rightsBasis string
+	if err := json.Unmarshal(fields["source"], &source); err != nil || source == "" {
+		t.Fatalf("generic JSON receipt dropped its source label: %s", output)
+	}
+	if err := json.Unmarshal(fields["rights_basis"], &rightsBasis); err != nil || rightsBasis == "" {
+		t.Fatalf("generic JSON receipt dropped its rights basis: %s", output)
+	}
+	var recordsExpected int
+	if err := json.Unmarshal(fields["records_expected"], &recordsExpected); err != nil || recordsExpected == 0 {
+		t.Fatalf("generic JSON receipt scored no records: %s", output)
+	}
+}
+
 func TestRunRejectsDuplicateFeedNames(t *testing.T) {
 	err := run([]string{"--feed", "same=127.0.0.1:20001", "--feed", "same=127.0.0.1:20002"})
 	if err == nil || !strings.Contains(err.Error(), "duplicate --feed name") {
