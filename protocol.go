@@ -35,6 +35,19 @@ type AMTProtocol interface {
 	CreateIGMPLeaveReport(source, group netip.Addr) ([]byte, error)
 
 	// CreateMembershipUpdate creates an AMT Membership Update message with IGMP report
+	//
+	// Precondition, and it is the same for both implementations: a Membership
+	// Query must have been processed by HandleQuery, so a response MAC is
+	// available. There is deliberately NO further state precondition — an
+	// Update is valid for every membership change on a live tunnel, not just
+	// the first one after a Query. RFC 7450 §4.2.1.2: the nonce and MAC are
+	// taken from the last Membership Query, and subsequent report/leave
+	// messages are "immediately encapsulated and transmitted to the relay".
+	//
+	// This contract is stated here because the two implementations disagreed
+	// on it (BLO-28805): the Rust FFI path guarded on Querying and consumed it,
+	// making the call single-shot per Query, so every leave and every second
+	// join failed with InvalidState while the pure-Go path succeeded.
 	CreateMembershipUpdate(igmpReport []byte) ([]byte, error)
 
 	// CreateTeardownMessage creates an AMT Teardown message

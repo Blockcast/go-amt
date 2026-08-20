@@ -236,45 +236,67 @@ jobs:
       - name: Vet the cgo selection
         run: go vet ./...
 
-      # Known-failing on the cgo path only, tracked in BLO-28805. Two distinct
-      # confidence levels here — do not collapse them into one claim.
+      # One test remains known-failing on the cgo path, tracked in BLO-28805.
+      # The other three are retired by this commit's submodule bump; their
+      # mechanism and the evidence are recorded below so the next reader does
+      # not re-derive them.
       #
-      # CONFIRMED implementation divergence (2 tests):
+      # RETIRED by amt-protocol 06fde63 -> 0d21170 (3 tests), all one guard:
       #   TestUnsubscribeDuringPendingJoinPreservesOtherSource
       #   TestV4MappedSubscriptionCompletesFullLifecycle
-      # amt-protocol/src/gateway.rs:252 guards send_update with a single-state
-      # check, `if self.state != GatewayState::Querying`, and :259 then assigns
-      # GatewayState::Active — so the Querying state is consumed and
-      # CreateMembershipUpdate is single-shot per Membership Query. Every later
-      # leave/unsubscribe re-enters at :252 with state Active, fails the guard,
-      # and returns InvalidState (= 2, ffi.rs:40). The failure text naming state
-      # `Active` is what confirms this: Active is rejected by that guard, not
-      # accepted, so the nonce lookup at :256 is never reached. The pure-Go
-      # implementation permits the call from Active, which is why the same
-      # untagged tests pass in `test`.
+      #   TestQueuedPacketsOwnPayloadAndSourceAddress
+      # gateway.rs guarded send_update with `state != Querying` and then
+      # assigned Active, making CreateMembershipUpdate single-shot per
+      # Membership Query: the first join consumed Querying and every later
+      # membership change returned InvalidState (= 2, ffi.rs:40). Fixed
+      # upstream in a5d31b1, which accepts Querying *and* Active.
+      # TestQueuedPackets... was previously filed here as UNVERIFIED on the
+      # grounds that it fails with "never became active (state Suspended)"
+      # rather than error code 2. It is the same guard: that test subscribes a
+      # *second* source (fakerelay_flows_test.go:141), and a second join is as
+      # much a subsequent membership change as a leave is. The reported failure
+      # names (10.9.9.2,232.1.2.3):5005 — exactly srcB at testHarnessPort+1 on
+      # that line. It is not the buffer-aliasing guard.
       #
-      # UNVERIFIED, grouped here only because they fail on this path (2 tests):
-      #   TestQueuedPacketsOwnPayloadAndSourceAddress   — fails on "never became
-      #     active (state Suspended)", not on error code 2. This is the buffer
-      #     aliasing / gopacket.NoCopy guard, so skipping it drops shared-read-
-      #     buffer coverage exactly where that buffer crosses the FFI boundary.
-      #   TestDataStarvationReconnectsDespiteControlTraffic — fails on its own
-      #     premise guard ("relay sent no Membership Query ... 1 -> 1") with no
-      #     InvalidState in the message. fakerelay_flows_test.go:536-541
-      #     documents that exact failure as a possible loaded-runner timing
-      #     artifact, so it may be a flake rather than a divergence.
-      # If either proves to be a flake it has nothing to fix under BLO-28805 and
-      # must not stay skipped under a ticket that can never retire it. Both are
-      # untagged, so a genuine flake will also surface in `test` and `race`
-      # while being masked in this job alone — treat a red there as signal.
-      #
-      # This list is narrow and named on purpose. It does not weaken the gate:
-      # the selection assertion above still fails if the cgo files are not
-      # compiled, and the Gateway.Open guards below still run. Delete the -skip
-      # when BLO-28805 lands; its acceptance criteria require exactly that.
+      # STILL FAILING, mechanism now confirmed (1 test):
+      #   TestDataStarvationReconnectsDespiteControlTraffic
+      # This was filed as a possible loaded-runner timing artifact. It is not a
+      # flake: it passes on the pure-Go path, and the mechanism traces end to
+      # end. keepaliveLoop calls CreateRequestMessage (relay_manager.go:957),
+      # which maps to request_membership; that still requires Idle
+      # (gateway.rs:195), so from Active it returns InvalidState, which the
+      # loop discards at :958-959. No Request reaches the wire, the relay never
+      # answers with a Query, and the test's premise guard reports 1 -> 1.
+      # It is the counterpart to #6 relaxing handle_query to accept Active: a
+      # Query can only arrive while Active if a Request can be sent from
+      # Active. Fix is amt-protocol#9; delete this last -skip and the step
+      # below when it merges and the pin moves. BLO-28805's acceptance
+      # criteria require exactly that.
       - name: Test
         run: |
-          go test -skip 'TestQueuedPacketsOwnPayloadAndSourceAddress|TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestDataStarvationReconnectsDespiteControlTraffic' ./...
+          go test -skip 'TestDataStarvationReconnectsDespiteControlTraffic' ./...
+
+      # Positive proof that the three retired tests actually ran on the cgo
+      # path. Deleting a name from -skip only stops deselecting it; without
+      # this, a regression that made them skip (or a package that failed to
+      # build its test binary) would still show a bare "ok". Same anti-vacuity
+      # requirement as the Gateway.Open guards below.
+      - name: Prove the retired BLO-28805 tests ran on the cgo path
+        run: |
+          set -euo pipefail
+          rc=0
+          go test -v -count=1 \
+            -run 'TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestQueuedPacketsOwnPayloadAndSourceAddress' \
+            . 2>&1 | tee /tmp/blo28805.log || rc=$?
+          for t in TestUnsubscribeDuringPendingJoinPreservesOtherSource \
+                   TestV4MappedSubscriptionCompletesFullLifecycle \
+                   TestQueuedPacketsOwnPayloadAndSourceAddress; do
+            grep -qF -- "--- PASS: $t" /tmp/blo28805.log || {
+              echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
+              rc=1
+            }
+          done
+          exit $rc
 
       # Run the Gateway.Open guards by name so the log carries positive proof
       # they executed, rather than a bare "ok" that is also what a fully
