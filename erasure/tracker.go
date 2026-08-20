@@ -68,8 +68,15 @@ const maxSlotJump = 4096
 // Counting alone is not enough: 16 MUTUALLY UNRELATED out-of-range slots are
 // evidence of noise, not of a feed that moved, and adopting the last of them
 // would hand the frontier to whichever datagram happened to arrive 16th. A run
-// therefore only extends while each observation stays within maxSlotJump of the
-// one that opened it -- "16 that agree", not "16 in a row".
+// therefore only extends while each observation stays within maxSlotJump of its
+// PREDECESSOR -- a coherent chain, not 16 in a row. Scattered noise still
+// perpetually restarts its own run, which is the property that matters; what a
+// chain does not give is a tight bound on where the run ends up, so 16 steps can
+// carry the frontier up to (16-1)*maxSlotJump = 61,440 slots from the opener.
+// See extendRun for why the tighter opener-anchored rule cannot be used: it
+// would cap the per-observation step at 273 slots, below the 69-364 range real
+// traffic occupies, and a feed at the top of its own normal range would never
+// recover.
 const slotResyncThreshold = 16
 
 // frontierDistrustThreshold is how many consecutive too-far-BEHIND rejections
@@ -487,17 +494,34 @@ func releaseUnused[T any](s []T) []T {
 
 // extendRun advances a coherence-gated run of rejected observations.
 //
-// The run extends only while each new slot stays within maxSlotJump of the one
-// that opened it, and restarts at length 1 otherwise. That is what makes a run
-// evidence of a feed that moved to a specific place, rather than evidence that
-// some number of unrelated datagrams arrived: scattered noise perpetually
-// restarts its own run and never reaches a threshold.
+// The run extends while each new slot stays within maxSlotJump of its
+// PREDECESSOR, and restarts at length 1 otherwise. It is a chain of small steps,
+// not a cluster around the slot that opened it, so a run of n can drift up to
+// (n-1)*maxSlotJump from where it started — 61,440 slots at the thresholds used
+// here.
+//
+// That is deliberate and the tighter opener-anchored rule is NOT available.
+// Anchoring on the opener would cap the per-observation step at
+// maxSlotJump/(threshold-1) = 273 slots, and real capture data advances 69–364
+// slots between consecutive observations, so a feed in the upper half of its own
+// normal range could never assemble a run and would never recover — which is the
+// permanent blackout this guard exists to prevent, reintroduced. Measured, not
+// assumed: TestRampingFeedAtRealisticSlotSpacingStillResyncs fails if the anchor
+// is hoisted into the else branch.
+//
+// What the chain still buys is the property the counting alone lacks: scattered
+// noise perpetually restarts its own run and never reaches a threshold, because
+// unrelated datagrams are further apart than maxSlotJump. Verified to hold under
+// both anchorings — only the reach differs, not the noise rejection.
 func extendRun(count *int, anchor *uint64, slot uint64) int {
 	if *count > 0 && slotDistance(slot, *anchor) <= maxSlotJump {
 		*count++
 	} else {
 		*count = 1
 	}
+	// Deliberately outside the if/else: the anchor is the predecessor, which is
+	// what makes a ramping feed able to recover. See the docstring before
+	// "simplifying" this into the else branch.
 	*anchor = slot
 	return *count
 }
