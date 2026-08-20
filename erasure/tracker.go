@@ -38,11 +38,85 @@ type Window struct {
 	Schema          uint8        `json:"schema"`
 }
 
-// Stats describes the currently retained scoring state.
+// maxSlotJump bounds how far a single observation may advance the frontier.
+//
+// Slot arrives from the wire as a raw little-endian uint64 and, unlike version,
+// geometry and local index, is not validated by ParseWireHeader. The receiver
+// listens on 0.0.0.0 with no source filtering, so one wire-valid datagram
+// carrying an out-of-range slot used to advance newestSlot arbitrarily; every
+// real shred then sat more than 2 slots behind the frontier and was rejected
+// for the life of the process. Delivery and ingress accounting are untouched by
+// that, so /healthz and ingress_packets_total stay green and the operator sees a
+// live feed with a perfect erasure score -- the exact "confidently clean feed
+// under arbitrary real loss" failure this package exists to remove.
+//
+// Sized from capture data: consecutive slots differ by 69 to 364, so a few
+// thousand is generous for real reordering while still making one bad datagram
+// non-permanent.
+const maxSlotJump = 4096
+
+// slotResyncThreshold is how many consecutive implausible observations are
+// treated as evidence that the FEED moved rather than that one datagram lied.
+//
+// Rejecting a large jump outright would trade one permanent blackout for
+// another: a receiver that misses a genuine multi-minute gap would reject every
+// subsequent packet, since they are all beyond the bound of a frontier that can
+// no longer advance. A single poisoned datagram does not repeat -- the next real
+// shred is within the bound and clears the counter -- whereas a genuine jump
+// arrives as a continuous stream, so sustained evidence resyncs the frontier.
+//
+// Counting alone is not enough: 16 MUTUALLY UNRELATED out-of-range slots are
+// evidence of noise, not of a feed that moved, and adopting the last of them
+// would hand the frontier to whichever datagram happened to arrive 16th. A run
+// therefore only extends while each observation stays within maxSlotJump of its
+// PREDECESSOR -- a coherent chain, not 16 in a row. Scattered noise still
+// perpetually restarts its own run, which is the property that matters; what a
+// chain does not give is a tight bound on where the run ends up, so 16 steps can
+// carry the frontier up to (16-1)*maxSlotJump = 61,440 slots from the opener.
+// See extendRun for why the tighter opener-anchored rule cannot be used: it
+// would cap the per-observation step at 273 slots, below the 69-364 range real
+// traffic occupies, and a feed at the top of its own normal range would never
+// recover.
+const slotResyncThreshold = 16
+
+// frontierDistrustThreshold is how many consecutive too-far-BEHIND rejections
+// are treated as evidence that the FRONTIER is wrong rather than the traffic.
+//
+// Without it the forward guard is one-way and its failure is terminal: once
+// newestSlot holds a far-future value, every real shred is more than two slots
+// behind it, takes the stale branch, and returns without accumulating toward
+// anything. Delivery and ingress accounting are untouched, so the operator sees
+// a live feed with a permanently perfect erasure score -- the same failure this
+// package exists to remove, reached through the guard instead of around it.
+//
+// The same coherence rule applies as for forward jumps, and any accepted
+// observation clears the run, so ordinary reordering behind a healthy frontier
+// cannot reach the threshold while real in-window traffic is interleaved.
+const frontierDistrustThreshold = 16
+
+// Stats describes the currently retained scoring state, plus the cumulative
+// slot-guard totals.
+//
+// The guard counters reach /metrics via ReceiverMetrics.PublishGuard, which
+// publishWindows calls with this value on every report tick. They are deliberately
+// not carried on Window: Window is drained and reset per reporting window, and a
+// frontier resync is a discontinuity an operator must still be able to see after
+// the window that contained it has rolled.
 type Stats struct {
 	NewestSlot   uint64
 	TrackedSlots int
 	TrackedSets  int
+	// RejectedSlotJumps counts observations refused for an implausible slot
+	// advance. A silent guard replaces one invisible failure with another, so
+	// this is exported for the same reason the erasure gauge is.
+	RejectedSlotJumps uint64
+	// StaleRejections counts observations refused for sitting too far BEHIND
+	// the frontier. Sustained growth here means the frontier is suspect: real
+	// traffic is being refused because a prior advance moved it too far.
+	StaleRejections uint64
+	// FrontierResyncs counts how often sustained implausible slots were accepted
+	// as a genuine feed jump.
+	FrontierResyncs uint64
 }
 
 type setKey struct {
@@ -159,11 +233,25 @@ type Tracker struct {
 	grace       time.Duration
 	initialized bool
 	newestSlot  uint64
-	boundaries  map[uint64]time.Time
-	slots       map[uint64]*slotState
-	windowStart time.Time
-	delivery    deliveryWindow
-	scores      []scoreEvent
+	// pendingJumps counts CONSECUTIVE implausible advances; any plausible
+	// observation clears it, which is what separates one bad datagram from a
+	// feed that genuinely moved. pendingJumpSlot anchors the run so that only
+	// mutually coherent jumps accumulate toward slotResyncThreshold.
+	pendingJumps    int
+	pendingJumpSlot uint64
+	// staleRun is the mirror of pendingJumps for observations too far BEHIND
+	// the frontier, anchored by staleRunSlot on the same coherence rule. It is
+	// the only way out of a frontier that was resynced to a wrong slot.
+	staleRun          int
+	staleRunSlot      uint64
+	rejectedSlotJumps uint64
+	staleRejections   uint64
+	frontierResyncs   uint64
+	boundaries        map[uint64]time.Time
+	slots             map[uint64]*slotState
+	windowStart       time.Time
+	delivery          deliveryWindow
+	scores            []scoreEvent
 }
 
 // NewTracker constructs a tracker whose first report begins at windowStart. A
@@ -206,6 +294,16 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 		t.newestSlot = header.Slot
 		t.recordPriorBoundaries(header.Slot, receivedAt)
 	} else if header.Slot > t.newestSlot {
+		if header.Slot-t.newestSlot > maxSlotJump {
+			t.rejectedSlotJumps++
+			if extendRun(&t.pendingJumps, &t.pendingJumpSlot, header.Slot) < slotResyncThreshold {
+				return false
+			}
+			// Sustained AND self-consistent: the feed moved. Resync rather
+			// than stay blacked out.
+			return t.resyncFrontier(header, receivedAt)
+		}
+		t.clearRuns()
 		for slot, state := range t.slots {
 			if slot < header.Slot && state.boundary.IsZero() {
 				state.boundary = receivedAt
@@ -215,7 +313,18 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 		t.newestSlot = header.Slot
 		t.recordPriorBoundaries(header.Slot, receivedAt)
 	} else if t.newestSlot-header.Slot > 2 {
-		return false
+		t.staleRejections++
+		if extendRun(&t.staleRun, &t.staleRunSlot, header.Slot) < frontierDistrustThreshold {
+			return false
+		}
+		// A sustained, self-consistent run of traffic behind the frontier is
+		// evidence the FRONTIER is wrong, not the traffic. Adopt it; this is
+		// the only exit from a frontier poisoned by a forged advance.
+		return t.resyncFrontier(header, receivedAt)
+	} else {
+		// A plausible in-window observation is evidence the frontier is still
+		// real, so a lone poisoned datagram cannot accumulate toward a resync.
+		t.clearRuns()
 	}
 	t.scoreDue(receivedAt)
 	t.reclaimOldSlots()
@@ -309,9 +418,15 @@ func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 		}
 		retainedScores = append(retainedScores, event)
 	}
-	t.scores = retainedScores
-	window.ErasureFraction = fraction(window.SetsErased, window.SetsTotal)
+	t.scores = releaseUnused(retainedScores)
+	window.ErasureFraction = Fraction(window.SetsErased, window.SetsTotal)
 
+	// Delivery is a fixed-size streaming fold (BLO-28451), so unlike the score
+	// slice above there is no arrival backing array to walk, filter, or
+	// right-size here. This branch's releaseUnused guard therefore applies to
+	// t.scores only; the arrival high-water mark it also used to cover cannot
+	// exist any more. See releaseUnused and maxReportInterval in
+	// cmd/blockcast-shreds for what that does and does not still bound.
 	t.delivery.report(&window, cutoff.Sub(t.windowStart))
 	t.windowStart = cutoff
 	return window, nil
@@ -322,7 +437,13 @@ func (t *Tracker) Stats() Stats {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	stats := Stats{NewestSlot: t.newestSlot, TrackedSlots: len(t.slots)}
+	stats := Stats{
+		NewestSlot:        t.newestSlot,
+		TrackedSlots:      len(t.slots),
+		RejectedSlotJumps: t.rejectedSlotJumps,
+		StaleRejections:   t.staleRejections,
+		FrontierResyncs:   t.frontierResyncs,
+	}
 	for _, state := range t.slots {
 		stats.TrackedSets += len(state.sets)
 	}
@@ -344,6 +465,132 @@ func (t *Tracker) scoreDue(now time.Time) {
 	}
 }
 
+// minRetainedCapacity is the slice capacity below which shrinking is not worth
+// the copy: a steady feed refills a small backing array immediately.
+const minRetainedCapacity = 1024
+
+// releaseUnused right-sizes a drained slice so a burst does not pin resident
+// memory for the process lifetime.
+//
+// The drain filters in place via s[:0], which reuses -- and therefore retains --
+// the backing array at its high-water mark. On a long-running validator that
+// mark is set by the worst burst the process ever saw, so a single catch-up
+// leaves the peak pinned across an otherwise idle feed forever. Copying only
+// when the array is mostly empty keeps the steady-state path allocation-free.
+//
+// Scope note: this guarded BOTH the score slice and an arrival slice when it
+// was written. BLO-28451 replaced the arrival slice with the fixed-size
+// deliveryWindow fold, which removes that retention outright rather than
+// right-sizing it, so t.scores is now the only in-place-filtered slice left and
+// the only caller. It is still load-bearing there: one scoreEvent accumulates
+// per completed FEC set for the whole report interval, so a catch-up burst
+// still grows this array and nothing else returns it.
+func releaseUnused[T any](s []T) []T {
+	if cap(s) <= minRetainedCapacity || cap(s) <= 4*len(s) {
+		return s
+	}
+	return append(make([]T, 0, max(len(s), minRetainedCapacity)), s...)
+}
+
+// extendRun advances a coherence-gated run of rejected observations.
+//
+// The run extends while each new slot stays within maxSlotJump of its
+// PREDECESSOR, and restarts at length 1 otherwise. It is a chain of small steps,
+// not a cluster around the slot that opened it, so a run of n can drift up to
+// (n-1)*maxSlotJump from where it started — 61,440 slots at the thresholds used
+// here.
+//
+// That is deliberate and the tighter opener-anchored rule is NOT available.
+// Anchoring on the opener would cap the per-observation step at
+// maxSlotJump/(threshold-1) = 273 slots, and the observed step range is 69–364,
+// so a feed in the upper half of its own normal range could never assemble a run
+// and would never recover — which is the permanent blackout this guard exists to
+// prevent, reintroduced. Measured, not assumed:
+// TestRampingFeedAtRealisticSlotSpacingStillResyncs fails if the anchor is
+// hoisted into the else branch.
+//
+// Where 69–364 comes from, since that number decides the rule: it is the five
+// gaps between the six slots of the bundled capture fixture, quoted verbatim in
+// README.md and shred/retention.go — 159, 270, 69, 364, 207. Two consequences
+// are easy to get backwards. 364 is a floor on the top of the range, not a
+// candidate ceiling: it was observed, so the true maximum is >= 364 and cannot
+// turn out to be lower. And the cliff sits INSIDE that five-sample set rather
+// than out in its tail — the second-largest gap, 270, is three slots under the
+// 273 cap — so under opener anchoring the feed that never recovers is an
+// ordinary one, not a pathological one.
+//
+// One caveat, recorded so it is not later mistaken for an argument to switch:
+// those same two files describe the slot-distance window as correct "for the
+// dense live feed it scores", where slots advance one at a time. So 69–364
+// characterises the capture regime, not the live feed. It is still the regime
+// that decides this, because blockcast-shreds scores captures too — and the
+// asymmetry settles it either way. Predecessor anchoring costs a looser reach:
+// 61,440 slots, bounded, and self-healing once real traffic resumes. Opener
+// anchoring costs a frontier that never recovers for the life of the process.
+// Under uncertainty about the real step distribution, the loose rule is the
+// right trade even where the tight one would probably have worked.
+//
+// What the chain still buys is the property the counting alone lacks: scattered
+// noise perpetually restarts its own run and never reaches a threshold, because
+// unrelated datagrams are further apart than maxSlotJump. Verified to hold under
+// both anchorings — only the reach differs, not the noise rejection.
+func extendRun(count *int, anchor *uint64, slot uint64) int {
+	if *count > 0 && slotDistance(slot, *anchor) <= maxSlotJump {
+		*count++
+	} else {
+		*count = 1
+	}
+	// Deliberately outside the if/else: the anchor is the predecessor, which is
+	// what makes a ramping feed able to recover. See the docstring before
+	// "simplifying" this into the else branch.
+	*anchor = slot
+	return *count
+}
+
+func slotDistance(a, b uint64) uint64 {
+	if a > b {
+		return a - b
+	}
+	return b - a
+}
+
+// clearRuns discards both rejection runs. Any observation the tracker accepts
+// is evidence the current frontier is real, which is what keeps a lone forged
+// datagram -- in either direction -- from accumulating toward a resync.
+func (t *Tracker) clearRuns() {
+	t.pendingJumps = 0
+	t.staleRun = 0
+}
+
+// resyncFrontier abandons scoring state and adopts header.Slot as the frontier.
+//
+// Reached from both directions: a sustained coherent run of advances beyond
+// maxSlotJump (the feed moved forward), or a sustained coherent run of traffic
+// behind the frontier (the frontier itself is wrong). Retained state describes
+// a slot range that no longer exists either way, so it is dropped rather than
+// scored -- scoring it would charge sets to an erasure figure they never had a
+// chance to complete under.
+func (t *Tracker) resyncFrontier(header shred.Header, receivedAt time.Time) bool {
+	t.frontierResyncs++
+	t.clearRuns()
+	t.slots = make(map[uint64]*slotState)
+	t.boundaries = make(map[uint64]time.Time)
+	t.newestSlot = header.Slot
+	t.recordPriorBoundaries(header.Slot, receivedAt)
+	t.scoreDue(receivedAt)
+	t.reclaimOldSlots()
+	state := &slotState{sets: make(map[setKey]uint64), boundary: receivedAt}
+	t.slots[header.Slot] = state
+	state.sets[setKey{fecSetIndex: header.FECSetIndex}] |= 1 << header.IndexWithinSet
+	// A resync accepts this observation, so it must be folded into delivery
+	// exactly like the ordinary accept path in Observe. Dropping scoring state
+	// must not drop the arrival: delivery and erasure are independent surfaces,
+	// and a resync that silently stopped counting shreds would make r_mean and
+	// the gap histogram under-report for the window containing it.
+	t.delivery.observe(receivedAt)
+	return true
+}
+
 func (h *GapHistogram) observe(gap time.Duration) {
 	switch {
 	case gap < time.Millisecond:
@@ -359,16 +606,51 @@ func (h *GapHistogram) observe(gap time.Duration) {
 	}
 }
 
-func fraction(numerator, denominator uint64) float64 {
-	if denominator == 0 {
+// Fraction is the erased-set ratio carried in Window.ErasureFraction.
+//
+// It is exported so that a consumer validating an untrusted Window recomputes
+// the ratio with the same implementation that produced it, rather than a second
+// spelling that could disagree at the edges. A zero denominator yields 0: a
+// window that scored no sets has no erasure, which is distinct from a window
+// that scored sets and erased none only in SetsTotal.
+//
+// The parameters are named for their meaning rather than their arithmetic role
+// because both are uint64 and transposing them compiles: Fraction(total,
+// erased) is a silent bug that returns a value above 1 for any window with a
+// non-total erasure.
+func Fraction(erased, total uint64) float64 {
+	if total == 0 {
 		return 0
 	}
-	return float64(numerator) / float64(denominator)
+	return float64(erased) / float64(total)
 }
 
+// reclaimOldSlots drops scoring state that can no longer change.
+//
+// Slot state is retained until it has been SCORED, not merely until it is two
+// slots behind the newest. Slot numbers are not contiguous on a real feed --
+// this receiver sees only the shreds for its own feed, so consecutive observed
+// slots routinely differ by tens or hundreds -- and reclaiming on slot-number
+// distance alone deletes a set in the same Observe call that first gave it a
+// boundary, which is always before boundary+grace has elapsed. Every set is
+// then destroyed unscored and the erasure SLA reads a permanent zero under
+// arbitrary real loss. The same race fires on contiguous slots whenever three
+// slots arrive within one grace period.
+//
+// Retention stays bounded, but the bound is a RATE, not a constant: scoreDue
+// runs on every Observe and Advance, so a slot is scored once boundary+grace has
+// passed and reclaimed on the next pass. Slots observed within the last grace
+// period cannot be scored yet, so retained slot state is
+// (observed-slot arrival rate x grace) + 1, the trailing term being the newest
+// slot -- which is held indefinitely, and only because a slot cannot be scored
+// until a later slot proves it ended.
+//
+// At steady capture rates that product is small, but it is NOT "only the newest
+// slot": a burst or catch-up -- post-hiccup replay, backfill -- raises the
+// arrival rate and the retained set grows with it for the duration.
 func (t *Tracker) reclaimOldSlots() {
-	for slot := range t.slots {
-		if slot < t.newestSlot && t.newestSlot-slot > 2 {
+	for slot, state := range t.slots {
+		if slot < t.newestSlot && t.newestSlot-slot > 2 && state.scored {
 			delete(t.slots, slot)
 		}
 	}
