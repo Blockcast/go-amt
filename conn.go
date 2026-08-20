@@ -234,13 +234,21 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			ms[i].N = len(stream.Payload())
 			ms[i].Buffers[0] = stream.Payload()
 		case m.MembershipQueryType:
-			err = mc.amtGw.handleMembershipQuery(cur.Buffers[0])
+			// [:n], not the whole buffer — see the slicing note in Gateway.Open.
+			// The Rust Relay Advertisement decoder matches on EXACT length (12
+			// or 24), so handing it a full-MTU buffer makes re-discovery in
+			// steady state fail the same way the initial handshake did under
+			// BLO-29437. The Query decoder is length-tolerant, but is sliced
+			// here too so the "decode what you received" invariant holds
+			// uniformly and nobody has to re-derive which decoders forgive
+			// padding.
+			err = mc.amtGw.handleMembershipQuery(cur.Buffers[0][:n])
 			bad++
 			cur = ms[N-bad]
 			ms[N-bad] = cur
 			i--
 		case m.RelayAdvertisementType:
-			err = mc.amtGw.handleRelayAdvertisement(cur.Buffers[0])
+			err = mc.amtGw.handleRelayAdvertisement(cur.Buffers[0][:n])
 			bad++
 			cur = ms[N-bad]
 			ms[N-bad] = cur

@@ -298,6 +298,23 @@ func (g *Gateway) Open() (err error) {
 		// logging filtered out precisely when it is needed.
 		var stalled bool
 		for {
+			// SLEEP FIRST. This loop used to run its body immediately, before
+			// the handshake it is meant to maintain had any chance to complete.
+			// At that instant the Rust gateway is in Discovering (set by
+			// start_discovery, gateway.rs:155) and request_membership requires
+			// Idle (gateway.rs:195), so the very first keepalive reliably
+			// returned InvalidState and stored it in loopErr — where the next
+			// ReadBatch picks it up via `loopErr.Swap(nil)` (conn.go) and
+			// returns it to the caller. A successful Open was therefore
+			// followed by a spurious error on the first read of the tunnel.
+			//
+			// Sleeping first is also what the loop already means: nothing can
+			// be stale at t=0, because lastData was stored moments earlier, so
+			// the idle branch below could never fire on that first pass either.
+			// Shutdown latency is unchanged — leave is still observed within
+			// one interval, it is just checked after the sleep instead of
+			// before it.
+			time.Sleep(g.intervalTime.Load())
 			if g.leave.Load() {
 				return
 			}
@@ -322,7 +339,6 @@ func (g *Gateway) Open() (err error) {
 				slog.Warn("amt: keepalive send failed", "relay", relay, "error", loopErr)
 				g.loopErr.Store(loopErr)
 			}
-			time.Sleep(g.intervalTime.Load())
 		}
 	}()
 
@@ -336,16 +352,58 @@ func (g *Gateway) Open() (err error) {
 	// Wait for advertisement and query
 	buffer := make([]byte, g.MTU)
 	for {
-		_, _, _, err = g.conn.ReadFrom(buffer)
+		// SLICE TO WHAT WAS ACTUALLY RECEIVED. This used to discard n and hand
+		// the decoders `buffer[:]` — the whole MTU-sized array, of which only
+		// the first n bytes were the message and the rest was zero padding.
+		//
+		// For every message type but one that is merely wasteful, because the
+		// Rust decoders bound-check with `<` (a minimum length) and the Go ones
+		// read relative offsets. Relay Advertisement is the exception, and it is
+		// decoded by EXACT length: amt-protocol/src/messages.rs:213-224 selects
+		// IPv4 on `buf.len() == 12` and IPv6 on `== 24`, and errors on anything
+		// else. A 1500-byte buffer is neither, so the advertisement failed to
+		// decode on every single handshake — the Rust gateway stayed in
+		// Discovering, no Request was ever sent, and Open sat until its deadline
+		// and surfaced an i/o timeout that named nothing. That is BLO-29437, and
+		// it made the whole cgo AMT path unable to complete a handshake against
+		// any relay, real or fake.
+		//
+		// Close() already sliced its read correctly (`buffer[:n]` below), so the
+		// two halves of this file disagreed with each other; this makes Open
+		// match the half that was right.
+		var n int
+		n, _, _, err = g.conn.ReadFrom(buffer)
 		if err != nil {
 			g.stopKeepalive()
 			return fmt.Errorf("error reading from connection: %w", err)
 		}
-		amtMessageType := determineAMTmessageType(buffer[:])
+		// A zero-length UDP datagram is legal and carries no type byte;
+		// determineAMTmessageType would index past the end of it.
+		if n == 0 {
+			continue
+		}
+		msg := buffer[:n]
+		amtMessageType := determineAMTmessageType(msg)
 		switch amtMessageType {
 		case m.RelayAdvertisementType:
-			slog.Debug("amt: relay advertisement received", "relay", relay)
-			err = g.handleRelayAdvertisement(buffer[:])
+			slog.Debug("amt: relay advertisement received", "relay", relay, "bytes", n)
+			// Report rather than discard. The result of this call used to be
+			// assigned to `err` and then overwritten by the next iteration's
+			// ReadFrom, so a rejected advertisement was indistinguishable from
+			// never having received one: both ended as the same bare i/o
+			// timeout, which is precisely what made the length bug above take a
+			// full CI run to localise.
+			//
+			// Logged and retried rather than fatal, deliberately. A relay is
+			// free to retransmit an advertisement, and a duplicate arriving
+			// after the gateway has left Discovering is rejected by
+			// gateway.rs:167 as InvalidState — benign protocol noise that must
+			// not fail an otherwise healthy Open. A genuinely undecodable
+			// advertisement still ends at the deadline, but now says why.
+			if advErr := g.handleRelayAdvertisement(msg); advErr != nil {
+				slog.Warn("amt: relay advertisement rejected",
+					"relay", relay, "bytes", n, "error", advErr)
+			}
 		case m.MembershipQueryType:
 			// Handshake done: clear the deadline so steady-state reads are not
 			// bounded by the Open timeout.
@@ -353,7 +411,7 @@ func (g *Gateway) Open() (err error) {
 				g.stopKeepalive()
 				return fmt.Errorf("error clearing handshake deadline: %w", deadlineErr)
 			}
-			if queryErr := g.handleMembershipQuery(buffer[:]); queryErr != nil {
+			if queryErr := g.handleMembershipQuery(msg); queryErr != nil {
 				g.stopKeepalive()
 				return queryErr
 			}
