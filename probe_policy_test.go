@@ -100,9 +100,9 @@ func TestProbeClampsNonPositiveMTU(t *testing.T) {
 	for _, mtu := range []int{0, -1, -1500} {
 		var got int
 		conn := &probeConnStub{}
-		native, err := probeNativeTraffic(conn, time.Second, mtu, func(b []byte) error {
+		_, native, err := probeNativeTraffic(conn, time.Second, mtu, func(b []byte) (int, error) {
 			got = len(b)
-			return nil
+			return 0, nil
 		})
 		if err != nil {
 			t.Fatalf("mtu=%d: unexpected error: %v", mtu, err)
@@ -122,9 +122,9 @@ func TestProbePassesThroughAPlausibleMTU(t *testing.T) {
 	for _, mtu := range []int{576, 1500, 9000} {
 		var got int
 		conn := &probeConnStub{}
-		if _, err := probeNativeTraffic(conn, time.Second, mtu, func(b []byte) error {
+		if _, _, err := probeNativeTraffic(conn, time.Second, mtu, func(b []byte) (int, error) {
 			got = len(b)
-			return nil
+			return 0, nil
 		}); err != nil {
 			t.Fatalf("mtu=%d: unexpected error: %v", mtu, err)
 		}
@@ -139,7 +139,7 @@ func TestProbePassesThroughAPlausibleMTU(t *testing.T) {
 // would fail every subsequent read instantly.
 func TestProbeClearsItsDeadlineOnSuccess(t *testing.T) {
 	conn := &probeConnStub{}
-	if _, err := probeNativeTraffic(conn, time.Second, 1500, func([]byte) error { return nil }); err != nil {
+	if _, _, err := probeNativeTraffic(conn, time.Second, 1500, func([]byte) (int, error) { return 0, nil }); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(conn.deadlines) != 2 {

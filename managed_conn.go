@@ -72,6 +72,11 @@ type ManagedConn struct {
 
 	// For native multicast fallback
 	nativeConn *ipv4.PacketConn
+
+	// pending holds the datagram a successful native probe consumed, so the
+	// caller's first read gets it instead of waiting a whole signalling interval
+	// for the next one. Atomic, so it is outside mu deliberately; see probe.go.
+	pending pendingStore
 }
 
 // Open initializes the connection, trying native multicast first, then AMT relay
@@ -152,7 +157,7 @@ func (mc *ManagedConn) Open() error {
 		// Runs outside mc.mu: this is the multi-second call. dialNativeMulticast
 		// returns the socket rather than installing it, so the only thing that
 		// needs the lock is the handful of assignments below.
-		conn, err := mc.dialNativeMulticast(plan.Probe)
+		conn, pkt, err := mc.dialNativeMulticast(plan.Probe)
 		if err == nil {
 			mc.mu.Lock()
 			if mc.closed {
@@ -167,6 +172,12 @@ func (mc *ManagedConn) Open() error {
 			mc.localAddr = conn.LocalAddr()
 			mc.usingTunnel = false
 			mc.mu.Unlock()
+			// Installed after the lock is dropped: pendingStore is atomic, so it
+			// needs no help from mu, and the readers that drain it call waitOpen
+			// first — so none of them can look before this line runs.
+			if pkt != nil {
+				mc.pending.put(pkt)
+			}
 			return nil
 		}
 		if !plan.Probe.TunnelOnFailure {
@@ -344,6 +355,12 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	done := mc.done
 	mc.mu.RUnlock()
 
+	// Drained after the closed check, never before: a closed connection owes the
+	// caller an error, not a packet it happens to still be holding.
+	if pkt := mc.pending.take(); pkt != nil {
+		return copy(p, pkt.buf), pkt.src, nil
+	}
+
 	if !usingTunnel && nativeConn != nil {
 		n, _, src, err := nativeConn.ReadFrom(p)
 		return n, src, err
@@ -376,6 +393,11 @@ func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.C
 	done := mc.done
 	mc.mu.RUnlock()
 
+	// See ReadFrom: drained after the closed check, never before.
+	if pkt := mc.pending.take(); pkt != nil {
+		return copy(buf, pkt.buf), pkt.cm, pkt.src, nil
+	}
+
 	if !usingTunnel && nativeConn != nil {
 		return nativeConn.ReadFrom(buf)
 	}
@@ -406,6 +428,18 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	readBuffer := mc.readBuffer
 	done := mc.done
 	mc.mu.RUnlock()
+
+	// See ReadFrom. Checked before len(ms) so a zero-length batch cannot
+	// silently discard the packet instead of leaving it for the next call.
+	if pkt := mc.pending.take(); pkt != nil {
+		if len(ms) == 0 || len(ms[0].Buffers) == 0 {
+			mc.pending.put(pkt)
+			return 0, nil
+		}
+		ms[0].N = copy(ms[0].Buffers[0], pkt.buf)
+		ms[0].Addr = pkt.src
+		return 1, nil
+	}
 
 	if !usingTunnel && nativeConn != nil {
 		return nativeConn.ReadBatch(ms, flags)
