@@ -27,8 +27,9 @@ import (
 // switchover story is therefore written as one test with subtests, so the suite
 // pays that window once rather than once per assertion.
 
-// parseNativeSeq extracts the sequence number from a tagged payload.
-func parseNativeSeq(t *testing.T, payload []byte) int {
+// parsePayloadSeq extracts the sequence number from a tagged payload, on either
+// delivery path — the tag is parsed by provenanceOf, not here.
+func parsePayloadSeq(t *testing.T, payload []byte) int {
 	t.Helper()
 	_, rest, ok := strings.Cut(string(payload), "|")
 	if !ok {
@@ -196,6 +197,62 @@ func TestFakeNativeSourceDeliversOnlyWhileEnabled(t *testing.T) {
 	}
 }
 
+// TestReadOneTimeoutDoesNotStealTheNextDatagram pins the property the assertion
+// above depends on and cannot check for itself.
+//
+// That test ends with a drain loop that exits BY timing out, immediately
+// followed by a "must receive nothing" check on the same socket. If a timed-out
+// readOne left a reader parked on that socket, the two readers would race for
+// any straggler — and a straggler is precisely the defect the check exists to
+// catch. Only one of the two outcomes fails the test, so the assertion would be
+// a coin flip under the condition it is written to detect.
+//
+// Sending exactly ONE datagram, directly rather than through the cadence, is
+// what makes "stolen" and "delivered" distinguishable: at the source's 10ms
+// cadence packets are plentiful enough that a theft is invisible.
+func TestReadOneTimeoutDoesNotStealTheNextDatagram(t *testing.T) {
+	nat := installFakeNativeSource(t)
+
+	group := &net.UDPAddr{IP: net.IP(testHarnessGroup.AsSlice()), Port: testHarnessPort}
+	conn, err := listenMulticastUDP4("udp4", nil, testHarnessSource, group, nil, false, 1, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("seam join: %v", err)
+	}
+	defer conn.Close()
+
+	// Native stays disabled throughout, so the only datagram this socket ever
+	// sees is the one sent below.
+	if _, err := readOne(nativeSocketReader{conn}, 250*time.Millisecond); err == nil {
+		t.Fatal("received a datagram while native delivery was disabled; this test " +
+			"needs a socket whose only traffic is the datagram it sends itself")
+	}
+
+	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("open sender: %v", err)
+	}
+	defer sender.Close()
+
+	want := nativePayload(1)
+	if _, err := sender.WriteToUDP(want, conn.LocalAddr().(*net.UDPAddr)); err != nil {
+		t.Fatalf("send the single datagram: %v", err)
+	}
+
+	got, err := readOne(nativeSocketReader{conn}, 2*time.Second)
+	if err != nil {
+		t.Fatalf("the one datagram sent after a timed-out read never arrived (%v): the "+
+			"timed-out read left a reader on the socket and it consumed the datagram, "+
+			"which makes every negative assertion following a timed-out drain a coin flip", err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("payload = %q, want %q", got, want)
+	}
+	if nat.Delivered() != 0 {
+		t.Errorf("the source delivered %d datagrams; this test is only meaningful "+
+			"while native is silent", nat.Delivered())
+	}
+}
+
 // TestFakeNativeSourceIsolatesGroups pins that the switch is per-group, which is
 // what lets a test silence the group under test without silencing everything.
 func TestFakeNativeSourceIsolatesGroups(t *testing.T) {
@@ -343,12 +400,15 @@ func TestManagedConnSwitchesFromNativeToRelayAndBack(t *testing.T) {
 				t.Fatalf("packet %d has provenance %q, want %q: native is silent, so "+
 					"anything arriving must have come through the tunnel", i, got, tunnelProvenanceTag)
 			}
-			if seq := parseNativeSeq(t, payload); seq <= prev {
+			// Advance prev unconditionally: if one packet arrives out of order,
+			// comparing every later packet against the stale prev would turn a
+			// single reorder into an Errorf per remaining packet in the burst.
+			seq := parsePayloadSeq(t, payload)
+			if seq <= prev {
 				t.Errorf("packet %d carries sequence %d, not greater than %d: the "+
 					"tunnel reordered the burst", i, seq, prev)
-			} else {
-				prev = seq
 			}
+			prev = seq
 		}
 	})
 
