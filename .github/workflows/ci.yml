@@ -11,11 +11,19 @@ permissions:
 # Build-selection coverage map. conn.go, gateway.go and protocol_cgo.go are
 # tagged `cgo && !purego`, so which job compiles them is not obvious:
 #
-#   job       | CGO_ENABLED | tags   | conn/gateway/protocol_cgo | race
-#   ----------|-------------|--------|---------------------------|-----
-#   test      | 0           | -      | NO (conn_nocgo.go instead)| no
-#   race      | 1           | purego | NO (conn_nocgo.go instead)| yes
-#   cgo-test  | 1           | -      | YES                       | named tests only
+#   job              | CGO_ENABLED | tags   | conn/gateway/protocol_cgo | race
+#   -----------------|-------------|--------|---------------------------|-----
+#   test             | 0           | -      | NO (conn_nocgo.go instead)| no
+#   race             | 1           | purego | NO (conn_nocgo.go instead)| yes
+#   cgo-test         | 1           | -      | YES                       | named tests only
+#   mobile-typecheck | 0           | -      | NO (conn_mobile.go instead)| no
+#
+# mobile-typecheck is the fourth selection, not a variant of the first three:
+# GOOS=android picks conn_mobile.go, which none of the ubuntu-only jobs above
+# compiles at all. That is how it came to be missing a field the other variants
+# carry (BLO-28640). It supersedes an earlier cgo-typecheck job, whose whole
+# purpose — type-checking the cgo selection nothing else compiled — is now done
+# for real by cgo-test, which links libamt_protocol and runs those tests.
 #
 # Only conn.go has a tagged counterpart: conn_nocgo.go is `(!cgo || purego)`,
 # a genuine either/or with conn.go. protocol_pure.go is UNTAGGED and compiles
@@ -264,3 +272,31 @@ jobs:
             }
           done
           exit $rc
+
+  # MulticastConn is defined three times under mutually exclusive build tags
+  # (conn.go for cgo, conn_nocgo.go, conn_mobile.go for android/ios). Nothing in
+  # the ubuntu-only jobs above compiles the mobile variant, which is how it came
+  # to be missing the Mode field that conn_nocgo.go documents as settable "under
+  # any build configuration" (BLO-28640, Ally review on go-amt#49).
+  #
+  # `go vet` rather than `go build`: a struct missing a field builds perfectly
+  # well on its own, so only the assignment in
+  # managed_conn_plan_test.go:modeIsSettableUnderEveryBuildConfiguration catches
+  # the drift, and vet is what type-checks test files.
+  #
+  # android only, deliberately. conn_mobile.go is tagged `android || ios`, so
+  # vetting android type-checks the same file ios would; and GOOS=ios cannot be
+  # vetted on ubuntu at all — the toolchain refuses with "ios/arm64 requires
+  # external (cgo) linking" under CGO_ENABLED=0 and wants clang under =1. That is
+  # a pre-existing toolchain limit, not something this job introduced.
+  mobile-typecheck:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: GOOS=android GOARCH=arm64 go vet ./...

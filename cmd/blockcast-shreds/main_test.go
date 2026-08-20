@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -119,7 +120,7 @@ func TestPacketDeliveryDoesNotDependOnScoring(t *testing.T) {
 	packet := []byte{0x01, 0x02, 0x03}
 
 	for range 2 {
-		processPacket("feed", packet, time.Now(), scorer, fanout, metrics)
+		processPacket("feed", packet, time.Now(), scorer, fanout, metrics, nil)
 	}
 
 	for range 2 {
@@ -152,7 +153,7 @@ func TestFanoutPublishesEgressToTheScrapedRegistry(t *testing.T) {
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
 	for range 2 {
-		processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics)
+		processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics, nil)
 	}
 	for range 2 {
 		select {
@@ -193,7 +194,7 @@ func TestFanoutPublishesWriteErrorsToTheScrapedRegistry(t *testing.T) {
 	}
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
-	processPacket("feed", []byte{0x09}, time.Now(), scorer, fanout, metrics)
+	processPacket("feed", []byte{0x09}, time.Now(), scorer, fanout, metrics, nil)
 	if err := fanout.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -261,8 +262,8 @@ func TestUnparsablePacketPublishesUnparsedToTheScrapedRegistry(t *testing.T) {
 	}
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
-	processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics)
-	processPacket("feed", fixtureShred(t), time.Now(), scorer, fanout, metrics)
+	processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics, nil)
+	processPacket("feed", fixtureShred(t), time.Now(), scorer, fanout, metrics, nil)
 	for range 2 {
 		select {
 		case <-writer.packets:
@@ -312,7 +313,7 @@ func TestValidShredDuplicateIsForwardedByteIdentically(t *testing.T) {
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
 	for range 2 {
-		processPacket("feed", packet, time.Now(), scorer, fanout, metrics)
+		processPacket("feed", packet, time.Now(), scorer, fanout, metrics, nil)
 	}
 	for range 2 {
 		select {
@@ -403,7 +404,7 @@ func TestShutdownDoesNotInflateTheFanoutDropCounter(t *testing.T) {
 	}
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
-	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics)
+	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics, nil)
 
 	if got := gaugeValue(t, registry, "bcast_shred_gw_fanout_dropped_packets_total", "feed"); got != 0 {
 		t.Fatalf("scraped fanout_dropped_packets_total = %v, want 0; a post-close reject is shutdown, not ring overflow", got)
@@ -429,14 +430,14 @@ func TestRingOverflowIncrementsTheFanoutDropCounter(t *testing.T) {
 	}
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
-	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics)
+	processPacket("feed", []byte{0x01}, time.Now(), scorer, fanout, metrics, nil)
 	select {
 	case <-writer.entered:
 	case <-time.After(time.Second):
 		t.Fatal("fan-out worker did not enter the writer")
 	}
-	processPacket("feed", []byte{0x02}, time.Now(), scorer, fanout, metrics) // fills the ring
-	processPacket("feed", []byte{0x03}, time.Now(), scorer, fanout, metrics) // overflows
+	processPacket("feed", []byte{0x02}, time.Now(), scorer, fanout, metrics, nil) // fills the ring
+	processPacket("feed", []byte{0x03}, time.Now(), scorer, fanout, metrics, nil) // overflows
 
 	if got := gaugeValue(t, registry, "bcast_shred_gw_fanout_dropped_packets_total", "feed"); got != 1 {
 		t.Fatalf("scraped fanout_dropped_packets_total = %v, want 1", got)
@@ -521,7 +522,7 @@ func TestConcurrentProcessPacketIsRaceFreeAndOrderTolerant(t *testing.T) {
 			slot := uint64(500 + feedIndex)
 			for i := 0; i < shredsPerSet; i++ {
 				at := base.Add(time.Duration(shredsPerSet-i) * time.Millisecond)
-				processPacket(names[feedIndex], forwarderDataShred(slot, 0, uint32(i)), at, scorer, fanout, metrics)
+				processPacket(names[feedIndex], forwarderDataShred(slot, 0, uint32(i)), at, scorer, fanout, metrics, nil)
 			}
 		}(f)
 	}
@@ -569,3 +570,111 @@ type discardWriter struct{}
 
 func (w *discardWriter) Write(p []byte) (int, error) { return len(p), nil }
 func (w *discardWriter) Close() error                { return nil }
+
+// TestScoringFlagsBindEachFlagToItsOwnField pins the flag-to-field wiring.
+//
+// The compile-time half of BLO-28993 -- distinct defined types on the scoring
+// struct -- makes a swap at a construction site unbuildable. It cannot say
+// anything about scoringFlags itself, which is the one place a string still
+// becomes a scoringMode/scoringSource/scoringRights. Swapping two Var calls
+// there compiles perfectly and mis-stamps every receipt, so the binding needs
+// a behavioural assertion rather than a type.
+//
+// The three values are pairwise distinct on purpose: with the real defaults
+// ("shred", "", "") two of the three are the empty string, which is precisely
+// why a swap is invisible in production and why the issue rejected
+// call-site-constant naming as a mitigation.
+func TestScoringFlagsBindEachFlagToItsOwnField(t *testing.T) {
+	flags := flag.NewFlagSet("scoring", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	score := scoringFlags(flags)
+	if err := flags.Parse([]string{
+		"--mode", "generic",
+		"--source-label", "provenance-value",
+		"--rights-basis", "rights-value",
+	}); err != nil {
+		t.Fatalf("parse scoring flags: %v", err)
+	}
+	if score.mode != "generic" {
+		t.Errorf("--mode landed in the wrong field: got mode=%q", score.mode)
+	}
+	if score.sourceLabel != "provenance-value" {
+		t.Errorf("--source-label landed in the wrong field: got sourceLabel=%q", score.sourceLabel)
+	}
+	if score.rightsBasis != "rights-value" {
+		t.Errorf("--rights-basis landed in the wrong field: got rightsBasis=%q", score.rightsBasis)
+	}
+}
+
+// TestScoringFlagsDefaultToShredMode fixes the default that run() relies on:
+// omitting --mode selects shred scoring, not the empty string, which validate
+// would reject as an unknown mode.
+func TestScoringFlagsDefaultToShredMode(t *testing.T) {
+	flags := flag.NewFlagSet("scoring", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	score := scoringFlags(flags)
+	if err := flags.Parse(nil); err != nil {
+		t.Fatalf("parse scoring flags: %v", err)
+	}
+	if score.mode != "shred" {
+		t.Errorf("default mode = %q, want shred", score.mode)
+	}
+	if err := score.validate(); err != nil {
+		t.Errorf("default scoring must validate, got %v", err)
+	}
+}
+
+func TestScoringValidate(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		score   scoring
+		wantErr string
+	}{
+		{name: "shred with no labels", score: scoring{mode: "shred"}},
+		{
+			name:    "shred rejects a source label",
+			score:   scoring{mode: "shred", sourceLabel: "synthetic"},
+			wantErr: "apply to --mode generic only",
+		},
+		{
+			name:    "shred rejects a rights basis",
+			score:   scoring{mode: "shred", rightsBasis: "owned"},
+			wantErr: "apply to --mode generic only",
+		},
+		{
+			name:  "generic with both labels",
+			score: scoring{mode: "generic", sourceLabel: "synthetic", rightsBasis: "owned"},
+		},
+		{
+			name:    "generic requires a source label",
+			score:   scoring{mode: "generic", rightsBasis: "owned"},
+			wantErr: "requires --source-label and --rights-basis",
+		},
+		{
+			name:    "generic requires a rights basis",
+			score:   scoring{mode: "generic", sourceLabel: "synthetic"},
+			wantErr: "requires --source-label and --rights-basis",
+		},
+		{
+			name:    "unknown mode",
+			score:   scoring{mode: "multicast"},
+			wantErr: `--mode "multicast" must be shred or generic`,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := testCase.score.validate()
+			if testCase.wantErr == "" {
+				if err != nil {
+					t.Fatalf("validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("validate() = nil, want error containing %q", testCase.wantErr)
+			}
+			if !strings.Contains(err.Error(), testCase.wantErr) {
+				t.Fatalf("validate() = %v, want error containing %q", err, testCase.wantErr)
+			}
+		})
+	}
+}

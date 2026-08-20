@@ -17,16 +17,28 @@ import (
 
 var _ net.PacketConn = (*MulticastConn)(nil)
 
-// nativeConn is the subset of methods shared by *ipv4.PacketConn and
-// *ipv6.PacketConn that the non-data-plane bookkeeping (Close, deadlines,
-// local address) needs, independent of the IP version's control-message type.
-type nativeConn interface {
-	Close() error
-	LocalAddr() net.Addr
-	SetDeadline(t time.Time) error
-	SetReadDeadline(t time.Time) error
-	SetWriteDeadline(t time.Time) error
-}
+// nativeConn and probeNativeTraffic live in probe.go, which carries no build
+// tags so ManagedConn can share them; see the note there.
+
+// listenMulticastUDP4 is the seam MulticastConn.Open performs its v4 group join
+// through. Production always runs the real ListenMulticastUDP4; a test may wrap
+// it to observe whether the join was ATTEMPTED.
+//
+// That distinction is the whole point and it is not decoration. The guard on the
+// plan-before-bind ordering has to answer "did Open touch the socket?", and
+// there is no way to answer it from the outside afterwards. Inferring it from
+// the bind FAILING does not work: a bogus interface makes the join fail on
+// darwin but bind successfully on linux, and on the tunnel-handover path below
+// the socket is closed and mc.conn4 set back to nil anyway — so on
+// ubuntu-latest, the only platform cgo-test runs, "did it fail the right way"
+// and "is conn4 still set" both answer identically whether or not the bind
+// happened. A guard built on either is green under the mutation it exists to
+// catch (Ally review on go-amt#49, after a first repair that looked correct on
+// darwin and was vacuous on CI).
+//
+// A wrapper counts and delegates rather than stubbing, so what the test measures
+// is Open's real behaviour and not the wrapper's.
+var listenMulticastUDP4 = ListenMulticastUDP4
 
 type MulticastConn struct {
 	RelayAddr net.UDPAddr
@@ -35,6 +47,16 @@ type MulticastConn struct {
 	GroupPort uint16
 	TTL       int
 	IFace     *net.Interface
+	// Timeout is the operator's relay timeout, and it sizes two unrelated things:
+	// the native probe window (floored at MinUsefulProbeWindow, because a shorter
+	// window is not evidence) and the AMT handshake bound (dropped below
+	// MinRelayHandshakeTimeout, so Gateway.Open applies DefaultOpenTimeout
+	// instead of failing every handshake).
+	//
+	// That overloading is what let one bad value break both paths at once in
+	// BLO-28640. This is the seam a split into two explicit config keys lands on;
+	// multicast-api has since done so (probeWindow + relayHandshakeTimeout, with
+	// timeout kept as a deprecated alias seeding both).
 	Timeout   time.Duration
 	Timestamp bool
 
@@ -45,6 +67,12 @@ type MulticastConn struct {
 	RcvBufBytes int
 	// SndBufBytes is the send-side counterpart of RcvBufBytes.
 	SndBufBytes int
+
+	// Mode selects native-vs-tunnel. The zero value (AMTModeAuto) keeps the
+	// historical inference, where a configured RelayAddr makes the native join
+	// provisional. Set it explicitly to stop a relay address that was inherited
+	// by configuration clone from deciding the delivery path (BLO-28640).
+	Mode AMTMode
 
 	conn4 *ipv4.PacketConn
 	conn6 *ipv6.PacketConn
@@ -69,75 +97,101 @@ func (mc *MulticastConn) Open() error {
 	dstAddr := net.UDPAddrFromAddrPort(addr)
 
 	if mc.GroupAddr.Is6() {
-		flags6 := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit
-		conn, err := ListenMulticastUDP6("udp6", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags6, mc.RcvBufBytes, mc.SndBufBytes)
+		// The plan is consulted BEFORE the socket is bound. Binding first made
+		// AMTModeTunnel fail closed in its own use case: a bind error returned
+		// here, so mc.amtGw was never constructed on precisely the hosts where
+		// an operator selects the mode. See probePlan.attemptNative.
+		plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
+
+		if plan.attemptNative() {
+			flags6 := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit
+			conn, err := ListenMulticastUDP6("udp6", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags6, mc.RcvBufBytes, mc.SndBufBytes)
+			if err != nil {
+				return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
+			}
+			mc.conn6 = conn
+
+			if plan.Probe {
+				native, err := probeNativeTraffic(mc.conn6, plan.Window, mc.IFace.MTU, func(b []byte) error {
+					_, _, _, err := mc.conn6.ReadFrom(b)
+					return err
+				})
+				if err != nil {
+					return err
+				}
+				if native {
+					return nil
+				}
+			}
+			if !plan.TunnelOnFailure {
+				return nil
+			}
+
+			if err := mc.conn6.Close(); err != nil {
+				return err
+			}
+			mc.conn6 = nil
+		}
+
+		// Native v6 produced no traffic — or was never attempted, because the
+		// operator asked for the tunnel outright — and a tunnel was asked for,
+		// but the AMT tunnel data plane is v4-only. Surface a clear error rather
+		// than silently falling back to an unsupported path.
+		return fmt.Errorf("v6 AMT tunnel fallback not yet supported")
+	}
+
+	// Same ordering as the v6 branch above: decide, then bind. An operator who
+	// selected AMTModeTunnel never pays for a socket on this path, so the bind
+	// can neither fail the tunnel out from under them nor emit an IGMP
+	// join/leave pair for a group nothing here will read.
+	plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
+
+	if plan.attemptNative() {
+		flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
+		conn, err := listenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
 		if err != nil {
 			return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 		}
-		mc.conn6 = conn
+		mc.conn4 = conn
 
-		if len(mc.RelayAddr.IP) > 0 {
-			if err = mc.conn6.SetReadDeadline(time.Now().Add(mc.Timeout)); err != nil {
+		if plan.Probe {
+			native, err := probeNativeTraffic(mc.conn4, plan.Window, mc.IFace.MTU, func(b []byte) error {
+				_, _, _, err := mc.conn4.ReadFrom(b)
+				return err
+			})
+			if err != nil {
 				return err
 			}
-			discard := make([]byte, mc.IFace.MTU)
-			n, _, _, err := mc.conn6.ReadFrom(discard)
-			_ = n
-			if err, ok := err.(net.Error); ok && err.Timeout() {
-				if err := mc.conn6.Close(); err != nil {
-					return err
-				}
-				mc.conn6 = nil
-				// Native v6 join produced no traffic and a relay is configured,
-				// but the AMT tunnel data plane is v4-only. Surface a clear error
-				// rather than silently falling back to an unsupported path.
-				return fmt.Errorf("v6 AMT tunnel fallback not yet supported")
-			} else if err != nil {
-				return err
-			} else {
-				return mc.conn6.SetReadDeadline(time.Time{})
+			if native {
+				return nil
 			}
 		}
-		return nil
-	}
+		if !plan.TunnelOnFailure {
+			return nil
+		}
 
-	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
-	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
-	if err != nil {
-		return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
-	}
-	mc.conn4 = conn
-
-	if len(mc.RelayAddr.IP) > 0 {
-		if err = mc.conn4.SetReadDeadline(time.Now().Add(mc.Timeout)); err != nil {
+		// Hand the group over to an AMT tunnel. The native join is dropped only here,
+		// once the plan has actually concluded native is not deliverable — never on
+		// the strength of a window too short to be evidence (BLO-28640).
+		if err := mc.conn4.Close(); err != nil {
 			return err
 		}
-		discard := make([]byte, mc.IFace.MTU)
-		n, _, _, err := mc.conn4.ReadFrom(discard)
-		_ = n
-		if err, ok := err.(net.Error); ok && err.Timeout() {
-			if err := mc.conn4.Close(); err != nil {
-				return err
-			}
-			mc.amtGw = &Gateway{
-				RelayAddr:   &mc.RelayAddr,
-				GroupAddr:   dstAddr.IP,
-				MTU:         mc.IFace.MTU,
-				RcvBufBytes: mc.RcvBufBytes,
-				SndBufBytes: mc.SndBufBytes,
-				Timeout:     mc.Timeout,
-			}
-			if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
-				mc.amtGw.SourceAddr = mc.SrcAddr.AsSlice()
-			}
-			if err := mc.amtGw.Open(); err != nil {
-				return fmt.Errorf("Error setting up socket: %w", err)
-			}
-		} else if err != nil {
-			return err
-		} else {
-			return mc.conn4.SetReadDeadline(time.Time{})
-		}
+		mc.conn4 = nil
+	}
+
+	mc.amtGw = &Gateway{
+		RelayAddr:   &mc.RelayAddr,
+		GroupAddr:   dstAddr.IP,
+		MTU:         mc.IFace.MTU,
+		RcvBufBytes: mc.RcvBufBytes,
+		SndBufBytes: mc.SndBufBytes,
+		Timeout:     gatewayOpenTimeout(mc.Timeout),
+	}
+	if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
+		mc.amtGw.SourceAddr = mc.SrcAddr.AsSlice()
+	}
+	if err := mc.amtGw.Open(); err != nil {
+		return fmt.Errorf("Error setting up socket: %w", err)
 	}
 	return nil
 }

@@ -11,14 +11,45 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/blockcast/go-amt/erasure"
 	"github.com/blockcast/go-amt/receiver"
+	"github.com/blockcast/go-amt/receiver/config"
 	"github.com/blockcast/go-amt/shred"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// defaultReportInterval matches the broker heartbeat cadence. /metrics and the
+// heartbeat must publish the same window or the two SLA surfaces disagree, so
+// the scrape shows the last drained window rather than a live partial count.
+const defaultReportInterval = 30 * time.Second
+
+// maxReportInterval bounds --report-interval from above.
+//
+// The original bound was justified by arrival retention: the tracker kept one
+// 24-byte timestamp per accepted shred until the window drained, which made
+// --report-interval 1h ask for ~2.5 GiB at 30k shred/s -- an OOM reachable
+// through a plausible operator setting. BLO-28451 replaced that slice with a
+// fixed-size streaming fold, so that justification no longer holds and the
+// figure is not merely smaller, it is gone: delivery retention is now O(1) in
+// the shred count.
+//
+// The bound is kept, for two weaker but real reasons. First, one 32-byte score
+// event still accumulates per COMPLETED FEC SET until the window drains, so
+// retention still grows linearly with the interval -- just per set rather than
+// per shred, a 64x smaller slope. Measured: 0.4 MiB at the 30s default and
+// 51.5 MiB at 1h, both at 30k shred/s. That is worth capping and is no longer
+// worth calling an OOM. Second, and now the primary reason, erasure_fraction is
+// a windowed gauge: at hour-long windows it stops being an SLA signal an
+// operator can alert on, because a single bad minute is averaged into 59 good
+// ones and the discontinuity a frontier resync introduces is invisible. 5
+// minutes is well past any broker heartbeat cadence and caps the same feed near
+// 4.3 MiB.
+const maxReportInterval = 5 * time.Minute
 
 const help = `blockcast-shreds demo mode
 
@@ -99,17 +130,19 @@ func run(args []string) error {
 	flags.SetOutput(os.Stderr)
 	flags.Usage = func() { fmt.Fprintln(flags.Output(), help) }
 	var configuredFeeds feeds
-	var listen, destinations, httpAddress, mode, sourceLabel, rightsBasis string
+	var listen, destinations, httpAddress string
 	var healthMaxAge time.Duration
 	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed")
 	flags.StringVar(&listen, "listen", "0.0.0.0:20000", "unicast UDP listen address")
 	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated UDP forward destinations")
 	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	flags.StringVar(&httpAddress, "http-addr", "127.0.0.1:8080", "metrics and health HTTP address; empty disables HTTP")
-	flags.StringVar(&mode, "mode", "shred", "scoring mode: shred or generic")
-	flags.StringVar(&sourceLabel, "source-label", "", "generic mode: provenance of the input, e.g. synthetic")
-	flags.StringVar(&rightsBasis, "rights-basis", "", "generic mode: recorded rights basis for the input")
+	score := scoringFlags(flags)
 	flags.DurationVar(&healthMaxAge, "health-max-age", 30*time.Second, "/healthz ingress freshness window; readiness-shaped, see README")
+	graceMS := flags.Int("erasure-grace-ms", int(config.DefaultErasureGrace/time.Millisecond),
+		"receiver-observed FEC-set scoring grace in milliseconds; a set still below 32 of 64 shreds at slot_boundary plus this grace scores erased")
+	reportInterval := flags.Duration("report-interval", defaultReportInterval,
+		"how often the delivery window is drained into /metrics; matches the broker heartbeat cadence")
 	retention := flags.Duration("retain", shred.DefaultRetention, "how far behind the newest arrival to keep per-shred scoring state; see README")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -120,21 +153,17 @@ func run(args []string) error {
 	if flags.NArg() != 0 {
 		return fmt.Errorf("unexpected arguments: %s", strings.Join(flags.Args(), " "))
 	}
-	switch mode {
-	case "shred":
-		if sourceLabel != "" || rightsBasis != "" {
-			return errors.New("--source-label and --rights-basis apply to --mode generic only")
-		}
-	case "generic":
-		// Both labels are mandatory rather than defaulted. A generic receipt
-		// whose input provenance is unstated is the artifact the rights
-		// guardrail exists to prevent, and defaulting to "synthetic" would let
-		// a real capture be scored under a synthetic label by omission.
-		if sourceLabel == "" || rightsBasis == "" {
-			return errors.New("--mode generic requires --source-label and --rights-basis")
-		}
-	default:
-		return fmt.Errorf("--mode %q must be shred or generic", mode)
+	if *graceMS <= 0 {
+		return errors.New("--erasure-grace-ms must be positive")
+	}
+	if *reportInterval <= 0 {
+		return errors.New("--report-interval must be positive")
+	}
+	if *reportInterval > maxReportInterval {
+		return fmt.Errorf("--report-interval must not exceed %s: erasure_fraction is a windowed gauge, so a longer window stops being a signal an operator can alert on, and one score event per completed FEC set is retained until the window drains", maxReportInterval)
+	}
+	if err := score.validate(); err != nil {
+		return err
 	}
 	configured := []feed{{name: "default", address: listen}}
 	if len(configuredFeeds) != 0 {
@@ -171,7 +200,8 @@ func run(args []string) error {
 	if warning := retentionWarning(*retention); warning != "" {
 		fmt.Fprintln(os.Stderr, warning)
 	}
-	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON, *retention, mode, sourceLabel, rightsBasis)
+	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON,
+		time.Duration(*graceMS)*time.Millisecond, *reportInterval, *retention, nil, *score)
 }
 
 // retentionWarning returns an early-hint warning for a retention window at or
@@ -299,18 +329,100 @@ func gensend(args []string) error {
 	return nil
 }
 
-func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, retention time.Duration, mode, sourceLabel, rightsBasis string) error {
+// listenAndScore serves every configured feed until stop is closed or a socket
+// fails. stop may be nil, in which case only a signal or a socket error ends it.
+// scoring names the scoring mode and its generic-mode provenance.
+//
+// These three travelled as adjacent positional strings at the tail of an
+// already-long signature. Reordering them -- or adding a fourth label --
+// would still compile at every call site while scoring the wrong thing and
+// stamping the wrong provenance, and the tests would go on passing. Naming
+// the fields makes that a compile error instead.
+type scoring struct {
+	mode        scoringMode
+	sourceLabel scoringSource
+	rightsBasis scoringRights
+}
+
+// The three fields carry DISTINCT defined types rather than three plain
+// strings. Grouping them in a struct alone is not sufficient: an unkeyed
+// composite literal -- scoring{a, b, c} -- reassembles the original hazard,
+// because three string fields accept three strings in any order. Distinct
+// types make that swap a compile error too, which is what the acceptance
+// criterion on BLO-28993 actually asks for.
+type (
+	scoringMode   string
+	scoringSource string
+	scoringRights string
+)
+
+// Distinct types are still not enough on their own. An explicit conversion
+// accepts ANY string, so building the struct from three plain string locals --
+// scoring{sourceLabel: scoringSource(rightsBasis), ...} -- launders the swap
+// back through the type system and compiles cleanly. The conversion has to
+// happen somewhere, so it happens exactly once per field, here, keyed by flag
+// name, and never again at a construction site.
+type stringFlag[T ~string] struct{ target *T }
+
+func (f stringFlag[T]) String() string {
+	if f.target == nil {
+		return ""
+	}
+	return string(*f.target)
+}
+
+func (f stringFlag[T]) Set(value string) error {
+	*f.target = T(value)
+	return nil
+}
+
+// scoringFlags registers the three scoring flags, each bound straight to its
+// own typed field. Because no caller ever writes a conversion, no caller can
+// write the wrong one.
+func scoringFlags(flags *flag.FlagSet) *scoring {
+	score := &scoring{mode: "shred"}
+	flags.Var(stringFlag[scoringMode]{&score.mode}, "mode", "scoring mode: shred or generic")
+	flags.Var(stringFlag[scoringSource]{&score.sourceLabel}, "source-label", "generic mode: provenance of the input, e.g. synthetic")
+	flags.Var(stringFlag[scoringRights]{&score.rightsBasis}, "rights-basis", "generic mode: recorded rights basis for the input")
+	return score
+}
+
+// validate rejects mode/label combinations that would produce a receipt whose
+// provenance is unstated or misattributed.
+func (s scoring) validate() error {
+	switch s.mode {
+	case "shred":
+		if s.sourceLabel != "" || s.rightsBasis != "" {
+			return errors.New("--source-label and --rights-basis apply to --mode generic only")
+		}
+	case "generic":
+		// Both labels are mandatory rather than defaulted. A generic receipt
+		// whose input provenance is unstated is the artifact the rights
+		// guardrail exists to prevent, and defaulting to "synthetic" would let
+		// a real capture be scored under a synthetic label by omission.
+		if s.sourceLabel == "" || s.rightsBasis == "" {
+			return errors.New("--mode generic requires --source-label and --rights-basis")
+		}
+	default:
+		return fmt.Errorf("--mode %q must be shred or generic", s.mode)
+	}
+	return nil
+}
+
+func (s scoring) generic() bool { return s.mode == "generic" }
+
+func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, grace, reportInterval, retention time.Duration, stop <-chan struct{}, mode scoring) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
 	}
 	var scorer sessionScorer
-	if mode == "generic" {
-		scorer = shred.NewGenericFeedScorer(names, sourceLabel, rightsBasis)
+	if mode.generic() {
+		scorer = shred.NewGenericFeedScorer(names, string(mode.sourceLabel), string(mode.rightsBasis))
 		// The provenance is announced at start, not only in the closing
 		// receipt, so a run that is interrupted still has its input labelled.
 		// It goes to stderr so --json keeps stdout a single JSON document.
-		fmt.Fprintf(os.Stderr, "mode=generic source=%s rights=%s\n", sourceLabel, rightsBasis)
+		fmt.Fprintf(os.Stderr, "mode=generic source=%s rights=%s\n", mode.sourceLabel, mode.rightsBasis)
 	} else {
 		scorer = shred.NewFeedScorerWithRetention(shred.FormatForwarder, names, retention)
 	}
@@ -318,6 +430,27 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	metrics, err := receiver.NewReceiverMetrics(registry, names)
 	if err != nil {
 		return err
+	}
+
+	// One tracker per feed. The delivery SLA is per feed, and a shared tracker
+	// would let a healthy feed mask an erased one behind a pooled fraction.
+	windowStart := time.Now()
+	// Erasure scoring is shred-only. Generic mode does no erasure coding, so a
+	// tracker there would never be fed -- shred.Parse rejects a generic record
+	// -- and publishWindows would then drain an empty window every interval and
+	// publish zeros. A zero erasure window reads as a perfect feed, which is the
+	// exact confusion the drain-failure path below refuses to create. Leaving
+	// the map empty makes trackers[feed] nil, which processPacket treats as
+	// "erasure scoring disabled" without touching delivery.
+	trackers := make(map[string]*erasure.Tracker, len(names))
+	if !mode.generic() {
+		for _, name := range names {
+			tracker, err := erasure.NewTracker(grace, windowStart)
+			if err != nil {
+				return fmt.Errorf("erasure tracker for feed %q: %w", name, err)
+			}
+			trackers[name] = tracker
+		}
 	}
 
 	// The fan-out is constructed after the metrics so the worker can attribute
@@ -342,11 +475,39 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	if httpServer != nil {
 		defer func() { _ = httpServer.Close() }()
 	}
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(stop)
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	// Drain each feed's window into /metrics on the heartbeat cadence. The
+	// tracker carries its own mutex, so this runs off the read path and cannot
+	// hold up ingress or delivery.
+	reporter := time.NewTicker(reportInterval)
+	defer reporter.Stop()
+	reporterStop := make(chan struct{})
+	reportDone := make(chan struct{})
+	go func() {
+		defer close(reportDone)
+		for {
+			select {
+			case now := <-reporter.C:
+				publishWindows(trackers, metrics, now)
+			case <-reporterStop:
+				return
+			}
+		}
+	}()
+	// stopReporter is idempotent so the error path can unwind through the defer
+	// while the clean path stops the ticker explicitly, before the final drain.
+	stopReporter := sync.OnceFunc(func() {
+		close(reporterStop)
+		<-reportDone
+	})
+	defer stopReporter()
+
 	errCh := make(chan error, len(feeds))
 	var sockets []*net.UDPConn
+	var mu sync.Mutex
 	for _, feed := range feeds {
 		udpAddress, err := net.ResolveUDPAddr("udp", feed.address)
 		if err != nil {
@@ -369,14 +530,21 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 				// is a true arrival timestamp rather than a lock-ordered one.
 				// Every consumer below synchronizes itself.
 				receivedAt := time.Now()
+				// mu guards the tracker set against the periodic reporter and
+				// the final drain; receivedAt is taken before it so the
+				// timestamp stays a true arrival time rather than a
+				// lock-ordered one.
+				mu.Lock()
 				health.MarkReceived(receivedAt)
 				_ = metrics.IncIngress(feedName)
-				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics)
+				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics, trackers[feedName])
+				mu.Unlock()
 			}
 		}(feed.name, conn)
 	}
 
 	select {
+	case <-signals:
 	case <-stop:
 	case err := <-errCh:
 		for _, conn := range sockets {
@@ -387,6 +555,15 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	for _, conn := range sockets {
 		_ = conn.Close()
 	}
+	mu.Lock()
+	defer mu.Unlock()
+	// Stop the periodic reporter before the last drain so the two cannot split
+	// the final window between them.
+	stopReporter()
+	// Drain once more on the way out. Without this a run shorter than one report
+	// interval exits having scraped nothing but zeros, which is the same wrong
+	// answer -- a clean feed -- that this reporting path exists to prevent.
+	publishWindows(trackers, metrics, time.Now())
 	// Sockets are closed, but a reader goroutine can still be mid-packet: it may
 	// be blocked in Enqueue or between the read and Observe. Both scorers behind
 	// sessionScorer take their own lock in Receipt, so the receipt is a
@@ -394,13 +571,36 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	return printReceipt(scorer.SessionReceipt(), asJSON)
 }
 
-// processPacket delivers a packet and then scores it.
+// publishWindows scores every tracker through now and publishes the drained
+// window for each feed. Advance is called first so sets whose deadline has
+// passed are scored even when a feed has gone silent and Observe is no longer
+// running.
 //
-// Delivery runs first and is never held up by scoring: malformed and duplicate
-// packets must still reach every configured validator destination unchanged.
-// Every value used here is internally synchronized — Fanout copies the packet
+// A drain that fails leaves the previously published window in place rather
+// than substituting a zero. Publishing a zero window on error would report a
+// perfect feed, which is indistinguishable from a genuinely clean one.
+func publishWindows(trackers map[string]*erasure.Tracker, metrics *receiver.ReceiverMetrics, now time.Time) {
+	for feedID, tracker := range trackers {
+		tracker.Advance(now)
+		window, err := tracker.DrainWindow(now)
+		if err != nil {
+			continue
+		}
+		_ = metrics.PublishWindow(feedID, window)
+		_ = metrics.PublishGuard(feedID, tracker.Stats())
+	}
+}
+
+// processPacket delivers one packet and then scores it.
+//
+// Delivery runs FIRST and unconditionally. Scoring is accounting: it may not
+// sit in front of a validator's packet, and it may not decide whether a packet
+// is forwarded. Malformed and duplicate packets reach every destination
+// unchanged; what to do with them is the validator's decision.
+//
+// Every value used here is internally synchronized -- Fanout copies the packet
 // under its own lock, both sessionScorer implementations serialize their own
-// state, and Health and ReceiverMetrics each carry their own — so feed
+// state, and Health and ReceiverMetrics each carry their own -- so feed
 // goroutines do not serialize behind a caller-held lock on the ingress hot path.
 //
 // receivedAt is captured at the socket read, so concurrent feeds can present it
@@ -412,13 +612,32 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 // packet, but that is a shutdown artifact rather than receiver overload, and
 // charging it to the ring-overflow counter would let shutdown inflate a metric
 // the README defines as ring-full only.
-func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer sessionScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics) {
+//
+// tracker may be nil, which disables receiver-observed erasure scoring for the
+// feed without affecting delivery.
+func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer sessionScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics, tracker *erasure.Tracker) {
 	if fanout != nil && fanout.Enqueue(feedName, packet) == receiver.EnqueueOverflow {
 		_ = metrics.IncFanoutDrop(feedName)
 	}
-	if _, parseErr := scorer.Observe(feedName, packet, receivedAt); parseErr != nil {
+
+	_, parseErr := scorer.Observe(feedName, packet, receivedAt)
+	if parseErr != nil {
 		_ = metrics.IncUnparsed(feedName)
+		return
 	}
+	if tracker == nil {
+		return
+	}
+	// The header is parsed a second time here rather than threaded out of
+	// FeedScorer.Observe: shred/score.go is under concurrent change by other
+	// in-flight receiver PRs, and widening its signature would conflict with
+	// them for a header parse that is a handful of little-endian field reads on
+	// a path that no longer precedes delivery. Reunify the two once those land.
+	header, err := shred.Parse(packet, shred.FormatForwarder)
+	if err != nil {
+		return
+	}
+	tracker.Observe(header, receivedAt)
 }
 
 func startHTTP(address string, registry *prometheus.Registry, health http.Handler) (*http.Server, error) {
