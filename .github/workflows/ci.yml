@@ -1,9 +1,47 @@
 name: CI
 
+# WHY THIS RUNS ON EVERY BRANCH PUSH, NOT JUST main (BLO-29064 follow-up)
+#
+# `pull_request` builds and tests refs/pull/N/merge. That ref only exists while
+# GitHub can merge the head into the base — so the moment an unrelated commit
+# lands on main and puts a PR into CONFLICTING, GitHub stops producing the merge
+# ref and **queues nothing**. No run appears, no check turns red, and the last
+# green run stays as the PR's latest status.
+#
+# That silence is not visible from the usual tools. `gh pr checks` reported this
+# repo's PR #47 as fully passing at 383730f while `test`, `race` and `cgo-test`
+# had executed against that head ZERO times: the four green checks it was
+# reading came from static-binary.yml and packaging.yml, which are
+# `on: [push, pull_request]` and so kept firing on the branch tip. The window
+# opened when an unrelated PR merged 28 minutes earlier — neither side touched a
+# shared file, and nobody did anything wrong. With no branch protection on main
+# here, a PR in that state is one click from merging untested.
+#
+# The branch tip always exists, whether or not the PR is mergeable, so a plain
+# `push` trigger cannot be silenced this way. Both triggers are kept
+# deliberately: `push` guarantees the head is tested, and `pull_request` keeps
+# testing the MERGE RESULT, which is the only thing that catches a latent
+# conflict with main that still compiles — exactly how the BLO-28422
+# sentinel-flag hang surfaced.
+#
+# Measured before this change, over the last 100 CI runs: 78 pull_request runs
+# across 26 branches, 22 push runs across exactly ONE branch (main), and zero
+# push runs on any feature branch.
+#
+# Cost of the overlap is negligible here — all four jobs are ubuntu-latest and
+# the whole workflow finishes in about a minute.
 on:
   pull_request:
   push:
-    branches: [main]
+    # '**' matches every branch and, unlike a bare `push:`, excludes tags.
+    branches: ['**']
+
+# Supersede in-flight runs when a branch is pushed again — but never on main,
+# where a cancelled run is indistinguishable from one that passed and would
+# leave a commit on the default branch with no completed CI at all.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
