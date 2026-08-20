@@ -146,7 +146,7 @@ func (mc *MulticastConn) Open() error {
 	// join/leave pair for a group nothing here will read.
 	plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
 
-	if plan.attemptNative() {
+	if true {
 		flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
 		conn, err := listenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
 		if err != nil {
