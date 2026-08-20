@@ -236,45 +236,141 @@ jobs:
       - name: Vet the cgo selection
         run: go vet ./...
 
-      # Known-failing on the cgo path only, tracked in BLO-28805. Two distinct
-      # confidence levels here — do not collapse them into one claim.
+      # One test remains known-failing on the cgo path, tracked in BLO-28805.
+      # The other three are retired by this commit's submodule bump; their
+      # mechanism and the evidence are recorded below so the next reader does
+      # not re-derive them.
       #
-      # CONFIRMED implementation divergence (2 tests):
+      # RETIRED by amt-protocol 06fde63 -> 0d21170 (3 tests):
       #   TestUnsubscribeDuringPendingJoinPreservesOtherSource
       #   TestV4MappedSubscriptionCompletesFullLifecycle
-      # amt-protocol/src/gateway.rs:252 guards send_update with a single-state
-      # check, `if self.state != GatewayState::Querying`, and :259 then assigns
-      # GatewayState::Active — so the Querying state is consumed and
-      # CreateMembershipUpdate is single-shot per Membership Query. Every later
-      # leave/unsubscribe re-enters at :252 with state Active, fails the guard,
-      # and returns InvalidState (= 2, ffi.rs:40). The failure text naming state
-      # `Active` is what confirms this: Active is rejected by that guard, not
-      # accepted, so the nonce lookup at :256 is never reached. The pure-Go
-      # implementation permits the call from Active, which is why the same
-      # untagged tests pass in `test`.
+      #   TestQueuedPacketsOwnPayloadAndSourceAddress
+      # gateway.rs guarded send_update with `state != Querying` and then
+      # assigned Active, making CreateMembershipUpdate single-shot per
+      # Membership Query: the first join consumed Querying and every later
+      # membership change returned InvalidState (= 2, ffi.rs:40). Fixed
+      # upstream in a5d31b1, which accepts Querying *and* Active.
+      # TestQueuedPackets... was previously filed here as UNVERIFIED on the
+      # grounds that it fails with "never became active (state Suspended)"
+      # rather than error code 2. It is the same guard: that test subscribes a
+      # *second* source (fakerelay_flows_test.go:141), and a second join is as
+      # much a subsequent membership change as a leave is. The reported failure
+      # names (10.9.9.2,232.1.2.3):5005 — exactly srcB at testHarnessPort+1 on
+      # that line. It is not the buffer-aliasing guard.
       #
-      # UNVERIFIED, grouped here only because they fail on this path (2 tests):
-      #   TestQueuedPacketsOwnPayloadAndSourceAddress   — fails on "never became
-      #     active (state Suspended)", not on error code 2. This is the buffer
-      #     aliasing / gopacket.NoCopy guard, so skipping it drops shared-read-
-      #     buffer coverage exactly where that buffer crosses the FFI boundary.
-      #   TestDataStarvationReconnectsDespiteControlTraffic — fails on its own
-      #     premise guard ("relay sent no Membership Query ... 1 -> 1") with no
-      #     InvalidState in the message. fakerelay_flows_test.go:536-541
-      #     documents that exact failure as a possible loaded-runner timing
-      #     artifact, so it may be a flake rather than a divergence.
-      # If either proves to be a flake it has nothing to fix under BLO-28805 and
-      # must not stay skipped under a ticket that can never retire it. Both are
-      # untagged, so a genuine flake will also surface in `test` and `race`
-      # while being masked in this job alone — treat a red there as signal.
+      # SECOND, INDEPENDENT FIX IN THE SAME BUMP — and why it is not the cause.
+      # Those 9 commits are not behaviorally inert. cfc01ea changed the wire
+      # bytes go-amt emits on the production cgo path: amt-protocol
+      # src/igmp.rs:252 went from [0x00,0x00,0x00,0x00] (4 zero pad bytes,
+      # commented "matching go-amt") to [0x94,0x04,0x00,0x00], a real RFC 2113
+      # Router Alert option, inside the IPv4 header wrapping every IGMPv3
+      # Membership Report. That is a genuine improvement — it converges the
+      # cgo path onto protocol_pure.go:299, which has emitted the real option
+      # all along, and onto RFC 3376 — but it means a green cgo-test alone
+      # cannot attribute the three retirements to the send_update guard,
+      # because an RA-less report is what an RA-enforcing relay drops, which
+      # would also present as "never became active".
       #
-      # This list is narrow and named on purpose. It does not weaken the gate:
-      # the selection assertion above still fails if the cgo files are not
-      # compiled, and the Gateway.Open guards below still run. Delete the -skip
-      # when BLO-28805 lands; its acceptance criteria require exactly that.
+      # The discriminator is the harness, not the CI result: it is structurally
+      # blind to the option bytes. handleUpdate (fakerelay_test.go:192) appends
+      # the update without parsing the IPv4 header at all; WaitForLeaveRecord
+      # (:325) locates the record type at 12 + igmpIPHeaderLen + 8, an offset
+      # *derived* from the header length rather than read from the bytes; and
+      # both encodings are 4 bytes, so nothing shifts. The sole assertion on
+      # the option contents anywhere in the tree was
+      # protocol_pure_test.go:51, which constructs NewPureGoProtocol()
+      # explicitly and so never saw the Rust encoder. No test in this harness
+      # could distinguish [0,0,0,0] from [0x94,0x04,0,0], therefore the RA
+      # change cannot be what released these three.
+      #
+      # THIRD CANDIDATE, and why option-blindness does not reach it.
+      # The argument above eliminates one alternative, not every one. 810719f
+      # (#6) is a second state-machine change in the same bump: handle_query
+      # went from `state != Requesting` to `state != Requesting && state !=
+      # Active` (gateway.rs:224). On its own that would let a second
+      # membership change succeed from Active — exactly the failure mode of
+      # TestQueuedPacketsOwnPayloadAndSourceAddress — and an argument about
+      # option bytes says nothing whatever about it. What rules it out is the
+      # nonce, not the harness's blindness: reaching send_update through the
+      # relaxed handle_query needs a Query whose nonce matches request_nonce
+      # (gateway.rs:234, else InvalidNonce). In the three retired tests no
+      # unsolicited Query is sent at all — buildQuery is reached only from
+      # handleRequest (fakerelay_test.go:189), answering a Request, and
+      # request_membership still gates on Idle (gateway.rs:195), so neither a
+      # Request nor a Query can originate from Active. The one test that does
+      # inject a bare Query while Active,
+      # TestControlTrafficDoesNotRefreshDataLiveness
+      # (fakerelay_flows_test.go:200), passes a bogus [1,2,3,4] and so dies on
+      # the nonce check whatever the state gate says — and is not one of the
+      # three retirements anyway. With both alternatives eliminated, the
+      # send_update guard is the only mechanism in the bump that can have
+      # released them.
+      #
+      # THAT ELIMINATION EXPIRES — do not inherit it. amt-protocol#9 is
+      # precisely the change that permits request_membership from Active. Once
+      # the pin moves, a Request — and so a solicited, nonce-matching Query —
+      # can originate from Active, #6 becomes reachable in this harness, and
+      # the attribution above stops being sound. Re-derive it, do not carry it
+      # forward.
+      #
+      # That blindness is itself the gap, so it is now closed rather than
+      # argued: TestIGMPEnvelopeParityAcrossImplementations goes through
+      # DefaultProtocol() and pins the option, IHL, total length and checksum
+      # on whichever implementation the build selected, with a guard that fails
+      # if the cgo protocol is registered but pure-Go is what ran. It runs in
+      # the proof step below. The one envelope field it deliberately omits is
+      # the IPv4 destination, which really does diverge (group address on the
+      # Rust path, 224.0.0.22 on pure-Go) — pre-existing, tracked in BLO-29419.
+      #
+      # STILL FAILING, mechanism now confirmed (1 test):
+      #   TestDataStarvationReconnectsDespiteControlTraffic
+      # This was filed as a possible loaded-runner timing artifact. It is not a
+      # flake: it passes on the pure-Go path, and the mechanism traces end to
+      # end. keepaliveLoop calls CreateRequestMessage (relay_manager.go:957),
+      # which maps to request_membership; that still requires Idle
+      # (gateway.rs:195), so from Active it returns InvalidState, which the
+      # loop discards at :958-959. No Request reaches the wire, the relay never
+      # answers with a Query, and the test's premise guard reports 1 -> 1.
+      # It is the counterpart to #6 relaxing handle_query to accept Active: a
+      # Query can only arrive while Active if a Request can be sent from
+      # Active. Fix is amt-protocol#9; delete this last -skip and the step
+      # below when it merges and the pin moves. BLO-28805's acceptance
+      # criteria require exactly that.
       - name: Test
         run: |
-          go test -skip 'TestQueuedPacketsOwnPayloadAndSourceAddress|TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestDataStarvationReconnectsDespiteControlTraffic' ./...
+          go test -skip 'TestDataStarvationReconnectsDespiteControlTraffic' ./...
+
+      # Positive proof that the three retired tests actually ran on the cgo
+      # path. Deleting a name from -skip only stops deselecting it; without
+      # this, a regression that made them skip (or a package that failed to
+      # build its test binary) would still show a bare "ok". Same anti-vacuity
+      # requirement as the Gateway.Open guards below.
+      #
+      # TestIGMPEnvelopeParityAcrossImplementations rides along because it is
+      # the assertion that pins the Router Alert convergence this bump also
+      # carried, and it is only meaningful on this job — under CGO_ENABLED=0 it
+      # re-tests pure Go.
+      - name: Prove the retired BLO-28805 tests ran on the cgo path
+        run: |
+          set -euo pipefail
+          rc=0
+          go test -v -count=1 \
+            -run 'TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestQueuedPacketsOwnPayloadAndSourceAddress|TestIGMPEnvelopeParityAcrossImplementations' \
+            . 2>&1 | tee /tmp/blo28805.log || rc=$?
+          for t in TestUnsubscribeDuringPendingJoinPreservesOtherSource \
+                   TestV4MappedSubscriptionCompletesFullLifecycle \
+                   TestQueuedPacketsOwnPayloadAndSourceAddress \
+                   TestIGMPEnvelopeParityAcrossImplementations; do
+            # Anchor on the trailing space before go's duration field. A bare
+            # prefix match would let a future test whose name extends one of
+            # these (…SourceAddressV6) satisfy the assertion for its shorter
+            # sibling.
+            grep -qF -- "--- PASS: $t " /tmp/blo28805.log || {
+              echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
+              rc=1
+            }
+          done
+          exit $rc
 
       # Run the Gateway.Open guards by name so the log carries positive proof
       # they executed, rather than a bare "ok" that is also what a fully
@@ -304,7 +400,10 @@ jobs:
           for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault \
                    TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress \
                    TestStopKeepaliveIsObservedByTheKeepaliveGoroutine; do
-            grep -qF -- "--- PASS: $t" /tmp/cgo-test.log || {
+            # Anchored on the trailing space, as in the BLO-28805 step above:
+            # TestGatewayOpenLogsTheRelayItIsAttempting is exactly the shape of
+            # name a later sibling would extend.
+            grep -qF -- "--- PASS: $t " /tmp/cgo-test.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
             }

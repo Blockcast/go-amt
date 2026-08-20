@@ -35,6 +35,36 @@ type AMTProtocol interface {
 	CreateIGMPLeaveReport(source, group netip.Addr) ([]byte, error)
 
 	// CreateMembershipUpdate creates an AMT Membership Update message with IGMP report
+	//
+	// Precondition, and it is the same for both implementations: a Membership
+	// Query must have been processed by HandleQuery, so a response MAC is
+	// available. There is deliberately NO further state precondition — an
+	// Update is valid for every membership change on a live tunnel, not just
+	// the first one after a Query. RFC 7450 §4.2.1.2: the nonce and MAC are
+	// taken from the last Membership Query, and subsequent report/leave
+	// messages are "immediately encapsulated and transmitted to the relay".
+	//
+	// This contract is stated here because the two implementations disagreed
+	// on it (BLO-28805): the Rust FFI path guarded on Querying and consumed it,
+	// making the call single-shot per Query, so every leave and every second
+	// join failed with InvalidState while the pure-Go path succeeded.
+	//
+	// "The same for both implementations" is a claim about this precondition,
+	// not blanket parity. The IGMP encapsulation is not fully in agreement: a
+	// join report's IPv4 destination is the multicast group on the Rust path
+	// and 224.0.0.22 on the pure-Go one (BLO-29419). The IHL, Router Alert
+	// option, total length and header checksum are pinned across
+	// implementations by TestIGMPEnvelopeParityAcrossImplementations; the TTL,
+	// protocol byte and source address are asserted nowhere, so they are not
+	// pinned either.
+	//
+	// igmpReport must be non-empty. The implementations diverge on an empty
+	// slice rather than agreeing on an error: the cgo path takes
+	// &igmpReport[0] (protocol_cgo.go:279) and panics, where pure-Go marshals
+	// it into an empty Encapsulated field. No caller can reach it today —
+	// every CreateIGMP*Report builder returns a non-empty slice on success —
+	// so this is a documented precondition rather than a latent panic, and a
+	// new caller should treat it as one.
 	CreateMembershipUpdate(igmpReport []byte) ([]byte, error)
 
 	// CreateTeardownMessage creates an AMT Teardown message
