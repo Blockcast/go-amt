@@ -26,6 +26,9 @@ type MulticastConn struct {
 	Timestamp   bool
 	RcvBufBytes int
 	SndBufBytes int
+	// Mode mirrors the cgo build's field so callers can set it under any build
+	// configuration without tag-specific code.
+	Mode AMTMode
 }
 
 var errNoCGO = fmt.Errorf("multicast connections require CGO; rebuild with CGO_ENABLED=1")
