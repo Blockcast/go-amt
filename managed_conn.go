@@ -61,7 +61,11 @@ type ManagedConn struct {
 	// without a separate gate two concurrent Opens could each bind a socket and
 	// the loser's would leak. openMu preserves the serialization the single
 	// full-length mu.Lock used to provide, without the lock-hold.
-	openMu      sync.Mutex
+	openMu sync.Mutex
+	// openDone is closed when an in-flight Open reaches a final state. It is
+	// what lets the data-plane methods resume against the finished connection
+	// instead of a half-built one — see waitOpen for why that is load-bearing.
+	openDone    chan struct{}
 	closed      bool
 	usingTunnel bool
 	localAddr   net.Addr
@@ -78,8 +82,21 @@ type ManagedConn struct {
 // inside the exclusive lock, Close() had to wait the whole window out with no
 // cancellation path, and because Go's RWMutex queues new readers behind a
 // waiting writer, one pending Close also stalled every IsUsingTunnel/LocalAddr/
-// Stats reader for the remainder of it. Callers concurrent with Open therefore
-// observe a not-yet-open connection rather than blocking on one.
+// Stats reader for the remainder of it.
+//
+// Two consequences of that split are worth stating rather than leaving to be
+// discovered. The observers — IsUsingTunnel, LocalAddr, Stats — may return a
+// provisional value while Open is in flight, which is deliberate: a stale-but-
+// immediate answer beats a ten-second stall. The data-plane methods do NOT get
+// that treatment; they call waitOpen first, because a reader that snapshots a
+// half-built connection can park forever rather than merely read a stale field.
+//
+// Close does not *cancel* an in-flight Open, it marks the connection. The probe
+// has no cancellation path plumbed into it, so after Close returns, a concurrent
+// Open can still hold the native socket and its IGMP join for the remainder of
+// the probe window before noticing and undoing its own work. Nothing leaks and
+// every commit point re-checks closed, but a caller cannot treat Close returning
+// as proof the join is already gone.
 func (mc *ManagedConn) Open() error {
 	mc.openMu.Lock()
 	defer mc.openMu.Unlock()
@@ -89,22 +106,26 @@ func (mc *ManagedConn) Open() error {
 		mc.mu.Unlock()
 		return fmt.Errorf("connection already closed")
 	}
-	if !mc.SrcAddr.Is4() {
-		mc.mu.Unlock()
-		return fmt.Errorf("AMT source address must be IPv4: %s", mc.SrcAddr)
-	}
-	if !mc.GroupAddr.Is4() {
-		mc.mu.Unlock()
-		return fmt.Errorf("AMT group address must be IPv4: %s", mc.GroupAddr)
-	}
 	mc.done = make(chan struct{})
 	// Allocated here rather than beside the subscription below, so a Read racing
 	// Open cannot select on a nil channel. mc.done goes live in this same
 	// section, so a nil buffer would park that reader until Close instead of it
 	// simply finding no packets yet.
 	mc.readBuffer = make(chan *DataPacket, 100)
-	done, readBuffer := mc.done, mc.readBuffer
+	// Must be closed on EVERY exit path below, including the validation errors,
+	// or a data-plane call that is waiting on it never wakes. The deferred close
+	// immediately after this section is what guarantees that.
+	mc.openDone = make(chan struct{})
+	done, readBuffer, openDone := mc.done, mc.readBuffer, mc.openDone
 	mc.mu.Unlock()
+	defer close(openDone)
+
+	if !mc.SrcAddr.Is4() {
+		return fmt.Errorf("AMT source address must be IPv4: %s", mc.SrcAddr)
+	}
+	if !mc.GroupAddr.Is4() {
+		return fmt.Errorf("AMT group address must be IPv4: %s", mc.GroupAddr)
+	}
 
 	hasRelay := len(mc.RelayAddr.IP) > 0
 	plan := planManagedOpen(mc.Mode, hasRelay, mc.EnableDRIAD, mc.Timeout)
@@ -177,6 +198,17 @@ func (mc *ManagedConn) Open() error {
 	}
 	config.TransportConfig = transportCfg
 
+	// Re-check before the expensive relay work. Close cannot interrupt the probe
+	// above, but there is no reason to run a full AMT handshake against a
+	// connection the caller has already closed just to unsubscribe from it again
+	// at the commit point below.
+	mc.mu.RLock()
+	closedDuringProbe := mc.closed
+	mc.mu.RUnlock()
+	if closedDuringProbe {
+		return fmt.Errorf("connection closed while opening")
+	}
+
 	// For DRIAD, use source address as registry key since relay is unknown
 	registryKey := mc.RelayAddr
 	if useDRIAD {
@@ -191,7 +223,6 @@ func (mc *ManagedConn) Open() error {
 	if err != nil {
 		return fmt.Errorf("failed to get relay manager: %w", err)
 	}
-
 	// Create subscription
 	key := SubscriptionKey{
 		Source: mc.SrcAddr,
@@ -251,8 +282,45 @@ func (mc *ManagedConn) IsUsingTunnel() bool {
 	return mc.usingTunnel
 }
 
+// waitOpen blocks until an in-flight Open has reached a final state, so a
+// data-plane call that races Open resumes against the finished connection
+// rather than a half-built one.
+//
+// This is the serialization mc.mu used to provide for free: Open held the write
+// lock for its whole duration, so every RLock below queued behind it and always
+// saw the final state. Narrowing that lock — so Close and the health readers
+// stop stalling for the probe window — removed the serialization, and without a
+// replacement ReadFrom could snapshot usingTunnel=false, nativeConn=nil and then
+// park on readBuffer forever: if Open goes on to succeed NATIVELY, nothing ever
+// writes readBuffer, because only the tunnel's OnPacket callback does. The
+// parked reader would wake only at Close. Allocating readBuffer early avoids a
+// select on a nil channel but does not fix that — it is the same hang one line
+// further along (Ally review on go-amt#49).
+//
+// The observers (IsUsingTunnel, LocalAddr, Stats) deliberately do NOT call this.
+// Returning a provisional value is better than stalling for them, and unlike a
+// blocking read they cannot hang on a half-open connection.
+func (mc *ManagedConn) waitOpen() {
+	mc.mu.RLock()
+	openDone, done := mc.openDone, mc.done
+	mc.mu.RUnlock()
+
+	if openDone == nil {
+		// Open has never been called on this conn. There is nothing to wait for,
+		// and the caller's own closed/nil-conn checks produce the right error.
+		return
+	}
+	select {
+	case <-openDone:
+	case <-done:
+		// Close releases waiters even while Open is still running, so a shutdown
+		// is never held up for the remainder of a probe window.
+	}
+}
+
 // ReadFrom reads a packet from the connection
 func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
+	mc.waitOpen()
 	mc.mu.RLock()
 	if mc.closed {
 		mc.mu.RUnlock()
@@ -284,6 +352,7 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 
 // ReadFromWithControlMessage reads a packet with control message
 func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.ControlMessage, src net.Addr, err error) {
+	mc.waitOpen()
 	mc.mu.RLock()
 	if mc.closed {
 		mc.mu.RUnlock()
@@ -314,6 +383,7 @@ func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.C
 
 // ReadBatch reads multiple packets efficiently
 func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
+	mc.waitOpen()
 	mc.mu.RLock()
 	if mc.closed {
 		mc.mu.RUnlock()
@@ -378,6 +448,7 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 
 // WriteTo writes a packet (not supported for AMT tunnel)
 func (mc *ManagedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+	mc.waitOpen()
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
@@ -395,6 +466,7 @@ func (mc *ManagedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 
 // WriteToWithControlMessage writes a packet with an IPv4 control message.
 func (mc *ManagedConn) WriteToWithControlMessage(p []byte, cm *ipv4.ControlMessage, addr net.Addr) (n int, err error) {
+	mc.waitOpen()
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
@@ -411,6 +483,7 @@ func (mc *ManagedConn) WriteToWithControlMessage(p []byte, cm *ipv4.ControlMessa
 
 // WriteBatch writes multiple packets (not supported for AMT tunnel)
 func (mc *ManagedConn) WriteBatch(msg []ipv4.Message, flags int) (int, error) {
+	mc.waitOpen()
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
