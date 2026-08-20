@@ -281,8 +281,37 @@ jobs:
       # protocol_pure_test.go:51, which constructs NewPureGoProtocol()
       # explicitly and so never saw the Rust encoder. No test in this harness
       # could distinguish [0,0,0,0] from [0x94,0x04,0,0], therefore the RA
-      # change cannot be what released these three, and the send_update guard
-      # is the only mechanism in the bump that can be.
+      # change cannot be what released these three.
+      #
+      # THIRD CANDIDATE, and why option-blindness does not reach it.
+      # The argument above eliminates one alternative, not every one. 810719f
+      # (#6) is a second state-machine change in the same bump: handle_query
+      # went from `state != Requesting` to `state != Requesting && state !=
+      # Active` (gateway.rs:224). On its own that would let a second
+      # membership change succeed from Active — exactly the failure mode of
+      # TestQueuedPacketsOwnPayloadAndSourceAddress — and an argument about
+      # option bytes says nothing whatever about it. What rules it out is the
+      # nonce, not the harness's blindness: reaching send_update through the
+      # relaxed handle_query needs a Query whose nonce matches request_nonce
+      # (gateway.rs:234, else InvalidNonce). In the three retired tests no
+      # unsolicited Query is sent at all — buildQuery is reached only from
+      # handleRequest (fakerelay_test.go:189), answering a Request, and
+      # request_membership still gates on Idle (gateway.rs:195), so neither a
+      # Request nor a Query can originate from Active. The one test that does
+      # inject a bare Query while Active,
+      # TestControlTrafficDoesNotRefreshDataLiveness
+      # (fakerelay_flows_test.go:200), passes a bogus [1,2,3,4] and so dies on
+      # the nonce check whatever the state gate says — and is not one of the
+      # three retirements anyway. With both alternatives eliminated, the
+      # send_update guard is the only mechanism in the bump that can have
+      # released them.
+      #
+      # THAT ELIMINATION EXPIRES — do not inherit it. amt-protocol#9 is
+      # precisely the change that permits request_membership from Active. Once
+      # the pin moves, a Request — and so a solicited, nonce-matching Query —
+      # can originate from Active, #6 becomes reachable in this harness, and
+      # the attribution above stops being sound. Re-derive it, do not carry it
+      # forward.
       #
       # That blindness is itself the gap, so it is now closed rather than
       # argued: TestIGMPEnvelopeParityAcrossImplementations goes through

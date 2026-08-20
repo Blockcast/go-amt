@@ -52,9 +52,11 @@ type AMTProtocol interface {
 	// "The same for both implementations" is a claim about this precondition,
 	// not blanket parity. The IGMP encapsulation is not fully in agreement: a
 	// join report's IPv4 destination is the multicast group on the Rust path
-	// and 224.0.0.22 on the pure-Go one (BLO-29419). Everything else in that
-	// envelope is pinned across implementations by
-	// TestIGMPEnvelopeParityAcrossImplementations.
+	// and 224.0.0.22 on the pure-Go one (BLO-29419). The IHL, Router Alert
+	// option, total length and header checksum are pinned across
+	// implementations by TestIGMPEnvelopeParityAcrossImplementations; the TTL,
+	// protocol byte and source address are asserted nowhere, so they are not
+	// pinned either.
 	//
 	// igmpReport must be non-empty. The implementations diverge on an empty
 	// slice rather than agreeing on an error: the cgo path takes
