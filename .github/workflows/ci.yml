@@ -409,31 +409,32 @@ jobs:
           done
           exit $rc
 
-      # The shared half, in this lane too — but only the parts whose behaviour
-      # here is predictable from first principles.
+      # The shared half, in this lane too.
       #
-      # These three touch no protocol implementation at all: they drive the fake
-      # native source through the join seam and assert its switch and its
-      # provenance decoder. So they must pass identically in every lane, and if
-      # they do not, the harness itself is broken rather than the arbiter.
+      # The first three touch no protocol implementation at all — they drive the
+      # fake native source through the join seam and assert its switch and its
+      # provenance decoder — so they must pass identically in every lane, and a
+      # failure means the harness itself is broken rather than the arbiter.
       #
-      # The ManagedConn switchover tests are deliberately NOT re-gated by name
-      # here. They already run in the `Test` step above, and they are gated by
-      # name in the `test` job where their behaviour is verified; re-running them
-      # here would duplicate two MinUsefulProbeWindow waits for no new signal.
-      # More to the point, ManagedConn tunnels through RelayManager, which under
-      # cgo dispatches to the Rust amt_protocol implementation — the same path
-      # whose divergences are catalogued in the BLO-28805 block above, one of
-      # which is a subscription that never leaves Suspended. Whether a
-      # ManagedConn subscription reaches Active on the Rust path is an open
-      # question this lane answers; asserting it by name before it is answered
-      # would be predicting, not testing.
-      - name: Prove the native-source harness guards ran under cgo
+      # The ManagedConn switchover tests are gated here as well, which was NOT
+      # obviously safe: ManagedConn tunnels through RelayManager, and under cgo
+      # RelayManager dispatches to the Rust amt_protocol implementation — the same
+      # path whose divergences are catalogued in the BLO-28805 block above, one of
+      # which is a subscription that never leaves Suspended. Run 32420713736
+      # (2026-08-20) settled it: the subscription reaches Active and the 16-packet
+      # tunnel burst is delivered on the Rust path, so BLO-28805 is confined to
+      # leave/unsubscribe rather than join-and-deliver. They are named here now
+      # that the lane has answered; before that, asserting them would have been
+      # predicting rather than testing.
+      - name: Prove the native-delivery harness guards ran under cgo
         run: |
           set -euo pipefail
           names='TestFakeNativeSourceDeliversOnlyWhileEnabled
           TestFakeNativeSourceIsolatesGroups
-          TestProvenanceOfNamesEachDeliveryPath'
+          TestProvenanceOfNamesEachDeliveryPath
+          TestManagedConnKeepsNativeWhenBothPathsAreLive
+          TestManagedConnSwitchesFromNativeToRelayAndBack
+          TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
           rc=0
           go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness-cgo.log || rc=$?
           for t in $names; do

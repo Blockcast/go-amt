@@ -3,6 +3,7 @@
 package amt
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -103,21 +104,24 @@ func TestMulticastConnKeepsNativeWhenBothPathsAreLive(t *testing.T) {
 // Gateway as production does" means here, and it holds whether or not the
 // handshake then completes.
 //
-// Whether it completes is deliberately NOT asserted either way, because it is
-// not yet known. Every Gateway test in this repository drives Open to failure —
-// a silent relay (gateway_timeout_test.go), an unroutable address
-// (conn_tunnel_callsite_test.go), a logging assertion (gateway_logging_test.go) —
-// so no test has ever completed a Gateway handshake against fakeRelay, and
-// Gateway's handshake is decoded by the Rust amt_protocol library rather than by
-// this package's Go decoders. fakeRelay's advertisement is hand-built to what
-// HandleAdvertisement accepts (see its buildQuery note), and whether the Rust
-// side is equally permissive is an open question that cannot be answered on a
-// host without cgo. The branch is logged so the cgo-test lane answers it, after
-// which this test should be tightened to assert the outcome unconditionally.
+// It does not complete, and that is now measured rather than assumed. On the
+// cgo-test lane (run 32420713736, 2026-08-20) Open returned in 12.001s — the 10s
+// probe window plus the 2s handshake bound — with `Error setting up socket:
+// error reading from connection: read udp 0.0.0.0:0: raw-read udp 0.0.0.0:0:
+// i/o timeout`. fakeRelay answers the discovery, so the counter below is
+// satisfied, but the Rust amt_protocol decoder does not carry the gateway to the
+// next leg: fakeRelay's advertisement is hand-built to what this package's Go
+// HandleAdvertisement accepts (see its buildQuery note), and the Rust side is
+// not equally permissive. So the MulticastConn tunnel-DATA leg remains
+// untestable, tracked as BLO-29437 — teaching fakeRelay the Rust wire format is
+// its own piece of work and BLO-28740 item 1 step 2 needs it.
 //
-// What keeps that honest is that the logged branch is not the assertion. The
-// discovery count below is checked on both branches, so this test cannot pass by
-// taking a path that asserts nothing.
+// The failure is therefore pinned to its known SHAPE — a timeout — rather than
+// accepted as any error at all. A different failure here (a panic, a decode
+// error, a refusal before the socket read) is new information and must fail the
+// test rather than pass as "still does not complete". The completed branch is
+// kept live so that fixing fakeRelay starts asserting the data leg rather than
+// silently skipping it.
 func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 	fr := newFakeRelay(t)
 	nat := installFakeNativeSource(t)
@@ -128,8 +132,9 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 
 	start := time.Now()
 	err := mc.Open()
+	elapsed := time.Since(start)
 	t.Logf("Open with native silent took %s (probe window floor is %s), err=%v",
-		time.Since(start).Round(time.Millisecond), MinUsefulProbeWindow, err)
+		elapsed.Round(time.Millisecond), MinUsefulProbeWindow, err)
 
 	if nat.Binds() != 1 {
 		t.Fatalf("native joins through the seam = %d, want 1: the handover did not "+
@@ -147,11 +152,29 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 			"probe timed out but the group was never handed to an AMT gateway", n)
 	}
 
+	// Both legs are bounded, and this is the only test that covers them in
+	// series. gateway_timeout_test.go bounds the handshake from a bare Gateway;
+	// here the probe window runs first, so a regression that made either leg
+	// unbounded — the #29 hang, or a probe deadline that outlived its window —
+	// shows up as an overrun rather than a slow pass.
+	if bound := MinUsefulProbeWindow + 2*time.Second + 8*time.Second; elapsed > bound {
+		t.Errorf("Open took %s, over the %s bound (probe window + handshake timeout "+
+			"+ slack): one of the two legs is not bounding itself", elapsed, bound)
+	}
+
 	if err != nil {
-		t.Logf("Gateway.Open did not complete against fakeRelay: %v. The handover "+
-			"reached the relay, which is what this test asserts. Completing the "+
-			"handshake needs fakeRelay to satisfy the Rust amt_protocol decoder; "+
-			"tighten this once the lane confirms either way.", err)
+		// Pinned to the known shape. See the header: anything other than a
+		// timeout is new behaviour and should be looked at, not absorbed.
+		var netErr net.Error
+		if !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Errorf("Gateway.Open failed with a NON-timeout error: %v. The known "+
+				"behaviour is that fakeRelay's advertisement does not satisfy the Rust "+
+				"amt_protocol decoder, so the gateway times out waiting for the next "+
+				"leg. A different failure means something else changed.", err)
+		}
+		t.Logf("Gateway.Open did not complete against fakeRelay (expected, timeout): "+
+			"%v. The handover reached the relay, which is what this test asserts; the "+
+			"tunnel data leg needs fakeRelay taught the Rust wire format.", err)
 		return
 	}
 
