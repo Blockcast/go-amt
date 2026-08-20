@@ -77,17 +77,66 @@ func (mc *MulticastConn) Open() error {
 	dstAddr := net.UDPAddrFromAddrPort(addr)
 
 	if mc.GroupAddr.Is6() {
-		flags6 := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit
-		conn, err := ListenMulticastUDP6("udp6", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags6, mc.RcvBufBytes, mc.SndBufBytes)
+		// The plan is consulted BEFORE the socket is bound. Binding first made
+		// AMTModeTunnel fail closed in its own use case: a bind error returned
+		// here, so mc.amtGw was never constructed on precisely the hosts where
+		// an operator selects the mode. See probePlan.attemptNative.
+		plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
+
+		if plan.attemptNative() {
+			flags6 := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit
+			conn, err := ListenMulticastUDP6("udp6", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags6, mc.RcvBufBytes, mc.SndBufBytes)
+			if err != nil {
+				return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
+			}
+			mc.conn6 = conn
+
+			if plan.Probe {
+				native, err := probeNativeTraffic(mc.conn6, plan.Window, mc.IFace.MTU, func(b []byte) error {
+					_, _, _, err := mc.conn6.ReadFrom(b)
+					return err
+				})
+				if err != nil {
+					return err
+				}
+				if native {
+					return nil
+				}
+			}
+			if !plan.TunnelOnFailure {
+				return nil
+			}
+
+			if err := mc.conn6.Close(); err != nil {
+				return err
+			}
+			mc.conn6 = nil
+		}
+
+		// Native v6 produced no traffic — or was never attempted, because the
+		// operator asked for the tunnel outright — and a tunnel was asked for,
+		// but the AMT tunnel data plane is v4-only. Surface a clear error rather
+		// than silently falling back to an unsupported path.
+		return fmt.Errorf("v6 AMT tunnel fallback not yet supported")
+	}
+
+	// Same ordering as the v6 branch above: decide, then bind. An operator who
+	// selected AMTModeTunnel never pays for a socket on this path, so the bind
+	// can neither fail the tunnel out from under them nor emit an IGMP
+	// join/leave pair for a group nothing here will read.
+	plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
+
+	if plan.attemptNative() {
+		flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
+		conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
 		if err != nil {
 			return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 		}
-		mc.conn6 = conn
+		mc.conn4 = conn
 
-		plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
 		if plan.Probe {
-			native, err := probeNativeTraffic(mc.conn6, plan.Window, mc.IFace.MTU, func(b []byte) error {
-				_, _, _, err := mc.conn6.ReadFrom(b)
+			native, err := probeNativeTraffic(mc.conn4, plan.Window, mc.IFace.MTU, func(b []byte) error {
+				_, _, _, err := mc.conn4.ReadFrom(b)
 				return err
 			})
 			if err != nil {
@@ -101,47 +150,15 @@ func (mc *MulticastConn) Open() error {
 			return nil
 		}
 
-		// Native v6 produced no traffic and a tunnel was asked for, but the AMT
-		// tunnel data plane is v4-only. Surface a clear error rather than silently
-		// falling back to an unsupported path.
-		if err := mc.conn6.Close(); err != nil {
+		// Hand the group over to an AMT tunnel. The native join is dropped only here,
+		// once the plan has actually concluded native is not deliverable — never on
+		// the strength of a window too short to be evidence (BLO-28640).
+		if err := mc.conn4.Close(); err != nil {
 			return err
 		}
-		mc.conn6 = nil
-		return fmt.Errorf("v6 AMT tunnel fallback not yet supported")
+		mc.conn4 = nil
 	}
 
-	flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
-	conn, err := ListenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
-	if err != nil {
-		return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
-	}
-	mc.conn4 = conn
-
-	plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
-	if plan.Probe {
-		native, err := probeNativeTraffic(mc.conn4, plan.Window, mc.IFace.MTU, func(b []byte) error {
-			_, _, _, err := mc.conn4.ReadFrom(b)
-			return err
-		})
-		if err != nil {
-			return err
-		}
-		if native {
-			return nil
-		}
-	}
-	if !plan.TunnelOnFailure {
-		return nil
-	}
-
-	// Hand the group over to an AMT tunnel. The native join is dropped only here,
-	// once the plan has actually concluded native is not deliverable — never on
-	// the strength of a window too short to be evidence (BLO-28640).
-	if err := mc.conn4.Close(); err != nil {
-		return err
-	}
-	mc.conn4 = nil
 	mc.amtGw = &Gateway{
 		RelayAddr:   &mc.RelayAddr,
 		GroupAddr:   dstAddr.IP,

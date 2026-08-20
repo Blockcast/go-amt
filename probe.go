@@ -30,7 +30,7 @@ type nativeConn interface {
 // multicast delivers here and this is the answer "no".
 //
 // probeNativeTraffic itself distinguishes this from a real error by its bool
-// return; the sentinel exists for callers like ManagedConn.tryNativeMulticast
+// return; the sentinel exists for callers like ManagedConn.dialNativeMulticast
 // whose signature can only report an error.
 var errNativeProbeTimedOut = errors.New("native multicast produced no traffic inside the probe window")
 
@@ -49,6 +49,15 @@ func probeNativeTraffic(conn nativeConn, window time.Duration, mtu int, read fun
 		return false, err
 	}
 
+	// Clamp rather than trust: an interface reporting MTU 0 (or a negative
+	// value) would otherwise make a zero-length buffer and read into nothing.
+	// The clamp lives here because probe.go is the single shared implementation,
+	// so one guard covers all three call sites — both conn.go branches, which
+	// pass mc.IFace.MTU straight through, and managed_conn_native.go, whose own
+	// default only handles a nil IFace and not a present one reporting zero.
+	if mtu <= 0 {
+		mtu = 1500
+	}
 	discard := make([]byte, mtu)
 	err := read(discard)
 	if err == nil {

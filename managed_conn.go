@@ -50,11 +50,18 @@ type ManagedConn struct {
 	DNSServers  []string // Optional, uses system default if empty
 
 	// Internal state
-	rm          *RelayManager
-	sub         *Subscription
-	readBuffer  chan *DataPacket
-	done        chan struct{}
-	mu          sync.RWMutex
+	rm         *RelayManager
+	sub        *Subscription
+	readBuffer chan *DataPacket
+	done       chan struct{}
+	mu         sync.RWMutex
+	// openMu serializes Open against itself. mu deliberately no longer spans
+	// the whole of Open — the native probe and the relay handshake both block
+	// for seconds and must not be holding an exclusive lock while they do — so
+	// without a separate gate two concurrent Opens could each bind a socket and
+	// the loser's would leak. openMu preserves the serialization the single
+	// full-length mu.Lock used to provide, without the lock-hold.
+	openMu      sync.Mutex
 	closed      bool
 	usingTunnel bool
 	localAddr   net.Addr
@@ -64,20 +71,40 @@ type ManagedConn struct {
 }
 
 // Open initializes the connection, trying native multicast first, then AMT relay
+//
+// Open can take seconds to return — up to MinUsefulProbeWindow proving the
+// native join, plus the relay handshake — but it holds mc.mu only for short
+// sections at each end. That split is deliberate: when the probe window ran
+// inside the exclusive lock, Close() had to wait the whole window out with no
+// cancellation path, and because Go's RWMutex queues new readers behind a
+// waiting writer, one pending Close also stalled every IsUsingTunnel/LocalAddr/
+// Stats reader for the remainder of it. Callers concurrent with Open therefore
+// observe a not-yet-open connection rather than blocking on one.
 func (mc *ManagedConn) Open() error {
-	mc.mu.Lock()
-	defer mc.mu.Unlock()
+	mc.openMu.Lock()
+	defer mc.openMu.Unlock()
 
+	mc.mu.Lock()
 	if mc.closed {
+		mc.mu.Unlock()
 		return fmt.Errorf("connection already closed")
 	}
-	mc.done = make(chan struct{})
 	if !mc.SrcAddr.Is4() {
+		mc.mu.Unlock()
 		return fmt.Errorf("AMT source address must be IPv4: %s", mc.SrcAddr)
 	}
 	if !mc.GroupAddr.Is4() {
+		mc.mu.Unlock()
 		return fmt.Errorf("AMT group address must be IPv4: %s", mc.GroupAddr)
 	}
+	mc.done = make(chan struct{})
+	// Allocated here rather than beside the subscription below, so a Read racing
+	// Open cannot select on a nil channel. mc.done goes live in this same
+	// section, so a nil buffer would park that reader until Close instead of it
+	// simply finding no packets yet.
+	mc.readBuffer = make(chan *DataPacket, 100)
+	done, readBuffer := mc.done, mc.readBuffer
+	mc.mu.Unlock()
 
 	hasRelay := len(mc.RelayAddr.IP) > 0
 	plan := planManagedOpen(mc.Mode, hasRelay, mc.EnableDRIAD, mc.Timeout)
@@ -89,9 +116,24 @@ func (mc *ManagedConn) Open() error {
 	// value silently removed native multicast — the BLO-28640 defect, in this
 	// file rather than conn.go.
 	if plan.AttemptNative {
-		err := mc.tryNativeMulticast(plan.Probe)
+		// Runs outside mc.mu: this is the multi-second call. dialNativeMulticast
+		// returns the socket rather than installing it, so the only thing that
+		// needs the lock is the handful of assignments below.
+		conn, err := mc.dialNativeMulticast(plan.Probe)
 		if err == nil {
+			mc.mu.Lock()
+			if mc.closed {
+				// Close ran while we were probing. It could not have seen this
+				// socket, so installing it now would strand a live descriptor on
+				// a closed connection — drop it here instead.
+				mc.mu.Unlock()
+				conn.Close()
+				return fmt.Errorf("connection closed while opening")
+			}
+			mc.nativeConn = conn
+			mc.localAddr = conn.LocalAddr()
 			mc.usingTunnel = false
+			mc.mu.Unlock()
 			return nil
 		}
 		if !plan.Probe.TunnelOnFailure {
@@ -102,8 +144,10 @@ func (mc *ManagedConn) Open() error {
 		// Native multicast failed or the probe timed out, so use the AMT relay.
 	}
 
-	// Use RelayManager for AMT tunnel
-	mc.usingTunnel = true
+	// Use RelayManager for AMT tunnel. usingTunnel, rm and sub are installed
+	// together in the commit section at the end rather than here, so no reader
+	// can observe a connection that claims to be tunnelling before it has a
+	// subscription to tunnel through.
 
 	// Build transport config
 	transportCfg := TransportConfig{
@@ -147,7 +191,6 @@ func (mc *ManagedConn) Open() error {
 	if err != nil {
 		return fmt.Errorf("failed to get relay manager: %w", err)
 	}
-	mc.rm = rm
 
 	// Create subscription
 	key := SubscriptionKey{
@@ -156,14 +199,12 @@ func (mc *ManagedConn) Open() error {
 		Port:   mc.GroupPort,
 	}
 
-	mc.readBuffer = make(chan *DataPacket, 100)
-
 	sub, err := rm.Subscribe(key, SubscriptionCallbacks{
 		OnPacket: func(data []byte, src net.Addr) error {
 			select {
-			case <-mc.done:
+			case <-done:
 				return nil
-			case mc.readBuffer <- &DataPacket{
+			case readBuffer <- &DataPacket{
 				Data:      data,
 				Source:    src,
 				Timestamp: time.Now(),
@@ -183,7 +224,22 @@ func (mc *ManagedConn) Open() error {
 	if err != nil {
 		return fmt.Errorf("failed to subscribe: %w", err)
 	}
+
+	mc.mu.Lock()
+	if mc.closed {
+		// Close ran during the handshake, so it saw a nil sub and could not have
+		// unsubscribed this one. Undo it here rather than leaving the relay
+		// manager holding a subscription for a closed connection.
+		mc.mu.Unlock()
+		if unsubErr := rm.Unsubscribe(sub.Key()); unsubErr != nil {
+			return fmt.Errorf("connection closed while opening, and unsubscribing failed: %w", unsubErr)
+		}
+		return fmt.Errorf("connection closed while opening")
+	}
+	mc.usingTunnel = true
+	mc.rm = rm
 	mc.sub = sub
+	mc.mu.Unlock()
 
 	return nil
 }

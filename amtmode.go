@@ -122,6 +122,26 @@ func planProbe(mode AMTMode, relayConfigured bool, timeout time.Duration) probeP
 	}
 }
 
+// attemptNative reports whether the native socket should be bound at all.
+//
+// Only a deliberate AMTModeTunnel with a relay to reach declines it: such an
+// operator has already concluded native multicast is not deliverable here, so
+// binding first can only do harm. The bind is most likely to *fail* on exactly
+// that host (no multicast route, no IP_ADD_MEMBERSHIP permission, interface
+// down), and a caller that binds before consulting the plan therefore fails
+// closed in the one situation the mode exists for. When the bind succeeds it is
+// no better: the join is torn down immediately, so the group gets an IGMP
+// join/leave pair for traffic this path never reads.
+//
+// This is a method rather than a field or a repeated expression because both
+// MulticastConn.Open and planManagedOpen must answer it identically. They did
+// not: planManagedOpen declined the bind while conn.go bound unconditionally,
+// so the same Mode value produced two different behaviours depending on which
+// type the caller held (Ally review on go-amt#49). One predicate, one answer.
+func (p probePlan) attemptNative() bool {
+	return p.Probe || !p.TunnelOnFailure
+}
+
 // managedPlan is the decision ManagedConn.Open acts on. ManagedConn reaches the
 // AMT tunnel through RelayManager rather than Gateway directly, so it needs one
 // extra branch MulticastConn does not have (DRIAD discovery) — but the
@@ -159,7 +179,7 @@ func planManagedOpen(mode AMTMode, hasRelay, enableDRIAD bool, timeout time.Dura
 	plan := planProbe(mode, hasRelay, timeout)
 
 	return managedPlan{
-		AttemptNative: plan.Probe || !plan.TunnelOnFailure,
+		AttemptNative: plan.attemptNative(),
 		Probe:         plan,
 	}
 }
