@@ -380,17 +380,28 @@ func gensend(args []string) error {
 // stamping the wrong provenance, and the tests would go on passing. Naming
 // the fields makes that a compile error instead.
 type scoring struct {
+	// _ forces every literal to be keyed. Without it an unkeyed literal is
+	// still writable, and the distinct types below do NOT save it: untyped
+	// string CONSTANTS convert to any ~string type, so scoring{"", "",
+	// "shred"} -- mode and rightsBasis transposed -- compiled clean and
+	// passed `go vet` (which only flags unkeyed literals for imported
+	// structs, never same-package ones). The blank field makes the arity
+	// wrong, so the only way to build a scoring is by naming fields.
+	_ struct{}
+
 	mode        scoringMode
 	sourceLabel scoringSource
 	rightsBasis scoringRights
 }
 
 // The three fields carry DISTINCT defined types rather than three plain
-// strings. Grouping them in a struct alone is not sufficient: an unkeyed
-// composite literal -- scoring{a, b, c} -- reassembles the original hazard,
-// because three string fields accept three strings in any order. Distinct
-// types make that swap a compile error too, which is what the acceptance
-// criterion on BLO-28993 actually asks for.
+// strings, which closes the case the blank field above cannot see: a KEYED
+// literal built from typed values, scoring{sourceLabel: s.rightsBasis, ...},
+// is correctly-keyed and correctly-shaped yet still transposed. Only the types
+// reject it.
+//
+// The two guards are complementary, not redundant -- each catches a swap the
+// other admits. Neither alone satisfies BLO-28993; both together do.
 type (
 	scoringMode   string
 	scoringSource string

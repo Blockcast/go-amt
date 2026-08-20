@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -603,6 +604,36 @@ func TestScoringFlagsBindEachFlagToItsOwnField(t *testing.T) {
 	}
 	if score.rightsBasis != "rights-value" {
 		t.Errorf("--rights-basis landed in the wrong field: got rightsBasis=%q", score.rightsBasis)
+	}
+}
+
+// TestScoringRejectsUnkeyedLiterals pins the blank guard field on scoring.
+//
+// The guard reads like dead weight -- an unused, unnamed, zero-width field --
+// which is exactly why it needs a test standing on it: deleting it is a
+// one-line cleanup that compiles, passes every other test, and silently
+// reopens a swap class.
+//
+// What it defends: the distinct field types alone do NOT make an unkeyed
+// literal safe. Untyped string constants convert to any ~string type, so
+// before the guard, scoring{"", "", "shred"} -- mode and rightsBasis
+// transposed -- type-checked clean, and `go vet` stayed silent because its
+// composites check only flags unkeyed literals for imported structs, never
+// same-package ones. The guard breaks the arity so no unkeyed literal of any
+// ordering can be written at all.
+//
+// This asserts the guard's presence rather than the compile failure, because a
+// test cannot observe a build it prevents. The compile failure itself is
+// verified by mutation in the PR description.
+func TestScoringRejectsUnkeyedLiterals(t *testing.T) {
+	scoringType := reflect.TypeOf(scoring{})
+	if got := scoringType.Field(0).Name; got != "_" {
+		t.Fatalf("scoring's first field is %q, want the blank guard %q: an unkeyed "+
+			"literal is writable again, so scoring{\"\", \"\", \"shred\"} compiles with "+
+			"mode and rightsBasis transposed (BLO-28993)", got, "_")
+	}
+	if got := scoringType.Field(0).Type.Size(); got != 0 {
+		t.Errorf("guard field size = %d, want 0: the guard must stay zero-width", got)
 	}
 }
 
