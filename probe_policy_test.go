@@ -1,6 +1,7 @@
 package amt
 
 import (
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -76,8 +77,12 @@ func TestOnlyDeliberateTunnelModeDeclinesTheNativeBind(t *testing.T) {
 
 // probeConnStub satisfies nativeConn without a socket, so the shared probe
 // machinery can be exercised on a host with no multicast route.
+//
+// clearErr, when set, fails only the deadline-CLEARING call (the zero-time one),
+// which is the single failure the success path has to handle distinctly.
 type probeConnStub struct {
 	deadlines []time.Time
+	clearErr  error
 }
 
 func (c *probeConnStub) Close() error                     { return nil }
@@ -86,6 +91,9 @@ func (c *probeConnStub) SetDeadline(t time.Time) error    { return nil }
 func (c *probeConnStub) SetWriteDeadline(time.Time) error { return nil }
 func (c *probeConnStub) SetReadDeadline(t time.Time) error {
 	c.deadlines = append(c.deadlines, t)
+	if t.IsZero() {
+		return c.clearErr
+	}
 	return nil
 }
 
@@ -100,9 +108,9 @@ func TestProbeClampsNonPositiveMTU(t *testing.T) {
 	for _, mtu := range []int{0, -1, -1500} {
 		var got int
 		conn := &probeConnStub{}
-		native, err := probeNativeTraffic(conn, time.Second, mtu, func(b []byte) error {
+		_, native, err := probeNativeTraffic(conn, time.Second, mtu, func(b []byte) (int, error) {
 			got = len(b)
-			return nil
+			return 0, nil
 		})
 		if err != nil {
 			t.Fatalf("mtu=%d: unexpected error: %v", mtu, err)
@@ -122,9 +130,9 @@ func TestProbePassesThroughAPlausibleMTU(t *testing.T) {
 	for _, mtu := range []int{576, 1500, 9000} {
 		var got int
 		conn := &probeConnStub{}
-		if _, err := probeNativeTraffic(conn, time.Second, mtu, func(b []byte) error {
+		if _, _, err := probeNativeTraffic(conn, time.Second, mtu, func(b []byte) (int, error) {
 			got = len(b)
-			return nil
+			return 0, nil
 		}); err != nil {
 			t.Fatalf("mtu=%d: unexpected error: %v", mtu, err)
 		}
@@ -139,7 +147,7 @@ func TestProbePassesThroughAPlausibleMTU(t *testing.T) {
 // would fail every subsequent read instantly.
 func TestProbeClearsItsDeadlineOnSuccess(t *testing.T) {
 	conn := &probeConnStub{}
-	if _, err := probeNativeTraffic(conn, time.Second, 1500, func([]byte) error { return nil }); err != nil {
+	if _, _, err := probeNativeTraffic(conn, time.Second, 1500, func([]byte) (int, error) { return 0, nil }); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(conn.deadlines) != 2 {
@@ -147,5 +155,39 @@ func TestProbeClearsItsDeadlineOnSuccess(t *testing.T) {
 	}
 	if !conn.deadlines[1].IsZero() {
 		t.Errorf("probe left a read deadline of %v on the socket; it must be cleared", conn.deadlines[1])
+	}
+}
+
+// TestProbeYieldsNoPacketWhenClearingTheDeadlineFails pins the contract that an
+// error return never carries a datagram.
+//
+// The success path reads a packet and then clears the deadline, so it is the one
+// place that can hold a real packet at the moment an error appears. Returning
+// (pkt, true, err) there would be unactionable: every call site tests the error
+// and returns before it looks at the bool, so the datagram would be consumed by
+// the probe and discarded by the caller — the exact defect this PR closes,
+// re-entering through the signature rather than through the predicate.
+//
+// Asserting the bool as well as the packet is deliberate. A future call site
+// that checked native before err would otherwise read a nil packet as a
+// zero-length datagram, which is a distinction this file works to preserve
+// everywhere else.
+func TestProbeYieldsNoPacketWhenClearingTheDeadlineFails(t *testing.T) {
+	wantErr := errors.New("use of closed network connection")
+	conn := &probeConnStub{clearErr: wantErr}
+
+	pkt, native, err := probeNativeTraffic(conn, time.Second, 1500, func(b []byte) (int, error) {
+		copy(b, []byte("slt"))
+		return 3, nil
+	})
+
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("probe returned error %v, want %v", err, wantErr)
+	}
+	if pkt != nil {
+		t.Errorf("probe returned a %d-byte packet alongside an error; no caller reads it, so the datagram is silently discarded", len(pkt))
+	}
+	if native {
+		t.Errorf("probe reported native=true alongside an error; the bool must carry no information on the error path")
 	}
 }

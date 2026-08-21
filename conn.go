@@ -77,6 +77,12 @@ type MulticastConn struct {
 	conn4 *ipv4.PacketConn
 	conn6 *ipv6.PacketConn
 	amtGw *Gateway
+
+	// pending holds the datagram a successful probe consumed, so the first read
+	// after Open returns it instead of the caller waiting a whole signalling
+	// interval for the next one. Drained by ReadFromWithControlMessage and
+	// ReadBatch; see pendingPacket in probe.go.
+	pending pendingStore
 }
 
 // activeConn returns the version-agnostic view of whichever native PacketConn
@@ -112,14 +118,19 @@ func (mc *MulticastConn) Open() error {
 			mc.conn6 = conn
 
 			if plan.Probe {
-				native, err := probeNativeTraffic(mc.conn6, plan.Window, mc.IFace.MTU, func(b []byte) error {
-					_, _, _, err := mc.conn6.ReadFrom(b)
-					return err
+				var src net.Addr
+				pkt, native, err := probeNativeTraffic(mc.conn6, plan.Window, mc.IFace.MTU, func(b []byte) (int, error) {
+					n, _, s, err := mc.conn6.ReadFrom(b)
+					src = s
+					return n, err
 				})
 				if err != nil {
 					return err
 				}
 				if native {
+					// cm stays nil: the v6 read path drops the control message
+					// anyway, since ipv6.ControlMessage is a different type.
+					mc.pending.put(&pendingPacket{buf: pkt, src: src})
 					return nil
 				}
 			}
@@ -155,14 +166,18 @@ func (mc *MulticastConn) Open() error {
 		mc.conn4 = conn
 
 		if plan.Probe {
-			native, err := probeNativeTraffic(mc.conn4, plan.Window, mc.IFace.MTU, func(b []byte) error {
-				_, _, _, err := mc.conn4.ReadFrom(b)
-				return err
+			var cm *ipv4.ControlMessage
+			var src net.Addr
+			pkt, native, err := probeNativeTraffic(mc.conn4, plan.Window, mc.IFace.MTU, func(b []byte) (int, error) {
+				n, c, s, err := mc.conn4.ReadFrom(b)
+				cm, src = c, s
+				return n, err
 			})
 			if err != nil {
 				return err
 			}
 			if native {
+				mc.pending.put(&pendingPacket{buf: pkt, cm: cm, src: src})
 				return nil
 			}
 		}
@@ -200,6 +215,32 @@ func (mc *MulticastConn) IsUsingTunnel() bool {
 	return mc.amtGw != nil
 }
 func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
+	// A packet the probe consumed is owed to the caller before anything read
+	// from the socket, or the stream would be delivered out of order.
+	//
+	// Room is checked first, and a no-room batch only ever peeks: taking the
+	// packet just to put it back leaves the store empty in between, which lets a
+	// concurrent reader fall through to the socket and deliver a later packet
+	// ahead of this one — the reordering this check exists to prevent.
+	//
+	// "Room" must include a non-empty *first buffer*, not merely a non-empty
+	// Buffers slice: copy into a zero-length buffer moves no bytes, so taking
+	// the packet there would return (1, nil) with N=0 and an emptied store — a
+	// loss reported as success, and indistinguishable from a legitimately
+	// received zero-length datagram. That coupling of "did the path deliver?"
+	// to "how big was the payload?" is exactly what the ([]byte, bool, error)
+	// probe signature exists to make unrepresentable.
+	if len(ms) == 0 || len(ms[0].Buffers) == 0 || len(ms[0].Buffers[0]) == 0 {
+		if mc.pending.peek() != nil {
+			// Nowhere to put it. Leave it for the next call rather than drop it.
+			return 0, nil
+		}
+	} else if pkt := mc.pending.take(); pkt != nil {
+		n := copy(ms[0].Buffers[0], pkt.buf)
+		ms[0].N = n
+		ms[0].Addr = pkt.src
+		return 1, nil
+	}
 	if !mc.IsUsingTunnel() {
 		if mc.conn6 != nil {
 			// ipv6.Message and ipv4.Message are both aliases for socket.Message.
@@ -277,6 +318,10 @@ func (mc *MulticastConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	return n, src, err
 }
 func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.ControlMessage, src net.Addr, err error) {
+	// See ReadBatch: the probe's packet is owed to the caller first.
+	if pkt := mc.pending.take(); pkt != nil {
+		return copy(buf, pkt.buf), pkt.cm, pkt.src, nil
+	}
 	if !mc.IsUsingTunnel() {
 		if mc.conn6 != nil {
 			// Native v6 receive: the v6 control message has a different type, so

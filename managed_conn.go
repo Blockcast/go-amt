@@ -72,6 +72,11 @@ type ManagedConn struct {
 
 	// For native multicast fallback
 	nativeConn *ipv4.PacketConn
+
+	// pending holds the datagram a successful native probe consumed, so the
+	// caller's first read gets it instead of waiting a whole signalling interval
+	// for the next one. Atomic, so it is outside mu deliberately; see probe.go.
+	pending pendingStore
 }
 
 // Open initializes the connection, trying native multicast first, then AMT relay
@@ -152,7 +157,7 @@ func (mc *ManagedConn) Open() error {
 		// Runs outside mc.mu: this is the multi-second call. dialNativeMulticast
 		// returns the socket rather than installing it, so the only thing that
 		// needs the lock is the handful of assignments below.
-		conn, err := mc.dialNativeMulticast(plan.Probe)
+		conn, pkt, err := mc.dialNativeMulticast(plan.Probe)
 		if err == nil {
 			mc.mu.Lock()
 			if mc.closed {
@@ -167,6 +172,12 @@ func (mc *ManagedConn) Open() error {
 			mc.localAddr = conn.LocalAddr()
 			mc.usingTunnel = false
 			mc.mu.Unlock()
+			// Installed after the lock is dropped: pendingStore is atomic, so it
+			// needs no help from mu, and the readers that drain it call waitOpen
+			// first — so none of them can look before this line runs.
+			if pkt != nil {
+				mc.pending.put(pkt)
+			}
 			return nil
 		}
 		if !plan.Probe.TunnelOnFailure {
@@ -342,7 +353,27 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	nativeConn := mc.nativeConn
 	readBuffer := mc.readBuffer
 	done := mc.done
+	// Drained inside the read lock, so the closed check above is exact rather
+	// than advisory: Close takes the write lock, so it cannot interleave between
+	// the two and leave a closed connection serving a packet it still holds. A
+	// closed connection owes the caller an error, not a packet.
+	//
+	// Unlike ReadBatch this takes unconditionally, even when p is too short or
+	// empty, and that asymmetry is deliberate. A short buffer truncating a
+	// datagram is what the underlying socket does and what net.PacketConn
+	// documents, so matching it keeps the pending path and the socket path
+	// indistinguishable to the caller. ReadBatch can do better only because it
+	// has a way to say "no room, nothing consumed" — zero messages returned.
+	// ReadFrom has none: (0, addr, nil) with the packet retained is
+	// indistinguishable from a zero-length datagram, so a caller looping on a
+	// short buffer would spin forever instead of making progress. Do not
+	// "align" this with ReadBatch.
+	pending := mc.pending.take()
 	mc.mu.RUnlock()
+
+	if pending != nil {
+		return copy(p, pending.buf), pending.src, nil
+	}
 
 	if !usingTunnel && nativeConn != nil {
 		n, _, src, err := nativeConn.ReadFrom(p)
@@ -374,7 +405,13 @@ func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.C
 	nativeConn := mc.nativeConn
 	readBuffer := mc.readBuffer
 	done := mc.done
+	// See ReadFrom: taken inside the read lock so the closed check is exact.
+	pending := mc.pending.take()
 	mc.mu.RUnlock()
+
+	if pending != nil {
+		return copy(buf, pending.buf), pending.cm, pending.src, nil
+	}
 
 	if !usingTunnel && nativeConn != nil {
 		return nativeConn.ReadFrom(buf)
@@ -405,7 +442,35 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	nativeConn := mc.nativeConn
 	readBuffer := mc.readBuffer
 	done := mc.done
+	// See ReadFrom for why the store is touched inside the read lock. Room is
+	// checked first, and a no-room batch only ever peeks: take-then-put-back
+	// leaves the store momentarily empty, which lets a concurrent reader fall
+	// through to the socket and deliver a later packet ahead of this one.
+	//
+	// "Room" must include a non-empty *first buffer*, not merely a non-empty
+	// Buffers slice: copy into a zero-length buffer moves no bytes, so taking
+	// the packet there would return (1, nil) with N=0 and an emptied store —
+	// a loss reported as success, and indistinguishable from a legitimately
+	// received zero-length datagram. This is the same predicate the
+	// subscription path below uses (see the len(ms[i].Buffers[0]) checks).
+	var pending *pendingPacket
+	pendingWaiting := false
+	if len(ms) == 0 || len(ms[0].Buffers) == 0 || len(ms[0].Buffers[0]) == 0 {
+		pendingWaiting = mc.pending.peek() != nil
+	} else {
+		pending = mc.pending.take()
+	}
 	mc.mu.RUnlock()
+
+	if pendingWaiting {
+		// Nowhere to put it. Leave it for the next call rather than drop it.
+		return 0, nil
+	}
+	if pending != nil {
+		ms[0].N = copy(ms[0].Buffers[0], pending.buf)
+		ms[0].Addr = pending.src
+		return 1, nil
+	}
 
 	if !usingTunnel && nativeConn != nil {
 		return nativeConn.ReadBatch(ms, flags)
