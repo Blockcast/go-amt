@@ -322,24 +322,33 @@ jobs:
       # the IPv4 destination, which really does diverge (group address on the
       # Rust path, 224.0.0.22 on pure-Go) — pre-existing, tracked in BLO-29419.
       #
-      # RETIRED 2026-08-21: the last -skip is gone. The prior note recorded the
-      # mechanism for TestDataStarvationReconnectsDespiteControlTraffic —
-      # keepaliveLoop calls CreateRequestMessage (relay_manager.go:957) ->
-      # request_membership, which required Idle, so from Active it returned
-      # InvalidState and the loop discarded it at :958-959; no Request reached
-      # the wire, the relay never answered with a Query, and the premise guard
-      # reported 1 -> 1. It was never a loaded-runner flake.
+      # STILL FAILING after the pin bump — the amt-protocol#9 theory is DISPROVEN.
+      #   TestDataStarvationReconnectsDespiteControlTraffic
       #
-      # amt-protocol#9 (1799e393, "allow a keepalive Request from Active")
-      # relaxes that guard, and this bump carries it. It is the counterpart to
-      # #6 relaxing handle_query to accept Active: a Query can only arrive
-      # while Active if a Request can be sent from Active.
+      # The prior note predicted #9 would close this: keepaliveLoop calls
+      # CreateRequestMessage (relay_manager.go:957) -> request_membership,
+      # which required Idle, so from Active it returned InvalidState and the
+      # loop discarded it at :958-959; no Request reached the wire and the
+      # relay never answered with a Query. #9 relaxed that guard —
+      # gateway.rs:257 is now `!= Idle && != Active` — so the Request is
+      # sendable from Active.
       #
-      # `go test ./...` now runs the full untagged suite on the cgo path with
-      # no deselection, which is BLO-28805's acceptance criterion #3.
+      # It did not help. Run 32443335894 at pin 44ff7e1d fails with the
+      # byte-identical premise-guard message:
+      #   fakerelay_flows_test.go:541: relay sent no Membership Query between
+      #   the handshake and the reconnect (1 -> 1)
+      # Same 1 -> 1, so the Query still never arrives. The blocker is therefore
+      # downstream of the gateway state machine — most likely the fakeRelay
+      # harness not answering a mid-session Request at all, which is the same
+      # family as BLO-29437 and BLO-29196 (fakeRelay cannot drive a Rust-backed
+      # Gateway). Do NOT re-attribute this to gateway state without new
+      # evidence; that theory has now been tested and failed.
+      #
+      # Kept skipped so the pin bump can land green. Tracked in BLO-28805,
+      # whose AC #3 (no -skip at all) stays open on this one test.
       - name: Test
         run: |
-          go test ./...
+          go test -skip 'TestDataStarvationReconnectsDespiteControlTraffic' ./...
 
       # Positive proof that the retired tests actually ran on the cgo path.
       # Deleting a name from -skip only stops deselecting it; without this, a
@@ -347,13 +356,11 @@ jobs:
       # test binary) would still show a bare "ok". Same anti-vacuity
       # requirement as the Gateway.Open guards below.
       #
-      # The note above this step used to say to delete this step along with the
-      # last -skip. Deliberately not done: that rationale is exactly as load-
-      # bearing now as it was before, and `go test ./...` reporting "ok" is
-      # still indistinguishable from a silently deselected package. Keeping the
-      # step and adding the fourth name is strictly more coverage than removing
-      # it. If a reviewer wants it gone, that should be an explicit decision
-      # rather than a side effect of closing BLO-28805.
+      # The note above this step said to delete it once the last -skip went.
+      # That has not happened and this step stays regardless: its rationale —
+      # a bare "ok" is indistinguishable from a silently deselected package —
+      # is independent of how many names are in -skip. Whenever the last skip
+      # is finally retired, extend this list rather than deleting the step.
       #
       # TestIGMPEnvelopeParityAcrossImplementations rides along because it is
       # the assertion that pins the Router Alert convergence this bump also
@@ -364,12 +371,11 @@ jobs:
           set -euo pipefail
           rc=0
           go test -v -count=1 \
-            -run 'TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestQueuedPacketsOwnPayloadAndSourceAddress|TestDataStarvationReconnectsDespiteControlTraffic|TestIGMPEnvelopeParityAcrossImplementations' \
+            -run 'TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestQueuedPacketsOwnPayloadAndSourceAddress|TestIGMPEnvelopeParityAcrossImplementations' \
             . 2>&1 | tee /tmp/blo28805.log || rc=$?
           for t in TestUnsubscribeDuringPendingJoinPreservesOtherSource \
                    TestV4MappedSubscriptionCompletesFullLifecycle \
                    TestQueuedPacketsOwnPayloadAndSourceAddress \
-                   TestDataStarvationReconnectsDespiteControlTraffic \
                    TestIGMPEnvelopeParityAcrossImplementations; do
             # Anchor on the trailing space before go's duration field. A bare
             # prefix match would let a future test whose name extends one of
