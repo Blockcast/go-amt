@@ -212,7 +212,8 @@ Losses inside the receiver — as opposed to before it — appear as
 Sizing it at the host is the only lever today. A per-socket setter exists and is
 tested (`receiver.OpenUDPFlow`, `RcvBufBytes`), but the shipped binary opens its
 ingress socket with bare `net.ListenUDP` and never calls it — the same
-built-but-unwired shape as the erasure defect above.
+built-but-unwired shape the erasure metrics had before
+[BLO-28442](https://paperclip.blockcast.net/BLO/issues/BLO-28442) wired them.
 
 ## What the score actually means
 
@@ -228,19 +229,39 @@ built-but-unwired shape as the erasure defect above.
 - A packet whose header will not parse increments `shreds_unparsed_total`. It is
   still forwarded, byte for byte.
 
-### When a set is scored — read this carefully
+### When a set is scored — two deadlines, two answers
 
 The v1 specification scores a set at **`slot_boundary + erasure_grace`**, with
-`erasure_grace` defaulting to **400 ms**.
+`erasure_grace` defaulting to **400 ms** (`--erasure-grace-ms`). The binary
+drives that definition: `erasure.Tracker` scores each set against its grace
+deadline and publishes the result to `/metrics` every `--report-interval`.
 
-**The shipped binary does not do this yet.** It has no scoring deadline at all:
+The stdout receipt answers a **different question**, and always has.
 `Scorer.Receipt()` walks every FEC set it has ever seen and counts any set still
-short of 32 distinct shreds as erased. The effective deadline is therefore
-**whenever the receipt is produced** — process shutdown — not a slot-boundary
-grace. The completion threshold, the dedup rule and the gap buckets are all as
-specified; only the deadline differs.
+short of 32 distinct shreds as erased, so its effective deadline is *whenever the
+receipt is produced* — process shutdown — not a slot boundary.
 
-Two consequences worth knowing before you quote the number:
+| | `/metrics` + heartbeat | the stdout receipt |
+|---|---|---|
+| question | was this set complete **at its deadline**? | did this set **ever** complete, over the whole run? |
+| window | the last drained reporting window | the entire process lifetime |
+| authoritative for the SLA | **yes** | no |
+
+**The tracker is authoritative for the delivery SLA.** The receipt is a whole-run
+summary for demo and debugging.
+
+The two therefore report **different numbers by design, and a discrepancy
+between them is not a bug**. On the bundled 401-shred capture the receipt reports
+`sets_total 7, sets_erased 2, fraction 0.2857` while `/metrics` reports
+`total 4, erased 0`: two of the receipt's sets are single shreds arriving 90–120
+seconds late, whose scoring deadline had long passed, and one more belongs to the
+newest slot, which no later slot has ended. Full derivation:
+**[erasure-scoring.md](erasure-scoring.md)**.
+
+Do not reconcile the two by loosening the deadline: a score that counts a shred
+arriving two minutes late is not a score of timely delivery.
+
+Two consequences worth knowing before you quote the *receipt's* number:
 
 - A set that was still legitimately in flight when you sent `SIGTERM` is counted
   as erased. On a short run that tail bias is visible; on a long one it is
@@ -248,26 +269,32 @@ Two consequences worth knowing before you quote the number:
 - Because sets are never aged out, the receipt is a whole-run figure, not a
   windowed one. It cannot be compared against a 30-second heartbeat window.
 
-The grace-anchored implementation exists and is tested (`erasure.Tracker`) but is
-not yet driven by the binary — tracked as
-[BLO-28442](https://paperclip.blockcast.net/BLO/issues/BLO-28442). Until that
-lands:
+### Alerting: `erasure_fraction 0` has three meanings
 
-- The **shutdown receipt** on stdout carries the real numbers.
-- The **`/metrics` erasure, rate and gap series report zero regardless of actual
-  loss.** Do not scrape them for the SLA, and do not read
-  `bcast_shred_gw_erasure_fraction 0` as a clean feed. `report_schema 0` and
-  `erasure_grace_milliseconds 0` are the tell that the series is unwired — the
-  specified values are `1` and `400`.
+The erasure, rate and gap series are **windowed gauges**, drained every
+`--report-interval` and falling back to zero when a window carries no traffic. A
+scrape reading `bcast_shred_gw_erasure_fraction 0` therefore means any of:
 
-A receiver whose deadline is retention expiry is *more* forgiving than the
-specified one: it gives a set up to two seconds to complete, where the
-specification gives it 400 ms past the slot boundary. Reasoning from that alone,
-it should report erasure equal to or lower than the specified definition — but
-that is an expectation from the deadline arithmetic, not a measured result, and
-it has not been validated against a grace-anchored run. Do not lean on it in a
-dispute until [BLO-28442](https://paperclip.blockcast.net/BLO/issues/BLO-28442)
-lands and the two can be compared directly.
+1. **No erasure** in the last window — the feed is genuinely healthy.
+2. **No traffic** in the last window — the feed is stopped. An alert on the
+   fraction alone reads a dead feed as a perfect one.
+3. **The tracker stopped scoring a live feed** — a slot implausibly far from the
+   frontier moved it, so real shreds are refused until the frontier re-syncs.
+   Packets keep arriving and are still forwarded byte for byte.
+
+Alert on liveness **first** and the erasure fraction second:
+
+- `bcast_shred_gw_ingress_packets_total` is a monotonic counter — a flat counter
+  is a dead feed, whatever the fraction says.
+- `/healthz` fails on last-packet freshness.
+- `bcast_shred_gw_erasure_slot_rejections_total` and
+  `bcast_shred_gw_erasure_frontier_resyncs_total` are cumulative counters that
+  survive a window drain. Sustained growth is case 3 — **the case the first two
+  signals cannot see**, because ingress keeps climbing and `/healthz` stays 200.
+  Treat every resync as a discontinuity in the erasure series, not a point in it.
+
+The first two signals separate case 1 from case 2; only the slot-guard counters
+separate case 1 from case 3.
 
 ### The gap histogram
 
@@ -316,7 +343,7 @@ that is merely idle:
 | `bcast_shred_gw_fanout_dropped_packets_total` | Packets dropped because the bounded fan-out ring was full. **The receiver-overload signal — alert on any increase.** |
 | `bcast_shred_gw_fanout_write_errors_total` | Failed or short destination writes; each is a packet a target did not receive. |
 | `bcast_shred_gw_shreds_unparsed_total` | Delivered packets whose shred header would not parse. |
-| `bcast_shred_gw_erasure_*`, `_shreds_per_second`, `_gap_events` | Per-feed delivery SLA for the last drained window, on the `--report-interval` cadence. `erasure_fraction` is a **windowed gauge**: `0` means "no erasure OR no traffic", so do not alert on it without a liveness signal — pair it with `ingress_packets_total`. |
+| `bcast_shred_gw_erasure_*`, `_shreds_per_second`, `_gap_events` | Per-feed delivery SLA for the last drained window, on the `--report-interval` cadence. `erasure_fraction` is a **windowed gauge**: `0` has [three meanings](#alerting-erasure_fraction-0-has-three-meanings), only one of which is a healthy feed. Never alert on it without a liveness signal — pair it with `ingress_packets_total` and the slot-guard counters below. |
 | `bcast_shred_gw_erasure_slot_rejections_total` | Observations refused by the slot-plausibility guard, by `direction`. `ahead` is beyond the forward jump bound; a sustained `behind` rate means the frontier itself is suspect. |
 | `bcast_shred_gw_erasure_frontier_resyncs_total` | Times the slot frontier was abandoned and re-adopted. Each is a discontinuity in the erasure series — sets in flight were dropped unscored, so a fraction spanning a resync is not comparable across it. |
 
@@ -342,9 +369,12 @@ Honest scope of this build, so you are not surprised in an audit:
   the 30-second heartbeat are not in this binary yet. It runs standalone.
 - **No version string.** The binary cannot report its own version; identify a
   deployment by release artifact checksum until the broker lane lands.
-- **Erasure metrics are unwired** ([BLO-28442](https://paperclip.blockcast.net/BLO/issues/BLO-28442)).
-  Use the shutdown receipt.
-- **Scoring deadline is retention expiry**, not `slot_boundary + 400 ms`. See
-  above.
+- **Erasure metrics are windowed gauges.** `/metrics` reports the last drained
+  window, so `erasure_fraction 0` is not by itself evidence of a healthy feed —
+  see [Alerting](#alerting-erasure_fraction-0-has-three-meanings) above and
+  [erasure-scoring.md](erasure-scoring.md).
+- **The receipt and `/metrics` report different numbers**, because they answer
+  different questions. The tracker is authoritative for the SLA; the receipt is a
+  whole-run summary. See above before filing a discrepancy.
 - **No AMT, no relay, no FEC decode or repair.** Scoring is counting only; the
   receiver never reconstructs a shred.
