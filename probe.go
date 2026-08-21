@@ -100,6 +100,9 @@ func (s *pendingStore) peek() *pendingPacket { return s.p.Load() }
 // the byte count so that a zero-length datagram — valid UDP — stays
 // distinguishable from "nothing arrived"; that distinction is carried by the
 // bool, never by len(buf).
+//
+// A non-nil error always comes with a nil packet and a false bool. The error
+// return never carries a datagram the caller has to remember not to use.
 func probeNativeTraffic(conn nativeConn, window time.Duration, mtu int, read func([]byte) (int, error)) ([]byte, bool, error) {
 	if err := conn.SetReadDeadline(time.Now().Add(window)); err != nil {
 		return nil, false, err
@@ -117,7 +120,22 @@ func probeNativeTraffic(conn nativeConn, window time.Duration, mtu int, read fun
 	buf := make([]byte, mtu)
 	n, err := read(buf)
 	if err == nil {
-		return buf[:n], true, conn.SetReadDeadline(time.Time{})
+		// Clear the deadline first, and yield no packet if that clear fails.
+		// Returning (buf[:n], true, err) would describe a state no caller can
+		// act on: all three call sites — conn.go's v6 and v4 branches and
+		// managed_conn_native.go — test the error and return before they ever
+		// look at the bool, so the datagram would be consumed here and then
+		// dropped there. That is the defect this file exists to close, and
+		// leaving it expressible in the signature invites it back.
+		//
+		// Nothing is lost by dropping it: SetReadDeadline can only fail on a
+		// socket that has gone away underneath the probe (a structurally
+		// invalid conn already returned at the deadline set above), and there
+		// is then no live connection left to deliver into.
+		if clearErr := conn.SetReadDeadline(time.Time{}); clearErr != nil {
+			return nil, false, clearErr
+		}
+		return buf[:n], true, nil
 	}
 	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 		// Clear the expired deadline even though every caller today hands the
