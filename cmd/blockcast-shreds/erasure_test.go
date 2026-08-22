@@ -284,14 +284,19 @@ func TestListenAndScorePublishesRealErasureToMetrics(t *testing.T) {
 		t.Fatalf("erasure_fraction = %v, want %v (erased/total from the same window)", fraction, expected)
 	}
 
-	// The two series that are self-refuting when zero: v1 fixes schema at 1 and
-	// the default grace at 400ms, so a zero here advertises a schema that does
-	// not exist.
+	// The two series that are self-refuting when zero: the report schema and
+	// the default grace are both fixed, so a zero here advertises a schema that
+	// does not exist.
 	if graceMS != float64(grace/time.Millisecond) {
 		t.Fatalf("erasure_grace_milliseconds = %v, want %v", graceMS, grace/time.Millisecond)
 	}
-	if schema != 1 {
-		t.Fatalf("report_schema = %v, want 1", schema)
+	// Must move with erasure.reportSchema, which is unexported and so cannot be
+	// referenced from this package. This gauge is the only per-gateway signal
+	// for which report schema a deployed producer emits, which is what the
+	// schema-1 retirement census in broker.FeedReport.Erasure has to count — so
+	// it is pinned here rather than left to follow whatever the producer does.
+	if schema != 2 {
+		t.Fatalf("report_schema = %v, want 2", schema)
 	}
 
 	// Rate and gap come from the same drained window, so they must be populated

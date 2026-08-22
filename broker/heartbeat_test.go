@@ -665,7 +665,14 @@ func TestValidateHeartbeatRejects(t *testing.T) {
 		{"empty sent_at", func(h *Heartbeat) { h.SentAt = "" }},
 		{"empty feed id", func(h *Heartbeat) { h.Feeds[0].FeedID = "" }},
 		{"oversized feed id", func(h *Heartbeat) { h.Feeds[0].FeedID = strings.Repeat("f", MaxFeedIDBytes+1) }},
-		{"wrong erasure schema", func(h *Heartbeat) { h.Feeds[0].Erasure.Schema = 2 }},
+		// Above the accepted range. This case used to set 2 and pass for the
+		// right reason; 2 is now an accepted schema, so setting it here would
+		// still fail this test but only because the window fields schema 2
+		// requires are absent — a rejection with nothing to do with the schema
+		// number. Both of those live in TestWindowDurationContract, which
+		// distinguishes them; keep this one unambiguously out of range.
+		{"erasure schema above range", func(h *Heartbeat) { h.Feeds[0].Erasure.Schema = erasureReportSchema + 1 }},
+		{"erasure schema below range", func(h *Heartbeat) { h.Feeds[0].Erasure.Schema = erasureReportSchemaFloor - 1 }},
 		{"erased exceeds total", func(h *Heartbeat) { h.Feeds[0].Erasure.SetsErased = h.Feeds[0].Erasure.SetsTotal + 1 }},
 		// sets_total is the denominator the fraction recompute polices against,
 		// so an unbounded one lets an untrusted producer choose a denominator
@@ -1033,5 +1040,262 @@ func TestMaxSetsTotalExceedsTheLongestLegalWindow(t *testing.T) {
 	if margin := float64(MaxSetsTotal) / float64(worstCase); margin < 7.0 || margin > 7.2 {
 		t.Fatalf("headroom over the longest legal window is %.2fx, but the doc on MaxSetsTotal "+
 			"claims 7.1x; update whichever is wrong", margin)
+	}
+}
+
+// schema2Window returns the fixture window at the newest schema, complete with
+// the window identity that schema requires.
+func schema2Window() erasure.Window {
+	window := validHeartbeat().Feeds[0].Erasure
+	window.Schema = 2
+	window.WindowStart = "2026-08-18T05:59:30Z"
+	window.WindowMS = 30_000
+	return window
+}
+
+// TestWindowDurationContract is the verifying signal for the window-duration
+// contract decision (BLO-29493) and for the transition window W2b's sign-off
+// required (BLO-29669, BLO-29707).
+//
+// The decision was to add a per-feed duration and identity under a schema bump.
+// The transition window is why ingest accepts a RANGE of schemas rather than
+// only the newest: the validator and the producer fleet cannot move atomically,
+// and a rejection here discards a whole heartbeat rather than one feed. So this
+// test asserts BOTH schemas are accepted — asserting only the newest would let
+// a hard cut back in without failing anything, which is precisely the outcome
+// the sign-off was given to prevent.
+//
+// It also asserts the field rules in both directions, because a range of
+// accepted schemas is only safe while the number still decides the shape. See
+// validateReportWindowBounds.
+func TestWindowDurationContract(t *testing.T) {
+	t.Run("both schemas in the transition window are accepted", func(t *testing.T) {
+		accepted := []struct {
+			name   string
+			window erasure.Window
+		}{
+			{"schema 1 without the window fields", validHeartbeat().Feeds[0].Erasure},
+			{"schema 2 with the window fields", schema2Window()},
+		}
+		for _, testCase := range accepted {
+			t.Run(testCase.name, func(t *testing.T) {
+				hb := validHeartbeat()
+				hb.Feeds[0].Erasure = testCase.window
+				if err := ValidateHeartbeat(hb); err != nil {
+					t.Fatalf("ingest rejected %s: %v — the transition window "+
+						"requires both schemas to be accepted, not just the newest", testCase.name, err)
+				}
+			})
+		}
+
+		// Stated as a range rather than by listing the two values, so that
+		// retiring schema 1 by raising the floor cannot leave this test
+		// asserting a window that no longer exists.
+		if erasureReportSchemaFloor >= erasureReportSchema {
+			t.Fatalf("the accepted schema range [%d,%d] has collapsed to a single value: "+
+				"a hard cut is back, and the fleet has no upgrade window",
+				erasureReportSchemaFloor, erasureReportSchema)
+		}
+	})
+
+	t.Run("the window fields are required from the schema that introduced them", func(t *testing.T) {
+		rejected := []struct {
+			name   string
+			mutate func(*erasure.Window)
+		}{
+			{"both fields absent", func(w *erasure.Window) { w.WindowStart, w.WindowMS = "", 0 }},
+			{"identity absent", func(w *erasure.Window) { w.WindowStart = "" }},
+			{"duration absent", func(w *erasure.Window) { w.WindowMS = 0 }},
+			{"negative duration", func(w *erasure.Window) { w.WindowMS = -1 }},
+			{"duration above MaxWindowMS", func(w *erasure.Window) { w.WindowMS = MaxWindowMS + 1 }},
+			{"identity not UTC", func(w *erasure.Window) { w.WindowStart = "2026-08-18T07:59:30+02:00" }},
+			{"identity with trailing zeros", func(w *erasure.Window) { w.WindowStart = "2026-08-18T05:59:30.000Z" }},
+			{"identity not a timestamp", func(w *erasure.Window) { w.WindowStart = "2026-08-18 05:59:30" }},
+		}
+		for _, testCase := range rejected {
+			t.Run(testCase.name, func(t *testing.T) {
+				hb := validHeartbeat()
+				window := schema2Window()
+				testCase.mutate(&window)
+				hb.Feeds[0].Erasure = window
+				if err := ValidateHeartbeat(hb); !errors.Is(err, ErrInvalidHeartbeat) {
+					t.Fatalf("ingest accepted a schema-%d report with %s: %v",
+						window.Schema, testCase.name, err)
+				}
+			})
+		}
+	})
+
+	// The direction that is easy to leave out. A schema-1 report carrying a
+	// window would say "comparable within one producer only" in its number and
+	// the opposite in its body, and a consumer branching on the number would
+	// then be wrong about the same bytes.
+	t.Run("the window fields are refused below the schema that introduced them", func(t *testing.T) {
+		rejected := []struct {
+			name   string
+			mutate func(*erasure.Window)
+		}{
+			{"identity present", func(w *erasure.Window) { w.WindowStart = "2026-08-18T05:59:30Z" }},
+			{"duration present", func(w *erasure.Window) { w.WindowMS = 30_000 }},
+			{"both present", func(w *erasure.Window) {
+				w.WindowStart, w.WindowMS = "2026-08-18T05:59:30Z", 30_000
+			}},
+		}
+		for _, testCase := range rejected {
+			t.Run(testCase.name, func(t *testing.T) {
+				hb := validHeartbeat()
+				window := hb.Feeds[0].Erasure
+				if window.Schema >= erasureWindowSchema {
+					t.Skipf("the fixture is at schema %d, so there is no below-introduction "+
+						"schema left to test: schema %d has been retired",
+						window.Schema, erasureWindowSchema-1)
+				}
+				testCase.mutate(&window)
+				hb.Feeds[0].Erasure = window
+				if err := ValidateHeartbeat(hb); !errors.Is(err, ErrInvalidHeartbeat) {
+					t.Fatalf("ingest accepted a schema-%d report with %s: %v",
+						window.Schema, testCase.name, err)
+				}
+			})
+		}
+	})
+
+	// AC-3 on BLO-29493, as amended by the ruling: satisfied here as a
+	// CanonicalBytes + JSON round-trip rather than against W4a's storage,
+	// which is not reachable from this repository's CI.
+	t.Run("the window fields survive canonicalization byte-identically", func(t *testing.T) {
+		hb := validHeartbeat()
+		hb.Feeds[0].Erasure = schema2Window()
+
+		canonical, err := CanonicalBytes(hb)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var decoded Heartbeat
+		if err := json.Unmarshal(canonical, &decoded); err != nil {
+			t.Fatal(err)
+		}
+		if got := decoded.Feeds[0].Erasure; got != hb.Feeds[0].Erasure {
+			t.Fatalf("window did not survive the round trip: got %+v, want %+v", got, hb.Feeds[0].Erasure)
+		}
+		if err := ValidateHeartbeat(decoded); err != nil {
+			t.Fatalf("the canonical form of a valid heartbeat no longer validates: %v", err)
+		}
+
+		requoted, err := CanonicalBytes(decoded)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(canonical, requoted) {
+			t.Fatalf("canonicalization is not idempotent over the window fields:\n first: %s\nsecond: %s",
+				canonical, requoted)
+		}
+	})
+
+	// Why the fields are omitempty. The broker's ledger diffs canonical bytes,
+	// so if a schema-1 report's bytes changed the moment the struct grew, every
+	// retained schema-1 feed would diff as changed once without its delivery
+	// having changed at all.
+	t.Run("adding the fields leaves a schema-1 report's canonical bytes untouched", func(t *testing.T) {
+		canonical, err := CanonicalBytes(validHeartbeat())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(canonical) != canonicalWire {
+			t.Fatalf("the canonical form of a schema-1 heartbeat changed when the window fields "+
+				"were added, so every retained schema-1 feed would diff as changed once:\n got: %s\nwant: %s",
+				canonical, canonicalWire)
+		}
+		if strings.Contains(string(canonical), "window_") {
+			t.Fatal("a schema-1 report emitted a window field; omitempty is missing from erasure.Window")
+		}
+	})
+}
+
+// TestDrainedWindowSatisfiesIngest is the guard that nothing in the type system
+// provides: the producer's schema constant lives in package erasure and the
+// validator's in package broker, so bumping one without the other invalidates
+// every heartbeat while both files still read correctly.
+//
+// It asserts agreement on behaviour rather than on constants, which is what
+// makes it reach: erasure.reportSchema is unexported and cannot be compared
+// from here, and a constant comparison would in any case miss the second half
+// of the coupling — that the producer must populate the fields its own schema
+// number obliges it to, in the exact timestamp spelling the validator accepts.
+// erasure renders WindowStart through its own copy of broker.FormatTimestamp's
+// rule for the same import-cycle reason, and this is the only thing standing
+// between those two copies.
+func TestDrainedWindowSatisfiesIngest(t *testing.T) {
+	windowStart := time.Date(2026, 8, 18, 5, 59, 30, 0, time.UTC)
+	tracker, err := erasure.NewTracker(400*time.Millisecond, windowStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+	window, err := tracker.DrainWindow(windowStart.Add(HeartbeatInterval))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	hb := validHeartbeat()
+	// A drained window from a feed that observed nothing pairs with a feed that
+	// reports no packets; validateFeedActivity enforces that pairing.
+	hb.Feeds[0].Erasure = window
+	hb.Feeds[0].Packets, hb.Feeds[0].Bytes = 0, 0
+	hb.Feeds[0].FirstPacketAt, hb.Feeds[0].LastPacketAt = "", ""
+
+	if err := ValidateHeartbeat(hb); err != nil {
+		t.Fatalf("ingest rejected a window straight out of the producer: %v\n"+
+			"the producer's schema constant (erasure.reportSchema) and the validator's "+
+			"(broker.erasureReportSchema) have drifted, or the producer is not populating "+
+			"the fields its schema requires", err)
+	}
+	if window.Schema < erasureWindowSchema {
+		t.Fatalf("the producer emits schema %d, below the schema that introduced the window "+
+			"fields (%d): sets_total is being reported with no interval to normalize it against",
+			window.Schema, erasureWindowSchema)
+	}
+	if window.WindowMS != HeartbeatInterval.Milliseconds() {
+		t.Fatalf("drained window_ms = %d, want %d", window.WindowMS, HeartbeatInterval.Milliseconds())
+	}
+	if want := FormatTimestamp(windowStart); window.WindowStart != want {
+		t.Fatalf("drained window_start = %q, want %q — erasure's timestamp spelling has "+
+			"drifted from broker.FormatTimestamp", window.WindowStart, want)
+	}
+}
+
+// TestMaxWindowMSExceedsTheLongestLegalWindow pins MaxWindowMS above the
+// longest interval an operator can configure, and above the point at which
+// MaxSetsTotal binds first.
+//
+// The bound is deliberately NOT the configured maximum. window_ms is measured
+// elapsed, and a delayed drain legitimately reports longer than its interval
+// exactly when the box is loaded — so a bound at the configured maximum would
+// reject honest heartbeats under precisely the conditions an SLA dispute is
+// about. See MaxWindowMS.
+func TestMaxWindowMSExceedsTheLongestLegalWindow(t *testing.T) {
+	// Mirrors cmd/blockcast-shreds/main.go, which lives in package main and
+	// cannot be imported here. Raising --report-interval's cap without updating
+	// this is what the assertion is here to catch.
+	const (
+		maxReportInterval = 5 * time.Minute
+		sizingShredRate   = 30_000
+		shredsPerSet      = 64
+	)
+
+	if MaxWindowMS <= maxReportInterval.Milliseconds() {
+		t.Fatalf("MaxWindowMS %d does not exceed the longest configurable drain interval %d: "+
+			"a drain delayed by even one tick would be rejected at ingest",
+			MaxWindowMS, maxReportInterval.Milliseconds())
+	}
+
+	// The doc's claim: sets_total is the bound that binds first, so a
+	// pathologically delayed drain is rejected with the delivery figure named
+	// rather than with a bare complaint about the clock.
+	setsBindAfter := time.Duration(MaxSetsTotal*shredsPerSet/sizingShredRate) * time.Second
+	if MaxWindowMS <= setsBindAfter.Milliseconds() {
+		t.Fatalf("MaxWindowMS %d is at or below the %v at which MaxSetsTotal binds at %d shred/s, "+
+			"so the duration bound would reject first and the doc on MaxWindowMS is wrong",
+			MaxWindowMS, setsBindAfter, sizingShredRate)
 	}
 }

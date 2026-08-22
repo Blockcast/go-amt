@@ -73,17 +73,56 @@ const (
 	// Ingest bounds are declared together on this contract so a producer can
 	// discover them without reading the validator: at most MaxFeeds feed
 	// reports per heartbeat, at most MaxVersionBytes in version, at most
-	// MaxFeedIDBytes in each feed_id, and at most MaxSetsTotal in each feed's
-	// erasure.sets_total.
+	// MaxFeedIDBytes in each feed_id, at most MaxSetsTotal in each feed's
+	// erasure.sets_total, and at most MaxWindowMS in each feed's
+	// erasure.window_ms.
 	HeartbeatSchema = "blockcast.shred-gw-heartbeat.v1"
 
 	// HeartbeatInterval is the fixed v1 emission cadence.
 	HeartbeatInterval = 30 * time.Second
 
-	// erasureReportSchema is the per-feed delivery report schema this envelope
-	// carries. Pinned so an envelope cannot smuggle a future report shape past
-	// a broker that only understands v1.
-	erasureReportSchema = 1
+	// erasureReportSchema is the newest per-feed delivery report schema ingest
+	// understands, and the one erasure's producer emits. Bounded rather than
+	// open-ended so an envelope cannot smuggle a future report shape past a
+	// broker that does not know the shape's rules.
+	erasureReportSchema = 2
+
+	// erasureReportSchemaFloor is the oldest per-feed report schema ingest
+	// still accepts. Ingest accepts the closed range
+	// [erasureReportSchemaFloor, erasureReportSchema].
+	//
+	// The range exists because the schema check is exact-match, so a
+	// single-value pin makes any bump a flag day — and one that cannot be made
+	// atomic. The validator and the producers sit on opposite sides of a module
+	// boundary consumed as a version pin, and the producers are independently
+	// deployed fleet software, so there is no ordering in which both move at
+	// once: whichever moves first rejects the other. Rejection is also
+	// whole-heartbeat rather than per-feed, since this error exits
+	// ValidateHeartbeat, so one report at the wrong schema discards the
+	// liveness and delivery evidence for up to MaxFeeds-1 well-formed feeds
+	// that did nothing wrong. For a register whose job is reproducing a
+	// historical delivery record, that is evidence loss for as long as the
+	// version skew lasts. Accepting a range costs one comparison; a flag day
+	// costs the record.
+	//
+	// RETIRING A SCHEMA is therefore gated on producer evidence, not on a
+	// date: raise this floor only once a census shows no deployed producer
+	// still emits the schema being dropped. A wall-clock expiry does not
+	// remove the flag day, it just relocates it to a moment when nobody is
+	// watching. See the census gate on FeedReport.Erasure for what has to be
+	// observable before the floor can move to 2.
+	erasureReportSchemaFloor = 1
+
+	// erasureWindowSchema is the schema from which erasure.window_start and
+	// erasure.window_ms are REQUIRED, and below which they must be absent.
+	//
+	// Held separately from the floor and the newest schema so the two
+	// questions stay independent: which schemas ingest tolerates is a
+	// deployment fact that changes as the fleet moves, whereas which schema
+	// introduced these fields is a permanent fact about the wire format.
+	// Collapsing them into one constant would make the field rules silently
+	// follow the deployment window.
+	erasureWindowSchema = 2
 
 	// erasureFractionEpsilon bounds the disagreement tolerated between a
 	// reported ErasureFraction and the ratio recomputed from the two integers
@@ -169,6 +208,34 @@ const (
 	// firing and the lost report is not the incident.
 	MaxSetsTotal = 999_999
 
+	// MaxWindowMS bounds erasure.window_ms.
+	//
+	// Deliberately far above the five-minute maximum drain interval rather
+	// than equal to it. window_ms is MEASURED elapsed, not the configured
+	// interval, and the two diverge upward exactly under load: one serial
+	// ticker drains every feed and Go's ticker drops ticks when the receiver
+	// is slow, so a gateway configured at the legal maximum legitimately
+	// reports longer windows precisely when the box is struggling — the
+	// condition an SLA dispute is about. A bound at the configured maximum
+	// would reject those heartbeats wholesale, which is the same
+	// confidently-clean-feed failure that pinning the drain interval was
+	// rejected for, reached through the validator instead.
+	//
+	// 40 minutes is chosen to sit above the point where MaxSetsTotal binds
+	// first: at the 30,000 shred/s rate the receiver sizes for, 999,999 sets
+	// accumulate in about 35 minutes. So a drain delayed far enough to matter
+	// is rejected by the count bound, whose message names the delivery figure
+	// an operator needs, rather than by a duration bound that only reports
+	// that the clock looked odd. This is a sanity bound against a garbage or
+	// hostile value, not an assertion about scheduling.
+	//
+	// A producer whose own window exceeds this must emit the report anyway and
+	// never clamp window_ms, for the same reason sets_total must not be
+	// clamped: clamping fabricates the interval an SLA is normalized against,
+	// whereas an over-bound report is rejected loudly and the operator finds
+	// out.
+	MaxWindowMS = 2_400_000
+
 	// MaxVersionBytes bounds the version string.
 	MaxVersionBytes = 128
 
@@ -217,23 +284,59 @@ func Version() string { return version }
 // positive when Packets is — a zero-length UDP datagram is legal and counts as
 // a packet that carried no bytes.
 //
-// Erasure carries no window duration, and a v1 broker cannot recover one, so
-// its counts are comparable within a gateway and not across gateways. The
-// window is the producer's configured drain interval — operator-settable, 30
-// seconds by default and legal up to five minutes — and it is independent of
-// HeartbeatInterval, so sets_total 140,625 from one gateway and 14,062 from
-// another can describe identical delivery quality. Nothing on the wire
-// distinguishes them: FirstPacketAt and LastPacketAt bound observed traffic
+// Erasure is the receiver's delivery report for the feed, and carries its own
+// schema number distinct from this envelope's. Ingest accepts the closed range
+// [erasureReportSchemaFloor, erasureReportSchema]; the number decides how the
+// counts must be read, so it is validated together with the fields it governs
+// (see validateReportWindowBounds).
+//
+// From schema 2, sets_total and sets_erased are a COUNTER DELTA over the
+// half-open interval [window_start, window_start + window_ms), and a broker
+// deduplicates on (feed_id, window_start) before summing. Delta rather than
+// gauge deliberately: a gauge would forbid the cross-heartbeat aggregation
+// billing needs, whereas a delta plus an identity makes a repeat identifiable
+// and idempotent to drop. Both halves are needed. The receiver's metrics
+// surface republishes the last drained window on every scrape, and the drain
+// interval is independent of HeartbeatInterval and legal up to five minutes,
+// so at the maximum the same window is carried by ten consecutive heartbeats:
+// summing without deduplicating overstates delivery ten-fold, and refusing to
+// sum at all leaves billing unable to aggregate. window_ms alone would not
+// settle it, since ten identical windows each reporting the same duration are
+// indistinguishable from ten genuinely distinct ones — which is why the
+// identity ships alongside the duration rather than after it.
+//
+// window_ms is measured elapsed, not the producer's configured interval, and
+// window_start is a timestamp rather than a counter because a counter resets
+// on restart and can then collide across distinct windows. See erasure.Window
+// for both arguments in full, and MaxWindowMS for why the duration's bound is
+// far above the maximum configured interval rather than equal to it.
+//
+// Schema 1 carried neither field, and a broker cannot recover the interval for
+// such a report: first_packet_at and last_packet_at bound observed traffic
 // rather than the scoring window, and while the duration is nominally
 // arrivals/r_mean, the numerator is the tracker's accepted-shred count rather
 // than Packets, so this contract does not license that division. For a feed
 // that received nothing r_mean is 0 and the duration is unrecoverable by any
-// route — precisely the silent feed an SLA dispute is about.
+// route — precisely the silent feed an SLA dispute is about. A broker must
+// therefore keep SLA math for a schema-1 report per-gateway, and must not
+// normalize its counts against a window of a different length. Schema 2 is
+// what lifts that restriction, and it is the reason schema 1 is on a
+// retirement path rather than supported indefinitely.
 //
-// A v1 broker must therefore treat sets_total and sets_erased as counts over an
-// interval it cannot observe, and keep SLA math per-gateway. Cross-gateway
-// normalization needs an explicit window_ms field and a schema bump; it is a
-// deliberate contract decision rather than something to infer at ingest.
+// RETIREMENT GATE for schema 1: raise erasureReportSchemaFloor to 2 only on
+// evidence that no deployed producer still emits schema 1 — not on a date. The
+// evidence has to be a census of PRODUCERS, and the per-producer signal
+// already exists: each gateway publishes the schema of its last drained window
+// as the report_schema gauge on its own /metrics (receiver.ReceiverMetrics).
+// What does not exist is an aggregate view of it — either central scraping of
+// that gauge across the fleet, or a broker-side record of the per-feed schema
+// each ingest accepted. Either satisfies the gate; neither is in place, so the
+// floor stays at 1. Building one is a precondition for the floor moving, not a
+// follow-up to it, because a census that cannot see a straggler is
+// indistinguishable from one that found none.
+//
+// Until then the range costs one comparison and buys the fleet an upgrade
+// window it cannot otherwise have.
 type FeedReport struct {
 	FeedID        string         `json:"feed_id"`
 	Packets       uint64         `json:"packets"`
@@ -463,9 +566,19 @@ func ValidateHeartbeat(hb Heartbeat) error {
 // The same threat model is why SetsTotal is bounded: an untrusted producer that
 // could name any denominator could pick one large enough for
 // erasureFractionEpsilon to swallow a miscounted set. See MaxSetsTotal.
+//
+// The accepted schema is a RANGE, [erasureReportSchemaFloor,
+// erasureReportSchema], rather than a single pinned value. See
+// erasureReportSchemaFloor for why a single value makes every bump a flag day
+// that cannot be made atomic, and validateReportWindowBounds for the field
+// rules that keep the schema number load-bearing across that range.
 func validateErasureReport(window erasure.Window) error {
-	if window.Schema != erasureReportSchema {
-		return fmt.Errorf("erasure.schema must be %d", erasureReportSchema)
+	if window.Schema < erasureReportSchemaFloor || window.Schema > erasureReportSchema {
+		return fmt.Errorf("erasure.schema must be within [%d,%d], got %d",
+			erasureReportSchemaFloor, erasureReportSchema, window.Schema)
+	}
+	if err := validateReportWindowBounds(window); err != nil {
+		return err
 	}
 	if window.SetsTotal > MaxSetsTotal {
 		return fmt.Errorf("erasure.sets_total must be at most %d, got %d", MaxSetsTotal, window.SetsTotal)
@@ -508,6 +621,60 @@ func validateErasureReport(window erasure.Window) error {
 func requireFinite(field string, value float64) error {
 	if math.IsNaN(value) || math.IsInf(value, 0) {
 		return fmt.Errorf("%s must be a finite number, got %v", field, value)
+	}
+	return nil
+}
+
+// validateReportWindowBounds enforces the window fields PER SCHEMA, which is
+// what keeps the schema number meaningful now that ingest accepts a range of
+// them rather than one pinned value.
+//
+// Below erasureWindowSchema the fields must be ABSENT; from it they are
+// REQUIRED. Enforcing both directions is the point. A range of accepted
+// schemas is only safe if the number still decides the shape, and it would
+// stop deciding anything if either direction were dropped:
+//
+//   - Absent-when-required would let a producer claim the newer schema and
+//     omit the very fields the bump exists to add, and a consumer that
+//     branches on the number would then normalize against a zero interval and
+//     deduplicate on an empty identity — collapsing every window of that feed
+//     onto one key.
+//   - Present-when-absent-expected is the subtler one, and it is not merely
+//     untidy. A schema-1 report carrying a window would be a report whose
+//     number says "these counts are comparable within one producer only"
+//     while its body says otherwise. Since a consumer decides how to treat
+//     the counts from the number, the two would disagree about the same
+//     bytes. Rejecting costs nothing — no producer emits that shape — and
+//     keeps one reading of every accepted report.
+//
+// Note that "absent" is judged on the DECODED struct, so a JSON document that
+// omits the keys and one that sends them at their zero values are the same
+// thing here. That is deliberate: validation is structurally blind to the
+// difference (see HeartbeatSchema on why byte-level distinctions are a broker
+// obligation, not a producer one), so the rule is written in terms of what it
+// can actually see. erasure.Window tags both fields omitempty so the
+// canonical form of a schema-1 report is unchanged from before the fields
+// existed.
+func validateReportWindowBounds(window erasure.Window) error {
+	if window.Schema < erasureWindowSchema {
+		if window.WindowStart != "" || window.WindowMS != 0 {
+			return fmt.Errorf(
+				"erasure.window_start and erasure.window_ms must be absent at erasure.schema %d (they are introduced at schema %d), got %q and %d",
+				window.Schema, erasureWindowSchema, window.WindowStart, window.WindowMS)
+		}
+		return nil
+	}
+
+	// Positive rather than non-negative: zero is what an absent field decodes
+	// to, so admitting it here would silently re-open the absent-when-required
+	// hole this function exists to close. A producer whose measured window
+	// truncates below a millisecond reports the 1ms floor instead of zero; see
+	// erasure.Tracker.DrainWindow.
+	if window.WindowMS <= 0 || window.WindowMS > MaxWindowMS {
+		return fmt.Errorf("erasure.window_ms must be within [1,%d], got %d", MaxWindowMS, window.WindowMS)
+	}
+	if _, err := parseCanonicalUTCTimestamp(window.WindowStart); err != nil {
+		return fmt.Errorf("erasure.window_start must be a canonical UTC timestamp: %s", canonicalTimestampRule)
 	}
 	return nil
 }
