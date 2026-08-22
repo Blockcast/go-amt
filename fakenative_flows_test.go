@@ -145,6 +145,30 @@ func assertNativeIsTheDeliveryPath(r reporter, mc *ManagedConn, readTimeout time
 	}
 }
 
+// assertNativeSourceFedTheTest is the precondition guard for any assertion that
+// claims native won: it requires the fake to have actually put something on the
+// wire. Without it assertNativeIsTheDeliveryPath could pass vacuously if the
+// fake ever stopped sending, so this is what stops a silent harness from reading
+// as a working delivery path.
+//
+// Extracted from TestManagedConnKeepsNativeWhenBothPathsAreLive so the negative
+// control below can drive THIS body through a failureRecorder and require it to
+// fire. Inline, its "still fails when native is silent" property was unverifiable
+// — the only way to observe it was to break the harness and watch CI.
+//
+// It relies on Delivered() never reporting 0 for a payload already read; see the
+// ordering note in fakeNativeSource.run (BLO-29741). Before that fix this guard
+// was the flake: it read a counter that was merely late and reported a valid test
+// as a vacuous one.
+func assertNativeSourceFedTheTest(r reporter, nat *fakeNativeSource) {
+	r.Helper()
+
+	if nat.Delivered() == 0 {
+		r.Errorf("native source delivered nothing, yet the connection reports " +
+			"native; the assertion above cannot have been testing what it claims")
+	}
+}
+
 // TestFakeNativeSourceDeliversOnlyWhileEnabled pins the harness switch itself,
 // in both directions, before anything relies on it.
 //
@@ -374,10 +398,7 @@ func TestManagedConnKeepsNativeWhenBothPathsAreLive(t *testing.T) {
 		t.Errorf("relay answered %d discovery message(s), want 0: native was "+
 			"delivering, so Open should never have reached the relay at all", n)
 	}
-	if nat.Delivered() == 0 {
-		t.Error("native source delivered nothing, yet the connection reports native; " +
-			"the assertion above cannot have been testing what it claims")
-	}
+	assertNativeSourceFedTheTest(t, nat)
 }
 
 // TestManagedConnSwitchesFromNativeToRelayAndBack is the switchover story, in the
@@ -515,5 +536,60 @@ func TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers(t *testing.T) {
 	if !mc.IsUsingTunnel() {
 		t.Error("connection did not fall back to the tunnel, so the assertion above " +
 			"may have failed for an unrelated reason")
+	}
+}
+
+// TestNativeSourceFedGuardFiresWhenTheSourceIsDisabled is the negative control
+// for the precondition guard, and the reason the BLO-29741 fix can be shown to
+// have preserved that guard rather than defeated it.
+//
+// The fix reordered fakeNativeSource.run so the counter LEADS the datagram
+// instead of trailing it. That removes the false failure, but a counter that
+// only ever moved upward would remove the guard's teeth just as effectively —
+// and the symptom of that would be silence, not a failure: every native
+// assertion would go green, including the ones testing nothing. So the guard has
+// to be shown still firing on a genuinely silent source.
+//
+// It runs assertNativeSourceFedTheTest — the SAME function the positive test
+// calls, not a paraphrase — against a source that is explicitly disabled and
+// never enabled, and requires it to report a failure. No ManagedConn is opened:
+// the claim under test is about the guard and the counter, and pulling the
+// arbiter in would let an unrelated failure masquerade as this one.
+func TestNativeSourceFedGuardFiresWhenTheSourceIsDisabled(t *testing.T) {
+	nat := installFakeNativeSource(t)
+
+	// Explicitly disable rather than relying on the off-by-default, so this
+	// stays a control over the switch even if that default ever changes.
+	nat.Disable(testHarnessGroup)
+
+	group := &net.UDPAddr{IP: net.IP(testHarnessGroup.AsSlice()), Port: testHarnessPort}
+	conn, err := listenMulticastUDP4("udp4", nil, testHarnessSource, group, nil, false, 1, 0, 0, 0)
+	if err != nil {
+		t.Fatalf("seam join: %v", err)
+	}
+	defer conn.Close()
+
+	// Give the ticker several cadences to run. Without this the guard could fire
+	// merely because nothing had been attempted yet, which would pass this test
+	// while proving nothing about a source that is actually silenced.
+	time.Sleep(10 * nat.cadence)
+
+	rec := &failureRecorder{}
+	assertNativeSourceFedTheTest(rec, nat)
+
+	if !rec.failed() {
+		t.Fatal("the precondition guard PASSED against a disabled native source. It " +
+			"therefore no longer detects a silent harness, and every " +
+			"assertNativeIsTheDeliveryPath result it is meant to qualify could be " +
+			"vacuous without anything failing.")
+	}
+	t.Logf("negative control: guard fired as required (%s)", rec.report())
+
+	// The counter must be the reason it fired. A guard that fires while the
+	// source is in fact delivering would be the BLO-29741 flake all over again,
+	// just passing this test for the wrong reason.
+	if got := nat.Delivered(); got != 0 {
+		t.Errorf("Delivered() = %d on a disabled source, want 0: the guard fired, "+
+			"but not because the source was silent", got)
 	}
 }

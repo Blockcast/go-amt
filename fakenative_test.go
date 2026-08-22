@@ -227,6 +227,13 @@ func (fn *fakeNativeSource) Disable(group netip.Addr) {
 
 // Delivered reports how many datagrams the source has put on the wire, so a
 // test can tell "native never sent" apart from "native sent and was ignored".
+//
+// The guarantee is one-directional, and that is deliberate — see run. If a
+// payload has been read by the code under test, this CANNOT report 0. The
+// converse does not hold: a write that failed is counted for the instant
+// between the increment and its undo, so this can momentarily read high. Assert
+// Delivered() > 0 to prove the source fed a test; assert Delivered() == 0 only
+// in a test that never enables a group.
 func (fn *fakeNativeSource) Delivered() int64 { return fn.sent.Load() }
 
 // Binds reports how many joins went through the seam.
@@ -279,11 +286,37 @@ func (fn *fakeNativeSource) run() {
 			fn.mu.Unlock()
 
 			for _, addr := range batch {
-				// A closed target is expected: the code under test tears its
-				// join down on handover to the tunnel. Ignore rather than fail
-				// the test from a background goroutine.
-				if _, err := fn.send.WriteToUDP(payload, addr); err == nil {
-					fn.sent.Add(1)
+				// COUNT BEFORE WRITING, and undo on failure. The ordering is
+				// load-bearing, not stylistic.
+				//
+				// Once WriteToUDP returns, the datagram is already queued in the
+				// kernel and readable by the code under test. Incrementing after
+				// it — which this did until BLO-29741 — leaves a window in which a
+				// payload has been read and verified while Delivered() still
+				// reports 0, because the scheduler is free to preempt this
+				// goroutine between the two statements. A precondition guard
+				// asserting Delivered() > 0 then fails a test that genuinely
+				// passed: CI run 32568421905 hit exactly that, and the guard at
+				// fakenative_flows_test.go accused the assertion above it of
+				// testing nothing when it had in fact tested everything it claims.
+				//
+				// Counting first inverts the error into the harmless direction. A
+				// failed write is briefly over-counted before the decrement lands,
+				// which can only ever make Delivered() read HIGH for a datagram
+				// that was not delivered — never zero for one that was. Nothing
+				// asserts an exact successful-write count; the guards are
+				// Delivered() > 0 with a group enabled, and Delivered() == 0 in
+				// tests that never enable a group at all. The latter attempt no
+				// writes whatsoever, so the transient is unreachable from them.
+				// Do not add a Delivered() == 0 assertion to a test that enables a
+				// group — that is the one shape this ordering cannot serve.
+				//
+				// A closed target is expected: the code under test tears its join
+				// down on handover to the tunnel. Ignore rather than fail the test
+				// from a background goroutine.
+				fn.sent.Add(1)
+				if _, err := fn.send.WriteToUDP(payload, addr); err != nil {
+					fn.sent.Add(-1)
 				}
 			}
 		}
