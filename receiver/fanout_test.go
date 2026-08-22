@@ -1125,3 +1125,90 @@ func TestReconcileReportsNoRemovalsWhenTheSetOnlyGrows(t *testing.T) {
 		t.Errorf("reconcile reported %+v removed, want none", removed)
 	}
 }
+
+// A packet already in flight when the table is swapped must still land in the
+// departing target's final counters.
+//
+// This is the case the post-swap read alone does not cover, and the one that
+// turns a wrong final bill into a silent one: the worker loads the table once
+// per packet, so at the instant of the swap it can be mid-deliver holding the
+// old snapshot, with the departing target's charges not yet applied. A
+// reconcile that reads counters straight after the store races those charges
+// and reports a total short by the packet in flight.
+//
+// The stub parks the worker INSIDE deliver — after the table load, before any
+// counter is charged — which is precisely that window, held open so the
+// assertion is deterministic rather than timing-dependent.
+func TestDepartingTargetCountersIncludeAPacketInFlightAcrossTheSwap(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+	}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	packet := []byte("shred")
+	inside := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	fanout.sendBatch = func(_ *ipv4.PacketConn, messages []ipv4.Message, _ bool) (int, error) {
+		once.Do(func() {
+			close(inside)
+			<-release
+		})
+		return len(messages), nil
+	}
+
+	if result := fanout.Enqueue("feed", packet); result != EnqueueAccepted {
+		t.Fatalf("enqueue returned %v, want accepted", result)
+	}
+
+	// The worker is now parked inside deliver holding the pre-swap snapshot,
+	// with grant-b's charge for this packet still pending.
+	select {
+	case <-inside:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker never entered deliver")
+	}
+
+	type reconcileResult struct {
+		removed []DestinationStat
+		err     error
+	}
+	done := make(chan reconcileResult, 1)
+	go func() {
+		removed, err := fanout.ReconcileDestinations([]Target{{ID: "grant-a", Address: "127.0.0.1:20001"}})
+		done <- reconcileResult{removed, err}
+	}()
+
+	// Give the reconcile time to publish the new table and reach the boundary
+	// wait. Without this the parked packet might be released before the
+	// reconcile ever reads, and a build that does not wait would pass by
+	// timing luck rather than by construction.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	var outcome reconcileResult
+	select {
+	case outcome = <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconcile never returned")
+	}
+	if outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	if len(outcome.removed) != 1 {
+		t.Fatalf("reconcile reported %d removed targets, want 1: %+v", len(outcome.removed), outcome.removed)
+	}
+
+	departed := outcome.removed[0]
+	if departed.TargetID != "grant-b" {
+		t.Fatalf("reconcile reported %q as departing, want grant-b", departed.TargetID)
+	}
+	if departed.Packets != 1 || departed.Bytes != uint64(len(packet)) {
+		t.Errorf("departing target billed %d packets / %d bytes, want 1 / %d — the packet in flight across the swap was delivered and went unbilled",
+			departed.Packets, departed.Bytes, len(packet))
+	}
+}

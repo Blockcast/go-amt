@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/ipv4"
 )
@@ -177,6 +178,20 @@ type Fanout struct {
 	// so two concurrent reconciles cannot both read the old table and each
 	// write a swap that loses the other's carried-over counters.
 	reconcileMu sync.Mutex
+
+	// deliverSeq is a seqlock-style bracket around one packet's delivery:
+	// deliver makes it odd before loading the table and even again once it has
+	// finished charging the ledger. It is the ONLY signal a reconcile has for
+	// "is a worker currently holding a snapshot I just replaced", which is what
+	// lets ReconcileDestinations wait out an in-flight packet before reading a
+	// departing target's final counters.
+	//
+	// This costs two uncontended atomic adds per packet on the egress path.
+	// That is deliberate and measured against the alternative: the fan-out's
+	// own p50 is 161 microseconds at N=42, so a pair of adds is ~0.002% of the
+	// packet budget, and it buys an exact final bill instead of one that is
+	// short by however many packets were in flight at the swap.
+	deliverSeq atomic.Uint64
 
 	queuedPackets  atomic.Uint64
 	droppedPackets atomic.Uint64
@@ -410,23 +425,24 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 
 	f.table.Store(&destTable{entries: entries})
 
-	// Read the departing counters AFTER the swap, not before.
+	// Wait out any packet already in flight, THEN read the departing counters.
 	//
 	// The worker loads the table pointer once per packet, so at the instant of
 	// the store a worker already inside deliver holds the OLD snapshot and will
-	// still charge a departing target for the packet it is on. Reading before
-	// the store would miss every such packet; reading after captures all of
-	// them that have landed by now. The counters outlive the table — the old
-	// entry still points at the same *destCounters — so this read is well
-	// defined, and every field is atomic.
+	// still charge a departing target for the packet it is on. Reading straight
+	// after the store captures only the charges that happen to have landed by
+	// then, which leaves the final bill short by whatever was mid-flight — a
+	// silent under-bill, and exactly what this method exists to prevent.
 	//
-	// This narrows the window rather than closing it: a packet still mid-deliver
-	// when we read here is charged to a counter nobody will read again, so it is
-	// delivered and unbilled. The residue is bounded by the packets in flight at
-	// the swap, not by time, which is the difference between a rounding error
-	// and the unbounded under-bill of dropping these counters entirely. Closing
-	// it completely would mean quiescing the worker on every reconcile, i.e.
-	// stalling delivery to every surviving subscriber to bill a departing one.
+	// awaitDeliveryBoundary closes that window. It is an RCU-style grace
+	// period: the reconciling caller waits, the worker never does. Delivery to
+	// surviving subscribers continues at full rate throughout, and the wait is
+	// bounded by a single packet's delivery, not by the reconcile interval.
+	//
+	// The counters outlive the table — the old entry still points at the same
+	// *destCounters — so this read is well defined, and every field is atomic.
+	f.awaitDeliveryBoundary()
+
 	var removed []DestinationStat
 	for _, entry := range departing {
 		removed = append(removed, DestinationStat{
@@ -439,6 +455,39 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 		})
 	}
 	return removed, nil
+}
+
+// awaitDeliveryBoundary blocks until no worker is inside a deliver that could
+// still be holding a pre-swap snapshot. It must be called AFTER the table
+// store, which is what makes it terminate: any deliver that starts from here
+// on loads the new table and cannot charge a departing target.
+//
+// An even sequence means the worker is between packets and returns
+// immediately, which is the common case and the reason an idle fan-out does
+// not pay for this. An odd sequence means one packet is in flight; the wait
+// ends as soon as that specific bracket closes, so it costs one packet's
+// delivery at most.
+//
+// The deadline is a liveness backstop, not part of the contract. Reconcile
+// refuses non-UDP fan-outs, so the in-flight work is a bounded sendmmsg rather
+// than an arbitrary io.Writer — but a wedged socket must not deadlock the
+// broker-grant client that drives reconciles. If it ever expires we fall
+// through and read anyway: a short final bill beats a hung control plane, and
+// it is no worse than not having waited at all.
+func (f *Fanout) awaitDeliveryBoundary() {
+	const boundaryTimeout = 250 * time.Millisecond
+
+	started := f.deliverSeq.Load()
+	if started%2 == 0 {
+		return
+	}
+	deadline := time.Now().Add(boundaryTimeout)
+	for f.deliverSeq.Load() == started {
+		if time.Now().After(deadline) {
+			return
+		}
+		runtime.Gosched()
+	}
 }
 
 // resolveTargets validates a target set and builds its table entries, reusing
@@ -553,6 +602,17 @@ func (f *Fanout) run() {
 // deliver writes one packet to every destination and reports how many landed.
 func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
 	size := uint64(len(packet))
+	// Announce that this packet is in flight BEFORE loading the table, and
+	// stand it down only after the last counter has been charged. A reconcile
+	// that observes an odd sequence knows a worker may still be holding the
+	// snapshot it just replaced, and waits for this bracket to close before
+	// reading a departing target's final counters. Ordering matters in both
+	// directions: incrementing after the Load would let a reconcile read
+	// counters for a packet it never saw as in flight, and decrementing before
+	// the charges land would do the same.
+	f.deliverSeq.Add(1)
+	defer f.deliverSeq.Add(1)
+
 	// One Load for the whole packet. Charging and batch construction must
 	// agree on the same destination set; re-loading would let a reconcile land
 	// mid-packet and attribute a send to the wrong subscriber.
