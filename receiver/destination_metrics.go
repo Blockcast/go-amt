@@ -3,6 +3,7 @@ package receiver
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -58,7 +59,7 @@ func NewDestinationMetrics(registerer prometheus.Registerer, ledger DestinationL
 	if registerer == nil {
 		return nil, errors.New("destination metrics registerer is nil")
 	}
-	if ledger == nil {
+	if ledgerIsNil(ledger) {
 		return nil, errors.New("destination metrics ledger is nil")
 	}
 
@@ -90,6 +91,31 @@ func NewDestinationMetrics(registerer prometheus.Registerer, ledger DestinationL
 		return nil, fmt.Errorf("register destination metrics: %w", err)
 	}
 	return metrics, nil
+}
+
+// ledgerIsNil reports whether ledger is unusable: either an untyped nil, or a
+// non-nil interface value holding a nil pointer.
+//
+// The second case is the one a plain ledger == nil misses. A (*Fanout)(nil)
+// satisfies DestinationLedger, so the interface itself is non-nil and
+// construction would succeed; the nil receiver is then not dereferenced until
+// DestinationStats runs inside Collect. That is not a recoverable 500. Gather
+// runs each collector on a goroutine it spawns itself, so the panic surfaces
+// there rather than in the handler, where neither promhttp's recover nor the
+// scraping caller can catch it — the first scrape takes the whole process
+// down. Rejecting at construction keeps that failure at wiring time, where the
+// stack still names the caller that passed the nil.
+func ledgerIsNil(ledger DestinationLedger) bool {
+	if ledger == nil {
+		return true
+	}
+	// IsNil panics on kinds that cannot be nil, so it must be guarded.
+	switch value := reflect.ValueOf(ledger); value.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 // Describe implements prometheus.Collector.

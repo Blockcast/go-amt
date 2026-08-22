@@ -136,6 +136,43 @@ func TestNewDestinationMetricsRejectsMissingDependencies(t *testing.T) {
 	}
 }
 
+// TestNewDestinationMetricsRejectsATypedNilLedger covers the nil that an
+// interface hides. A (*Fanout)(nil) satisfies DestinationLedger, so the
+// interface is non-nil and a plain ledger == nil check lets it through; the
+// nil receiver is not dereferenced until DestinationStats runs inside Collect.
+//
+// That is why this is rejected at construction rather than tolerated at scrape
+// time: Gather runs collectors on goroutines it spawns, so the panic does not
+// surface in the handler and promhttp's recover cannot catch it. A typed nil
+// reaching the registry crashes the process on first scrape instead of
+// degrading one endpoint — the same blast radius the duplicate-label case is
+// guarded against, arrived at from the other direction.
+func TestNewDestinationMetricsRejectsATypedNilLedger(t *testing.T) {
+	var fanout *Fanout // non-nil interface, nil pointer inside
+
+	registry := prometheus.NewRegistry()
+	if _, err := NewDestinationMetrics(registry, fanout); err == nil {
+		t.Fatal("typed-nil ledger accepted; it would panic in Collect on a Gather goroutine")
+	}
+
+	// Nothing was registered, so the endpoint stays scrapeable. Without the
+	// guard this Gather is what panics.
+	if _, err := registry.Gather(); err != nil {
+		t.Fatalf("gather after rejected registration: %v", err)
+	}
+
+	// Negative control: the guard must reject only nil pointers, not every
+	// pointer, so a live *Fanout still registers.
+	live, err := NewFanout([]io.WriteCloser{&recordingWriter{}}, 4, nil)
+	if err != nil {
+		t.Fatalf("new fanout: %v", err)
+	}
+	defer live.Close()
+	if _, err := NewDestinationMetrics(prometheus.NewRegistry(), live); err != nil {
+		t.Fatalf("live *Fanout ledger rejected: %v", err)
+	}
+}
+
 // TestDestinationMetricsHelpWarnsAgainstAlertingOnTheCrossDestinationInvariant
 // keeps the caveat attached to the series an operator actually reads. The
 // Packets+Drops equality tears across destinations on a live snapshot, and a
