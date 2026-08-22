@@ -12,7 +12,16 @@ import (
 const (
 	shredsPerSet   = 64
 	peakRateBucket = 100 * time.Millisecond
-	reportSchema   = 1
+
+	// reportSchema is the report shape this producer emits. It moved 1 -> 2
+	// when WindowStart and WindowMS were added (BLO-29493).
+	//
+	// A broker validates against its own copy of this number, so bumping one
+	// without the other invalidates every heartbeat while both files still read
+	// correctly. Nothing in the type system ties them: the guard is
+	// broker.TestDrainedWindowSatisfiesIngest, which drains a real tracker and
+	// requires the validator to accept what comes out.
+	reportSchema = 2
 )
 
 var ErrInvalidWindowCutoff = errors.New("report cutoff must follow window start")
@@ -26,15 +35,33 @@ type GapHistogram struct {
 	GTE32      uint64 `json:">=32"`
 }
 
-// Window is one schema-1 receiver delivery report.
+// Window is one receiver delivery report.
 //
-// It deliberately carries no window duration. SetsTotal and SetsErased are
-// counts over the caller's drain interval, which DrainWindow knows and passes
-// to report as elapsed, where it is consumed to derive RMean and then dropped.
-// A consumer therefore cannot normalize these counts against a window of a
-// different length, and for a feed that received nothing RMean is 0, so the
-// duration is not even nominally recoverable. Keep comparisons within one
-// producer; see broker.FeedReport for what this obliges a broker to do.
+// SetsTotal and SetsErased are a COUNTER DELTA over the half-open interval
+// [WindowStart, WindowStart+WindowMS), not a gauge. They are summable across
+// consecutive reports, and a consumer deduplicates on the feed's ID plus
+// WindowStart before summing. Both halves of that sentence are load-bearing:
+// the receiver's metrics surface republishes the last drained window on every
+// scrape (see receiver.ReceiverMetrics.PublishWindow), so the same window
+// object is observed repeatedly, and a consumer that summed without
+// deduplicating would multiply delivery by however many times it saw one
+// window — ten-fold at the longest legal drain interval.
+//
+// WindowMS is the MEASURED elapsed time DrainWindow computed, not the
+// producer's configured drain interval. The two differ precisely when it
+// matters: one serial ticker drains every feed, Go's ticker drops ticks under
+// a slow receiver, and a delayed drain deliberately reports its actual elapsed
+// interval so the derived rate is not distorted. A consumer must therefore
+// treat WindowMS as data, not as a restatement of a setting it already knows.
+//
+// WindowStart is the identity rather than a monotonic counter because a
+// counter resets on gateway restart and can then collide across genuinely
+// distinct windows — reintroducing the ambiguity it was added to remove. It is
+// sound modulo wall-clock steps, which is not a new exposure: an NTP step
+// already corrupts the surrounding packet timestamps.
+//
+// Schema 1 carried neither field, so its counts were comparable only within
+// one producer. See broker.FeedReport for what a broker owes each schema.
 type Window struct {
 	SetsTotal       uint64       `json:"sets_total"`
 	SetsErased      uint64       `json:"sets_erased"`
@@ -44,6 +71,32 @@ type Window struct {
 	GapMSHist       GapHistogram `json:"gap_ms_hist"`
 	GraceMS         int64        `json:"grace_ms"`
 	Schema          uint8        `json:"schema"`
+
+	// WindowStart and WindowMS are omitempty so that a schema-1 report's
+	// canonical bytes are byte-identical to what they were before these
+	// fields existed. A broker's ledger diffs on those bytes, so without
+	// omitempty every retained schema-1 feed would diff as changed the moment
+	// this struct grew, producing a one-time wave of spurious drift across
+	// feeds whose delivery did not change. With it, the wave coincides with
+	// the actual move to schema 2.
+	WindowStart string `json:"window_start,omitempty"`
+	WindowMS    int64  `json:"window_ms,omitempty"`
+}
+
+// canonicalUTCTimestamp renders a window boundary in the one spelling the
+// heartbeat contract accepts: UTC, "Z" rather than "+00:00", and fractional
+// seconds present only when non-zero with trailing zeros trimmed.
+//
+// This duplicates broker.FormatTimestamp, which is the canonical statement of
+// the rule and what every other producer of these timestamps should call. The
+// duplication is forced rather than chosen: broker imports erasure, so erasure
+// cannot import broker without a cycle, and WindowStart has to be rendered
+// where the window is drained. Since a shared symbol is unavailable, the drift
+// guard is behavioural — broker.TestDrainedWindowSatisfiesIngest drains a real
+// tracker and requires broker's validator to accept the timestamp this
+// produces, so the two spellings cannot diverge silently.
+func canonicalUTCTimestamp(t time.Time) string {
+	return t.UTC().Format(time.RFC3339Nano)
 }
 
 // maxSlotJump bounds how far a single observation may advance the frontier.
@@ -413,7 +466,28 @@ func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 		return Window{}, ErrInvalidWindowCutoff
 	}
 	t.scoreDue(cutoff)
-	window := Window{GraceMS: t.grace.Milliseconds(), Schema: reportSchema}
+	// DrainWindow guarantees only that cutoff is strictly after windowStart,
+	// so elapsed can be sub-millisecond and truncate to 0 — reachable in
+	// production via the final drain that runs immediately after a ticker
+	// drain when the sockets close. Zero is not a usable wire value: it is
+	// what an ABSENT window_ms decodes to, so emitting it would make a
+	// legitimate sub-millisecond window indistinguishable from a producer
+	// that failed to populate the field, and ingest could no longer require
+	// the field at all. Report the 1ms floor instead. The cost is an
+	// overstatement bounded by one millisecond, on a window too short for
+	// rate normalization to mean anything (sets_total is 0 or 1 there); the
+	// alternative is an ambiguity in the contract itself.
+	elapsed := cutoff.Sub(t.windowStart)
+	windowMS := elapsed.Milliseconds()
+	if windowMS < 1 {
+		windowMS = 1
+	}
+	window := Window{
+		GraceMS:     t.grace.Milliseconds(),
+		Schema:      reportSchema,
+		WindowStart: canonicalUTCTimestamp(t.windowStart),
+		WindowMS:    windowMS,
+	}
 
 	retainedScores := t.scores[:0]
 	for _, event := range t.scores {
@@ -435,7 +509,11 @@ func (t *Tracker) DrainWindow(cutoff time.Time) (Window, error) {
 	// t.scores only; the arrival high-water mark it also used to cover cannot
 	// exist any more. See releaseUnused and maxReportInterval in
 	// cmd/blockcast-shreds for what that does and does not still bound.
-	t.delivery.report(&window, cutoff.Sub(t.windowStart))
+	// report takes the untruncated elapsed rather than the 1ms-floored
+	// WindowMS above: the derived rate divides by it, so flooring here would
+	// understate the rate of a sub-millisecond window instead of merely
+	// rounding its reported duration.
+	t.delivery.report(&window, elapsed)
 	t.windowStart = cutoff
 	return window, nil
 }

@@ -111,8 +111,14 @@ func TestTrackerReportsRateGapAndSchemaWindow(t *testing.T) {
 	if window.GapMSHist != wantGaps {
 		t.Fatalf("gap histogram = %+v, want %+v", window.GapMSHist, wantGaps)
 	}
-	if window.GraceMS != 400 || window.Schema != 1 {
+	if window.GraceMS != 400 || window.Schema != 2 {
 		t.Fatalf("contract metadata = grace %d schema %d", window.GraceMS, window.Schema)
+	}
+	// The tracker was constructed at time.Unix(700, 0) and drained 30s later,
+	// so the window identity and duration are both fully determined.
+	if window.WindowStart != "1970-01-01T00:11:40Z" || window.WindowMS != 30_000 {
+		t.Fatalf("window identity = start %q ms %d, want %q and 30000",
+			window.WindowStart, window.WindowMS, "1970-01-01T00:11:40Z")
 	}
 
 	payload, err := json.Marshal(window)
@@ -136,8 +142,10 @@ func TestTrackerReportsRateGapAndSchemaWindow(t *testing.T) {
 			"7-32":  float64(1),
 			">=32":  float64(1),
 		},
-		"grace_ms": float64(400),
-		"schema":   float64(1),
+		"grace_ms":     float64(400),
+		"schema":       float64(2),
+		"window_start": "1970-01-01T00:11:40Z",
+		"window_ms":    float64(30_000),
 	}
 	if !reflect.DeepEqual(contract, wantContract) {
 		t.Fatalf("serialized window = %#v, want %#v", contract, wantContract)
