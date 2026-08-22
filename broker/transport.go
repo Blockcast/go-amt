@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -72,19 +74,33 @@ const (
 	// heartbeat interval's work and, worse, has no way to shrink the report it
 	// is holding without dropping delivery data an SLA is computed against.
 	//
-	// The headroom is real but narrower than it looks, so it is stated as a
-	// measurement rather than an adjective: a maximal heartbeat — MaxFeeds
-	// (4096) feeds, each with a MaxFeedIDBytes id, plus a MaxVersionBytes
-	// version — serializes to 1,704,213 bytes, or 40.6% of this cap. That is
-	// pinned by TestHeartbeatBodyFitsUnderCap, which fails if a future field
-	// erodes it.
+	// The headroom is real but much narrower than it looks, so it is stated as
+	// a measurement rather than an adjective: the widest heartbeat
+	// ValidateHeartbeat accepts — MaxFeeds (4096) feeds, each with a
+	// MaxFeedIDBytes id, a maximal packet/byte pair, a nanosecond-precision
+	// activity window, and a fully-populated erasure.Window at MaxSetsTotal —
+	// serializes to 2,752,799 bytes, or 65.6% of this cap. That is pinned by
+	// TestHeartbeatBodyFitsUnderCap, which fails if a future field erodes it.
 	//
-	// 2.5x of headroom against the legal maximum means a gateway that hits
-	// this cap has a bug rather than a large deployment, but it also means the
-	// cap is not so generous that per-feed fields can be added without
-	// re-checking. Treat a 413 as a producer bug; in particular do not respond
-	// by splitting the report, which would breach the byte-identical replay
-	// rule — see ReplayRule and CodeBodyTooLarge.
+	// 1.52x of headroom against the legal maximum means a gateway that hits
+	// this cap has a bug rather than a large deployment, but the margin is thin
+	// enough that a per-feed field cannot be added without re-measuring: the
+	// spare budget is ~351 bytes per feed report at MaxFeeds, and that is the
+	// number a proposed field must be sized against. FeedReport's own doc
+	// contemplates a schema-2 window_ms for cross-gateway normalization; it
+	// lands on 65.6%, not on an empty cap.
+	//
+	// The fixture that pins this is required to pass ValidateHeartbeat and
+	// CanonicalBytes, which is not ceremony. The first version of that test
+	// measured a body with an empty first_packet_at/last_packet_at pair against
+	// a nonzero packets count — a body the broker answers invalid_request to —
+	// and so reported 1,704,213 bytes / 40.6% for a heartbeat that cannot occur
+	// on the wire. A cap test able to measure an illegal body under-measures
+	// again the next time a field is added, while staying green.
+	//
+	// Treat a 413 as a producer bug; in particular do not respond by splitting
+	// the report, which would breach the byte-identical replay rule — see
+	// ReplayRule and CodeBodyTooLarge.
 	HeartbeatMaxBodyBytes = 4 << 20 // 4 MiB
 
 	// MaxRelayIDBytes bounds relay_id, matching MaxFeedIDBytes for feed_id.
@@ -207,6 +223,9 @@ type Identity struct{}
 // entitlement, the plane binding, and the certificate expiry the grant is
 // clamped against are all derived by the broker from the connection. See
 // Identity.
+//
+// Mint is idempotent — see MintIdempotency, which is the rule that makes
+// RetryTransportFailure safe to apply to this route.
 type MintRequest struct {
 	// FeedID names the feed to admit. Bounded by MaxFeedIDBytes, matching the
 	// feed_id in FeedReport so a feed nameable in one contract is nameable in
@@ -214,8 +233,68 @@ type MintRequest struct {
 	FeedID string `json:"feed_id"`
 
 	// RelayID names the relay the gateway intends to draw the feed from.
+	//
+	// It is not part of the idempotency key. A Mint naming a different relay
+	// for a feed this gateway already holds a ticket for re-binds the relay and
+	// returns the existing ticket; it does not mint a second one. See
+	// MintIdempotency.
 	RelayID string `json:"relay_id"`
 }
+
+// MintIdempotency states what a repeat Mint does, which is the rule that makes
+// retrying a Mint safe.
+//
+// # The rule
+//
+// Mint is idempotent on (gw_uuid, feed_id) for as long as that gateway holds an
+// active ticket for that feed. A Mint naming a feed the gateway already holds
+// returns the existing ticket — same ticket_id, same not_after — with an
+// ordinary 2xx, and consumes no additional seat. Once the ticket is no longer
+// active, the next Mint issues a fresh one.
+//
+// Three consequences the broker must implement and the gateway may rely on:
+//
+//   - The returned ticket is unchanged, not extended. Mint is not a renewal
+//     backdoor; Renew is the only path that advances not_after. A gateway that
+//     re-minted instead of renewing would otherwise hold a seat indefinitely
+//     without ever exercising the clamp at Ticket.NotAfter.
+//   - The idempotency lookup happens *before* the concurrency-cap check. A
+//     gateway at its cap that retries a Mint for a feed it already holds must
+//     receive its existing ticket, not CodeConcurrencyCapped. Checking the cap
+//     first would 409 a gateway against its own ticket — the precise failure
+//     this rule exists to prevent, one step removed.
+//   - relay_id is outside the key. Keying on (gw_uuid, feed_id, relay_id)
+//     would leave a deliberate relay switch minting a second seat while the
+//     first orphans to TicketTTL, which is the same orphan in a narrower case.
+//     The binding recorded is the one from the most recent accepted Mint, so a
+//     retry replaying identical bytes is a no-op and a relay switch takes
+//     effect without a new seat.
+//
+// # Why it is forced rather than chosen
+//
+// RetryTransportFailure is RetryBackoff, so a Mint whose response is lost to a
+// timeout or a broker restart mid-flight *is* retried. Without idempotency the
+// broker mints T2, and the gateway holds T2 while being unable to renew or
+// release T1 because it never learned that id. T1 orphans for up to TicketTTL,
+// and a gateway near its cap then receives CodeConcurrencyCapped against its
+// own orphan: an operator sees a licensing conflict that is not one, and
+// raising the cap does not clear it.
+//
+// The alternative — each Mint is a distinct seat, and the client must not retry
+// Mint on transport failure — was rejected because it is not implementable. A
+// client cannot distinguish "the request never reached the broker", which is
+// safe to retry, from "the response was lost", which is not; both present as
+// the same transport error. Any rule whose correctness depends on that
+// distinction is one the client cannot honour, so the constraint has to live on
+// the server, exactly as it does for heartbeats.
+//
+// That is ReplayRule's reasoning one plane over. There a uniqueness constraint
+// on (gw_uuid, sent_at) makes a heartbeat retry safe by construction rather
+// than by client care; here the same shape protects licensed seats instead of
+// ledger rows.
+//
+// MintIdempotency is a documentation anchor and has no behaviour.
+type MintIdempotency struct{}
 
 // RenewRequest is the renew envelope and is deliberately empty: the ticket is
 // named in the path and everything else is ambient.
@@ -230,6 +309,10 @@ type RenewRequest struct{}
 // identical ones, because a renewed ticket is not distinguishable from a fresh
 // one and a client that branched on which call produced it would be modelling a
 // difference the broker does not make.
+//
+// A Ticket returned by Mint is not necessarily newly issued: a repeat Mint for
+// a feed the gateway already holds returns the existing one. See
+// MintIdempotency.
 type Ticket struct {
 	// TicketID is a canonical, non-nil, lowercase UUID — the same spelling
 	// rule as gw_uuid, for the same reason: one identity, one spelling.
@@ -331,7 +414,11 @@ const (
 	// landed in a client's generic rate-limit backoff would be retried into
 	// silence — backed off, aggregated with unrelated 429s, and never surfaced
 	// to the operator who could raise the cap. It carries Retry-After and must
-	// be honoured on its own path. See RetryAfterHeader.
+	// be honoured on its own path. See RetryAfterHeader and ParseRetryAfter.
+	//
+	// It must never be returned for a feed the gateway already holds an active
+	// ticket for: the idempotency lookup precedes the cap check, so a retried
+	// Mint cannot be capped against its own ticket. See MintIdempotency.
 	CodeConcurrencyCapped ErrorCode = "concurrency_capped"
 
 	// CodeTicketNotRenewable means the named ticket cannot be renewed: it is
@@ -382,12 +469,92 @@ const (
 	// RetryAfterHeader means retry only after the delay in the response's
 	// Retry-After header, on a path separate from generic backoff so the
 	// condition stays visible to operators. Currently CodeConcurrencyCapped
-	// alone.
+	// alone. Read the delay with ParseRetryAfter, never with a bare
+	// strconv.Atoi — see RetryAfterHeaderName for why that distinction bites.
 	RetryAfterHeader
 
 	// RetryBackoff means retry with ordinary jittered exponential backoff.
 	RetryBackoff
 )
+
+// RetryAfterHeaderName is the response header carrying the delay for
+// RetryAfterHeader, named as a constant for the same reason RenewTicketIDParam
+// is: the broker writes it and the gateway reads it, and a re-spelling on
+// either side is a silent miss rather than a compile error.
+const RetryAfterHeaderName = "Retry-After"
+
+// The Retry-After format is pinned to delta-seconds, and this is the one wire
+// detail in this file whose drift mode is silent in the dangerous direction.
+//
+// RFC 9110 §10.2.3 permits both "Retry-After: 120" and an HTTP-date. A broker
+// emitting an HTTP-date against a gateway reaching for strconv.Atoi yields 0,
+// and the gateway retries immediately — turning the deliberate 409-not-429
+// choice at CodeConcurrencyCapped, whose whole purpose was to keep a licensing
+// conflict gentle and visible, into a *tighter* loop than the generic backoff
+// it was chosen over. Nothing errors; an operator just sees a hot client.
+//
+// Delta-seconds is the pinned form because a gateway already cannot trust its
+// own clock well enough for sent_at freshness to be checkable (see Heartbeat),
+// so an absolute deadline would resolve against a clock this contract declines
+// to rely on anywhere else.
+const (
+	// MinRetryAfterSeconds is the smallest meaningful delay. Zero or negative
+	// means "retry now", which is precisely the hot loop above, so it is
+	// rejected rather than honoured.
+	MinRetryAfterSeconds = 1
+
+	// MaxRetryAfterSeconds bounds the delay at TicketTTL. A wait longer than a
+	// ticket's maximum lifetime cannot be about ticket availability, so a
+	// larger value is clamped rather than obeyed.
+	MaxRetryAfterSeconds = int64(TicketTTL / time.Second)
+)
+
+// ParseRetryAfter reads the delay a RetryAfterHeader response carries.
+//
+// It returns ok=false for a missing, malformed, non-integer, zero, or negative
+// value — including a well-formed HTTP-date, which this contract does not use.
+// A caller that gets ok=false MUST fall back to its ordinary jittered backoff
+// and MUST NOT retry immediately; that fallback is the entire point of
+// returning a boolean rather than a zero duration a caller might sleep on.
+//
+// A value above MaxRetryAfterSeconds is clamped to it and returns ok=true: the
+// broker asking for a longer wait than a ticket can live is honoured as far as
+// it can be, rather than discarded down to generic backoff.
+//
+// Both sides use this rather than each parsing the header, so the format can
+// only be got wrong in one place.
+func ParseRetryAfter(header http.Header) (time.Duration, bool) {
+	raw := strings.TrimSpace(header.Get(RetryAfterHeaderName))
+	if raw == "" {
+		return 0, false
+	}
+	seconds, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || seconds < MinRetryAfterSeconds {
+		return 0, false
+	}
+	if seconds > MaxRetryAfterSeconds {
+		seconds = MaxRetryAfterSeconds
+	}
+	return time.Duration(seconds) * time.Second, true
+}
+
+// FormatRetryAfter renders d in the pinned delta-seconds form, rounding up so a
+// sub-second remainder never becomes a shorter wait than intended and a delay
+// below one second never becomes 0.
+//
+// The broker writes the header with it. It clamps to MaxRetryAfterSeconds so a
+// value ParseRetryAfter would clamp on read is never emitted in the first
+// place.
+func FormatRetryAfter(d time.Duration) string {
+	seconds := int64((d + time.Second - 1) / time.Second)
+	if seconds < MinRetryAfterSeconds {
+		seconds = MinRetryAfterSeconds
+	}
+	if seconds > MaxRetryAfterSeconds {
+		seconds = MaxRetryAfterSeconds
+	}
+	return strconv.FormatInt(seconds, 10)
+}
 
 // RetryTransportFailure is the posture for a failure that produced no status
 // code at all: TLS handshake failure, connection refused, timeout.

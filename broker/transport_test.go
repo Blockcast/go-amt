@@ -3,11 +3,15 @@ package broker
 import (
 	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/blockcast/go-amt/erasure"
 )
 
 // TestRoutePatternsAndBuildersAgree is the test this whole file exists for.
@@ -461,9 +465,32 @@ func TestEnvelopesRoundTrip(t *testing.T) {
 }
 
 // TestHeartbeatBodyFitsUnderCap checks the claim made at HeartbeatMaxBodyBytes:
-// a full-width heartbeat sits far inside the cap, so hitting it is a bug rather
-// than a large deployment. Built at MaxFeeds with worst-case-length ids.
+// the widest heartbeat the broker will accept still fits, so hitting the cap is
+// a producer bug rather than a large deployment.
+//
+// The fixture is required to pass ValidateHeartbeat and CanonicalBytes, and
+// that requirement is the substance of this test rather than a formality. Its
+// first version measured a body with an empty first_packet_at/last_packet_at
+// pair against packets = 1<<40, which ValidateHeartbeat rejects for breaking
+// the feed-activity pairing rule — so it pinned 1,704,213 bytes / 40.6% for a
+// heartbeat that cannot occur on the wire, and understated the real maximum by
+// more than a megabyte. It was green the whole time, and mutation-checking it
+// would not have helped: that proves a test reacts to a change in the code, not
+// that its fixture is reachable. Asserting the fixture's own legality is what
+// closes that, and it must stay for the next field that lands here.
+//
+// Every field is at its maximum legal width, because the claim is about the
+// supremum over accepted bodies and not about a realistic one — ingest is
+// untrusted (see validateErasureReport), so any body the validator admits is a
+// body the cap must survive.
 func TestHeartbeatBodyFitsUnderCap(t *testing.T) {
+	// sets_erased = 163 against MaxSetsTotal is the pair maximizing the two
+	// fields' combined width: it is the widest erasure_fraction the exact ratio
+	// can produce (0.00016300016300016301, 22 bytes), and the 3 bytes it gives
+	// back on the integer do not pay for the 4 it buys. Using the exact ratio
+	// also keeps CanonicalBytes, which recomputes the fraction, in agreement.
+	const setsErased = 163
+
 	feeds := make([]FeedReport, 0, MaxFeeds)
 	for i := 0; i < MaxFeeds; i++ {
 		// Distinct, sorted, maximal-length feed ids.
@@ -471,27 +498,263 @@ func TestHeartbeatBodyFitsUnderCap(t *testing.T) {
 			string(rune('a'+i/(26*26)%26)) + string(rune('a'+i/26%26)) + string(rune('a'+i%26))
 		feeds = append(feeds, FeedReport{
 			FeedID:  id,
-			Packets: 1 << 40,
-			Bytes:   1 << 50,
+			Packets: math.MaxUint64,
+			Bytes:   math.MaxUint64,
+			// Nanosecond precision with no trailing zeros is the widest
+			// timestamp parseCanonicalUTCTimestamp accepts; last must not
+			// precede first.
+			FirstPacketAt: "2026-08-22T05:00:00.123456789Z",
+			LastPacketAt:  "2026-08-22T05:00:00.987654321Z",
+			Erasure: erasure.Window{
+				SetsTotal:       MaxSetsTotal,
+				SetsErased:      setsErased,
+				ErasureFraction: erasure.Fraction(setsErased, MaxSetsTotal),
+				RMean:           math.MaxFloat64,
+				RPeak100MS:      math.MaxFloat64,
+				GapMSHist: erasure.GapHistogram{
+					LT1:        math.MaxUint64,
+					From1To2_4: math.MaxUint64,
+					From2_4To7: math.MaxUint64,
+					From7To32:  math.MaxUint64,
+					GTE32:      math.MaxUint64,
+				},
+				GraceMS: math.MaxInt64,
+				Schema:  erasureReportSchema,
+			},
 		})
 	}
 
-	encoded, err := json.Marshal(Heartbeat{
+	heartbeat := Heartbeat{
+		Schema:  HeartbeatSchema,
+		GWUUID:  "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
+		Version: strings.Repeat("v", MaxVersionBytes),
+		SentAt:  "2026-08-22T05:00:00.123456789Z",
+		Feeds:   feeds,
+	}
+
+	// The fixture must be a body the broker would accept. Without this, the
+	// measurement below is of nothing in particular.
+	if err := ValidateHeartbeat(heartbeat); err != nil {
+		t.Fatalf("the cap fixture is not a legal heartbeat, so the bytes it "+
+			"measures cannot occur on the wire: %v", err)
+	}
+	canonical, err := CanonicalBytes(heartbeat)
+	if err != nil {
+		t.Fatalf("the cap fixture is not canonicalizable, so it is not the "+
+			"form a gateway would send: %v", err)
+	}
+
+	// A gateway sends CanonicalBytes output; an untrusted producer may send
+	// anything encoding/json accepts. The cap must hold for both, so measure
+	// the larger.
+	encoded, err := json.Marshal(heartbeat)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	widest := len(encoded)
+	if len(canonical) > widest {
+		widest = len(canonical)
+	}
+
+	if widest >= HeartbeatMaxBodyBytes {
+		t.Fatalf("a %d-feed heartbeat is %d bytes, at or over the %d-byte cap; "+
+			"the cap no longer leaves room for a legal full-width report",
+			MaxFeeds, widest, HeartbeatMaxBodyBytes)
+	}
+
+	// Pin the documented figures. HeartbeatMaxBodyBytes quotes the byte count,
+	// the percentage, and a ~351-byte-per-feed spare budget that a proposed
+	// per-feed field is meant to be sized against; a change here that leaves
+	// that prose stale is the drift this guards.
+	const wantBytes = 2_752_799
+	if widest != wantBytes {
+		t.Errorf("widest legal heartbeat = %d bytes (%.1f%% of cap, %.2fx headroom, "+
+			"%d bytes/feed spare), want %d — update the measurement at "+
+			"HeartbeatMaxBodyBytes rather than this constant alone",
+			widest, 100*float64(widest)/float64(HeartbeatMaxBodyBytes),
+			float64(HeartbeatMaxBodyBytes)/float64(widest),
+			(HeartbeatMaxBodyBytes-widest)/MaxFeeds, wantBytes)
+	}
+	t.Logf("widest legal heartbeat: %d bytes, %.1f%% of the %d-byte cap, %.2fx headroom, %d bytes/feed spare",
+		widest, 100*float64(widest)/float64(HeartbeatMaxBodyBytes), HeartbeatMaxBodyBytes,
+		float64(HeartbeatMaxBodyBytes)/float64(widest), (HeartbeatMaxBodyBytes-widest)/MaxFeeds)
+}
+
+// TestCapFixtureIllegalityIsCaught is the regression guard for the defect the
+// cap test shipped with: a fixture that measures fine and is rejected on the
+// wire. It reconstructs the original shape — an empty activity pair against a
+// nonzero packet count — and asserts ValidateHeartbeat refuses it, so the
+// legality assertion above is known to have teeth rather than assumed to.
+func TestCapFixtureIllegalityIsCaught(t *testing.T) {
+	original := Heartbeat{
 		Schema:  HeartbeatSchema,
 		GWUUID:  "3f2504e0-4f89-41d3-9a0c-0305e82c3301",
 		Version: strings.Repeat("v", MaxVersionBytes),
 		SentAt:  "2026-08-22T05:00:00Z",
-		Feeds:   feeds,
-	})
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
+		Feeds: []FeedReport{{
+			FeedID:  strings.Repeat("f", MaxFeedIDBytes),
+			Packets: 1 << 40,
+			Bytes:   1 << 50,
+		}},
 	}
 
-	if len(encoded) >= HeartbeatMaxBodyBytes {
-		t.Fatalf("a %d-feed heartbeat is %d bytes, at or over the %d-byte cap; "+
-			"the cap no longer leaves room for a legal full-width report",
-			MaxFeeds, len(encoded), HeartbeatMaxBodyBytes)
+	err := ValidateHeartbeat(original)
+	if err == nil {
+		t.Fatal("ValidateHeartbeat accepted a feed reporting packets with an " +
+			"empty first/last packet pair; the cap test's legality assertion " +
+			"no longer proves anything")
 	}
-	t.Logf("full-width heartbeat: %d bytes, %.1f%% of the %d-byte cap",
-		len(encoded), 100*float64(len(encoded))/float64(HeartbeatMaxBodyBytes), HeartbeatMaxBodyBytes)
+	if !errors.Is(err, ErrInvalidHeartbeat) {
+		t.Errorf("error = %v, want it to wrap ErrInvalidHeartbeat", err)
+	}
+}
+
+// TestParseRetryAfterRejectsHTTPDate is the named case for the drift this
+// helper exists to stop.
+//
+// RFC 9110 §10.2.3 permits an HTTP-date, and a client reaching for
+// strconv.Atoi on one gets 0 and retries immediately — making the 409-not-429
+// choice at CodeConcurrencyCapped a tighter loop than the generic backoff it
+// was chosen over, with nothing erroring. ParseRetryAfter must refuse it and
+// report ok=false so the caller falls back to backoff.
+func TestParseRetryAfterRejectsHTTPDate(t *testing.T) {
+	header := http.Header{}
+	header.Set(RetryAfterHeaderName, "Fri, 31 Dec 1999 23:59:59 GMT")
+
+	delay, ok := ParseRetryAfter(header)
+	if ok {
+		t.Fatalf("ParseRetryAfter accepted an HTTP-date and returned %v; the "+
+			"contract pins delta-seconds and a caller must fall back to backoff", delay)
+	}
+	if delay != 0 {
+		t.Errorf("delay = %v on a rejected header, want 0 so it cannot be slept on", delay)
+	}
+}
+
+func TestParseRetryAfter(t *testing.T) {
+	tests := []struct {
+		name      string
+		value     string
+		setHeader bool
+		wantDelay time.Duration
+		wantOK    bool
+	}{
+		{name: "absent", setHeader: false},
+		{name: "empty", value: "", setHeader: true},
+		{name: "whitespace only", value: "   ", setHeader: true},
+		{name: "minimum", value: "1", setHeader: true, wantDelay: time.Second, wantOK: true},
+		{name: "ordinary", value: "120", setHeader: true, wantDelay: 120 * time.Second, wantOK: true},
+		{name: "surrounding whitespace tolerated", value: " 30 ", setHeader: true, wantDelay: 30 * time.Second, wantOK: true},
+		{name: "at TicketTTL", value: "300", setHeader: true, wantDelay: TicketTTL, wantOK: true},
+		// Above the bound is clamped rather than discarded: the broker asking
+		// for a longer wait than a ticket can live is honoured as far as it can
+		// be. Discarding it down to generic backoff would retry sooner than the
+		// broker asked.
+		{name: "above TicketTTL clamps", value: "99999", setHeader: true, wantDelay: TicketTTL, wantOK: true},
+		// Zero and negative are the hot-loop values, and are refused rather
+		// than honoured.
+		{name: "zero", value: "0", setHeader: true},
+		{name: "negative", value: "-5", setHeader: true},
+		{name: "fractional", value: "1.5", setHeader: true},
+		{name: "not a number", value: "soon", setHeader: true},
+		{name: "trailing garbage", value: "120s", setHeader: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			header := http.Header{}
+			if test.setHeader {
+				header.Set(RetryAfterHeaderName, test.value)
+			}
+
+			delay, ok := ParseRetryAfter(header)
+			if ok != test.wantOK {
+				t.Fatalf("ParseRetryAfter(%q) ok = %v, want %v", test.value, ok, test.wantOK)
+			}
+			if delay != test.wantDelay {
+				t.Errorf("ParseRetryAfter(%q) = %v, want %v", test.value, delay, test.wantDelay)
+			}
+			if !ok && delay != 0 {
+				t.Errorf("delay = %v with ok=false, want 0 so a caller cannot sleep on it", delay)
+			}
+		})
+	}
+}
+
+// TestFormatRetryAfterRoundTripsThroughParse pins the two halves together: the
+// broker writes with FormatRetryAfter and the gateway reads with
+// ParseRetryAfter, so anything the former emits must be something the latter
+// accepts. A format change on one side that skipped the other would show up
+// here rather than as an immediate-retry loop in production.
+func TestFormatRetryAfterRoundTripsThroughParse(t *testing.T) {
+	tests := []struct {
+		name  string
+		given time.Duration
+		want  time.Duration
+	}{
+		{name: "whole seconds", given: 45 * time.Second, want: 45 * time.Second},
+		// Rounded up, so a remainder never shortens the wait.
+		{name: "sub-second remainder rounds up", given: 1500 * time.Millisecond, want: 2 * time.Second},
+		// Never emitted as 0, which would be the hot loop.
+		{name: "below a second floors to the minimum", given: time.Millisecond, want: time.Second},
+		{name: "zero floors to the minimum", given: 0, want: time.Second},
+		{name: "negative floors to the minimum", given: -time.Hour, want: time.Second},
+		{name: "at TicketTTL", given: TicketTTL, want: TicketTTL},
+		{name: "above TicketTTL clamps on write", given: 24 * time.Hour, want: TicketTTL},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			header := http.Header{}
+			header.Set(RetryAfterHeaderName, FormatRetryAfter(test.given))
+
+			delay, ok := ParseRetryAfter(header)
+			if !ok {
+				t.Fatalf("FormatRetryAfter(%v) = %q, which ParseRetryAfter rejects",
+					test.given, header.Get(RetryAfterHeaderName))
+			}
+			if delay != test.want {
+				t.Errorf("round-tripped %v = %v, want %v", test.given, delay, test.want)
+			}
+		})
+	}
+}
+
+// TestRetryAfterBoundsAgreeWithTicketTTL keeps the delay ceiling tied to the
+// thing it is about. A Retry-After longer than a ticket's maximum lifetime
+// cannot be about ticket availability, so the bound is derived from TicketTTL
+// rather than written out — and this fails if someone unpins them.
+func TestRetryAfterBoundsAgreeWithTicketTTL(t *testing.T) {
+	if got, want := MaxRetryAfterSeconds, int64(TicketTTL/time.Second); got != want {
+		t.Errorf("MaxRetryAfterSeconds = %d, want %d (TicketTTL)", got, want)
+	}
+	if MinRetryAfterSeconds < 1 {
+		t.Errorf("MinRetryAfterSeconds = %d, want >= 1; 0 means retry-now, which "+
+			"is the loop CodeConcurrencyCapped's 409 exists to avoid", MinRetryAfterSeconds)
+	}
+}
+
+// TestOnlyConcurrencyCappedUsesRetryAfterHeader pins the one-code claim in
+// RetryAfterHeader's doc and at CodeConcurrencyCapped. If a second code is
+// later routed off generic backoff, that is a contract decision that should
+// come with its own Retry-After reasoning rather than arriving silently.
+func TestOnlyConcurrencyCappedUsesRetryAfterHeader(t *testing.T) {
+	for code := range statusByCode {
+		retry, err := RetryForCode(code)
+		if err != nil {
+			t.Fatalf("RetryForCode(%q): %v", code, err)
+		}
+		if retry == RetryAfterHeader && code != CodeConcurrencyCapped {
+			t.Errorf("%q is classified RetryAfterHeader; only %q is documented to be",
+				code, CodeConcurrencyCapped)
+		}
+	}
+
+	retry, err := RetryForCode(CodeConcurrencyCapped)
+	if err != nil {
+		t.Fatalf("RetryForCode(%q): %v", CodeConcurrencyCapped, err)
+	}
+	if retry != RetryAfterHeader {
+		t.Errorf("%q retry = %v, want RetryAfterHeader", CodeConcurrencyCapped, retry)
+	}
 }
