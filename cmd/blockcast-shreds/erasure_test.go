@@ -172,6 +172,7 @@ func TestListenAndScorePublishesRealErasureToMetrics(t *testing.T) {
 			[]feed{{name: "default", address: feedAddress}},
 			[]string{destination.LocalAddr().String()},
 			httpAddress, 30*time.Second, true, grace, reportInterval, shred.DefaultRetention, stop, scoring{mode: "shred"},
+			billing{},
 		)
 	}()
 
@@ -377,6 +378,7 @@ func TestDefaultGraceReachesMetrics(t *testing.T) {
 		finished <- listenAndScore(
 			[]feed{{name: "default", address: feedAddress}}, nil, httpAddress, 30*time.Second, true,
 			config.DefaultErasureGrace, 40*time.Millisecond, shred.DefaultRetention, stop, scoring{mode: "shred"},
+			billing{},
 		)
 	}()
 

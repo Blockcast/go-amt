@@ -14,8 +14,6 @@ func TestParse(t *testing.T) {
 		"--interface", "eth1",
 		"--rcvbuf-bytes", "8388608",
 		"--dest-ip-ports", "127.0.0.1:8001,[::1]:8002",
-		"--cert", "/etc/bcast/client.pem",
-		"--key", "/etc/bcast/client-key.pem",
 		"--broker-url", "https://broker.example.test/session",
 		"--erasure-grace-ms", "650",
 	})
@@ -78,8 +76,13 @@ func TestParseRejectsInvalidConfiguration(t *testing.T) {
 		{name: "mapped multicast destination", args: replaceArg(requiredArgs(), "--dest-ip-ports", "[::ffff:224.0.0.1]:8001"), wantErr: "must be a unicast IP"},
 		{name: "broadcast destination", args: replaceArg(requiredArgs(), "--dest-ip-ports", "255.255.255.255:8001"), wantErr: "must be a unicast IP"},
 		{name: "zero destination port", args: replaceArg(requiredArgs(), "--dest-ip-ports", "127.0.0.1:0"), wantErr: "must be a unicast IP"},
-		{name: "missing certificate", args: replaceArg(requiredArgs(), "--cert", ""), wantErr: "--cert is required"},
-		{name: "missing key", args: replaceArg(requiredArgs(), "--key", ""), wantErr: "--key is required"},
+		// --cert/--key were removed in BLO-29728: they were required and then
+		// ignored, with no crypto/tls anywhere in the repository, so they
+		// advertised an authenticated transport that did not exist. An unknown
+		// flag now fails loudly rather than being silently accepted, which is
+		// what stops a deployment from believing it still supplies mTLS.
+		{name: "removed cert flag", args: append(requiredArgs(), "--cert", "/tmp/client.pem"), wantErr: "flag provided but not defined: -cert"},
+		{name: "removed key flag", args: append(requiredArgs(), "--key", "/tmp/client-key.pem"), wantErr: "flag provided but not defined: -key"},
 		{name: "insecure broker", args: replaceArg(requiredArgs(), "--broker-url", "http://broker.example.test"), wantErr: "must be an HTTPS URL"},
 		{name: "broker user info", args: replaceArg(requiredArgs(), "--broker-url", "https://user@broker.example.test"), wantErr: "without user information"},
 		{name: "missing broker host", args: replaceArg(requiredArgs(), "--broker-url", "https://:443"), wantErr: "must be an HTTPS URL"},
@@ -103,8 +106,6 @@ func requiredArgs() []string {
 	return []string{
 		"--feed-ids", "primary",
 		"--dest-ip-ports", "127.0.0.1:8001",
-		"--cert", "/tmp/client.pem",
-		"--key", "/tmp/client-key.pem",
 		"--broker-url", "https://broker.example.test",
 	}
 }
