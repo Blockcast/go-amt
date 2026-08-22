@@ -430,7 +430,17 @@ func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.C
 	}
 }
 
-// ReadBatch reads multiple packets efficiently
+// ReadBatch reads multiple packets efficiently.
+//
+// The return count describes the contiguous filled prefix: exactly ms[:count]
+// received a packet, so a caller must iterate that prefix and must not inspect
+// ms[count:]. On the tunnel path a message with no room — no Buffers, or a
+// zero-length Buffers[0] — ends the batch and returns the count filled so far,
+// rather than being skipped over. That keeps the prefix honest and, because a
+// packet already taken off the subscription channel cannot be put back, is what
+// stops a no-room slot from silently destroying a packet (BLO-29454). A batch
+// whose first message has no room therefore reads (0, nil) without consuming
+// anything, the same shape as an empty ms.
 func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	mc.waitOpen()
 	mc.mu.RLock()
@@ -476,9 +486,25 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 		return nativeConn.ReadBatch(ms, flags)
 	}
 
-	// Read from subscription channel
+	// Read from subscription channel.
+	//
+	// The room check is deliberately *before* the channel receive, in both arms.
+	// A packet taken off readBuffer cannot be put back — unlike the pending
+	// store there is nowhere to hold it — so checking room afterwards means a
+	// slot that cannot accept the packet has already destroyed it (BLO-29454).
+	//
+	// A no-room slot returns the short count rather than skipping on to the next
+	// slot. count describes the contiguous filled prefix ms[:count], matching
+	// ipv4.PacketConn.ReadBatch, and every caller iterates that prefix
+	// (cmd/amt_bridge/main.go:155, cmd/amt_gw/main.go:70). Advancing i past an
+	// unfilled slot would keep it inside the prefix, so the caller would read a
+	// message that never received a packet — amt_bridge would re-emit a
+	// zero-length payload — on top of losing the packet the slot consumed.
 	count := 0
 	for i := range ms {
+		if len(ms[i].Buffers) == 0 || len(ms[i].Buffers[0]) == 0 {
+			return count, nil
+		}
 		select {
 		case <-done:
 			if count > 0 {
@@ -491,9 +517,6 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 					return count, nil
 				}
 				return 0, fmt.Errorf("connection closed")
-			}
-			if len(ms[i].Buffers) == 0 || len(ms[i].Buffers[0]) == 0 {
-				continue
 			}
 			ms[i].N = copy(ms[i].Buffers[0], pkt.Data)
 			ms[i].Addr = pkt.Source
@@ -511,11 +534,9 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 				if !ok {
 					return 0, fmt.Errorf("connection closed")
 				}
-				if len(ms[i].Buffers) > 0 && len(ms[i].Buffers[0]) > 0 {
-					ms[i].N = copy(ms[i].Buffers[0], pkt.Data)
-					ms[i].Addr = pkt.Source
-					count++
-				}
+				ms[i].N = copy(ms[i].Buffers[0], pkt.Data)
+				ms[i].Addr = pkt.Source
+				count++
 			}
 			return count, nil
 		}
