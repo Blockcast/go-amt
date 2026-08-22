@@ -66,6 +66,8 @@ def rss_at(rows, target):
 
 
 def main():
+    if len(sys.argv) != 4:
+        sys.exit(f"usage: {sys.argv[0]} RSS_CSV METRICS_TXT RECEIPT_JSON")
     series_path, metrics_path, receipt_path = sys.argv[1:4]
     rows = read_series(series_path)
     metrics_text = open(metrics_path).read()
