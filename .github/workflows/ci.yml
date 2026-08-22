@@ -151,6 +151,8 @@ jobs:
           names='TestFakeNativeSourceDeliversOnlyWhileEnabled
           TestFakeNativeSourceIsolatesGroups
           TestProvenanceOfNamesEachDeliveryPath
+          TestReadOneTimeoutDoesNotStealTheNextDatagram
+          TestConnTypesDoNotClaimInPlaceReadBounds
           TestManagedConnKeepsNativeWhenBothPathsAreLive
           TestManagedConnSwitchesFromNativeToRelayAndBack
           TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
@@ -194,6 +196,60 @@ jobs:
       # those tests do not reach — handleMembershipQuery, for one — has no race
       # coverage on any job.
       - run: go test -race -tags purego ./...
+
+      # The same two guards the `test` lane carries, because this lane needs them
+      # MORE, not less (BLO-29196 review). `race` is the only lane that can catch
+      # a data race between installFakeNativeSource's t.Cleanup restore of the
+      # package-global listenMulticastUDP4 seam and a background goroutine in the
+      # code under test still reaching it — and the only one exercising the
+      # switchover against protocol_pure.go rather than the Rust path. A future
+      # tag edit that dropped the harness out of this lane would take both with
+      # it and print nothing: `go test` exits 0 whether a file was selected or
+      # not. That is the BLO-28640 shape, in the lane this harness needs most.
+      - name: Assert the native-delivery harness is selected in this lane
+        run: |
+          set -euo pipefail
+          tst=$(go list -tags purego -f '{{join .TestGoFiles "\n"}}{{"\n"}}{{join .XTestGoFiles "\n"}}' .)
+          echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
+          rc=0
+          for t in fakenative_test.go fakenative_flows_test.go; do
+            printf '%s\n' "$tst" | grep -qxF "$t" || {
+              echo "::error::$t is not in the -tags purego test selection; the ManagedConn switchover tests are not race-covered"
+              rc=1
+            }
+          done
+          # purego deselects conn.go/gateway.go, so the cgo-only half must not be
+          # here either: it would run against conn_nocgo.go's stub, whose Open
+          # returns errNoCGO unconditionally, and could only pass by asserting
+          # nothing.
+          if printf '%s\n' "$tst" | grep -qxF fakerelay_switchover_test.go; then
+            echo "::error::fakerelay_switchover_test.go is selected under -tags purego; it needs the real MulticastConn, not the stub"
+            rc=1
+          fi
+          exit $rc
+
+      # By name and under -race, so the log carries positive proof these executed
+      # here rather than a bare "ok" that a fully deselected package also prints.
+      - name: Prove the native-delivery harness guards ran under -race
+        run: |
+          set -euo pipefail
+          names='TestFakeNativeSourceDeliversOnlyWhileEnabled
+          TestFakeNativeSourceIsolatesGroups
+          TestProvenanceOfNamesEachDeliveryPath
+          TestReadOneTimeoutDoesNotStealTheNextDatagram
+          TestConnTypesDoNotClaimInPlaceReadBounds
+          TestManagedConnKeepsNativeWhenBothPathsAreLive
+          TestManagedConnSwitchesFromNativeToRelayAndBack
+          TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
+          rc=0
+          go test -race -tags purego -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness-race.log || rc=$?
+          for t in $names; do
+            grep -qF -- "--- PASS: $t" /tmp/native-harness-race.log || {
+              echo "::error::$t did not report a PASS line under -race; it was skipped, deselected or failed"
+              rc=1
+            }
+          done
+          exit $rc
 
   # Build libamt_protocol and run the cgo-tagged tests for real.
   #
@@ -452,6 +508,8 @@ jobs:
           names='TestFakeNativeSourceDeliversOnlyWhileEnabled
           TestFakeNativeSourceIsolatesGroups
           TestProvenanceOfNamesEachDeliveryPath
+          TestReadOneTimeoutDoesNotStealTheNextDatagram
+          TestConnTypesDoNotClaimInPlaceReadBounds
           TestManagedConnKeepsNativeWhenBothPathsAreLive
           TestManagedConnSwitchesFromNativeToRelayAndBack
           TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
