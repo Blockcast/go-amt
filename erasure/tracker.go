@@ -27,6 +27,14 @@ type GapHistogram struct {
 }
 
 // Window is one schema-1 receiver delivery report.
+//
+// It deliberately carries no window duration. SetsTotal and SetsErased are
+// counts over the caller's drain interval, which DrainWindow knows and passes
+// to report as elapsed, where it is consumed to derive RMean and then dropped.
+// A consumer therefore cannot normalize these counts against a window of a
+// different length, and for a feed that received nothing RMean is 0, so the
+// duration is not even nominally recoverable. Keep comparisons within one
+// producer; see broker.FeedReport for what this obliges a broker to do.
 type Window struct {
 	SetsTotal       uint64       `json:"sets_total"`
 	SetsErased      uint64       `json:"sets_erased"`
