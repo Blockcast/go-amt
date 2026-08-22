@@ -354,20 +354,22 @@ func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObs
 // that, revoking one grant would renumber every later destination and hand
 // each one its neighbour's running totals.
 //
-// A departing target's counters are dropped rather than retained. That is
-// deliberate and safe: the delivery ledger is operational, not the billing
-// artifact (the WAL and the session records are), and delivery.Reporter
-// already treats a ledger that went backwards as "the ledger was rebuilt" and
-// takes the current value as the delta rather than underflowing.
+// The returned stats are the targets that left, each carrying its FINAL
+// counters. They are the sender's only authenticated per-destination teardown
+// signal: until this existed the set never shrank, so
+// delivery.CloseTicketExpired — "the broker grant backing the session lapsed" —
+// was a wire-contract value with no reachable producer, and the only close the
+// sender could attest to was CloseShutdown. The caller is expected to close
+// those sessions; this method does not reach into the billing plane itself.
 //
-// The returned targets are the ones that left. They are the sender's only
-// authenticated per-destination teardown signal: until this existed the set
-// never shrank, so delivery.CloseTicketExpired — "the broker grant backing the
-// session lapsed" — was a wire-contract value with no reachable producer, and
-// the only close the sender could attest to was CloseShutdown. The caller is
-// expected to close those sessions; this method does not reach into the
-// billing plane itself.
-func (f *Fanout) ReconcileDestinations(targets []Target) ([]Target, error) {
+// The counters ride on the return value because this is the last place they
+// exist. A departing target is absent from the new table, and DestinationStats
+// reads only the current one, so a caller told merely "grant-b left" can no
+// longer look up what grant-b was owed: the traffic between its last periodic
+// record and its removal would be delivered and never billed. Only the
+// reconcile holds both tables, so only the reconcile can answer that, and it
+// must hand the answer back rather than leave the caller to race the swap.
+func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, error) {
 	if f.udpConn == nil {
 		return nil, errors.New("fan-out: reconcile is only supported on a UDP fan-out")
 	}
@@ -399,14 +401,43 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]Target, error) {
 	for _, entry := range entries {
 		retained[entry.id] = struct{}{}
 	}
-	var removed []Target
+	var departing []destination
 	for _, entry := range previous {
 		if _, kept := retained[entry.id]; !kept {
-			removed = append(removed, Target{ID: entry.id, Address: entry.name})
+			departing = append(departing, entry)
 		}
 	}
 
 	f.table.Store(&destTable{entries: entries})
+
+	// Read the departing counters AFTER the swap, not before.
+	//
+	// The worker loads the table pointer once per packet, so at the instant of
+	// the store a worker already inside deliver holds the OLD snapshot and will
+	// still charge a departing target for the packet it is on. Reading before
+	// the store would miss every such packet; reading after captures all of
+	// them that have landed by now. The counters outlive the table — the old
+	// entry still points at the same *destCounters — so this read is well
+	// defined, and every field is atomic.
+	//
+	// This narrows the window rather than closing it: a packet still mid-deliver
+	// when we read here is charged to a counter nobody will read again, so it is
+	// delivered and unbilled. The residue is bounded by the packets in flight at
+	// the swap, not by time, which is the difference between a rounding error
+	// and the unbounded under-bill of dropping these counters entirely. Closing
+	// it completely would mean quiescing the worker on every reconcile, i.e.
+	// stalling delivery to every surviving subscriber to bill a departing one.
+	var removed []DestinationStat
+	for _, entry := range departing {
+		removed = append(removed, DestinationStat{
+			TargetID:    entry.id,
+			Destination: entry.name,
+			Packets:     entry.counters.packets.Load(),
+			Bytes:       entry.counters.bytes.Load(),
+			Drops:       entry.counters.drops.Load(),
+			WriteErrors: entry.counters.errors.Load(),
+		})
+	}
 	return removed, nil
 }
 

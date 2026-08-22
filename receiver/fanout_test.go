@@ -812,7 +812,7 @@ func TestReconcilePreservesSurvivingTargetCountersWhenATargetIsRevoked(t *testin
 		t.Fatal(err)
 	}
 
-	if len(removed) != 1 || removed[0].ID != "grant-b" {
+	if len(removed) != 1 || removed[0].TargetID != "grant-b" {
 		t.Fatalf("reconcile reported removed %+v, want exactly grant-b", removed)
 	}
 
@@ -1053,5 +1053,75 @@ func TestReconcileIsSafeWhileTheWorkerDelivers(t *testing.T) {
 	if got := stat.Packets + stat.Drops; got != processed {
 		t.Errorf("stable target charged %d packets+drops over %d processed; a swap either dropped or double-charged its accounting (%+v)",
 			got, processed, stat)
+	}
+}
+
+// TestRemovedTargetTotalsSurviveTheTableSwap pins the counters onto the
+// reconcile's return value.
+//
+// The swap is the point of no return: a departing target is absent from the new
+// table, and DestinationStats reads only the current one, so a caller told
+// merely "grant-b left" can no longer discover what grant-b was owed. Its tail
+// traffic would then be delivered and never billed, which no later reading can
+// repair. So the reconcile result must carry the same totals a reader saw
+// immediately before the swap.
+func TestRemovedTargetTotalsSurviveTheTableSwap(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+	}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	for _, entry := range fanout.table.Load().entries {
+		if entry.id != "grant-b" {
+			continue
+		}
+		entry.counters.packets.Add(22)
+		entry.counters.bytes.Add(2200)
+		entry.counters.drops.Add(2)
+		entry.counters.errors.Add(1)
+	}
+
+	// The pre-swap reading is the ground truth the return value must reproduce.
+	before := statsByTarget(fanout)["grant-b"]
+
+	removed, err := fanout.ReconcileDestinations([]Target{{ID: "grant-a", Address: "127.0.0.1:20001"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(removed) != 1 {
+		t.Fatalf("reconcile reported %d removed targets, want 1: %+v", len(removed), removed)
+	}
+	if removed[0] != before {
+		t.Errorf("reconcile returned %+v for the departing target, want the pre-swap reading %+v", removed[0], before)
+	}
+	// The whole point: the only surviving copy is the return value.
+	if _, present := statsByTarget(fanout)["grant-b"]; present {
+		t.Fatal("grant-b is still in the ledger, so this test is not exercising the post-swap read at all")
+	}
+}
+
+// A reconcile that removes nobody must report nobody, so a caller can treat a
+// non-empty result as "there are sessions to close" without a length check.
+func TestReconcileReportsNoRemovalsWhenTheSetOnlyGrows(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{{ID: "grant-a", Address: "127.0.0.1:20001"}}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	removed, err := fanout.ReconcileDestinations([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("reconcile reported %+v removed, want none", removed)
 	}
 }

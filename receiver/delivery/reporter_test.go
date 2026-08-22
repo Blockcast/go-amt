@@ -633,3 +633,205 @@ func TestCloseAllClosesEachTargetSharingAnAddress(t *testing.T) {
 		t.Errorf("open sessions after CloseAll = %d, want 0", open)
 	}
 }
+
+// TestRemovedTargetGetsFinalRecordWithTailDelta is the regression test for a
+// revoked grant billed as a shutdown.
+//
+// Before CloseRemoved existed, a target dropped by a reconcile kept an open
+// session until the process exited, and then closed as SHUTDOWN. Two things
+// were wrong with that: the reason misreports a lapsed grant as a deliberate
+// sender shutdown, and — the part no later reading can repair — the traffic
+// between the target's last periodic record and its removal was never billed,
+// because the counters carrying it vanished at the table swap.
+func TestRemovedTargetGetsFinalRecordWithTailDelta(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	// One periodic interval bills the first 1000 bytes.
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 1000, Packets: 10},
+	}); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// More traffic lands, then the grant is revoked. The reconcile hands back
+	// the cumulative counters as of the swap; the un-billed tail is the 500
+	// bytes / 5 packets delivered since the periodic record above.
+	if err := reporter.CloseRemoved([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 1500, Packets: 15},
+	}); err != nil {
+		t.Fatalf("CloseRemoved: %v", err)
+	}
+
+	records := sink.forTarget("grant-a")
+	var finals []Record
+	for _, record := range records {
+		if record.Final {
+			finals = append(finals, record)
+		}
+	}
+	if len(finals) != 1 {
+		t.Fatalf("got %d final records, want exactly 1: %+v", len(finals), records)
+	}
+	final := finals[0]
+	if final.CloseReason != CloseTicketExpired {
+		t.Errorf("final record close_reason = %q, want %q", final.CloseReason, CloseTicketExpired)
+	}
+	if final.CloseReason == CloseShutdown {
+		t.Error("a revoked grant closed as SHUTDOWN, which defers the record to process exit")
+	}
+	// The tail, not the cumulative total: billing 1500 here would re-bill the
+	// 1000 the periodic record already carried.
+	if final.BytesOut != 500 || final.PacketsOut != 5 {
+		t.Errorf("final record billed %d bytes / %d packets, want the 500/5 tail", final.BytesOut, final.PacketsOut)
+	}
+
+	// Nothing goes unbilled across the removal: the records must account for
+	// the whole ledger reading exactly once.
+	var billedBytes, billedPackets uint64
+	for _, record := range records {
+		billedBytes += record.BytesOut
+		billedPackets += record.PacketsOut
+	}
+	if billedBytes != 1500 || billedPackets != 15 {
+		t.Errorf("records bill %d bytes / %d packets in total, want the full 1500/15 ledger", billedBytes, billedPackets)
+	}
+}
+
+// TestReGrantedTargetOpensDistinctSession covers the other side of a removal:
+// the same subscriber coming back.
+//
+// A re-grant must be a NEW session, because the closed one has already been
+// invoiced and its final record cannot be reopened. It must also not re-bill:
+// the re-granted target gets fresh fan-out counters starting at zero while the
+// Reporter still holds the pre-removal watermark, and a naive delta against
+// that watermark would underflow uint64 into an astronomical over-bill.
+func TestReGrantedTargetOpensDistinctSession(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 1000, Packets: 10},
+	}); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if err := reporter.CloseRemoved([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 1500, Packets: 15},
+	}); err != nil {
+		t.Fatalf("CloseRemoved: %v", err)
+	}
+
+	// Re-granted. The target is a new entry in the fan-out table, so its
+	// counters start from zero -- below the watermark the Reporter still holds.
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.2:8000", Bytes: 400, Packets: 4},
+	}); err != nil {
+		t.Fatalf("Tick after re-grant: %v", err)
+	}
+
+	records := sink.forTarget("grant-a")
+	sessions := make(map[string]struct{}, len(records))
+	for _, record := range records {
+		sessions[record.SessionID] = struct{}{}
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("records span %d sessions, want 2 (the closed one and the re-granted one): %+v", len(sessions), records)
+	}
+
+	// The re-granted traffic must not resume the closed session.
+	for _, record := range records {
+		if record.Final && record.Destination == "10.0.0.2:8000" {
+			t.Error("the re-granted interval landed on the closed session's final record")
+		}
+	}
+
+	// Exactly the two ledgers' totals: 1500 before removal, 400 after. Anything
+	// higher is a re-bill; the underflow bug reports ~1.8e19 here.
+	var billedBytes, billedPackets uint64
+	for _, record := range records {
+		billedBytes += record.BytesOut
+		billedPackets += record.PacketsOut
+	}
+	if billedBytes != 1900 || billedPackets != 19 {
+		t.Errorf("records bill %d bytes / %d packets, want exactly 1900/19 (1500 pre-removal + 400 post-re-grant)", billedBytes, billedPackets)
+	}
+}
+
+// A close that the sink refuses must not be silently dropped: the final record
+// is the interval nothing will ever restate, so it is retained for verbatim
+// retransmission and reported as owed.
+func TestCloseRemovedRetainsAFinalRecordTheSinkRefused(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 1000, Packets: 10},
+	}); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	sink.failing = true
+	if err := reporter.CloseRemoved([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 1500, Packets: 15},
+	}); err == nil {
+		t.Fatal("CloseRemoved reported success while the sink was refusing records")
+	}
+	if reporter.Pending() != 1 {
+		t.Fatalf("Pending() = %d, want 1 record owed", reporter.Pending())
+	}
+
+	// The retained record ships verbatim once the sink recovers.
+	sink.failing = false
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 1500, Packets: 15},
+	}); err != nil {
+		t.Fatalf("Tick after sink recovery: %v", err)
+	}
+	if reporter.Pending() != 0 {
+		t.Errorf("Pending() = %d after recovery, want 0", reporter.Pending())
+	}
+	var finals int
+	for _, record := range sink.forTarget("grant-a") {
+		if record.Final {
+			finals++
+			if record.BytesOut != 500 {
+				t.Errorf("retransmitted final record billed %d bytes, want the original 500 tail", record.BytesOut)
+			}
+		}
+	}
+	if finals != 1 {
+		t.Errorf("got %d final records, want exactly 1 (retransmitted, not regenerated)", finals)
+	}
+}
+
+// CloseRemoved must close every target even when one fails, for the same reason
+// Tick does: a final record is the one interval nothing will ever restate.
+func TestCloseRemovedClosesEveryTargetDespiteAFailure(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 100, Packets: 1},
+		{TargetID: "grant-b", Destination: "10.0.0.2:8000", Bytes: 200, Packets: 2},
+	}); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	err := reporter.CloseRemoved([]LedgerSample{
+		// An empty target ID cannot be closed; grant-b after it still must be.
+		{TargetID: "", Destination: "10.0.0.9:8000", Bytes: 1, Packets: 1},
+		{TargetID: "grant-b", Destination: "10.0.0.2:8000", Bytes: 350, Packets: 3},
+	})
+	if err == nil {
+		t.Fatal("CloseRemoved reported success despite an unusable sample")
+	}
+
+	var closed bool
+	for _, record := range sink.forTarget("grant-b") {
+		if record.Final && record.CloseReason == CloseTicketExpired {
+			closed = true
+			if record.BytesOut != 150 {
+				t.Errorf("grant-b final record billed %d bytes, want the 150 tail", record.BytesOut)
+			}
+		}
+	}
+	if !closed {
+		t.Error("grant-b was never closed because an earlier sample failed")
+	}
+}

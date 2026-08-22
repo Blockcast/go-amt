@@ -194,17 +194,45 @@ func (r *Reporter) CloseAll(samples []LedgerSample, reason CloseReason) error {
 	return errors.Join(errs...)
 }
 
+// CloseRemoved closes the sessions of targets that a reconcile removed from the
+// served set, as CloseTicketExpired.
+//
+// The samples must carry the departing targets' FINAL counters, which is why
+// Fanout.ReconcileDestinations returns them: they are unreadable once the table
+// has been swapped. Passing the counters through is what puts the tail delta —
+// the traffic between a target's last periodic record and its removal — on the
+// closing record instead of dropping it.
+//
+// The reason is pinned rather than a parameter. A target leaving a
+// broker-derived grant table means the grant backing it lapsed, which is
+// exactly CloseTicketExpired; the alternative is a caller reaching for
+// CloseShutdown, which is the bug this exists to prevent — it reports a revoked
+// grant as a deliberate sender shutdown, and defers the record to process exit.
+// A caller closing for some other cause should say so via CloseDestination.
+//
+// Every target is closed even if an earlier one failed, for the same reason as
+// in Tick: one unreachable sink must not strand the other targets' final
+// records, which are the intervals nothing will ever restate.
+func (r *Reporter) CloseRemoved(samples []LedgerSample) error {
+	var errs []error
+	for _, sample := range samples {
+		if err := r.CloseDestination(sample, CloseTicketExpired); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // CloseDestination folds a final ledger sample for one target and emits its
 // final record carrying reason.
 //
-// This is the API a teardown signal drives. Note that blockcast-shreds has no
-// per-target teardown event today: nothing calls Fanout.ReconcileDestinations
-// in production yet, so the target set is fixed at start and the only close the
-// sender can currently attest to is CloseShutdown. A stale-traffic close is
-// deliberately NOT synthesised here — inventing a close from "no bytes moved"
-// would fabricate a billing gap the sender cannot actually attest to, which is
-// the same class of error as the forgeable AMT Teardown that Tracker.Teardown
-// refuses to treat as a close.
+// This is the API a teardown signal drives. Fanout.ReconcileDestinations is the
+// producer of that signal — it reports departing targets with their final
+// counters, and CloseRemoved is the path from there to here. A stale-traffic
+// close is deliberately NOT synthesised here: inventing a close from "no bytes
+// moved" would fabricate a billing gap the sender cannot actually attest to,
+// which is the same class of error as the forgeable AMT Teardown that
+// Tracker.Teardown refuses to treat as a close.
 func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) error {
 	if !reason.Valid() {
 		return fmt.Errorf("delivery: invalid close reason %q", string(reason))
