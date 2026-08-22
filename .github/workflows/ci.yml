@@ -155,7 +155,8 @@ jobs:
           TestConnTypesDoNotClaimInPlaceReadBounds
           TestManagedConnKeepsNativeWhenBothPathsAreLive
           TestManagedConnSwitchesFromNativeToRelayAndBack
-          TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
+          TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers
+          TestNativeSourceFedGuardFiresWhenTheSourceIsDisabled'
           rc=0
           go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness.log || rc=$?
           for t in $names; do
@@ -240,7 +241,8 @@ jobs:
           TestConnTypesDoNotClaimInPlaceReadBounds
           TestManagedConnKeepsNativeWhenBothPathsAreLive
           TestManagedConnSwitchesFromNativeToRelayAndBack
-          TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
+          TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers
+          TestNativeSourceFedGuardFiresWhenTheSourceIsDisabled'
           rc=0
           go test -race -tags purego -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness-race.log || rc=$?
           for t in $names; do
@@ -607,7 +609,8 @@ jobs:
           TestConnTypesDoNotClaimInPlaceReadBounds
           TestManagedConnKeepsNativeWhenBothPathsAreLive
           TestManagedConnSwitchesFromNativeToRelayAndBack
-          TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
+          TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers
+          TestNativeSourceFedGuardFiresWhenTheSourceIsDisabled'
           rc=0
           go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness-cgo.log || rc=$?
           for t in $names; do
