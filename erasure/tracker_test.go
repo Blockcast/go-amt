@@ -697,3 +697,69 @@ func TestTrackerStaleRunDoesNotTripOnInterleavedTraffic(t *testing.T) {
 		t.Fatalf("FrontierResyncs = %d on interleaved stragglers, want 0", got.FrontierResyncs)
 	}
 }
+
+// TestSubMillisecondWindowReportsTheOneMillisecondFloor pins the floor
+// DrainWindow applies, and it guards a producer that would otherwise fail its
+// own contract.
+//
+// A drain only has to follow the previous window's start, so back-to-back
+// drains produce a window of nanoseconds — reachable in production because the
+// final drain runs immediately after a ticker drain when the sockets close.
+// Truncated to milliseconds that is 0, and 0 is exactly what an ABSENT
+// window_ms decodes to, so ingest rejects it (see broker.MaxWindowMS and
+// broker's validateReportWindowBounds). Without the floor the receiver would
+// emit reports its own validator refuses, and only on shutdown — the least
+// observed moment in the process's life.
+//
+// Several tests above already drain sub-millisecond windows incidentally; none
+// of them assert the duration, so this is the only thing holding the floor.
+func TestSubMillisecondWindowReportsTheOneMillisecondFloor(t *testing.T) {
+	started := time.Unix(900, 0)
+	tracker, err := erasure.NewTracker(400*time.Millisecond, started)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first := drain(t, tracker, started.Add(30*time.Second))
+	if first.WindowMS != 30_000 {
+		t.Fatalf("first window_ms = %d, want 30000", first.WindowMS)
+	}
+
+	// 1ns after the previous cutoff: a genuine window, unrepresentable in
+	// milliseconds.
+	second := drain(t, tracker, started.Add(30*time.Second+time.Nanosecond))
+	if second.WindowMS != 1 {
+		t.Fatalf("a 1ns window reported window_ms = %d, want the 1ms floor: "+
+			"0 is indistinguishable from an absent field and is rejected at ingest", second.WindowMS)
+	}
+	if second.WindowStart != "1970-01-01T00:15:30Z" {
+		t.Fatalf("second window_start = %q, want the previous cutoff", second.WindowStart)
+	}
+}
+
+// TestWindowStartIsTheCanonicalSpellingIngestAccepts pins the timestamp form
+// this package renders, which is a duplicate of broker.FormatTimestamp's rule
+// that the import graph forbids sharing.
+func TestWindowStartIsTheCanonicalSpellingIngestAccepts(t *testing.T) {
+	cases := []struct {
+		name  string
+		start time.Time
+		want  string
+	}{
+		{"whole second carries no fraction", time.Unix(1_800_000_000, 0).UTC(), "2027-01-15T08:00:00Z"},
+		{"non-zero fraction is trimmed, not padded", time.Unix(1_800_000_000, 500_000_000).UTC(), "2027-01-15T08:00:00.5Z"},
+		{"a non-UTC zone is rendered as Z", time.Unix(1_800_000_000, 0).In(time.FixedZone("CEST", 2*60*60)), "2027-01-15T08:00:00Z"},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			tracker, err := erasure.NewTracker(400*time.Millisecond, testCase.start)
+			if err != nil {
+				t.Fatal(err)
+			}
+			window := drain(t, tracker, testCase.start.Add(time.Second))
+			if window.WindowStart != testCase.want {
+				t.Fatalf("window_start = %q, want %q", window.WindowStart, testCase.want)
+			}
+		})
+	}
+}
