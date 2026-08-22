@@ -708,6 +708,11 @@ func ledgerSamples(fanout *receiver.Fanout) []delivery.LedgerSample {
 	samples := make([]delivery.LedgerSample, 0, len(stats))
 	for _, stat := range stats {
 		samples = append(samples, delivery.LedgerSample{
+			// The stable target ID is the billing identity, and carrying it
+			// here is what keeps a re-granted subscriber on one session and
+			// keeps two subscribers sharing an address on two. The address
+			// rides along as endpoint metadata only.
+			TargetID:    stat.TargetID,
 			Destination: stat.Destination,
 			// These are cumulative process-lifetime totals. The Reporter is
 			// what turns them into the per-interval deltas the record carries;

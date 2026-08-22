@@ -24,10 +24,10 @@ func (c *captureSink) Ship(record Record) error {
 	return nil
 }
 
-func (c *captureSink) forDestination(destination string) []Record {
+func (c *captureSink) forTarget(targetID string) []Record {
 	var out []Record
 	for _, record := range c.shipped {
-		if record.SubscriberID == destination {
+		if record.SubscriberID == targetID {
 			out = append(out, record)
 		}
 	}
@@ -62,14 +62,14 @@ func TestTickBillsLedgerTotalExactlyOnce(t *testing.T) {
 	}
 	for _, reading := range ledger {
 		if err := reporter.Tick([]LedgerSample{
-			{Destination: "10.0.0.1:8000", Bytes: reading.bytes, Packets: reading.packets},
+			{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: reading.bytes, Packets: reading.packets},
 		}); err != nil {
 			t.Fatalf("Tick: %v", err)
 		}
 	}
 
 	var billedBytes, billedPackets uint64
-	for _, record := range sink.forDestination("10.0.0.1:8000") {
+	for _, record := range sink.forTarget("grant-a") {
 		billedBytes += record.BytesOut
 		billedPackets += record.PacketsOut
 	}
@@ -87,14 +87,14 @@ func TestTickOpensOneSessionPerDestination(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
 	if err := reporter.Tick([]LedgerSample{
-		{Destination: "10.0.0.1:8000", Bytes: 100, Packets: 10},
-		{Destination: "10.0.0.2:8000", Bytes: 250, Packets: 25},
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 100, Packets: 10},
+		{TargetID: "grant-b", Destination: "10.0.0.2:8000", Bytes: 250, Packets: 25},
 	}); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
 
-	first := sink.forDestination("10.0.0.1:8000")
-	second := sink.forDestination("10.0.0.2:8000")
+	first := sink.forTarget("grant-a")
+	second := sink.forTarget("grant-b")
 	if len(first) != 1 || len(second) != 1 {
 		t.Fatalf("records per destination = %d/%d, want 1/1", len(first), len(second))
 	}
@@ -117,7 +117,7 @@ func TestRefusedRecordIsRetransmittedVerbatim(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
 	sink.failing = true
-	err := reporter.Tick([]LedgerSample{{Destination: "10.0.0.1:8000", Bytes: 40, Packets: 4}})
+	err := reporter.Tick([]LedgerSample{{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 40, Packets: 4}})
 	if err == nil {
 		t.Fatal("Tick returned nil while the sink was refusing records")
 	}
@@ -129,7 +129,7 @@ func TestRefusedRecordIsRetransmittedVerbatim(t *testing.T) {
 	}
 
 	// More traffic arrives while the sink is still down.
-	if err := reporter.Tick([]LedgerSample{{Destination: "10.0.0.1:8000", Bytes: 90, Packets: 9}}); err == nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 90, Packets: 9}}); err == nil {
 		t.Fatal("Tick returned nil while the sink was still refusing records")
 	}
 	if reporter.Pending() != 1 {
@@ -138,14 +138,14 @@ func TestRefusedRecordIsRetransmittedVerbatim(t *testing.T) {
 
 	// Sink recovers.
 	sink.failing = false
-	if err := reporter.Tick([]LedgerSample{{Destination: "10.0.0.1:8000", Bytes: 90, Packets: 9}}); err != nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 90, Packets: 9}}); err != nil {
 		t.Fatalf("Tick after recovery: %v", err)
 	}
 	if reporter.Pending() != 0 {
 		t.Fatalf("Pending() = %d, want 0 after recovery", reporter.Pending())
 	}
 
-	records := sink.forDestination("10.0.0.1:8000")
+	records := sink.forTarget("grant-a")
 	var billed uint64
 	for _, record := range records {
 		billed += record.BytesOut
@@ -167,15 +167,15 @@ func TestRefusedRecordIsRetransmittedVerbatim(t *testing.T) {
 func TestLedgerResetTakesCurrentValueAsDelta(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
-	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 500, Packets: 50}}); err != nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 500, Packets: 50}}); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
 	// The ledger was rebuilt and now reads lower than the watermark.
-	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 20, Packets: 2}}); err != nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 20, Packets: 2}}); err != nil {
 		t.Fatalf("Tick after ledger reset: %v", err)
 	}
 
-	records := sink.forDestination("d")
+	records := sink.forTarget("grant-d")
 	if len(records) != 2 {
 		t.Fatalf("records = %d, want 2", len(records))
 	}
@@ -193,20 +193,20 @@ func TestCloseAllEmitsFinalRecordWithTailDelta(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
 	if err := reporter.Tick([]LedgerSample{
-		{Destination: "10.0.0.1:8000", Bytes: 100, Packets: 10},
-		{Destination: "10.0.0.2:8000", Bytes: 100, Packets: 10},
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 100, Packets: 10},
+		{TargetID: "grant-b", Destination: "10.0.0.2:8000", Bytes: 100, Packets: 10},
 	}); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
 	// More traffic lands, then the process shuts down before the next tick.
 	if err := reporter.CloseAll([]LedgerSample{
-		{Destination: "10.0.0.1:8000", Bytes: 175, Packets: 17},
-		{Destination: "10.0.0.2:8000", Bytes: 100, Packets: 10},
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 175, Packets: 17},
+		{TargetID: "grant-b", Destination: "10.0.0.2:8000", Bytes: 100, Packets: 10},
 	}, CloseShutdown); err != nil {
 		t.Fatalf("CloseAll: %v", err)
 	}
 
-	first := sink.forDestination("10.0.0.1:8000")
+	first := sink.forTarget("grant-a")
 	final := first[len(first)-1]
 	if !final.Final {
 		t.Error("last record for a closed session is not marked final")
@@ -227,7 +227,7 @@ func TestCloseAllEmitsFinalRecordWithTailDelta(t *testing.T) {
 	}
 
 	// A destination with no tail traffic still gets its terminating record.
-	second := sink.forDestination("10.0.0.2:8000")
+	second := sink.forTarget("grant-b")
 	if last := second[len(second)-1]; !last.Final || last.BytesOut != 0 {
 		t.Errorf("idle destination final record = {final:%v bytes:%d}, want {true 0}", last.Final, last.BytesOut)
 	}
@@ -247,12 +247,12 @@ func TestDurationIsCumulativeAndBytesAreDeltas(t *testing.T) {
 	}
 
 	for _, total := range []uint64{10, 20, 30} {
-		if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: total, Packets: 1}}); err != nil {
+		if err := reporter.Tick([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: total, Packets: 1}}); err != nil {
 			t.Fatalf("Tick: %v", err)
 		}
 	}
 
-	records := sink.forDestination("d")
+	records := sink.forTarget("grant-d")
 	for i, record := range records {
 		if record.BytesOut != 10 {
 			t.Errorf("record %d bytes_out = %d, want the constant 10-byte delta", i, record.BytesOut)
@@ -278,13 +278,13 @@ func TestDurationIsCumulativeAndBytesAreDeltas(t *testing.T) {
 func TestRefusedFinalRecordIsRetriedOnNextClose(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
-	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 100, Packets: 10}}); err != nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 100, Packets: 10}}); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
 
 	// The sink dies exactly as the final record is shipped.
 	sink.failing = true
-	final := LedgerSample{Destination: "d", Bytes: 150, Packets: 15}
+	final := LedgerSample{TargetID: "grant-d", Destination: "d", Bytes: 150, Packets: 15}
 	if err := reporter.CloseAll([]LedgerSample{final}, CloseShutdown); err == nil {
 		t.Fatal("CloseAll returned nil while the sink was refusing records")
 	}
@@ -301,7 +301,7 @@ func TestRefusedFinalRecordIsRetriedOnNextClose(t *testing.T) {
 		t.Fatalf("Pending() = %d, want 0; the retained final record was never retried", reporter.Pending())
 	}
 
-	records := sink.forDestination("d")
+	records := sink.forTarget("grant-d")
 	var finals int
 	var billed uint64
 	for _, record := range records {
@@ -328,24 +328,24 @@ func TestRefusedFinalRecordIsRetriedOnNextClose(t *testing.T) {
 func TestRefusedFinalRecordIsRetriedOnNextTick(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
-	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 100, Packets: 10}}); err != nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 100, Packets: 10}}); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
 	sink.failing = true
-	if err := reporter.CloseDestination(LedgerSample{Destination: "d", Bytes: 100, Packets: 10}, CloseShutdown); err == nil {
+	if err := reporter.CloseDestination(LedgerSample{TargetID: "grant-d", Destination: "d", Bytes: 100, Packets: 10}, CloseShutdown); err == nil {
 		t.Fatal("CloseDestination returned nil while the sink was refusing")
 	}
 
 	sink.failing = false
 	// More traffic arrives and the caller ticks again.
-	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 175, Packets: 17}}); err != nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 175, Packets: 17}}); err != nil {
 		t.Fatalf("Tick after recovery: %v", err)
 	}
 	if reporter.Pending() != 0 {
 		t.Fatalf("Pending() = %d, want 0", reporter.Pending())
 	}
 
-	records := sink.forDestination("d")
+	records := sink.forTarget("grant-d")
 	var billed uint64
 	for _, record := range records {
 		billed += record.BytesOut
@@ -371,20 +371,20 @@ func TestRefusedFinalRecordIsRetriedOnNextTick(t *testing.T) {
 func TestReopenAfterCloseDoesNotRebillFromProcessStart(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
-	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 1000, Packets: 100}}); err != nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 1000, Packets: 100}}); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if err := reporter.CloseAll([]LedgerSample{{Destination: "d", Bytes: 1000, Packets: 100}}, CloseShutdown); err != nil {
+	if err := reporter.CloseAll([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 1000, Packets: 100}}, CloseShutdown); err != nil {
 		t.Fatalf("CloseAll: %v", err)
 	}
 	// The same process keeps running and the destination comes back. The ledger
 	// still reads cumulatively: 1000 already billed, 40 new bytes.
-	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 1040, Packets: 104}}); err != nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 1040, Packets: 104}}); err != nil {
 		t.Fatalf("Tick after reopen: %v", err)
 	}
 
 	var billed uint64
-	for _, record := range sink.forDestination("d") {
+	for _, record := range sink.forTarget("grant-d") {
 		billed += record.BytesOut
 	}
 	if billed != 1040 {
@@ -401,12 +401,12 @@ func TestCloseWithoutAnyTickBillsTheWholeRun(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
 	if err := reporter.CloseAll([]LedgerSample{
-		{Destination: "10.0.0.1:8000", Bytes: 4400, Packets: 100},
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 4400, Packets: 100},
 	}, CloseShutdown); err != nil {
 		t.Fatalf("CloseAll: %v", err)
 	}
 
-	records := sink.forDestination("10.0.0.1:8000")
+	records := sink.forTarget("grant-a")
 	if len(records) != 1 {
 		t.Fatalf("records = %d, want exactly 1 (the final record)", len(records))
 	}
@@ -426,7 +426,7 @@ func TestCloseWithoutAnyTickBillsTheWholeRun(t *testing.T) {
 func TestCloseAllIsIdempotent(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
-	samples := []LedgerSample{{Destination: "d", Bytes: 500, Packets: 50}}
+	samples := []LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 500, Packets: 50}}
 	if err := reporter.CloseAll(samples, CloseShutdown); err != nil {
 		t.Fatalf("first CloseAll: %v", err)
 	}
@@ -434,7 +434,7 @@ func TestCloseAllIsIdempotent(t *testing.T) {
 		t.Fatalf("second CloseAll: %v", err)
 	}
 
-	records := sink.forDestination("d")
+	records := sink.forTarget("grant-d")
 	if len(records) != 1 {
 		t.Fatalf("records = %d, want 1; a repeated close emitted a duplicate record", len(records))
 	}
@@ -452,42 +452,184 @@ func TestCloseAllIsIdempotent(t *testing.T) {
 func TestCloseDestinationRejectsInvalidReason(t *testing.T) {
 	reporter, _ := newTestReporter(t)
 
-	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 1, Packets: 1}}); err != nil {
+	if err := reporter.Tick([]LedgerSample{{TargetID: "grant-d", Destination: "d", Bytes: 1, Packets: 1}}); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	err := reporter.CloseDestination(LedgerSample{Destination: "d", Bytes: 1, Packets: 1}, CloseReason("NOPE"))
+	err := reporter.CloseDestination(LedgerSample{TargetID: "grant-d", Destination: "d", Bytes: 1, Packets: 1}, CloseReason("NOPE"))
 	if err == nil || !strings.Contains(err.Error(), "invalid close reason") {
 		t.Fatalf("CloseDestination error = %v, want an invalid close reason error", err)
 	}
 }
 
 // TestObserveErrorLeavesDeltaForRetry pins that a rejected sample is not
-// silently swallowed: the destination keeps its watermark so the bytes are
-// re-offered rather than lost.
+// silently swallowed: the target keeps its watermark so the bytes are
+// re-offered rather than lost. The sample carries a perfectly good address —
+// it is rejected for having no IDENTITY, which is the only thing that may key
+// billing state.
 func TestObserveErrorLeavesDeltaForRetry(t *testing.T) {
 	reporter, _ := newTestReporter(t)
 
-	if err := reporter.Tick([]LedgerSample{{Destination: "", Bytes: 10, Packets: 1}}); err == nil {
-		t.Fatal("Tick accepted a sample with no destination")
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "", Destination: "10.0.0.1:8000", Bytes: 10, Packets: 1},
+	}); err == nil {
+		t.Fatal("Tick accepted a sample with no target ID")
 	}
 	if reporter.Pending() != 0 {
 		t.Errorf("Pending() = %d, want 0; nothing was emitted", reporter.Pending())
 	}
 }
 
-// TestTickContinuesPastOneBadDestination pins that one failing destination does
-// not stop the others from accounting for their traffic.
+// TestTickContinuesPastOneBadDestination pins that one failing target does not
+// stop the others from accounting for their traffic.
 func TestTickContinuesPastOneBadDestination(t *testing.T) {
 	reporter, sink := newTestReporter(t)
 
 	err := reporter.Tick([]LedgerSample{
-		{Destination: "", Bytes: 10, Packets: 1},
-		{Destination: "10.0.0.2:8000", Bytes: 250, Packets: 25},
+		{TargetID: "", Destination: "10.0.0.1:8000", Bytes: 10, Packets: 1},
+		{TargetID: "grant-b", Destination: "10.0.0.2:8000", Bytes: 250, Packets: 25},
 	})
 	if err == nil {
-		t.Fatal("Tick returned nil despite a bad destination")
+		t.Fatal("Tick returned nil despite a sample with no target ID")
 	}
-	if got := sink.forDestination("10.0.0.2:8000"); len(got) != 1 || got[0].BytesOut != 250 {
-		t.Errorf("healthy destination records = %+v, want one record of 250 bytes", got)
+	if got := sink.forTarget("grant-b"); len(got) != 1 || got[0].BytesOut != 250 {
+		t.Errorf("healthy target records = %+v, want one record of 250 bytes", got)
+	}
+}
+
+// TestTargetSurvivesAddressChangeOnOneSession is the regression test for the
+// first of the two mis-bills that address-keying produces: a subscriber
+// re-granted to a new endpoint mid-session.
+//
+// Keyed by address, the new address is an unseen key: a SECOND session opens
+// while the first is never closed, so one subscriber bills as two and one of
+// them stays open forever. Keyed by target ID the move is invisible to
+// billing, which is the point — the grant did not change, only where its bytes
+// go. The ledger counters survive the move because a reconcile carries them by
+// pointer, so the delta stays honest across it.
+func TestTargetSurvivesAddressChangeOnOneSession(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.1:8000", Bytes: 100, Packets: 10},
+	}); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	// The grant is re-pointed at a new endpoint. Same target, same session.
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: "10.0.0.9:9000", Bytes: 180, Packets: 18},
+	}); err != nil {
+		t.Fatalf("Tick after address change: %v", err)
+	}
+
+	records := sink.forTarget("grant-a")
+	if len(records) != 2 {
+		t.Fatalf("records = %d, want 2", len(records))
+	}
+	if records[0].SessionID != records[1].SessionID {
+		t.Errorf("address change split the target across sessions %s and %s; "+
+			"a re-granted subscriber must stay on one session",
+			records[0].SessionID, records[1].SessionID)
+	}
+	if open := reporter.tracker.OpenSessions(); open != 1 {
+		t.Errorf("open sessions = %d, want 1; the pre-move session was orphaned", open)
+	}
+
+	var billed uint64
+	for _, record := range records {
+		billed += record.BytesOut
+	}
+	if billed != 180 {
+		t.Errorf("summed bytes_out = %d, want 180", billed)
+	}
+	// The address is still reported — as metadata, tracking where the bytes of
+	// each interval actually went.
+	if records[0].Destination != "10.0.0.1:8000" || records[1].Destination != "10.0.0.9:9000" {
+		t.Errorf("record destinations = %q then %q, want the pre- then post-move address",
+			records[0].Destination, records[1].Destination)
+	}
+}
+
+// TestTwoTargetsSharingOneAddressBillSeparately is the regression test for the
+// second mis-bill: two grants resolving to one address.
+//
+// Fanout.ReconcileDestinations dedupes on target ID alone, so this state is
+// valid by construction rather than a misconfiguration. Keyed by address the
+// two collapse into a single session and a single watermark, and two customers
+// bill as one — with the second target's traffic silently folded into the
+// first's invoice.
+func TestTwoTargetsSharingOneAddressBillSeparately(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	// One host behind NAT, two distinct grants.
+	const shared = "10.0.0.1:8000"
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: shared, Bytes: 100, Packets: 10},
+		{TargetID: "grant-b", Destination: shared, Bytes: 250, Packets: 25},
+	}); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	first := sink.forTarget("grant-a")
+	second := sink.forTarget("grant-b")
+	if len(first) != 1 || len(second) != 1 {
+		t.Fatalf("records per target = %d/%d, want 1/1; two grants on one address "+
+			"were merged into a single session", len(first), len(second))
+	}
+	if first[0].SessionID == second[0].SessionID {
+		t.Error("both targets share a session ID; sessions are per target, not per address")
+	}
+	if first[0].BytesOut != 100 {
+		t.Errorf("first target bytes_out = %d, want 100", first[0].BytesOut)
+	}
+	if second[0].BytesOut != 250 {
+		t.Errorf("second target bytes_out = %d, want 250", second[0].BytesOut)
+	}
+
+	// Watermarks are per target too: a shared watermark would make the second
+	// tick's delta come out against the other target's total.
+	if err := reporter.Tick([]LedgerSample{
+		{TargetID: "grant-a", Destination: shared, Bytes: 130, Packets: 13},
+		{TargetID: "grant-b", Destination: shared, Bytes: 300, Packets: 30},
+	}); err != nil {
+		t.Fatalf("second Tick: %v", err)
+	}
+	if got := sink.forTarget("grant-a")[1].BytesOut; got != 30 {
+		t.Errorf("first target second bytes_out = %d, want its own 30-byte delta", got)
+	}
+	if got := sink.forTarget("grant-b")[1].BytesOut; got != 50 {
+		t.Errorf("second target second bytes_out = %d, want its own 50-byte delta", got)
+	}
+}
+
+// TestCloseAllClosesEachTargetSharingAnAddress pins that the shutdown path is
+// keyed by target too. CloseAll builds its close set from a map; keyed by
+// address, two targets sharing one address collapse to a single entry and one
+// of the two sessions never gets a terminating record at all.
+func TestCloseAllClosesEachTargetSharingAnAddress(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	const shared = "10.0.0.1:8000"
+	samples := []LedgerSample{
+		{TargetID: "grant-a", Destination: shared, Bytes: 100, Packets: 10},
+		{TargetID: "grant-b", Destination: shared, Bytes: 250, Packets: 25},
+	}
+	if err := reporter.Tick(samples); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if err := reporter.CloseAll(samples, CloseShutdown); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+
+	for _, targetID := range []string{"grant-a", "grant-b"} {
+		records := sink.forTarget(targetID)
+		last := records[len(records)-1]
+		if !last.Final || last.CloseReason != CloseShutdown {
+			t.Errorf("%s last record = {final:%v reason:%q}, want {true %q}: every "+
+				"target needs its own terminating record",
+				targetID, last.Final, last.CloseReason, CloseShutdown)
+		}
+	}
+	if open := reporter.tracker.OpenSessions(); open != 0 {
+		t.Errorf("open sessions after CloseAll = %d, want 0", open)
 	}
 }
