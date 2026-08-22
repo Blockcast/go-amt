@@ -545,15 +545,30 @@ func ParseRetryAfter(header http.Header) (time.Duration, bool) {
 // The broker writes the header with it. It clamps to MaxRetryAfterSeconds so a
 // value ParseRetryAfter would clamp on read is never emitted in the first
 // place.
+//
+// Both bounds are answered before the rounding arithmetic, and that ordering is
+// load-bearing rather than stylistic. Rounding up adds just under a second to
+// d, which overflows int64 for any d within a second of time.Duration's
+// maximum and wraps to a large negative value. Clamping afterwards would then
+// read that negative as "below the floor" and emit MinRetryAfterSeconds — the
+// shortest legal delay in answer to the longest possible one, which is both the
+// exact inversion this function exists to prevent and the hot retry loop
+// CodeConcurrencyCapped's 409 was chosen over a 429 to avoid. Bounding first
+// makes the overflow unreachable instead of merely unlikely.
 func FormatRetryAfter(d time.Duration) string {
-	seconds := int64((d + time.Second - 1) / time.Second)
-	if seconds < MinRetryAfterSeconds {
-		seconds = MinRetryAfterSeconds
+	// Ceiling first: at or above it the answer is the ceiling regardless of any
+	// sub-second remainder, so there is nothing to round.
+	if maxDelay := time.Duration(MaxRetryAfterSeconds) * time.Second; d >= maxDelay {
+		return strconv.FormatInt(MaxRetryAfterSeconds, 10)
 	}
-	if seconds > MaxRetryAfterSeconds {
-		seconds = MaxRetryAfterSeconds
+	// Floor next, which also absorbs zero and negative durations. One second
+	// exactly is already the floor, so it needs no rounding either.
+	if d <= time.Second {
+		return strconv.FormatInt(MinRetryAfterSeconds, 10)
 	}
-	return strconv.FormatInt(seconds, 10)
+	// d is now strictly between one second and the ceiling, so rounding up can
+	// neither overflow nor cross either bound.
+	return strconv.FormatInt(int64((d+time.Second-1)/time.Second), 10)
 }
 
 // RetryTransportFailure is the posture for a failure that produced no status

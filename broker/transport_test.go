@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -701,6 +703,12 @@ func TestFormatRetryAfterRoundTripsThroughParse(t *testing.T) {
 		{name: "negative floors to the minimum", given: -time.Hour, want: time.Second},
 		{name: "at TicketTTL", given: TicketTTL, want: TicketTTL},
 		{name: "above TicketTTL clamps on write", given: 24 * time.Hour, want: TicketTTL},
+		// The rounding step adds just under a second, so every duration in the
+		// top second of the range overflowed int64 and wrapped negative, which
+		// the old floor-after-rounding order then emitted as the *minimum*.
+		{name: "maximum duration clamps instead of overflowing", given: math.MaxInt64, want: TicketTTL},
+		{name: "first duration that overflows the rounding step", given: time.Duration(math.MaxInt64) - time.Second + 2, want: TicketTTL},
+		{name: "last duration that does not", given: time.Duration(math.MaxInt64) - time.Second + 1, want: TicketTTL},
 	}
 
 	for _, test := range tests {
@@ -717,6 +725,56 @@ func TestFormatRetryAfterRoundTripsThroughParse(t *testing.T) {
 				t.Errorf("round-tripped %v = %v, want %v", test.given, delay, test.want)
 			}
 		})
+	}
+}
+
+// TestFormatRetryAfterNeverInverts is the property behind the table above, and
+// it is the one that would have caught the overflow without anyone thinking to
+// try math.MaxInt64.
+//
+// The table pins named points; this pins the relation between them: asking for
+// a longer delay must never produce a shorter emitted one. That is the whole
+// purpose of a clamp, so any arithmetic that silently wraps — the round-up
+// overflowing int64 being the instance that shipped — violates it somewhere,
+// wherever the wrap happens to land.
+//
+// The sweep is deliberately weighted at the top of the range. Overflow is a
+// boundary defect and uniform sampling across 292 years of nanoseconds would
+// essentially never land in the one second where it lives.
+func TestFormatRetryAfterNeverInverts(t *testing.T) {
+	const maxDuration = time.Duration(math.MaxInt64)
+
+	durations := []time.Duration{
+		-time.Hour, 0, time.Nanosecond, time.Millisecond, time.Second,
+		time.Second + time.Nanosecond, 45 * time.Second, TicketTTL - time.Nanosecond,
+		TicketTTL, TicketTTL + time.Nanosecond, time.Hour, 24 * time.Hour,
+	}
+	// The overflow window is the top second of the range, so walk its edges
+	// directly rather than hoping to sample into it.
+	for offset := time.Duration(0); offset <= 2*time.Second; offset += 250 * time.Millisecond {
+		durations = append(durations, maxDuration-offset)
+	}
+	durations = append(durations, maxDuration-time.Second+1, maxDuration-time.Second+2, maxDuration-1)
+
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
+
+	prev := int64(-1)
+	prevGiven := time.Duration(0)
+	for _, given := range durations {
+		emitted, err := strconv.ParseInt(FormatRetryAfter(given), 10, 64)
+		if err != nil {
+			t.Fatalf("FormatRetryAfter(%v) = %q, not an integer: %v", given, FormatRetryAfter(given), err)
+		}
+		if emitted < MinRetryAfterSeconds || emitted > MaxRetryAfterSeconds {
+			t.Errorf("FormatRetryAfter(%v) = %d, outside [%d, %d]",
+				given, emitted, MinRetryAfterSeconds, MaxRetryAfterSeconds)
+		}
+		if emitted < prev {
+			t.Errorf("inversion: FormatRetryAfter(%v) = %d but the shorter %v gave %d; "+
+				"a longer requested delay must never emit a shorter one",
+				given, emitted, prevGiven, prev)
+		}
+		prev, prevGiven = emitted, given
 	}
 }
 
