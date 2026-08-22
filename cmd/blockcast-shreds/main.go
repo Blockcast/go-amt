@@ -462,6 +462,13 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 			return err
 		}
 		defer fanout.Close()
+		// The per-destination ledger is registered separately from the feed
+		// metrics because it can only be built once the fan-out exists, and it
+		// answers a different question: the feed series are summed over
+		// destinations, so they cannot show one subscriber falling behind.
+		if _, err := receiver.NewDestinationMetrics(registry, fanout); err != nil {
+			return err
+		}
 	}
 
 	health, err := receiver.NewHealth(healthMaxAge)
