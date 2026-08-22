@@ -155,8 +155,21 @@ func TestDeliveryRecordsBillLedgerTotalExactlyOnce(t *testing.T) {
 
 	var billedBytes, billedPackets uint64
 	for _, record := range records {
-		if record.SubscriberID != destinationAddress {
-			t.Errorf("record subscriber_id = %q, want the fan-out destination %q", record.SubscriberID, destinationAddress)
+		// The record is keyed by the fan-out's stable target ID, NOT by the
+		// resolved address. The address travels as endpoint metadata, so a
+		// re-granted subscriber stays on one session and two subscribers behind
+		// one address stay on two. Asserting subscriber_id == the address here
+		// is what let that mis-bill through in the first place.
+		if record.SubscriberID == "" {
+			t.Errorf("record subscriber_id is empty; the stable target ID did not reach the billing path")
+		}
+		if record.SubscriberID != records[0].SubscriberID {
+			t.Errorf("record subscriber_id = %q, want the single target's stable ID %q",
+				record.SubscriberID, records[0].SubscriberID)
+		}
+		if record.Destination != destinationAddress {
+			t.Errorf("record destination = %q, want the fan-out endpoint %q carried as metadata",
+				record.Destination, destinationAddress)
 		}
 		billedBytes += record.BytesOut
 		billedPackets += record.PacketsOut

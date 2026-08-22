@@ -6,11 +6,31 @@ import (
 	"sort"
 )
 
-// LedgerSample is one destination's delivery counters as read from the fan-out
+// LedgerSample is one target's delivery counters as read from the fan-out
 // ledger. The counters are CUMULATIVE over the life of the fan-out, which is
 // the opposite shape from what Tracker.Observe wants, and reconciling the two
 // is this file's whole reason for existing.
+//
+// TargetID is the identity; Destination is where the bytes went. Keeping them
+// apart is load-bearing, because the fan-out permits both of the states that
+// collapse if the address is treated as the key (see Target in fanout.go):
+//
+//   - One target, two addresses over time. A re-grant moves a subscriber to a
+//     new endpoint mid-session. Keyed by address that is a brand-new session,
+//     so the subscriber is split in two and the first session is never closed.
+//   - Two targets, one address. ReconcileDestinations dedupes on target ID
+//     alone, so distinct grants sharing an address are valid by construction.
+//     Keyed by address they merge into one session and one watermark, silently
+//     billing two subscribers as one.
+//
+// Both are mis-bills that every counter reports as healthy, which is why the
+// address is metadata here and never a map key.
 type LedgerSample struct {
+	// TargetID is the stable billing identity — a broker grant or subscriber
+	// ID, from DestinationStat.TargetID. It is required.
+	TargetID string
+	// Destination is the resolved UDP address, carried through onto the record
+	// as endpoint metadata. It is not an identity and must not be used as one.
 	Destination string
 	Bytes       uint64
 	Packets     uint64
@@ -49,14 +69,17 @@ type Sink interface {
 //
 // Reporter is not safe for concurrent use; drive it from one goroutine (in
 // blockcast-shreds, the reporter tick).
+//
+// Every map in here is keyed by TARGET ID, never by address — see LedgerSample
+// for the two mis-bills that keying by address produces.
 type Reporter struct {
 	tracker *Tracker
 	sink    Sink
 	// last is the ledger watermark: the counters already folded into the
 	// tracker. Deltas are measured against this, not against zero.
 	last map[string]LedgerSample
-	// pending holds the record a destination's sink call refused, awaiting
-	// verbatim retransmission. At most one entry per destination.
+	// pending holds the record a target's sink call refused, awaiting verbatim
+	// retransmission. At most one entry per target.
 	pending map[string]Record
 }
 
@@ -77,16 +100,15 @@ func NewReporter(tracker *Tracker, sink Sink) (*Reporter, error) {
 	}, nil
 }
 
-// Tick folds one ledger sample per destination into the tracker and emits a
+// Tick folds one ledger sample per target into the tracker and emits a
 // periodic record for each.
 //
-// A destination seen for the first time has a session opened for it, so
-// sessions follow the fan-out's destination set rather than needing to be
-// declared twice.
+// A target seen for the first time has a session opened for it, so sessions
+// follow the fan-out's target set rather than needing to be declared twice.
 //
-// Every destination is processed even if an earlier one failed; the errors are
-// joined. A single unreachable sink or a single bad destination must not stop
-// the other destinations from accounting for their traffic.
+// Every target is processed even if an earlier one failed; the errors are
+// joined. A single unreachable sink or a single bad sample must not stop the
+// other targets from accounting for their traffic.
 func (r *Reporter) Tick(samples []LedgerSample) error {
 	var errs []error
 	for _, sample := range samples {
@@ -95,7 +117,7 @@ func (r *Reporter) Tick(samples []LedgerSample) error {
 		// behind it any more, so observing first would fail with ErrNoSession
 		// and strand that record forever -- and it is the interval least
 		// affordable to lose, being the one nothing will ever restate.
-		if err := r.drainPending(sample.Destination); err != nil {
+		if err := r.drainPending(sample.TargetID); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -103,7 +125,7 @@ func (r *Reporter) Tick(samples []LedgerSample) error {
 			errs = append(errs, err)
 			continue
 		}
-		if err := r.emitOne(sample.Destination); err != nil {
+		if err := r.emitOne(sample); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -114,50 +136,53 @@ func (r *Reporter) Tick(samples []LedgerSample) error {
 // ledger sample first so the closing record carries the tail delta rather than
 // discarding it.
 //
-// Destinations are closed in a deterministic order so a caller comparing
-// records across runs sees a stable sequence.
+// Targets are closed in a deterministic order so a caller comparing records
+// across runs sees a stable sequence.
 func (r *Reporter) CloseAll(samples []LedgerSample, reason CloseReason) error {
-	byDestination := make(map[string]LedgerSample, len(samples))
+	byTarget := make(map[string]LedgerSample, len(samples))
 	for _, sample := range samples {
-		byDestination[sample.Destination] = sample
+		byTarget[sample.TargetID] = sample
 	}
 
-	// The union of three sets, because each can hold a destination the others
-	// do not: the caller's current sample set, the destinations we hold a
-	// watermark for (an open session whose destination has dropped out of the
-	// ledger), and the destinations that still owe a record (a closed session
-	// whose final record the sink refused). Missing any of them silently skips
-	// either a close or a retry.
-	names := make(map[string]struct{}, len(byDestination)+len(r.last)+len(r.pending))
-	for destination := range byDestination {
-		names[destination] = struct{}{}
+	// The union of three sets, because each can hold a target the others do
+	// not: the caller's current sample set, the targets we hold a watermark for
+	// (an open session whose target has dropped out of the ledger), and the
+	// targets that still owe a record (a closed session whose final record the
+	// sink refused). Missing any of them silently skips either a close or a
+	// retry.
+	names := make(map[string]struct{}, len(byTarget)+len(r.last)+len(r.pending))
+	for targetID := range byTarget {
+		names[targetID] = struct{}{}
 	}
-	for destination := range r.last {
-		names[destination] = struct{}{}
+	for targetID := range r.last {
+		names[targetID] = struct{}{}
 	}
-	for destination := range r.pending {
-		names[destination] = struct{}{}
+	for targetID := range r.pending {
+		names[targetID] = struct{}{}
 	}
 
-	destinations := make([]string, 0, len(names))
-	for destination := range names {
-		destinations = append(destinations, destination)
+	targetIDs := make([]string, 0, len(names))
+	for targetID := range names {
+		targetIDs = append(targetIDs, targetID)
 	}
 	// Deterministic order so a caller comparing records across runs sees a
 	// stable sequence.
-	sort.Strings(destinations)
+	sort.Strings(targetIDs)
 
 	var errs []error
-	for _, destination := range destinations {
-		sample, ok := byDestination[destination]
+	for _, targetID := range targetIDs {
+		sample, ok := byTarget[targetID]
 		if !ok {
-			// No final reading for a destination we were tracking. Close on the
+			// No final reading for a target we were tracking. Close on the
 			// watermark rather than skipping the close, so the session still
 			// gets its terminating record — and on the watermark specifically,
 			// so the closing delta is zero instead of re-billing the ledger.
-			previous := r.last[destination]
+			// The watermark's address rides along as the record's endpoint
+			// metadata: it is the last place this target's bytes actually went.
+			previous := r.last[targetID]
 			sample = LedgerSample{
-				Destination: destination,
+				TargetID:    targetID,
+				Destination: previous.Destination,
 				Bytes:       previous.Bytes,
 				Packets:     previous.Packets,
 			}
@@ -169,34 +194,34 @@ func (r *Reporter) CloseAll(samples []LedgerSample, reason CloseReason) error {
 	return errors.Join(errs...)
 }
 
-// CloseDestination folds a final ledger sample for one destination and emits
-// its final record carrying reason.
+// CloseDestination folds a final ledger sample for one target and emits its
+// final record carrying reason.
 //
 // This is the API a teardown signal drives. Note that blockcast-shreds has no
-// per-destination teardown event today: Fanout destinations are configured at
-// start and never leave the set, so the only close the sender can currently
-// attest to is CloseShutdown. A stale-traffic close is deliberately NOT
-// synthesised here — inventing a close from "no bytes moved" would fabricate a
-// billing gap the sender cannot actually attest to, which is the same class of
-// error as the forgeable AMT Teardown that Tracker.Teardown refuses to treat
-// as a close.
+// per-target teardown event today: nothing calls Fanout.ReconcileDestinations
+// in production yet, so the target set is fixed at start and the only close the
+// sender can currently attest to is CloseShutdown. A stale-traffic close is
+// deliberately NOT synthesised here — inventing a close from "no bytes moved"
+// would fabricate a billing gap the sender cannot actually attest to, which is
+// the same class of error as the forgeable AMT Teardown that Tracker.Teardown
+// refuses to treat as a close.
 func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) error {
 	if !reason.Valid() {
 		return fmt.Errorf("delivery: invalid close reason %q", string(reason))
 	}
-	if sample.Destination == "" {
-		return errors.New("delivery: ledger sample has no destination")
+	if sample.TargetID == "" {
+		return errors.New("delivery: ledger sample has no target ID")
 	}
 
 	// Ship what is owed before anything else, for the same reason as in Tick:
 	// once Tracker.Close has removed a session, a retained final record can no
 	// longer be regenerated, and observing first would fail with ErrNoSession
 	// and strand it.
-	if err := r.drainPending(sample.Destination); err != nil {
+	if err := r.drainPending(sample.TargetID); err != nil {
 		return err
 	}
 
-	if _, open := r.tracker.SessionID(sample.Destination); !open {
+	if _, open := r.tracker.SessionID(sample.TargetID); !open {
 		// No open session. Two very different situations, told apart by whether
 		// a watermark exists, and conflating them loses records either way:
 		//
@@ -206,17 +231,17 @@ func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) err
 		//     session first, emit a spurious second final record for a
 		//     zero-length session.
 		//
-		//   watermark absent -> a session was NEVER opened for this
-		//     destination, because no periodic tick has run yet. This is the
+		//   watermark absent -> a session was NEVER opened for this target,
+		//     because no periodic tick has run yet. This is the
 		//     run-shorter-than-one-report-interval case, and it is the one that
 		//     must fall through: the close is where that run's entire traffic
 		//     gets billed, so returning early here would discard all of it.
-		if _, tracked := r.last[sample.Destination]; tracked {
+		if _, tracked := r.last[sample.TargetID]; tracked {
 			// The watermark itself is deliberately NOT dropped. It belongs to
 			// the ledger, not the session: the ledger is cumulative over the
 			// whole process and does not reset when a session ends, so
-			// forgetting it would make a reopened destination re-bill every
-			// byte since process start.
+			// forgetting it would make a reopened target re-bill every byte
+			// since process start.
 			return nil
 		}
 	}
@@ -225,17 +250,18 @@ func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) err
 		return err
 	}
 
-	record, err := r.tracker.Close(sample.Destination, reason)
+	record, err := r.tracker.Close(sample.TargetID, reason)
 	if err != nil {
-		return fmt.Errorf("delivery: close session for %s: %w", sample.Destination, err)
+		return fmt.Errorf("delivery: close session for %s: %w", sample.TargetID, err)
 	}
+	record.Destination = sample.Destination
 	// The session is gone from the tracker now, so a refused final record can
 	// never be regenerated. Retain it for retransmission -- the drain at the
 	// top of this method and of Tick is what eventually ships it -- and keep
 	// the ledger watermark, so the retry cannot be mistaken for fresh traffic.
 	if err := r.sink.Ship(record); err != nil {
-		r.pending[sample.Destination] = record
-		return fmt.Errorf("delivery: ship final record for %s: %w", sample.Destination, err)
+		r.pending[sample.TargetID] = record
+		return fmt.Errorf("delivery: ship final record for %s: %w", sample.TargetID, err)
 	}
 	// The watermark stays, for the reason given above: it tracks the ledger,
 	// which outlives the session.
@@ -247,11 +273,11 @@ func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) err
 // yet billed, so it belongs on a dashboard.
 func (r *Reporter) Pending() int { return len(r.pending) }
 
-// observe opens a session for a destination that has none, then folds the
-// sample's delta into the tracker and advances the ledger watermark.
+// observe opens a session for a target that has none, then folds the sample's
+// delta into the tracker and advances the ledger watermark.
 func (r *Reporter) observe(sample LedgerSample) error {
-	if sample.Destination == "" {
-		return errors.New("delivery: ledger sample has no destination")
+	if sample.TargetID == "" {
+		return errors.New("delivery: ledger sample has no target ID")
 	}
 
 	// Two independent pieces of state, deliberately not conflated:
@@ -264,10 +290,10 @@ func (r *Reporter) observe(sample LedgerSample) error {
 	// whole process and does not reset when a session ends. Keying the Open on
 	// the watermark instead would re-bill every byte since process start into
 	// the first record of the reopened session.
-	previous := r.last[sample.Destination]
-	if _, open := r.tracker.SessionID(sample.Destination); !open {
-		if _, err := r.tracker.Open(sample.Destination); err != nil {
-			return fmt.Errorf("delivery: open session for %s: %w", sample.Destination, err)
+	previous := r.last[sample.TargetID]
+	if _, open := r.tracker.SessionID(sample.TargetID); !open {
+		if _, err := r.tracker.Open(sample.TargetID); err != nil {
+			return fmt.Errorf("delivery: open session for %s: %w", sample.TargetID, err)
 		}
 	}
 
@@ -278,6 +304,10 @@ func (r *Reporter) observe(sample LedgerSample) error {
 	// ledger) while this Reporter kept its watermark. The current value is then
 	// the whole of the new ledger's traffic, so take it as the delta rather
 	// than underflowing uint64 into a ~1.8e19 byte over-bill.
+	//
+	// A target that merely moved to a new address does NOT land here: its
+	// counters are carried across the reconcile by pointer, so they stay
+	// monotonic and the delta stays honest across the move.
 	if sample.Bytes < previous.Bytes {
 		bytesDelta = sample.Bytes
 	}
@@ -285,48 +315,53 @@ func (r *Reporter) observe(sample LedgerSample) error {
 		packetsDelta = sample.Packets
 	}
 
-	if err := r.tracker.Observe(sample.Destination, bytesDelta, packetsDelta); err != nil {
-		return fmt.Errorf("delivery: observe %s: %w", sample.Destination, err)
+	if err := r.tracker.Observe(sample.TargetID, bytesDelta, packetsDelta); err != nil {
+		return fmt.Errorf("delivery: observe %s: %w", sample.TargetID, err)
 	}
 	// Advance the watermark only after Observe succeeded, so a failed Observe
 	// leaves the delta to be retried on the next sample instead of dropping it.
-	r.last[sample.Destination] = sample
+	r.last[sample.TargetID] = sample
 	return nil
 }
 
 // emitOne emits and ships a new periodic record, provided nothing is owed for
-// the destination.
-func (r *Reporter) emitOne(destination string) error {
-	if record, owed := r.pending[destination]; owed {
+// the target.
+func (r *Reporter) emitOne(sample LedgerSample) error {
+	if record, owed := r.pending[sample.TargetID]; owed {
 		// Do not emit while a record is owed: a new Emit would advance the
 		// watermark past traffic whose record has not shipped, and the retained
 		// record's bytes would never be restated. The delta stays in the
 		// tracker and rolls into the next record instead. Callers drain before
 		// reaching here, so this is the case where that drain just failed.
-		return fmt.Errorf("delivery: record seq %d for %s still owed; not emitting", record.Seq, destination)
+		return fmt.Errorf("delivery: record seq %d for %s still owed; not emitting", record.Seq, sample.TargetID)
 	}
 
-	record, err := r.tracker.Emit(destination)
+	record, err := r.tracker.Emit(sample.TargetID)
 	if err != nil {
-		return fmt.Errorf("delivery: emit for %s: %w", destination, err)
+		return fmt.Errorf("delivery: emit for %s: %w", sample.TargetID, err)
 	}
+	// Stamp the endpoint the interval's bytes actually went to. A retained
+	// record keeps the address it was emitted with even if the target later
+	// moves, which is right: the record describes that interval, not the
+	// target's current endpoint.
+	record.Destination = sample.Destination
 	if err := r.sink.Ship(record); err != nil {
-		r.pending[destination] = record
-		return fmt.Errorf("delivery: ship record for %s: %w", destination, err)
+		r.pending[sample.TargetID] = record
+		return fmt.Errorf("delivery: ship record for %s: %w", sample.TargetID, err)
 	}
 	return nil
 }
 
 // drainPending retransmits a retained record verbatim. It returns nil when
-// nothing is owed for the destination.
-func (r *Reporter) drainPending(destination string) error {
-	record, owed := r.pending[destination]
+// nothing is owed for the target.
+func (r *Reporter) drainPending(targetID string) error {
+	record, owed := r.pending[targetID]
 	if !owed {
 		return nil
 	}
 	if err := r.sink.Ship(record); err != nil {
-		return fmt.Errorf("delivery: retransmit record seq %d for %s: %w", record.Seq, destination, err)
+		return fmt.Errorf("delivery: retransmit record seq %d for %s: %w", record.Seq, targetID, err)
 	}
-	delete(r.pending, destination)
+	delete(r.pending, targetID)
 	return nil
 }

@@ -76,17 +76,29 @@ var (
 // and PacketsOut are never restated by a later record. A record that fails to
 // ship must be retransmitted verbatim, not regenerated — see the retry
 // contract on Tracker.Emit.
+//
+// IDENTITY vs ENDPOINT. SubscriberID is the billing identity — a broker grant
+// ID, stable for the life of the grant. Destination is the resolved UDP address
+// the bytes went to, and is metadata ONLY: it can change under a subscriber
+// mid-session (a re-grant to a new endpoint), and two distinct subscribers may
+// legitimately share one address. Keying billing state on the address therefore
+// both splits one subscriber across two sessions and merges two subscribers
+// into one, so nothing downstream may treat Destination as an identity.
 type Record struct {
-	SessionID    string      `json:"session_id"`
-	SubscriberID string      `json:"subscriber_id"`
-	Seq          uint64      `json:"seq"`
-	DurationMS   int64       `json:"duration_ms"`
-	BytesOut     uint64      `json:"bytes_out"`
-	PacketsOut   uint64      `json:"packets_out"`
-	CloseReason  CloseReason `json:"close_reason,omitempty"`
-	Final        bool        `json:"final"`
-	OpenedAt     time.Time   `json:"opened_at"`
-	EmittedAt    time.Time   `json:"emitted_at"`
+	SessionID    string `json:"session_id"`
+	SubscriberID string `json:"subscriber_id"`
+	// Destination is endpoint metadata, not identity — see the note above. It
+	// is filled by the ledger side (Reporter), not by Tracker, because the
+	// session layer is deliberately address-agnostic.
+	Destination string      `json:"destination,omitempty"`
+	Seq         uint64      `json:"seq"`
+	DurationMS  int64       `json:"duration_ms"`
+	BytesOut    uint64      `json:"bytes_out"`
+	PacketsOut  uint64      `json:"packets_out"`
+	CloseReason CloseReason `json:"close_reason,omitempty"`
+	Final       bool        `json:"final"`
+	OpenedAt    time.Time   `json:"opened_at"`
+	EmittedAt   time.Time   `json:"emitted_at"`
 }
 
 // SeqStore reserves durable per-session emit sequence numbers. Implementations
