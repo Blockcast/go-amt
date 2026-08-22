@@ -668,6 +668,38 @@ func (rm *RelayManager) performHandshake() error {
 			}
 			rm.intervalTime = interval
 
+			// Answer the Query with a current-state Membership Update before
+			// declaring the handshake complete. This is not optional bookkeeping:
+			// the Query leaves the gateway in Querying, and that state can send
+			// nothing further. On the cgo/Rust path -- the one production uses --
+			// request_membership admits only Idle or Active
+			// (amt-protocol@44ff7e1d `src/gateway.rs:257`), so a gateway parked in
+			// Querying fails every keepalive with InvalidState. keepaliveLoop
+			// discards that error and continues (see the comment there), so no
+			// Request reaches the wire, no Query comes back, and the tunnel
+			// reconnects every intervalTime*2 forever while still reporting
+			// Active. send_update is the only transition into Active
+			// (`gateway.rs:332`) and it accepts Querying (`gateway.rs:325`), so
+			// this single Update is what makes the tunnel keepalive-capable.
+			//
+			// Sending it here rather than on first subscribe is what the wire
+			// contract requires: Querying is designed to be zero-width, and
+			// amt-protocol's reference driver answers every Query synchronously
+			// with a current-state report, empty when it holds no groups
+			// (`src/subscription/mod.rs:278`). A gateway with no subscriptions
+			// still owes the relay that empty report. BLO-28805.
+			report, err := buildIGMPCurrentStateReport()
+			if err != nil {
+				return fmt.Errorf("failed to build current-state report: %w", err)
+			}
+			update, err := rm.protocol.CreateMembershipUpdate(report)
+			if err != nil {
+				return fmt.Errorf("failed to create current-state membership update: %w", err)
+			}
+			if err := rm.transport.Send(update); err != nil {
+				return fmt.Errorf("failed to send current-state membership update: %w", err)
+			}
+
 			// Clear deadline for normal operation
 			_ = rm.transport.SetReadDeadline(time.Time{})
 			return nil

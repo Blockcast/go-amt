@@ -459,61 +459,81 @@ jobs:
       # the IPv4 destination, which really does diverge (group address on the
       # Rust path, 224.0.0.22 on pure-Go) — pre-existing, tracked in BLO-29419.
       #
-      # STILL FAILING after the pin bump — the amt-protocol#9 theory is DISPROVEN.
+      # RESOLVED (BLO-28805) — and note the shape of the mistake, because two
+      # successive notes here asserted a mechanism that the next CI run refuted.
       #   TestDataStarvationReconnectsDespiteControlTraffic
       #
-      # The prior note predicted #9 would close this: keepaliveLoop calls
-      # CreateRequestMessage (relay_manager.go:957) -> request_membership,
-      # which required Idle, so from Active it returned InvalidState and the
-      # loop discarded it at :958-959; no Request reached the wire and the
-      # relay never answered with a Query. #9 relaxed that guard —
-      # gateway.rs:257 is now `!= Idle && != Active` — so the Request is
-      # sendable from Active.
+      # The theory this block used to carry was that the blocker sat *downstream*
+      # of the gateway state machine, "most likely the fakeRelay harness not
+      # answering a mid-session Request". That was wrong too. The cause was the
+      # gateway state after all — just not the guard that #9 widened:
       #
-      # It did not help. Run 32443335894 at pin 44ff7e1d fails with the
-      # byte-identical premise-guard message:
-      #   fakerelay_flows_test.go:541: relay sent no Membership Query between
-      #   the handshake and the reconnect (1 -> 1)
-      # Same 1 -> 1, so the Query still never arrives. The blocker is therefore
-      # downstream of the gateway state machine — most likely the fakeRelay
-      # harness not answering a mid-session Request at all, which is the same
-      # family as BLO-29437 and BLO-29196 (fakeRelay cannot drive a Rust-backed
-      # Gateway). Do NOT re-attribute this to gateway state without new
-      # evidence; that theory has now been tested and failed.
+      #   - performHandshake ended at HandleQuery and returned, so the gateway
+      #     sat in Querying (gateway.rs:312).
+      #   - send_update is the only transition into Active (gateway.rs:332), and
+      #     it was reachable only from a subscribe — never on the handshake path.
+      #   - request_membership admits Idle or Active only (gateway.rs:257), so
+      #     from Querying every keepalive returned InvalidState, keepaliveLoop
+      #     discarded it, no Request reached the wire, and the relay never
+      #     answered with a Query. Hence the premise guard's 1 -> 1.
       #
-      # Kept skipped so the pin bump can land green. Tracked in BLO-28805,
-      # whose AC #3 (no -skip at all) stays open on this one test.
-      - name: Test
-        run: |
-          go test -skip 'TestDataStarvationReconnectsDespiteControlTraffic' ./...
-
-      # Positive proof that the retired tests actually ran on the cgo path.
-      # Deleting a name from -skip only stops deselecting it; without this, a
-      # regression that made them skip (or a package that failed to build its
-      # test binary) would still show a bare "ok". Same anti-vacuity
-      # requirement as the Gateway.Open guards below.
+      # #9 was necessary but aimed one state too far along: it made the Request
+      # sendable from Active, in a flow that never reached Active. The fix is in
+      # go-amt — performHandshake now answers the Query with a zero-record
+      # current-state Membership Update, which is what amt-protocol's own
+      # reference driver does unconditionally (src/subscription/mod.rs:278). The
+      # Rust guard was left alone deliberately: Querying is designed to be
+      # zero-width, so relaxing it would have blessed a permanent park in a
+      # state where handle_data refuses (gateway.rs:345).
       #
-      # The note above this step said to delete it once the last -skip went.
-      # That has not happened and this step stays regardless: its rationale —
-      # a bare "ok" is indistinguishable from a silently deselected package —
-      # is independent of how many names are in -skip. Whenever the last skip
-      # is finally retired, extend this list rather than deleting the step.
+      # The lesson worth keeping: every wrong attribution here was reached by
+      # reading one guard in isolation. Trace which call sites can actually
+      # reach the transition before blaming the predicate.
+      # Positive proof that these tests actually ran on the cgo path. Deleting a
+      # name from -skip only stops deselecting it; without this, a regression
+      # that made them skip (or a package that failed to build its test binary)
+      # would still show a bare "ok". Same anti-vacuity requirement as the
+      # Gateway.Open guards below.
+      #
+      # The note that used to sit here said to delete this step once the last
+      # -skip went. The last -skip is now gone and the step stays, because its
+      # rationale — a bare "ok" is indistinguishable from a silently deselected
+      # package — never depended on how many names were in -skip. Extend the
+      # list when a test joins the set worth proving; do not delete the step.
+      #
+      # DELIBERATELY ORDERED BEFORE `Test`. It used to sit after it, which made
+      # it inert exactly when it mattered: a red `go test ./...` aborts the job,
+      # so this step reported "skipped" and contributed no diagnosis on the only
+      # runs anyone needed diagnosis from. Running it first means a failure in
+      # one of these named tests arrives as full -v output rather than as a bare
+      # aggregate FAIL. Keep it first. The bare breadth run below still covers
+      # everything not named here.
       #
       # TestIGMPEnvelopeParityAcrossImplementations rides along because it is
-      # the assertion that pins the Router Alert convergence this bump also
+      # the assertion that pins the Router Alert convergence the 44ff7e1d bump
       # carried, and it is only meaningful on this job — under CGO_ENABLED=0 it
       # re-tests pure Go.
+      #
+      # TestDataStarvationReconnectsDespiteControlTraffic and
+      # TestHandshakeAnswersQueryWithCurrentStateUpdate are the BLO-28805 pair:
+      # the first is the symptom that stayed red through two wrong attributions,
+      # the second pins the invariant that fixed it (a handshake answers the
+      # Query with a current-state Update, so the gateway reaches Active and can
+      # keepalive). Both are cgo-critical — on the pure path they passed
+      # throughout, which is precisely why this job exists.
       - name: Prove the retired BLO-28805 tests ran on the cgo path
         run: |
           set -euo pipefail
           rc=0
           go test -v -count=1 \
-            -run 'TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestQueuedPacketsOwnPayloadAndSourceAddress|TestIGMPEnvelopeParityAcrossImplementations' \
+            -run 'TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestQueuedPacketsOwnPayloadAndSourceAddress|TestIGMPEnvelopeParityAcrossImplementations|TestDataStarvationReconnectsDespiteControlTraffic|TestHandshakeAnswersQueryWithCurrentStateUpdate' \
             . 2>&1 | tee /tmp/blo28805.log || rc=$?
           for t in TestUnsubscribeDuringPendingJoinPreservesOtherSource \
                    TestV4MappedSubscriptionCompletesFullLifecycle \
                    TestQueuedPacketsOwnPayloadAndSourceAddress \
-                   TestIGMPEnvelopeParityAcrossImplementations; do
+                   TestIGMPEnvelopeParityAcrossImplementations \
+                   TestDataStarvationReconnectsDespiteControlTraffic \
+                   TestHandshakeAnswersQueryWithCurrentStateUpdate; do
             # Anchor on the trailing space before go's duration field. A bare
             # prefix match would let a future test whose name extends one of
             # these (…SourceAddressV6) satisfy the assertion for its shorter
@@ -524,6 +544,10 @@ jobs:
             }
           done
           exit $rc
+
+      - name: Test
+        run: |
+          go test ./...
 
       # Run the Gateway.Open guards by name so the log carries positive proof
       # they executed, rather than a bare "ok" that is also what a fully
