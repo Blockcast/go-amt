@@ -351,6 +351,7 @@ func (g *Gateway) Open() (err error) {
 
 	// Wait for advertisement and query
 	buffer := make([]byte, g.MTU)
+	var lastAdvErr error
 	for {
 		// SLICE TO WHAT WAS ACTUALLY RECEIVED. This used to discard n and hand
 		// the decoders `buffer[:]` — the whole MTU-sized array, of which only
@@ -375,6 +376,12 @@ func (g *Gateway) Open() (err error) {
 		n, _, _, err = g.conn.ReadFrom(buffer)
 		if err != nil {
 			g.stopKeepalive()
+			if lastAdvErr != nil {
+				return fmt.Errorf(
+					"error reading from connection: %w (last advertisement rejected: %v)",
+					err, lastAdvErr,
+				)
+			}
 			return fmt.Errorf("error reading from connection: %w", err)
 		}
 		// A zero-length UDP datagram is legal and carries no type byte;
@@ -401,6 +408,7 @@ func (g *Gateway) Open() (err error) {
 			// not fail an otherwise healthy Open. A genuinely undecodable
 			// advertisement still ends at the deadline, but now says why.
 			if advErr := g.handleRelayAdvertisement(msg); advErr != nil {
+				lastAdvErr = advErr
 				slog.Warn("amt: relay advertisement rejected",
 					"relay", relay, "bytes", n, "error", advErr)
 			}

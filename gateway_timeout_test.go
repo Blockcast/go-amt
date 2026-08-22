@@ -5,6 +5,7 @@ package amt
 import (
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -54,6 +55,51 @@ func TestGatewayOpenTimesOutAgainstSilentRelay(t *testing.T) {
 	case <-time.After(30 * time.Second):
 		t.Fatal("Open did not return within 30s — it is still unbounded")
 	}
+}
+
+// A rejected advertisement must remain visible in the terminal Open error,
+// not only in a warning log. This distinguishes a relay that sent malformed
+// AMT bytes from one that never answered at all when the handshake deadline
+// eventually fires.
+func TestGatewayOpenTimeoutIncludesLastAdvertisementError(t *testing.T) {
+	relay, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("bind malformed relay: %v", err)
+	}
+	defer relay.Close()
+
+	served := make(chan struct{})
+	go func() {
+		defer close(served)
+		buf := make([]byte, 2048)
+		n, addr, readErr := relay.ReadFromUDP(buf)
+		if readErr != nil || n == 0 {
+			return
+		}
+		// Type 2 with an invalid length (8 bytes) is recognized as a Relay
+		// Advertisement, then rejected by the Rust decoder with DecodeError.
+		_, _ = relay.WriteToUDP([]byte{0x02, 0, 0, 0, 0, 0, 0, 0}, addr)
+	}()
+
+	gw := &Gateway{
+		RelayAddr:  relay.LocalAddr().(*net.UDPAddr),
+		GroupAddr:  net.ParseIP("232.0.0.1"),
+		SourceAddr: net.ParseIP("192.0.2.1"),
+		MTU:        1500,
+		Timeout:    500 * time.Millisecond,
+	}
+	err = gw.Open()
+	if err == nil {
+		t.Fatal("Open succeeded after a malformed advertisement and no query")
+	}
+	want := "last advertisement rejected: failed to handle advertisement: 5"
+	if !strings.Contains(err.Error(), want) {
+		t.Fatalf("Open error = %v, want substring %q", err, want)
+	}
+	if gw.conn != nil {
+		_ = gw.conn.Close()
+	}
+	<-served
 }
 
 // Zero Timeout must fall back to DefaultOpenTimeout rather than meaning

@@ -3,11 +3,14 @@
 package amt
 
 import (
+	"bytes"
 	"fmt"
 	"net"
+	"net/netip"
 	"testing"
 
 	m "github.com/blockcast/go-amt/messages"
+	"golang.org/x/net/ipv4"
 )
 
 // AmtResult codes from amt-protocol's FFI boundary (ffi.rs:34-53, mirrored in
@@ -139,6 +142,76 @@ func TestZeroLengthDatagramIsNotDispatchedFromAStaleTypeByte(t *testing.T) {
 		}()
 		_ = determineAMTmessageType(buf[:0])
 	}()
+}
+
+// TestProcessAMTBatchCompactsControlMessages proves that a control packet does
+// not consume, duplicate, or hide a data packet from the same kernel batch.
+//
+// On Linux ReadBatch can receive both datagrams at once. The old compaction was
+// a self-assignment, so [control, data] dispatched the control twice and
+// returned no data. Merely changing that assignment is not enough: [data,
+// control] then re-dispatches the tail control unless the loop's upper bound
+// shrinks with the compacted range. Exercise both orders here.
+func TestProcessAMTBatchCompactsControlMessages(t *testing.T) {
+	advertisement := []byte{
+		0x02, 0x00, 0x00, 0x00,
+		0xde, 0xad, 0xbe, 0xef,
+		127, 0, 0, 1,
+	}
+
+	for _, tt := range []struct {
+		name  string
+		first string
+	}{
+		{name: "control then data", first: "control"},
+		{name: "data then control", first: "data"},
+		{name: "zero length then data", first: "zero"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gw := newIdleRustGateway(t)
+			mc := &MulticastConn{
+				amtGw:     gw,
+				GroupAddr: netip.MustParseAddr("239.0.0.1"),
+			}
+
+			want := []byte("batched-data")
+			data := multicastDataPacket(t, want)
+			data[0] = byte(m.MulticastDataType)
+			controlMessage := ipv4.Message{Buffers: [][]byte{append([]byte(nil), advertisement...)}, N: len(advertisement)}
+			if tt.first == "zero" {
+				// Leave the stale advertisement type in the caller-owned buffer,
+				// but report a legal zero-length datagram. The guard must compact
+				// this slot exactly like the recognized control message above.
+				controlMessage.N = 0
+			}
+			dataMessage := ipv4.Message{Buffers: [][]byte{data}, N: len(data)}
+			messages := []ipv4.Message{controlMessage, dataMessage}
+			if tt.first == "data" {
+				messages[0], messages[1] = messages[1], messages[0]
+			}
+
+			n, err := mc.processAMTBatch(messages, len(messages))
+			if n != 1 {
+				t.Fatalf("processAMTBatch returned %d messages, want 1", n)
+			}
+			// The Idle Rust handle deliberately rejects the advertisement with
+			// InvalidState. That is expected and proves the data delivery result
+			// comes from compaction rather than a control handler succeeding.
+			if tt.first == "zero" {
+				if err != nil {
+					t.Fatalf("processAMTBatch error = %v, want nil for dropped zero-length datagram", err)
+				}
+			} else if err == nil || err.Error() != fmt.Sprintf("failed to handle advertisement: %d", resultInvalidState) {
+				t.Fatalf("processAMTBatch error = %v, want rejected advertisement", err)
+			}
+			if !bytes.Equal(messages[0].Buffers[0], want) {
+				t.Fatalf("returned payload = %q, want %q", messages[0].Buffers[0], want)
+			}
+			if messages[0].N != len(want) {
+				t.Fatalf("returned length = %d, want %d", messages[0].N, len(want))
+			}
+		})
+	}
 }
 
 // newIdleRustGateway builds a Gateway with a live Rust handle in its initial Idle

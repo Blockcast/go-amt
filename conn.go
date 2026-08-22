@@ -199,8 +199,23 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("error reading from connection: %w", err)
 	}
+	return mc.processAMTBatch(ms, N)
+}
+
+// processAMTBatch dispatches and compacts the messages returned by an AMT
+// socket read. The active portion of ms is [i, N-bad): control and unwanted
+// messages are moved to the tail, while the replacement at i is examined on
+// the next iteration. Keeping this separate from the socket read makes the
+// compaction invariant directly testable without depending on platform-specific
+// ReadBatch batching behavior.
+func (mc *MulticastConn) processAMTBatch(ms []ipv4.Message, N int) (int, error) {
 	var i, bad int
-	for i = 0; i < N && N > bad; i++ {
+	var err error
+	// The live portion is [i, N-bad). A dropped message is replaced from the
+	// tail and the same index is examined again; shrinking the loop bound with
+	// bad is what prevents re-dispatching a message that was already at that
+	// tail.
+	for i = 0; i < N-bad; i++ {
 		cur := ms[i]
 		n := cur.N
 		// Drop a zero-length datagram before dispatch, and read the type from
@@ -230,6 +245,7 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 		// this change; the same guard closes it.
 		if n == 0 {
 			bad++
+			ms[i] = ms[N-bad]
 			i--
 			continue
 		}
@@ -246,8 +262,7 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			}
 			if !ok || !ipHdr.DstIP.Equal(mc.GroupAddr.AsSlice()) {
 				bad++
-				cur = ms[N-bad]
-				ms[N-bad] = cur
+				ms[i] = ms[N-bad]
 				i--
 				break
 			}
@@ -274,19 +289,16 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			// padding.
 			err = mc.amtGw.handleMembershipQuery(cur.Buffers[0][:n])
 			bad++
-			cur = ms[N-bad]
-			ms[N-bad] = cur
+			ms[i] = ms[N-bad]
 			i--
 		case m.RelayAdvertisementType:
 			err = mc.amtGw.handleRelayAdvertisement(cur.Buffers[0][:n])
 			bad++
-			cur = ms[N-bad]
-			ms[N-bad] = cur
+			ms[i] = ms[N-bad]
 			i--
 		default:
 			bad++
-			cur = ms[N-bad]
-			ms[N-bad] = cur
+			ms[i] = ms[N-bad]
 			i--
 			err = fmt.Errorf("unknown data type: %d", amtMessageType) // TODO: see how to handle
 			break
