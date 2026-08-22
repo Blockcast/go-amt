@@ -203,7 +203,37 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	for i = 0; i < N && N > bad; i++ {
 		cur := ms[i]
 		n := cur.N
-		amtMessageType := determineAMTmessageType(cur.Buffers[0])
+		// Drop a zero-length datagram before dispatch, and read the type from
+		// the bytes actually received rather than from the buffer's stale tail.
+		// This is the same guard Gateway.Open carries, for the same reason; it
+		// was not mirrored here when the [:n] slicing below was introduced.
+		//
+		// A zero-length UDP datagram is legal and carries no type byte. Two
+		// things then go wrong, and neither is visible in the tests:
+		//
+		//  1. determineAMTmessageType was handed cur.Buffers[0] UNSLICED, so it
+		//     read whatever byte was left at offset 0 of this reused buffer by
+		//     an earlier ReadBatch. After any batch that carried an
+		//     advertisement (0x02) or a query (0x04), that stale byte routes the
+		//     empty datagram into one of the control arms below.
+		//  2. Those arms pass cur.Buffers[0][:n] — a len-0 slice — to
+		//     handleRelayAdvertisement / handleMembershipQuery, which both take
+		//     &data[0] unconditionally to reach the FFI. That panics with
+		//     "index out of range [0] with length 0".
+		//
+		// Before the [:n] change the handlers got the whole caller-allocated
+		// buffer, so &data[0] was always valid. A freshly zeroed buffer reads
+		// type 0 and falls to default:, which is why a test never sees this.
+		//
+		// The MulticastDataType arm is covered too: [m.DataMsgHdrLen:n] at n == 0
+		// is an invalid slice (low > high) and panics as well. That one predates
+		// this change; the same guard closes it.
+		if n == 0 {
+			bad++
+			i--
+			continue
+		}
+		amtMessageType := determineAMTmessageType(cur.Buffers[0][:n])
 		switch amtMessageType {
 		case m.MulticastDataType:
 			mc.amtGw.lastData.Store(time.Now())

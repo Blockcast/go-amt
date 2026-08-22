@@ -461,7 +461,8 @@ jobs:
           names='TestMulticastConnKeepsNativeWhenBothPathsAreLive
           TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent
           TestMulticastConnPicksNativeAgainAfterItRecovers
-          TestRelayAdvertisementMustBeDecodedAtItsReceivedLength'
+          TestRelayAdvertisementMustBeDecodedAtItsReceivedLength
+          TestZeroLengthDatagramIsNotDispatchedFromAStaleTypeByte'
           rc=0
           go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/switchover.log || rc=$?
           for t in $names; do

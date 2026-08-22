@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"testing"
+
+	m "github.com/blockcast/go-amt/messages"
 )
 
 // AmtResult codes from amt-protocol's FFI boundary (ffi.rs:34-53, mirrored in
@@ -92,6 +94,51 @@ func TestRelayAdvertisementMustBeDecodedAtItsReceivedLength(t *testing.T) {
 				len(padded), err, want)
 		}
 	})
+}
+
+// TestZeroLengthDatagramIsNotDispatchedFromAStaleTypeByte pins the two facts that
+// make ReadBatch's `n == 0` guard load-bearing — and that make its POSITION,
+// before the type read rather than after, load-bearing too.
+//
+// A zero-length UDP datagram is legal and carries no type byte. ReadBatch reads
+// into a reused ms[i].Buffers[0], so offset 0 still holds whatever the previous
+// read left there. Reading the type from the UNSLICED buffer therefore
+// misclassifies an empty datagram as whatever arrived last, and the control arms
+// then hand a len-0 slice to handleRelayAdvertisement / handleMembershipQuery,
+// both of which take &data[0] unconditionally to reach the FFI.
+//
+// Neither half is reachable from the harness tests: fakeRelay's message buffers
+// are freshly zeroed, so a zero-length datagram reads type 0 and falls to
+// default:. That is why this is a direct test of the mechanism rather than an
+// end-to-end one.
+func TestZeroLengthDatagramIsNotDispatchedFromAStaleTypeByte(t *testing.T) {
+	// A buffer reused from an earlier read that carried a Relay Advertisement.
+	buf := make([]byte, 1500)
+	buf[0] = byte(m.RelayAdvertisementType)
+
+	// 1. The stale tail really does misclassify. This is the reachability half of
+	//    the defect and the half a future reader is most likely to doubt.
+	if got := determineAMTmessageType(buf); got != m.RelayAdvertisementType {
+		t.Fatalf("unsliced type read = %d, want %d: this test assumes a reused "+
+			"buffer's stale offset-0 byte is what routes dispatch, which is the "+
+			"whole reason the type must be read from buf[:n]",
+			got, m.RelayAdvertisementType)
+	}
+
+	// 2. Slicing alone is NOT sufficient. At n == 0 there is no type byte to
+	//    read, so the sliced read indexes past the end. This is why the guard has
+	//    to come FIRST, and why "just slice the type read" is not the whole fix.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Error("determineAMTmessageType(buf[:0]) did not panic, which makes " +
+					"ReadBatch's n == 0 guard look redundant — and someone will " +
+					"delete it. It is not redundant: that guard is the only thing " +
+					"keeping this index off a zero-length datagram.")
+			}
+		}()
+		_ = determineAMTmessageType(buf[:0])
+	}()
 }
 
 // newIdleRustGateway builds a Gateway with a live Rust handle in its initial Idle
