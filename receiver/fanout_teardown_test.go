@@ -2,6 +2,7 @@ package receiver
 
 import (
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -221,5 +222,113 @@ func TestHarvestAfterCloseSettlesEveryWithheldDeparture(t *testing.T) {
 	if removed[0].Packets != 1 || removed[0].Bytes != uint64(len(packet)) {
 		t.Errorf("departure billed %d packets / %d bytes after Close, want 1 / %d",
 			removed[0].Packets, removed[0].Bytes, len(packet))
+	}
+}
+
+// A target ID whose departure has not settled must not be re-admitted, because
+// one ID would then name two lifecycles that nothing downstream can separate.
+//
+// This is the re-grant race. pendingTeardown keys the old generation on
+// TargetID alone, and a re-admitted ID gets fresh counters — carry is built from
+// the live table, which no longer holds the departed entry. So if the swap were
+// allowed, the next harvest would hand back the OLD generation's cumulative
+// total under an ID that is once again live, and Reporter.CloseRemoved — which
+// looks up only TargetID — would close the NEW session on that stale watermark:
+// the new generation's traffic billed into the old session, the old total
+// re-billed against the advanced watermark, and no session boundary left. A
+// refused reconcile costs a retry; a fused one corrupts the ledger for good.
+func TestReconcileRefusesToReAdmitAnUnsettledTargetID(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+	}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	packet := []byte("shred")
+	release := wedgeFanoutInDeliver(t, fanout, packet)
+	defer release()
+
+	// Force the deferral: the worker is wedged holding the pre-swap snapshot,
+	// so grant-b's departure cannot be certified and stays parked.
+	if _, err := fanout.ReconcileDestinations([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+	}); !errors.Is(err, ErrTeardownPending) {
+		t.Fatalf("removing reconcile returned err %v, want one wrapping ErrTeardownPending", err)
+	}
+
+	// Re-grant grant-b while its previous generation is still unsettled.
+	removed, err := fanout.ReconcileDestinations([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+	})
+	if !errors.Is(err, ErrTeardownPending) {
+		t.Fatalf("re-admitting an unsettled target ID returned err %v, want one wrapping ErrTeardownPending; "+
+			"admitting it fuses the old generation's parked total with a new one counting from zero", err)
+	}
+	if !strings.Contains(err.Error(), "grant-b") {
+		t.Errorf("refusal %q does not name grant-b; the caller cannot tell which grant to retry", err)
+	}
+	for _, stat := range removed {
+		if stat.TargetID == "grant-b" {
+			t.Fatalf("refused reconcile still reported grant-b as departed (%+v); "+
+				"a caller passing that to CloseRemoved closes a session it was just told it could not re-open", stat)
+		}
+	}
+
+	// The refusal must not have swapped the table: grant-b is still absent, and
+	// grant-a keeps being served throughout.
+	served := map[string]bool{}
+	for _, entry := range fanout.table.Load().entries {
+		served[entry.id] = true
+	}
+	if !served["grant-a"] {
+		t.Error("grant-a stopped being served by a reconcile that was refused; a refusal must change nothing")
+	}
+	if served["grant-b"] {
+		t.Error("grant-b was admitted despite the refusal, so its parked departure now shadows a live entry")
+	}
+
+	// Once the packet lands the departure settles, and the same re-grant is
+	// accepted — the refusal is a deferral, not a permanent rejection. It
+	// arrives carrying the OLD generation's final counters, so the caller can
+	// close that session before the new one bills a byte.
+	release()
+
+	var accepted []DestinationStat
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		accepted, err = fanout.ReconcileDestinations([]Target{
+			{ID: "grant-a", Address: "127.0.0.1:20001"},
+			{ID: "grant-b", Address: "127.0.0.1:20002"},
+		})
+		if err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("re-grant still refused after the packet landed: %v; the refusal has to clear or a flapping grant is stuck forever", err)
+	}
+	if len(accepted) != 1 || accepted[0].TargetID != "grant-b" {
+		t.Fatalf("accepted re-grant reported departures %+v, want exactly grant-b's settled old generation", accepted)
+	}
+	if accepted[0].Packets != 1 || accepted[0].Bytes != uint64(len(packet)) {
+		t.Errorf("settled old generation billed %d packets / %d bytes, want 1 / %d; the tail delta must ride on the close that precedes the re-grant",
+			accepted[0].Packets, accepted[0].Bytes, len(packet))
+	}
+
+	// The re-admitted generation starts from zero rather than inheriting the
+	// old total, which is what makes the two sessions separately billable.
+	for _, stat := range fanout.DestinationStats() {
+		if stat.TargetID != "grant-b" {
+			continue
+		}
+		if stat.Bytes != 0 || stat.Packets != 0 {
+			t.Errorf("re-granted grant-b starts at %d packets / %d bytes, want 0 / 0; inherited totals re-bill the closed session's traffic",
+				stat.Packets, stat.Bytes)
+		}
 	}
 }

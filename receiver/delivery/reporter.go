@@ -336,6 +336,14 @@ func (r *Reporter) observe(sample LedgerSample) error {
 	// A target that merely moved to a new address does NOT land here: its
 	// counters are carried across the reconcile by pointer, so they stay
 	// monotonic and the delta stays honest across the move.
+	//
+	// A target that was REMOVED and later re-granted does land here, and that
+	// is correct: it is served by a fresh counter set starting at zero, so the
+	// current value is exactly what the new generation has delivered. The
+	// fan-out refuses to re-admit an ID until its previous generation's
+	// departure has settled, so by the time a regressed sample arrives under a
+	// re-granted ID, the old session is closed and this delta opens the new one
+	// rather than extending the old.
 	if sample.Bytes < previous.Bytes {
 		bytesDelta = sample.Bytes
 	}

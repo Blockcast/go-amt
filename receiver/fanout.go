@@ -9,6 +9,7 @@ import (
 	"net"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -136,15 +137,23 @@ type destTable struct {
 	entries []destination
 }
 
-// ErrTeardownPending reports that a reconcile removed at least one target whose
-// final counters could not be certified before the boundary wait expired.
+// ErrTeardownPending reports that a departing target's final counters could not
+// be certified before the boundary wait expired. It is raised on two paths, and
+// the difference between them is whether the table swap happened.
 //
-// It is not a delivery failure: the new table is live, and every stat the
-// reconcile DID return is final. It says only that the departure set reported
-// so far is incomplete, so the caller must not treat the reconcile as having
-// enumerated every closed session. The withheld departures stay recoverable —
-// HarvestPendingTeardowns, or the next reconcile, returns them once their
-// in-flight packet finishes.
+//   - A reconcile removed the target and swapped anyway. The new table is live
+//     and every stat the reconcile DID return is final; only the departure set
+//     is incomplete, so the caller must not treat the reconcile as having
+//     enumerated every closed session.
+//   - A reconcile asked to re-admit a target ID whose previous generation has
+//     not settled. That one is REFUSED and no swap happens, because serving it
+//     would fuse two lifecycles under one ID — see ReconcileDestinations.
+//
+// Neither is a delivery failure, and in both cases the withheld departures stay
+// recoverable: HarvestPendingTeardowns, or the next reconcile, returns them
+// once their in-flight packet finishes. Callers already retry this error on
+// their grant-poll cycle, which is what makes the refusal safe — the wait is
+// bounded by one packet's delivery, not by a grant's lifetime.
 //
 // The distinction matters because closing a session is irreversible from the
 // ledger's point of view. A caller handed a falsely-final sample writes a final
@@ -438,6 +447,13 @@ func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObs
 // that has not yet closed a session can close it later, whereas one that closed
 // it on a short sample has written an unrepairable ledger record.
 //
+// For the same reason, a target ID whose previous generation has not settled is
+// REFUSED rather than re-admitted: the whole reconcile returns
+// ErrTeardownPending and no swap happens. Serving it would leave one ID naming
+// two lifecycles at once — a parked departure holding the old cumulative total
+// and a live entry counting from zero — which the billing plane, keyed on
+// TargetID, cannot separate. The caller retries; the wait is one packet long.
+//
 // The counters ride on the return value because this is the last place they
 // exist. A departing target is absent from the new table, and DestinationStats
 // reads only the current one, so a caller told merely "grant-b left" can no
@@ -459,6 +475,38 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 
 	f.reconcileMu.Lock()
 	defer f.reconcileMu.Unlock()
+
+	// Settle whatever became final since the last reconcile BEFORE looking at
+	// the requested set. A departure parked by an earlier reconcile is usually
+	// final within one packet's delivery, so by now it almost always is;
+	// harvesting here is what keeps the re-admission guard below from refusing
+	// a re-grant whose previous generation is already done and merely
+	// unharvested.
+	settled := f.harvestFinalDepartures()
+
+	// A target ID whose previous generation has NOT settled cannot be
+	// re-admitted, because nothing downstream can tell the two lifecycles
+	// apart.
+	//
+	// pendingTeardown holds the old generation's entry keyed by TargetID alone,
+	// and a re-admitted ID gets FRESH counters — carry is built from the live
+	// table, which no longer holds the departed entry. So admitting it here
+	// leaves the old generation's cumulative total parked under the same ID as
+	// a new generation counting from zero, and the harvest hands that stale
+	// total back as a final sample for an ID that is once again live.
+	// Reporter.CloseRemoved looks up only TargetID, so it would close the
+	// re-granted session on the old generation's watermark: the new
+	// generation's traffic lands in the old session, the old total is re-billed
+	// against the advanced watermark, and the session boundary the ledger
+	// depends on is gone. None of that is repairable after the record ships.
+	//
+	// Refusing costs a retry of a reconcile the caller already retries. It is
+	// the same trade the boundary wait makes everywhere else here: a deferral
+	// the caller can resolve, never a number it cannot.
+	if collisions := f.unsettledCollisions(targets); len(collisions) > 0 {
+		return settled, fmt.Errorf("%w: target(s) %s cannot be re-admitted until the previous generation's counters settle",
+			ErrTeardownPending, strings.Join(collisions, ", "))
+	}
 
 	// Read the old table under reconcileMu so two concurrent reconciles cannot
 	// both carry counters forward from the same pre-swap snapshot.
@@ -516,7 +564,7 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 	}
 	f.awaitDeliveryBoundary(swapSeq)
 
-	removed := f.harvestFinalDepartures()
+	removed := append(settled, f.harvestFinalDepartures()...)
 	if withheld := len(f.pendingTeardown); withheld > 0 {
 		// Deliberately NOT returning a sample for these. A short sample the
 		// caller believes is final is unrepairable; a withheld one is not.
@@ -524,6 +572,36 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 			ErrTeardownPending, withheld, boundaryTimeout)
 	}
 	return removed, nil
+}
+
+// unsettledCollisions reports which of targets are asking to re-use a target ID
+// whose previous generation is still parked in pendingTeardown. Callers must
+// hold reconcileMu.
+//
+// Duplicates within targets are collapsed so the error names each ID once;
+// rejecting the duplicate itself is resolveTargets' job.
+func (f *Fanout) unsettledCollisions(targets []Target) []string {
+	if len(f.pendingTeardown) == 0 {
+		return nil
+	}
+	unsettled := make(map[string]struct{}, len(f.pendingTeardown))
+	for _, pending := range f.pendingTeardown {
+		unsettled[pending.entry.id] = struct{}{}
+	}
+
+	var collisions []string
+	reported := make(map[string]struct{}, len(unsettled))
+	for _, target := range targets {
+		if _, pending := unsettled[target.ID]; !pending {
+			continue
+		}
+		if _, already := reported[target.ID]; already {
+			continue
+		}
+		reported[target.ID] = struct{}{}
+		collisions = append(collisions, target.ID)
+	}
+	return collisions
 }
 
 // harvestFinalDepartures moves every parked departure whose delivery bracket has
