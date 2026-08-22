@@ -268,6 +268,185 @@ func TestDurationIsCumulativeAndBytesAreDeltas(t *testing.T) {
 	}
 }
 
+// TestRefusedFinalRecordIsRetriedOnNextClose is the regression test for the
+// worst case of the retry contract. Tracker.Close removes the session, so a
+// final record the sink refused can never be regenerated -- it is the one
+// record with no possible replacement. If the retry path observes before it
+// drains, Observe hits the removed session, returns ErrNoSession, and the
+// retained record is stranded forever: the session's last interval and its
+// close reason are both lost, silently.
+func TestRefusedFinalRecordIsRetriedOnNextClose(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 100, Packets: 10}}); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+
+	// The sink dies exactly as the final record is shipped.
+	sink.failing = true
+	final := LedgerSample{Destination: "d", Bytes: 150, Packets: 15}
+	if err := reporter.CloseAll([]LedgerSample{final}, CloseShutdown); err == nil {
+		t.Fatal("CloseAll returned nil while the sink was refusing records")
+	}
+	if reporter.Pending() != 1 {
+		t.Fatalf("Pending() = %d, want 1 after a refused final record", reporter.Pending())
+	}
+
+	// The sink recovers and the caller retries.
+	sink.failing = false
+	if err := reporter.CloseAll([]LedgerSample{final}, CloseShutdown); err != nil {
+		t.Fatalf("CloseAll after recovery: %v", err)
+	}
+	if reporter.Pending() != 0 {
+		t.Fatalf("Pending() = %d, want 0; the retained final record was never retried", reporter.Pending())
+	}
+
+	records := sink.forDestination("d")
+	var finals int
+	var billed uint64
+	for _, record := range records {
+		billed += record.BytesOut
+		if record.Final {
+			finals++
+		}
+	}
+	if finals != 1 {
+		t.Errorf("final records = %d, want exactly 1: the retry must retransmit the "+
+			"original record, not emit a second closing interval", finals)
+	}
+	if billed != 150 {
+		t.Errorf("summed bytes_out = %d, want 150; the final interval was lost or double-counted", billed)
+	}
+	if last := records[len(records)-1]; last.CloseReason != CloseShutdown {
+		t.Errorf("retried final record close_reason = %q, want %q", last.CloseReason, CloseShutdown)
+	}
+}
+
+// TestRefusedFinalRecordIsRetriedOnNextTick pins the same recovery through the
+// periodic path, since a caller that keeps ticking after a failed shutdown
+// close must not strand the record either.
+func TestRefusedFinalRecordIsRetriedOnNextTick(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 100, Packets: 10}}); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	sink.failing = true
+	if err := reporter.CloseDestination(LedgerSample{Destination: "d", Bytes: 100, Packets: 10}, CloseShutdown); err == nil {
+		t.Fatal("CloseDestination returned nil while the sink was refusing")
+	}
+
+	sink.failing = false
+	// More traffic arrives and the caller ticks again.
+	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 175, Packets: 17}}); err != nil {
+		t.Fatalf("Tick after recovery: %v", err)
+	}
+	if reporter.Pending() != 0 {
+		t.Fatalf("Pending() = %d, want 0", reporter.Pending())
+	}
+
+	records := sink.forDestination("d")
+	var billed uint64
+	for _, record := range records {
+		billed += record.BytesOut
+	}
+	if billed != 175 {
+		t.Errorf("summed bytes_out = %d, want 175", billed)
+	}
+	// The closed session's record shipped, and the post-close traffic opened a
+	// NEW session rather than being folded into the closed one.
+	sessions := map[string]bool{}
+	for _, record := range records {
+		sessions[record.SessionID] = true
+	}
+	if len(sessions) != 2 {
+		t.Errorf("distinct sessions = %d, want 2: traffic after a close belongs to a new session", len(sessions))
+	}
+}
+
+// TestReopenAfterCloseDoesNotRebillFromProcessStart pins the watermark's
+// survival across a close. The ledger is cumulative over the whole process and
+// does not reset when a session ends, so a reopened session that took its
+// baseline as zero would bill every byte since process start all over again.
+func TestReopenAfterCloseDoesNotRebillFromProcessStart(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 1000, Packets: 100}}); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	if err := reporter.CloseAll([]LedgerSample{{Destination: "d", Bytes: 1000, Packets: 100}}, CloseShutdown); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+	// The same process keeps running and the destination comes back. The ledger
+	// still reads cumulatively: 1000 already billed, 40 new bytes.
+	if err := reporter.Tick([]LedgerSample{{Destination: "d", Bytes: 1040, Packets: 104}}); err != nil {
+		t.Fatalf("Tick after reopen: %v", err)
+	}
+
+	var billed uint64
+	for _, record := range sink.forDestination("d") {
+		billed += record.BytesOut
+	}
+	if billed != 1040 {
+		t.Errorf("summed bytes_out = %d, want 1040; a reopened session re-billed the cumulative ledger", billed)
+	}
+}
+
+// TestCloseWithoutAnyTickBillsTheWholeRun pins the run-shorter-than-one-report-
+// interval case. No periodic tick has fired, so no session has ever been
+// opened; the close is the only record that run will ever produce and must
+// therefore carry all of its traffic. A close path that treats "no open
+// session" as "already closed" silently bills such a run at zero.
+func TestCloseWithoutAnyTickBillsTheWholeRun(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	if err := reporter.CloseAll([]LedgerSample{
+		{Destination: "10.0.0.1:8000", Bytes: 4400, Packets: 100},
+	}, CloseShutdown); err != nil {
+		t.Fatalf("CloseAll: %v", err)
+	}
+
+	records := sink.forDestination("10.0.0.1:8000")
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want exactly 1 (the final record)", len(records))
+	}
+	if records[0].BytesOut != 4400 || records[0].PacketsOut != 100 {
+		t.Errorf("final record = %d bytes / %d packets, want 4400/100: a run that closed "+
+			"before its first tick must still bill everything it delivered",
+			records[0].BytesOut, records[0].PacketsOut)
+	}
+	if !records[0].Final || records[0].CloseReason != CloseShutdown {
+		t.Errorf("final record = {final:%v reason:%q}, want {true %q}",
+			records[0].Final, records[0].CloseReason, CloseShutdown)
+	}
+}
+
+// TestCloseAllIsIdempotent pins that a second close does not manufacture a
+// second terminating record for a session that already has one.
+func TestCloseAllIsIdempotent(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	samples := []LedgerSample{{Destination: "d", Bytes: 500, Packets: 50}}
+	if err := reporter.CloseAll(samples, CloseShutdown); err != nil {
+		t.Fatalf("first CloseAll: %v", err)
+	}
+	if err := reporter.CloseAll(samples, CloseShutdown); err != nil {
+		t.Fatalf("second CloseAll: %v", err)
+	}
+
+	records := sink.forDestination("d")
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1; a repeated close emitted a duplicate record", len(records))
+	}
+	var billed uint64
+	for _, record := range records {
+		billed += record.BytesOut
+	}
+	if billed != 500 {
+		t.Errorf("summed bytes_out = %d, want 500", billed)
+	}
+}
+
 // TestCloseDestinationRejectsInvalidReason keeps a malformed close reason off
 // the wire rather than letting it reach a billing rollup.
 func TestCloseDestinationRejectsInvalidReason(t *testing.T) {

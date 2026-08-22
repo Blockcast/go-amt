@@ -112,19 +112,19 @@ func runBilledReceiver(t *testing.T, walPath, recordPath string, packetCount int
 		slot += 7
 	}
 
-	// Let the fan-out worker drain its queue before shutdown, so the ledger the
-	// closing record reads has the traffic in it.
-	deadline := time.Now().Add(10 * time.Second)
+	// Wait only until the receiver has ACCEPTED every packet -- ingress, not
+	// egress. There is deliberately no settle sleep here: packets accepted by
+	// Enqueue but not yet written by the fan-out worker are exactly the case
+	// that must still be billed, and a sleep would let the queue drain and
+	// quietly stop testing the shutdown ordering. Shutdown has to drain the
+	// fan-out before it samples the ledger for the final record.
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if egress, ok := scrape(t, httpAddress, "bcast_shred_gw_egress_packets_total", `feed="default"`); ok && egress > 0 {
+		if ingress, ok := scrape(t, httpAddress, "bcast_shred_gw_ingress_packets_total", `feed="default"`); ok && int(ingress) >= packetCount {
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
-	// A short settle so the remaining queued packets reach the ledger; the
-	// exact count is asserted against the ledger itself, not against
-	// packetCount, so this cannot make the assertion vacuous.
-	time.Sleep(200 * time.Millisecond)
 
 	close(stop)
 	if err := <-finished; err != nil {
@@ -176,8 +176,18 @@ func TestDeliveryRecordsBillLedgerTotalExactlyOnce(t *testing.T) {
 		t.Errorf("billed %d bytes for %d packets, want exactly %d (%d-byte packets); a mismatch means bytes and packets disagree about the delta",
 			billedBytes, billedPackets, billedPackets*packetSize, packetSize)
 	}
-	if billedPackets > 96 {
-		t.Errorf("billed %d packets for at most 96 delivered; traffic is being counted more than once", billedPackets)
+	// Exactly the traffic sent -- an equality, not a bound, in both directions.
+	//
+	// Over-counting is the cumulative-versus-delta hazard. UNDER-counting is the
+	// shutdown-ordering hazard: packets accepted by Enqueue but still queued
+	// when the session closes are delivered by Fanout.Close afterwards, so
+	// sampling the ledger before draining the fan-out bills fewer packets than
+	// were actually delivered. The helper deliberately does not settle the
+	// queue before shutdown, so this assertion sees that case.
+	if billedPackets != 96 {
+		t.Errorf("billed %d packets, want exactly 96: over-counting means traffic is billed twice, "+
+			"under-counting means queued packets were delivered by fan-out shutdown after the final record was taken",
+			billedPackets)
 	}
 }
 

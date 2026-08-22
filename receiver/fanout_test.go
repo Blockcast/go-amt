@@ -661,3 +661,88 @@ func TestUDPFanoutLedgerLocalisesTheBrokenDestination(t *testing.T) {
 		})
 	}
 }
+
+// gatedWriter blocks its first write until released, so a test can hold the
+// fan-out worker still and guarantee the queue has depth.
+type gatedWriter struct {
+	release chan struct{}
+	once    sync.Once
+	mu      sync.Mutex
+	written int
+}
+
+func (g *gatedWriter) Write(p []byte) (int, error) {
+	g.once.Do(func() { <-g.release })
+	g.mu.Lock()
+	g.written++
+	g.mu.Unlock()
+	return len(p), nil
+}
+
+func (g *gatedWriter) Close() error { return nil }
+
+func (g *gatedWriter) Written() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.written
+}
+
+// TestCloseDeliversStillQueuedPacketsIntoTheLedger pins the fact that makes
+// shutdown ORDERING load-bearing for anything reading DestinationStats.
+//
+// Enqueue accepting a packet and the worker delivering it are two different
+// events. Accepted packets sit in the ring and reach the per-destination ledger
+// only when the worker writes them; Close then closes the ring and waits for
+// the worker, which delivers everything still queued. So a ledger sample taken
+// BEFORE Close is a sample of a counter that is about to grow.
+//
+// This matters to delivery-session billing (BLO-29728): blockcast-shreds must
+// drain the fan-out before it takes the final ledger sample, or packets that
+// were delivered during Close are delivered but never billed, and nothing
+// reports the shortfall. The assertions below are the two halves of that claim
+// -- the ledger under-reports while packets are queued, and Close makes it
+// whole -- so a change to Close that dropped queued packets instead of
+// delivering them would land here rather than in a billing discrepancy.
+func TestCloseDeliversStillQueuedPacketsIntoTheLedger(t *testing.T) {
+	const packets = 64
+
+	gate := &gatedWriter{release: make(chan struct{})}
+	fanout, err := NewFanout([]io.WriteCloser{gate}, 4096, nil)
+	if err != nil {
+		t.Fatalf("NewFanout: %v", err)
+	}
+
+	for i := 0; i < packets; i++ {
+		if result := fanout.Enqueue("feed", []byte("0123456789")); result != EnqueueAccepted {
+			t.Fatalf("Enqueue %d = %v, want EnqueueAccepted", i, result)
+		}
+	}
+
+	// The worker is parked inside the first write, so the ledger cannot yet
+	// account for everything Enqueue accepted.
+	queuedLedger := fanout.DestinationStats()[0]
+	if queuedLedger.Packets >= packets {
+		t.Fatalf("ledger already reports %d of %d packets while the worker is blocked; "+
+			"this test is no longer creating queue depth and proves nothing",
+			queuedLedger.Packets, packets)
+	}
+
+	close(gate.release)
+	if err := fanout.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	finalLedger := fanout.DestinationStats()[0]
+	if finalLedger.Packets != packets {
+		t.Errorf("ledger after Close = %d packets, want %d: Close must deliver what is still queued",
+			finalLedger.Packets, packets)
+	}
+	if got := gate.Written(); got != packets {
+		t.Errorf("writer received %d packets, want %d", got, packets)
+	}
+	// The gap between the two samples is exactly the traffic a caller loses by
+	// sampling before draining.
+	if finalLedger.Packets <= queuedLedger.Packets {
+		t.Error("the ledger did not grow across Close; the ordering hazard this pins would not exist")
+	}
+}

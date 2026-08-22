@@ -594,6 +594,22 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		if biller == nil {
 			return
 		}
+		// Drain the fan-out BEFORE reading the ledger for the last time.
+		//
+		// Enqueue accepting a packet is not the same event as the worker
+		// delivering it: accepted packets sit in a 4096-deep queue and only
+		// reach the per-destination ledger when the worker writes them.
+		// Fanout.Close closes that queue and waits for the worker, which
+		// delivers everything still queued -- so sampling before Close bills a
+		// ledger that is about to grow, and those bytes are delivered but never
+		// appear in any record. The deferred fanout.Close below is a closeOnce,
+		// so calling it here is safe and simply makes the ordering explicit
+		// rather than dependent on defer unwinding order.
+		if fanout != nil {
+			if err := fanout.Close(); err != nil {
+				fmt.Fprintln(os.Stderr, "fan-out close:", err)
+			}
+		}
 		if err := biller.CloseAll(ledgerSamples(fanout), delivery.CloseShutdown); err != nil {
 			fmt.Fprintln(os.Stderr, "delivery-session close:", err)
 		}
