@@ -152,6 +152,7 @@ jobs:
           TestFakeNativeSourceIsolatesGroups
           TestProvenanceOfNamesEachDeliveryPath
           TestReadOneTimeoutDoesNotStealTheNextDatagram
+          TestConnTypesDoNotClaimInPlaceReadBounds
           TestManagedConnKeepsNativeWhenBothPathsAreLive
           TestManagedConnSwitchesFromNativeToRelayAndBack
           TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
@@ -236,6 +237,7 @@ jobs:
           TestFakeNativeSourceIsolatesGroups
           TestProvenanceOfNamesEachDeliveryPath
           TestReadOneTimeoutDoesNotStealTheNextDatagram
+          TestConnTypesDoNotClaimInPlaceReadBounds
           TestManagedConnKeepsNativeWhenBothPathsAreLive
           TestManagedConnSwitchesFromNativeToRelayAndBack
           TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'
@@ -487,6 +489,7 @@ jobs:
           TestFakeNativeSourceIsolatesGroups
           TestProvenanceOfNamesEachDeliveryPath
           TestReadOneTimeoutDoesNotStealTheNextDatagram
+          TestConnTypesDoNotClaimInPlaceReadBounds
           TestManagedConnKeepsNativeWhenBothPathsAreLive
           TestManagedConnSwitchesFromNativeToRelayAndBack
           TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers'

@@ -316,20 +316,55 @@ func (r nativeSocketReader) SetReadDeadline(t time.Time) error {
 	return r.pc.SetReadDeadline(t)
 }
 
-// deadlineReader is a datagramReader whose read can be bounded in place, so a
+// deadlineReader is a datagramReader whose read can be bounded IN PLACE, so a
 // timed-out read leaves nothing running behind it.
 //
-// Only the raw seam socket satisfies this. MulticastConn and ManagedConn do not:
-// their reads park on a channel no deadline reaches.
+// Membership is by EXPLICIT OPT-IN — the unexported marker method — and not by
+// method presence. An earlier revision of this interface required only
+// datagramReader plus SetReadDeadline. Go interface satisfaction is structural,
+// so that also captured *ManagedConn and *MulticastConn, the two types the
+// comment here claimed it excluded: ManagedConn.SetReadDeadline is defined in
+// managed_conn.go and MulticastConn.SetReadDeadline in conn.go.
+//
+// For *ManagedConn on the tunnel path the two halves do not line up:
+//
+//   - SetReadDeadline falls through to `return nil` — it reports success having
+//     set nothing, because AMT deadline handling was never implemented.
+//   - ReadFrom selects on readBuffer/done with NO timeout case.
+//
+// So readOneWithDeadline set a deadline that reached nothing and then parked on
+// a channel forever, with none of the goroutine path's time.After backstop. The
+// concrete site is the 16-packet tunnel burst in fakenative_flows_test.go, which
+// calls readOne(silent, ...) after asserting IsUsingTunnel(): one dropped packet
+// and that read never returns, so the t.Fatalf naming the defect is unreachable
+// and the run dies on the test binary's global timeout with a goroutine dump
+// instead. The bound was missing in exactly the failure mode it exists to
+// report, and CI stayed green only because the relay does deliver.
+//
+// Hence the marker. Structural capture is silent and compiles; opting in is a
+// deliberate claim that has to be written down next to the reader making it.
 type deadlineReader interface {
 	datagramReader
 	SetReadDeadline(time.Time) error
+
+	// canBoundReadInPlace has no behaviour. Implementing it asserts that
+	// SetReadDeadline actually reaches the read ReadFrom performs. Do NOT
+	// implement it on a reader whose read can park on a channel — that is the
+	// defect described above.
+	canBoundReadInPlace()
 }
 
 // The seam socket MUST keep satisfying deadlineReader: if it stopped, readOne
 // would silently fall back to the goroutine path and
 // TestReadOneTimeoutDoesNotStealTheNextDatagram's hazard would return.
 var _ deadlineReader = nativeSocketReader{}
+
+// canBoundReadInPlace: nativeSocketReader wraps a real *ipv4.PacketConn, so the
+// deadline readOneWithDeadline sets does reach the ReadFrom underneath it.
+//
+// TestConnTypesDoNotClaimInPlaceReadBounds pins the negative direction, which is
+// the half a compile-time assertion cannot express.
+func (nativeSocketReader) canBoundReadInPlace() {}
 
 // readOne reads a single datagram under a bound.
 //

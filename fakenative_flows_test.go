@@ -253,8 +253,51 @@ func TestReadOneTimeoutDoesNotStealTheNextDatagram(t *testing.T) {
 	}
 }
 
-// TestFakeNativeSourceIsolatesGroups pins that the switch is per-group, which is
-// what lets a test silence the group under test without silencing everything.
+// TestConnTypesDoNotClaimInPlaceReadBounds pins the direction a compile-time
+// assertion cannot express: that *ManagedConn is NOT a deadlineReader, so readOne
+// routes it down the goroutine path with its time.After backstop rather than down
+// readOneWithDeadline.
+//
+// This is a regression test for a real hole, not a tautology. deadlineReader once
+// required only datagramReader plus SetReadDeadline; interface satisfaction being
+// structural in Go, *ManagedConn silently qualified — it defines SetReadDeadline
+// in managed_conn.go — even though the interface's own comment said it did not.
+// On the tunnel path that removed the bound outright: SetReadDeadline falls
+// through to `return nil` having set nothing, while ReadFrom selects on
+// readBuffer/done with no timeout case, so readOneWithDeadline parked forever.
+// The 16-packet burst in TestManagedConnSwitchesFromNativeToRelayAndBack calls
+// readOne(silent, ...) on exactly that path, so a single dropped packet hung the
+// run to the test binary's global timeout instead of failing with the message
+// that names the defect.
+//
+// *MulticastConn is deliberately not covered here: conn.go is `cgo && !purego`,
+// so the type does not exist in the CGO_ENABLED=0 `test` lane or the `purego`
+// `race` lane, and naming it would break their compile. It is also the benign
+// one — its SetReadDeadline delegates to a real socket. The cgo-lane equivalent
+// belongs with the MulticastConn switchover tests.
+//
+// A nil pointer is fine here: an interface type assertion inspects the method set
+// and never dereferences the value.
+func TestConnTypesDoNotClaimInPlaceReadBounds(t *testing.T) {
+	// Guarding the positive direction too, so a future change that drops the
+	// marker from the seam socket fails HERE, naming the consequence, rather
+	// than silently reinstating the straggler-theft hazard.
+	if _, ok := any(nativeSocketReader{}).(deadlineReader); !ok {
+		t.Error("nativeSocketReader is no longer a deadlineReader, so readOne has " +
+			"silently fallen back to the goroutine path for the raw seam socket and " +
+			"TestReadOneTimeoutDoesNotStealTheNextDatagram's hazard is back")
+	}
+
+	var managed datagramReader = (*ManagedConn)(nil)
+	if _, ok := any(managed).(deadlineReader); ok {
+		t.Error("*ManagedConn satisfies deadlineReader, so readOne bounds it with " +
+			"readOneWithDeadline instead of the goroutine path. That bound is not " +
+			"real on the tunnel path — SetReadDeadline reaches nothing and ReadFrom " +
+			"has no timeout case — so a read that should have failed with a " +
+			"diagnosis will instead hang until the test binary's global timeout. Do " +
+			"not implement canBoundReadInPlace on a reader that can park on a channel.")
+	}
+}
 func TestFakeNativeSourceIsolatesGroups(t *testing.T) {
 	nat := installFakeNativeSource(t)
 
