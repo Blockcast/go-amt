@@ -136,6 +136,44 @@ type destTable struct {
 	entries []destination
 }
 
+// ErrTeardownPending reports that a reconcile removed at least one target whose
+// final counters could not be certified before the boundary wait expired.
+//
+// It is not a delivery failure: the new table is live, and every stat the
+// reconcile DID return is final. It says only that the departure set reported
+// so far is incomplete, so the caller must not treat the reconcile as having
+// enumerated every closed session. The withheld departures stay recoverable —
+// HarvestPendingTeardowns, or the next reconcile, returns them once their
+// in-flight packet finishes.
+//
+// The distinction matters because closing a session is irreversible from the
+// ledger's point of view. A caller handed a falsely-final sample writes a final
+// record short by the in-flight packet and can never repair it; a caller handed
+// this error simply has not closed that session yet.
+var ErrTeardownPending = errors.New("fan-out: departing target counters are not yet final")
+
+// pendingDeparture is a target removed from the table whose counters are not
+// yet certifiably final, together with the delivery bracket that has to close
+// before they are.
+type pendingDeparture struct {
+	entry destination
+	// seq is the deliverSeq value observed immediately after the table swap. An
+	// even value means no packet was in flight, so the entry was already final
+	// when it was parked. An odd value means one packet was mid-deliver and may
+	// hold the pre-swap snapshot; the entry becomes final as soon as deliverSeq
+	// moves off this exact value, because that is that packet's bracket closing.
+	seq uint64
+}
+
+// isFinal reports whether the departure's counters can no longer change.
+//
+// now must be a deliverSeq reading taken after the departure was parked. Once
+// this returns true it stays true: the target is absent from every table the
+// worker can load from here on, so nothing can charge it again.
+func (p pendingDeparture) isFinal(now uint64) bool {
+	return p.seq%2 == 0 || now != p.seq
+}
+
 // Fanout copies packets into a bounded ring and writes each packet to every
 // destination from a dedicated worker. Enqueue never blocks the ingress path.
 //
@@ -192,6 +230,20 @@ type Fanout struct {
 	// packet budget, and it buys an exact final bill instead of one that is
 	// short by however many packets were in flight at the swap.
 	deliverSeq atomic.Uint64
+
+	// pendingTeardown holds targets that a reconcile removed from the table but
+	// whose counters are not yet certifiably final, because a packet was still
+	// in flight when the swap landed and had not finished charging by the time
+	// the boundary wait gave up. Guarded by reconcileMu.
+	//
+	// Parking them is what keeps the fall-back honest. The counters outlive the
+	// table — the departed entry still points at the same *destCounters — so a
+	// departure held here loses nothing by waiting, and once its bracket closes
+	// it is final forever: it is absent from every table the worker can now
+	// load, so no future deliver can charge it. The alternative, reading anyway
+	// and labelling the result FINAL, is the one outcome that cannot be
+	// repaired later, because the caller closes the session on it.
+	pendingTeardown []pendingDeparture
 
 	queuedPackets  atomic.Uint64
 	droppedPackets atomic.Uint64
@@ -377,6 +429,15 @@ func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObs
 // sender could attest to was CloseShutdown. The caller is expected to close
 // those sessions; this method does not reach into the billing plane itself.
 //
+// FINAL is a hard guarantee, which is why the departure set is best-effort
+// instead. A returned sample is never short: it is read only after the delivery
+// bracket that could still charge it has closed. If a wedged socket keeps that
+// bracket open past boundaryTimeout the departure is withheld rather than
+// guessed, and the error wraps ErrTeardownPending to say the set is incomplete;
+// HarvestPendingTeardowns finishes it. The asymmetry is deliberate: a caller
+// that has not yet closed a session can close it later, whereas one that closed
+// it on a short sample has written an unrepairable ledger record.
+//
 // The counters ride on the return value because this is the last place they
 // exist. A departing target is absent from the new table, and DestinationStats
 // reads only the current one, so a caller told merely "grant-b left" can no
@@ -425,7 +486,8 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 
 	f.table.Store(&destTable{entries: entries})
 
-	// Wait out any packet already in flight, THEN read the departing counters.
+	// Park the departures against the delivery bracket that was open at the
+	// swap, THEN wait for that bracket to close, THEN read counters.
 	//
 	// The worker loads the table pointer once per packet, so at the instant of
 	// the store a worker already inside deliver holds the OLD snapshot and will
@@ -439,12 +501,51 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 	// surviving subscribers continues at full rate throughout, and the wait is
 	// bounded by a single packet's delivery, not by the reconcile interval.
 	//
+	// Reading the sequence AFTER the store is what makes the parked snapshot
+	// safe: any deliver that begins from here on necessarily loads the new
+	// table and cannot charge a departing target, and an even reading here
+	// implies the previous packet's charges are already visible, because the
+	// worker's closing increment happens after them.
+	//
 	// The counters outlive the table — the old entry still points at the same
-	// *destCounters — so this read is well defined, and every field is atomic.
-	f.awaitDeliveryBoundary()
+	// *destCounters — so these reads are well defined, and every field is
+	// atomic.
+	swapSeq := f.deliverSeq.Load()
+	for _, entry := range departing {
+		f.pendingTeardown = append(f.pendingTeardown, pendingDeparture{entry: entry, seq: swapSeq})
+	}
+	f.awaitDeliveryBoundary(swapSeq)
+
+	removed := f.harvestFinalDepartures()
+	if withheld := len(f.pendingTeardown); withheld > 0 {
+		// Deliberately NOT returning a sample for these. A short sample the
+		// caller believes is final is unrepairable; a withheld one is not.
+		return removed, fmt.Errorf("%w: %d departing target(s) still delivering after %s",
+			ErrTeardownPending, withheld, boundaryTimeout)
+	}
+	return removed, nil
+}
+
+// harvestFinalDepartures moves every parked departure whose delivery bracket has
+// closed out of pendingTeardown and returns it as a final sample. Callers must
+// hold reconcileMu.
+//
+// One deliverSeq reading serves the whole sweep: it is taken after every
+// departure here was parked, which is the only precondition isFinal needs.
+func (f *Fanout) harvestFinalDepartures() []DestinationStat {
+	if len(f.pendingTeardown) == 0 {
+		return nil
+	}
+	now := f.deliverSeq.Load()
 
 	var removed []DestinationStat
-	for _, entry := range departing {
+	withheld := f.pendingTeardown[:0]
+	for _, pending := range f.pendingTeardown {
+		if !pending.isFinal(now) {
+			withheld = append(withheld, pending)
+			continue
+		}
+		entry := pending.entry
 		removed = append(removed, DestinationStat{
 			TargetID:    entry.id,
 			Destination: entry.name,
@@ -454,30 +555,65 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 			WriteErrors: entry.counters.errors.Load(),
 		})
 	}
-	return removed, nil
+	if len(withheld) == 0 {
+		// Drop the backing array so a harvested departure's counters and
+		// resolved address are not pinned for the process lifetime.
+		f.pendingTeardown = nil
+	} else {
+		f.pendingTeardown = withheld
+	}
+	return removed
 }
 
-// awaitDeliveryBoundary blocks until no worker is inside a deliver that could
-// still be holding a pre-swap snapshot. It must be called AFTER the table
-// store, which is what makes it terminate: any deliver that starts from here
-// on loads the new table and cannot charge a departing target.
+// HarvestPendingTeardowns returns the final counters of targets whose removal a
+// previous reconcile could not certify, and reports how many remain uncertain.
 //
-// An even sequence means the worker is between packets and returns
-// immediately, which is the common case and the reason an idle fan-out does
-// not pay for this. An odd sequence means one packet is in flight; the wait
-// ends as soon as that specific bracket closes, so it costs one packet's
-// delivery at most.
+// This is the recovery path for ErrTeardownPending, and the reason that error is
+// a deferral rather than a loss: a caller that saw it calls this until the
+// remaining count reaches zero, then closes those sessions with counters that
+// are genuinely final. The next ReconcileDestinations harvests them too, so a
+// caller on a grant-poll loop needs this only to settle the ledger off-cycle.
 //
-// The deadline is a liveness backstop, not part of the contract. Reconcile
+// After Close returns, the worker is stopped and no bracket can still be open,
+// so a call here reports every outstanding departure and a remaining count of
+// zero. That makes it the last chance to bill a departed target's tail before
+// the Reporter closes what is left as SHUTDOWN.
+func (f *Fanout) HarvestPendingTeardowns() (removed []DestinationStat, remaining int) {
+	f.reconcileMu.Lock()
+	defer f.reconcileMu.Unlock()
+
+	removed = f.harvestFinalDepartures()
+	return removed, len(f.pendingTeardown)
+}
+
+// boundaryTimeout bounds how long a reconcile waits for an in-flight packet to
+// finish before it gives up and withholds the departing target's sample.
+//
+// It is a liveness backstop, not part of the counter contract. Reconcile
 // refuses non-UDP fan-outs, so the in-flight work is a bounded sendmmsg rather
 // than an arbitrary io.Writer — but a wedged socket must not deadlock the
-// broker-grant client that drives reconciles. If it ever expires we fall
-// through and read anyway: a short final bill beats a hung control plane, and
-// it is no worse than not having waited at all.
-func (f *Fanout) awaitDeliveryBoundary() {
-	const boundaryTimeout = 250 * time.Millisecond
+// broker-grant client that drives reconciles. Expiry costs a deferral
+// (ErrTeardownPending), never a wrong number.
+const boundaryTimeout = 250 * time.Millisecond
 
-	started := f.deliverSeq.Load()
+// awaitDeliveryBoundary blocks until the delivery bracket open at started has
+// closed, or until boundaryTimeout expires.
+//
+// started must be a deliverSeq reading taken AFTER the table store, which is
+// what makes this terminate: any deliver that begins from there on loads the new
+// table and cannot charge a departing target, so the only bracket worth waiting
+// for is the one already open.
+//
+// An even started means the worker is between packets, so there is nothing to
+// wait for — the common case, and the reason an idle fan-out does not pay for
+// this. An odd started means one packet is in flight; the wait ends as soon as
+// that specific bracket closes, so it costs one packet's delivery at most.
+//
+// This reports nothing. Whether the boundary was actually reached is decided by
+// re-reading deliverSeq at harvest time via pendingDeparture.isFinal, so a
+// bracket that closes in the window between the deadline and the harvest is
+// still counted as final rather than pessimistically withheld.
+func (f *Fanout) awaitDeliveryBoundary(started uint64) {
 	if started%2 == 0 {
 		return
 	}
