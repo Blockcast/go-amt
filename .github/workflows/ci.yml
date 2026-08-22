@@ -322,29 +322,45 @@ jobs:
       # the IPv4 destination, which really does diverge (group address on the
       # Rust path, 224.0.0.22 on pure-Go) — pre-existing, tracked in BLO-29419.
       #
-      # STILL FAILING, mechanism now confirmed (1 test):
+      # STILL FAILING after the pin bump — the amt-protocol#9 theory is DISPROVEN.
       #   TestDataStarvationReconnectsDespiteControlTraffic
-      # This was filed as a possible loaded-runner timing artifact. It is not a
-      # flake: it passes on the pure-Go path, and the mechanism traces end to
-      # end. keepaliveLoop calls CreateRequestMessage (relay_manager.go:957),
-      # which maps to request_membership; that still requires Idle
-      # (gateway.rs:195), so from Active it returns InvalidState, which the
-      # loop discards at :958-959. No Request reaches the wire, the relay never
-      # answers with a Query, and the test's premise guard reports 1 -> 1.
-      # It is the counterpart to #6 relaxing handle_query to accept Active: a
-      # Query can only arrive while Active if a Request can be sent from
-      # Active. Fix is amt-protocol#9; delete this last -skip and the step
-      # below when it merges and the pin moves. BLO-28805's acceptance
-      # criteria require exactly that.
+      #
+      # The prior note predicted #9 would close this: keepaliveLoop calls
+      # CreateRequestMessage (relay_manager.go:957) -> request_membership,
+      # which required Idle, so from Active it returned InvalidState and the
+      # loop discarded it at :958-959; no Request reached the wire and the
+      # relay never answered with a Query. #9 relaxed that guard —
+      # gateway.rs:257 is now `!= Idle && != Active` — so the Request is
+      # sendable from Active.
+      #
+      # It did not help. Run 32443335894 at pin 44ff7e1d fails with the
+      # byte-identical premise-guard message:
+      #   fakerelay_flows_test.go:541: relay sent no Membership Query between
+      #   the handshake and the reconnect (1 -> 1)
+      # Same 1 -> 1, so the Query still never arrives. The blocker is therefore
+      # downstream of the gateway state machine — most likely the fakeRelay
+      # harness not answering a mid-session Request at all, which is the same
+      # family as BLO-29437 and BLO-29196 (fakeRelay cannot drive a Rust-backed
+      # Gateway). Do NOT re-attribute this to gateway state without new
+      # evidence; that theory has now been tested and failed.
+      #
+      # Kept skipped so the pin bump can land green. Tracked in BLO-28805,
+      # whose AC #3 (no -skip at all) stays open on this one test.
       - name: Test
         run: |
           go test -skip 'TestDataStarvationReconnectsDespiteControlTraffic' ./...
 
-      # Positive proof that the three retired tests actually ran on the cgo
-      # path. Deleting a name from -skip only stops deselecting it; without
-      # this, a regression that made them skip (or a package that failed to
-      # build its test binary) would still show a bare "ok". Same anti-vacuity
+      # Positive proof that the retired tests actually ran on the cgo path.
+      # Deleting a name from -skip only stops deselecting it; without this, a
+      # regression that made them skip (or a package that failed to build its
+      # test binary) would still show a bare "ok". Same anti-vacuity
       # requirement as the Gateway.Open guards below.
+      #
+      # The note above this step said to delete it once the last -skip went.
+      # That has not happened and this step stays regardless: its rationale —
+      # a bare "ok" is indistinguishable from a silently deselected package —
+      # is independent of how many names are in -skip. Whenever the last skip
+      # is finally retired, extend this list rather than deleting the step.
       #
       # TestIGMPEnvelopeParityAcrossImplementations rides along because it is
       # the assertion that pins the Router Alert convergence this bump also
