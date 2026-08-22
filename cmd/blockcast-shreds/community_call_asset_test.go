@@ -59,8 +59,63 @@ func TestCommunityCallAssetMentionsNoUndefinedFlag(t *testing.T) {
 	}
 }
 
+// sectionBounds locates a `## ` section by its exact heading and returns the
+// offsets of the heading and of the following heading (or end of file for a
+// trailing section). Both the extract-one-section and the remove-one-section
+// callers below need the same "to the next heading, or to EOF" rule, and they
+// disagreed about it while it was written out twice.
+func sectionBounds(asset, heading string) (start, end int, ok bool) {
+	start = strings.Index(asset, heading)
+	if start < 0 {
+		return 0, 0, false
+	}
+	next := strings.Index(asset[start:], "\n## ")
+	if next < 0 {
+		return start, len(asset), true
+	}
+	return start, start + next, true
+}
+
+// fencedBlocks returns the contents of each ``` fenced block in s, with the
+// fence lines themselves dropped. An unterminated final fence yields no block,
+// so a truncated document fails the callers below rather than matching on a
+// partial one.
+func fencedBlocks(s string) []string {
+	var blocks []string
+	var current []string
+	inside := false
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			if inside {
+				blocks = append(blocks, strings.Join(current, "\n"))
+				current = nil
+			}
+			inside = !inside
+			continue
+		}
+		if inside {
+			current = append(current, line)
+		}
+	}
+	return blocks
+}
+
+// normalizeReceiptBlock makes a comparison insensitive to indentation and blank
+// lines but exact about content, so reflowing the markdown is allowed and
+// changing a number is not.
+func normalizeReceiptBlock(s string) string {
+	var lines []string
+	for _, line := range strings.Split(s, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // TestCommunityCallAssetQuotesTheControlItActuallyProduces derives the control
-// receipt from the code and requires the asset to quote it verbatim.
+// receipt from the code and requires the asset's "Reproducing it" block to be
+// that receipt.
 //
 // Deriving rather than restating is the point. The comment on
 // TestDemoAssetQuotesTheFixtureReceipt notes that its literals are "a second
@@ -70,25 +125,40 @@ func TestCommunityCallAssetMentionsNoUndefinedFlag(t *testing.T) {
 // binary prints today, so a completion-ladder change like the one that
 // invalidated the recorded md5 fails this test with the new line in the message
 // rather than surfacing during a rehearsal.
+//
+// The comparison is scoped to the fenced block under "## Reproducing it", and is
+// whole-block rather than line-by-line. Searching the entire document for each
+// line — the first form of this test — accepted the lines appearing in prose, in
+// the checklist, or in an unrelated example, so the operator-facing control
+// block it names in its own failure message could be edited away or padded with
+// extra lines while CI stayed green.
 func TestCommunityCallAssetQuotesTheControlItActuallyProduces(t *testing.T) {
 	scorer := shred.NewScorer()
 	if err := shred.ReplayFixture(scorer); err != nil {
 		t.Fatalf("replay fixture: %v", err)
 	}
-	produced := scorer.Receipt().String()
+	produced := normalizeReceiptBlock(scorer.Receipt().String())
 
+	const heading = "## Reproducing it"
 	asset := readCommunityCallAsset(t)
-	for _, line := range strings.Split(strings.TrimSpace(produced), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		if !strings.Contains(asset, line) {
-			t.Errorf("%s must quote the control receipt the binary prints, but is "+
-				"missing this line:\n\t%s\nUpdate the asset's \"Reproducing it\" "+
-				"block to the current output.", communityCallAsset, line)
+	start, end, ok := sectionBounds(asset, heading)
+	if !ok {
+		t.Fatalf("%s must keep a %q section: it is the block the audience is told "+
+			"they can recompute, and this test has nothing to check without it.",
+			communityCallAsset, heading)
+	}
+
+	blocks := fencedBlocks(asset[start:end])
+	for _, block := range blocks {
+		if normalizeReceiptBlock(block) == produced {
+			return
 		}
 	}
+	t.Errorf("no fenced block under %q in %s is the control receipt the binary "+
+		"prints. Replace that block with the current output.\n\nwant:\n%s\n\n"+
+		"found %d fenced block(s) in that section:\n%s",
+		heading, communityCallAsset, produced, len(blocks),
+		strings.Join(blocks, "\n---\n"))
 }
 
 // TestCommunityCallAssetHonoursTheFramingRules pins the framing constraints the
@@ -97,23 +167,25 @@ func TestCommunityCallAssetQuotesTheControlItActuallyProduces(t *testing.T) {
 // section names these concepts precisely in order to rule them out, and must not
 // trip its own guard.
 func TestCommunityCallAssetHonoursTheFramingRules(t *testing.T) {
+	const heading = "## What this does not show"
 	asset := readCommunityCallAsset(t)
-	disclaimer := strings.Index(asset, "## What this does not show")
-	if disclaimer < 0 {
-		t.Fatal("the asset must carry an explicit 'What this does not show' section")
+	start, end, ok := sectionBounds(asset, heading)
+	if !ok {
+		t.Fatalf("the asset must carry an explicit %q section", heading)
 	}
-	end := strings.Index(asset[disclaimer:], "\n## ")
-	if end < 0 {
-		end = len(asset) - disclaimer
-	}
-	claiming := asset[:disclaimer] + asset[disclaimer+end:]
+	claiming := asset[:start] + asset[end:]
 
 	prohibited := []struct {
 		name    string
 		pattern *regexp.Regexp
 	}{
 		{"open-access", regexp.MustCompile(`(?i)open[ -]access`)},
-		{"attestation", regexp.MustCompile(`(?i)attest(ed|ation)`)},
+		// Match the stem with word boundaries, not two inflections of it. The
+		// first form of this guard was `attest(ed|ation)`, which let "we attest",
+		// "this attests" and "attesting" through — and "nothing here is attested"
+		// is a line the disclaimer already carries, so the prohibited forms are
+		// the ones a later edit is most likely to reach for.
+		{"attestation", regexp.MustCompile(`(?i)\battest(ed|ation|ations|ing|s)?\b`)},
 		{"decorrelated-paths", regexp.MustCompile(`(?i)independently operated|decorrelated`)},
 	}
 	for _, claim := range prohibited {
