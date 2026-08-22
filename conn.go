@@ -20,25 +20,10 @@ var _ net.PacketConn = (*MulticastConn)(nil)
 // nativeConn and probeNativeTraffic live in probe.go, which carries no build
 // tags so ManagedConn can share them; see the note there.
 
-// listenMulticastUDP4 is the seam MulticastConn.Open performs its v4 group join
-// through. Production always runs the real ListenMulticastUDP4; a test may wrap
-// it to observe whether the join was ATTEMPTED.
-//
-// That distinction is the whole point and it is not decoration. The guard on the
-// plan-before-bind ordering has to answer "did Open touch the socket?", and
-// there is no way to answer it from the outside afterwards. Inferring it from
-// the bind FAILING does not work: a bogus interface makes the join fail on
-// darwin but bind successfully on linux, and on the tunnel-handover path below
-// the socket is closed and mc.conn4 set back to nil anyway — so on
-// ubuntu-latest, the only platform cgo-test runs, "did it fail the right way"
-// and "is conn4 still set" both answer identically whether or not the bind
-// happened. A guard built on either is green under the mutation it exists to
-// catch (Ally review on go-amt#49, after a first repair that looked correct on
-// darwin and was vacuous on CI).
-//
-// A wrapper counts and delegates rather than stubbing, so what the test measures
-// is Open's real behaviour and not the wrapper's.
-var listenMulticastUDP4 = ListenMulticastUDP4
+// listenMulticastUDP4, the seam the v4 group join below goes through, lives in
+// listen_seam.go. It is tagged `linux || darwin` rather than declared here so
+// ManagedConn's native path — a different tag set, no cgo — reaches the same
+// seam instead of calling ListenMulticastUDP4 directly; see the note there.
 
 type MulticastConn struct {
 	RelayAddr net.UDPAddr
