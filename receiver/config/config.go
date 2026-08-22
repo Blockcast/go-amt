@@ -21,14 +21,21 @@ const (
 
 // Config contains the transport-independent v1 receiver configuration. The
 // broker session supplies each feed's remote UDP endpoint at runtime.
+//
+// There are deliberately no Certificate/PrivateKey fields. They existed here,
+// populated from required --cert/--key flags, while nothing in this repository
+// imported crypto/tls, crypto/x509, or a gRPC client — so the flags obliged an
+// operator to supply mTLS material and then ignored it. A required flag that is
+// ignored is worse than a missing feature: it reads as evidence the transport
+// is authenticated. They are removed rather than stubbed, so that whoever adds
+// the broker client has to add the flags back alongside a real *tls.Config and
+// cannot inherit the appearance of one. See BLO-29728.
 type Config struct {
 	FeedIDs      []string
 	BindAddress  netip.AddrPort
 	Interface    string
 	RcvBufBytes  int
 	Destinations []netip.AddrPort
-	Certificate  string
-	PrivateKey   string
 	BrokerURL    *url.URL
 	ErasureGrace time.Duration
 }
@@ -42,8 +49,6 @@ func Parse(args []string) (Config, error) {
 		interfaceName string
 		rcvBufBytes   int
 		destinations  string
-		certificate   string
-		privateKey    string
 		brokerURL     string
 		graceMS       int
 	}
@@ -55,8 +60,6 @@ func Parse(args []string) (Config, error) {
 	flags.StringVar(&raw.interfaceName, "interface", "", "optional local interface name")
 	flags.IntVar(&raw.rcvBufBytes, "rcvbuf-bytes", DefaultRcvBufBytes, "requested UDP receive buffer size")
 	flags.StringVar(&raw.destinations, "dest-ip-ports", "", "comma-separated validator destination IP:ports")
-	flags.StringVar(&raw.certificate, "cert", "", "mTLS client certificate path")
-	flags.StringVar(&raw.privateKey, "key", "", "mTLS client private-key path")
 	flags.StringVar(&raw.brokerURL, "broker-url", "", "HTTPS session broker URL")
 	flags.IntVar(&raw.graceMS, "erasure-grace-ms", int(DefaultErasureGrace/time.Millisecond), "receiver-observed FEC-set scoring grace in milliseconds")
 	if err := flags.Parse(args); err != nil {
@@ -91,12 +94,6 @@ func Parse(args []string) (Config, error) {
 	if int64(raw.graceMS) > maxDurationMillis {
 		return Config{}, errors.New("--erasure-grace-ms exceeds the maximum supported duration")
 	}
-	if strings.TrimSpace(raw.certificate) == "" {
-		return Config{}, errors.New("--cert is required")
-	}
-	if strings.TrimSpace(raw.privateKey) == "" {
-		return Config{}, errors.New("--key is required")
-	}
 	brokerURL, err := url.Parse(raw.brokerURL)
 	if err != nil {
 		return Config{}, fmt.Errorf("parse --broker-url: %w", err)
@@ -117,8 +114,6 @@ func Parse(args []string) (Config, error) {
 		Interface:    strings.TrimSpace(raw.interfaceName),
 		RcvBufBytes:  raw.rcvBufBytes,
 		Destinations: destinations,
-		Certificate:  strings.TrimSpace(raw.certificate),
-		PrivateKey:   strings.TrimSpace(raw.privateKey),
 		BrokerURL:    brokerURL,
 		ErasureGrace: time.Duration(raw.graceMS) * time.Millisecond,
 	}, nil

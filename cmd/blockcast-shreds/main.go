@@ -18,6 +18,7 @@ import (
 	"github.com/blockcast/go-amt/erasure"
 	"github.com/blockcast/go-amt/receiver"
 	"github.com/blockcast/go-amt/receiver/config"
+	"github.com/blockcast/go-amt/receiver/delivery"
 	"github.com/blockcast/go-amt/shred"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -144,6 +145,10 @@ func run(args []string) error {
 	reportInterval := flags.Duration("report-interval", defaultReportInterval,
 		"how often the delivery window is drained into /metrics; matches the broker heartbeat cadence")
 	retention := flags.Duration("retain", shred.DefaultRetention, "how far behind the newest arrival to keep per-shred scoring state; see README")
+	deliveryWAL := flags.String("delivery-wal", "",
+		"path to the delivery-session sequence WAL; enables per-destination billing records, requires --delivery-records")
+	deliveryRecords := flags.String("delivery-records", "",
+		"path to the delivery-session record file (JSON lines); requires --delivery-wal")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -200,8 +205,44 @@ func run(args []string) error {
 	if warning := retentionWarning(*retention); warning != "" {
 		fmt.Fprintln(os.Stderr, warning)
 	}
-	return listenAndScore(configured, splitNonempty(destinations), httpAddress, healthMaxAge, *asJSON,
-		time.Duration(*graceMS)*time.Millisecond, *reportInterval, *retention, nil, *score)
+	forwardTo := splitNonempty(destinations)
+	bill, err := billingOptions(*deliveryWAL, *deliveryRecords, forwardTo)
+	if err != nil {
+		return err
+	}
+	return listenAndScore(configured, forwardTo, httpAddress, healthMaxAge, *asJSON,
+		time.Duration(*graceMS)*time.Millisecond, *reportInterval, *retention, nil, *score, bill)
+}
+
+// billing holds the delivery-session record configuration. A zero value
+// disables billing, which is what every existing invocation gets.
+type billing struct {
+	walPath    string
+	recordPath string
+}
+
+func (b billing) enabled() bool { return b.walPath != "" }
+
+// billingOptions validates the delivery-session flags as a set.
+//
+// The two paths are all-or-nothing, and both are refused without a fan-out
+// destination: sessions are opened per destination, so billing with nothing to
+// forward to would open a WAL, emit no records, and look configured while
+// producing nothing — the exact silent-no-op this issue exists to remove.
+func billingOptions(walPath, recordPath string, destinations []string) (billing, error) {
+	walPath = strings.TrimSpace(walPath)
+	recordPath = strings.TrimSpace(recordPath)
+	switch {
+	case walPath == "" && recordPath == "":
+		return billing{}, nil
+	case walPath == "":
+		return billing{}, errors.New("--delivery-records requires --delivery-wal")
+	case recordPath == "":
+		return billing{}, errors.New("--delivery-wal requires --delivery-records")
+	case len(destinations) == 0:
+		return billing{}, errors.New("--delivery-wal requires at least one --dest-ip-ports destination to bill")
+	}
+	return billing{walPath: walPath, recordPath: recordPath}, nil
 }
 
 // retentionWarning returns an early-hint warning for a retention window at or
@@ -411,7 +452,7 @@ func (s scoring) validate() error {
 
 func (s scoring) generic() bool { return s.mode == "generic" }
 
-func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, grace, reportInterval, retention time.Duration, stop <-chan struct{}, mode scoring) error {
+func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, grace, reportInterval, retention time.Duration, stop <-chan struct{}, mode scoring, bill billing) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
@@ -464,6 +505,37 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		defer fanout.Close()
 	}
 
+	// Delivery-session billing. The Reporter converts the fan-out's cumulative
+	// per-destination ledger into the delta-shaped records the W3 wire contract
+	// wants; see receiver/delivery/reporter.go for why that conversion is not
+	// optional. It is driven only from the reporter goroutine below and from the
+	// shutdown path after that goroutine has been joined, so it needs no lock of
+	// its own.
+	var biller *delivery.Reporter
+	if bill.enabled() {
+		wal, err := delivery.OpenWAL(bill.walPath)
+		if err != nil {
+			return err
+		}
+		defer wal.Close()
+		recordFile, err := delivery.OpenRecordFile(bill.recordPath)
+		if err != nil {
+			return err
+		}
+		defer recordFile.Close()
+		sink, err := delivery.NewWriterSink(recordFile)
+		if err != nil {
+			return err
+		}
+		tracker, err := delivery.NewTracker(wal)
+		if err != nil {
+			return err
+		}
+		if biller, err = delivery.NewReporter(tracker, sink); err != nil {
+			return err
+		}
+	}
+
 	health, err := receiver.NewHealth(healthMaxAge)
 	if err != nil {
 		return err
@@ -492,6 +564,11 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 			select {
 			case now := <-reporter.C:
 				publishWindows(trackers, metrics, now)
+				// Billing rides the same cadence as the window drain so a
+				// record interval and a metrics window describe the same span,
+				// which is what lets the /metrics ledger cross-check the
+				// records at all.
+				billDestinations(biller, fanout)
 			case <-reporterStop:
 				return
 			}
@@ -504,6 +581,29 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		<-reportDone
 	})
 	defer stopReporter()
+
+	// closeSessions emits the final record per destination. It runs after
+	// stopReporter has joined the reporter goroutine, so the Reporter is only
+	// ever touched from one goroutine at a time and needs no lock.
+	//
+	// It is deferred as well as called on the clean path: an error return that
+	// unwinds from here still owes every open session a terminating record, and
+	// a session with no final record is an invoice with no end.
+	closeSessions := sync.OnceFunc(func() {
+		stopReporter()
+		if biller == nil {
+			return
+		}
+		if err := biller.CloseAll(ledgerSamples(fanout), delivery.CloseShutdown); err != nil {
+			fmt.Fprintln(os.Stderr, "delivery-session close:", err)
+		}
+		if pending := biller.Pending(); pending != 0 {
+			// Bytes were accounted for but never accepted by the sink, so they
+			// will not be billed. Say so rather than exiting 0 in silence.
+			fmt.Fprintf(os.Stderr, "delivery-session records unshipped: %d\n", pending)
+		}
+	})
+	defer closeSessions()
 
 	errCh := make(chan error, len(feeds))
 	var sockets []*net.UDPConn
@@ -564,11 +664,49 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	// interval exits having scraped nothing but zeros, which is the same wrong
 	// answer -- a clean feed -- that this reporting path exists to prevent.
 	publishWindows(trackers, metrics, time.Now())
+	// Same argument for billing: a run shorter than one report interval has
+	// delivered bytes and emitted no record, so the final close is where its
+	// entire traffic gets billed.
+	closeSessions()
 	// Sockets are closed, but a reader goroutine can still be mid-packet: it may
 	// be blocked in Enqueue or between the read and Observe. Both scorers behind
 	// sessionScorer take their own lock in Receipt, so the receipt is a
 	// consistent snapshot even if a late Observe lands after it.
 	return printReceipt(scorer.SessionReceipt(), asJSON)
+}
+
+// ledgerSamples reads the fan-out's per-destination ledger as delivery samples.
+// A nil fan-out yields none, which is the no-destinations case.
+func ledgerSamples(fanout *receiver.Fanout) []delivery.LedgerSample {
+	if fanout == nil {
+		return nil
+	}
+	stats := fanout.DestinationStats()
+	samples := make([]delivery.LedgerSample, 0, len(stats))
+	for _, stat := range stats {
+		samples = append(samples, delivery.LedgerSample{
+			Destination: stat.Destination,
+			// These are cumulative process-lifetime totals. The Reporter is
+			// what turns them into the per-interval deltas the record carries;
+			// passing them anywhere that expects an increment double-bills.
+			Bytes:   stat.Bytes,
+			Packets: stat.Packets,
+		})
+	}
+	return samples
+}
+
+// billDestinations folds one ledger reading into the delivery sessions and
+// emits a record per destination. Billing errors are reported and not fatal: a
+// record that cannot ship is retained for retransmission by the Reporter, and
+// dropping the feed because an invoice was late would be the wrong trade.
+func billDestinations(biller *delivery.Reporter, fanout *receiver.Fanout) {
+	if biller == nil {
+		return
+	}
+	if err := biller.Tick(ledgerSamples(fanout)); err != nil {
+		fmt.Fprintln(os.Stderr, "delivery-session emit:", err)
+	}
 }
 
 // publishWindows scores every tracker through now and publishes the drained
