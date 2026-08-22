@@ -24,8 +24,8 @@ func (l *stubLedger) DestinationStats() []DestinationStat { return l.stats }
 // and unobservable in production.
 func TestDestinationMetricsExportEveryLedgerColumn(t *testing.T) {
 	ledger := &stubLedger{stats: []DestinationStat{
-		{Destination: "10.0.0.1:7000", Packets: 12, Bytes: 480, Drops: 3, WriteErrors: 1},
-		{Destination: "10.0.0.2:7000", Packets: 15, Bytes: 600, Drops: 0, WriteErrors: 0},
+		{TargetID: "0", Destination: "10.0.0.1:7000", Packets: 12, Bytes: 480, Drops: 3, WriteErrors: 1},
+		{TargetID: "1", Destination: "10.0.0.2:7000", Packets: 15, Bytes: 600, Drops: 0, WriteErrors: 0},
 	}}
 	registry := prometheus.NewRegistry()
 	if _, err := NewDestinationMetrics(registry, ledger); err != nil {
@@ -37,13 +37,13 @@ func TestDestinationMetricsExportEveryLedgerColumn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first := map[string]string{"dest": "10.0.0.1:7000", "index": "0"}
+	first := map[string]string{"dest": "10.0.0.1:7000", "target": "0"}
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_packets_total", first, 12)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_bytes_total", first, 480)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_drops_total", first, 3)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_write_errors_total", first, 1)
 
-	second := map[string]string{"dest": "10.0.0.2:7000", "index": "1"}
+	second := map[string]string{"dest": "10.0.0.2:7000", "target": "1"}
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_packets_total", second, 15)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_bytes_total", second, 600)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_drops_total", second, 0)
@@ -57,11 +57,11 @@ func TestDestinationMetricsExportEveryLedgerColumn(t *testing.T) {
 // alone would emit two metrics with identical label sets, which makes Gather
 // fail; because the collector shares a registry with the feed metrics, that
 // would return 500 for the whole /metrics endpoint rather than degrade this
-// one series. The index label makes the pair distinguishable by construction.
+// one series. The target label makes the pair distinguishable by construction.
 func TestDestinationMetricsKeepDuplicateDestinationsScrapeable(t *testing.T) {
 	ledger := &stubLedger{stats: []DestinationStat{
-		{Destination: "10.0.0.1:7000", Packets: 4},
-		{Destination: "10.0.0.1:7000", Packets: 9},
+		{TargetID: "0", Destination: "10.0.0.1:7000", Packets: 4},
+		{TargetID: "1", Destination: "10.0.0.1:7000", Packets: 9},
 	}}
 	registry := prometheus.NewRegistry()
 	if _, err := NewDestinationMetrics(registry, ledger); err != nil {
@@ -74,9 +74,9 @@ func TestDestinationMetricsKeepDuplicateDestinationsScrapeable(t *testing.T) {
 	}
 
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_packets_total",
-		map[string]string{"dest": "10.0.0.1:7000", "index": "0"}, 4)
+		map[string]string{"dest": "10.0.0.1:7000", "target": "0"}, 4)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_packets_total",
-		map[string]string{"dest": "10.0.0.1:7000", "index": "1"}, 9)
+		map[string]string{"dest": "10.0.0.1:7000", "target": "1"}, 9)
 
 	// Both series must survive as separate samples, not collapse into one.
 	if got := countSamples(t, families, "bcast_shred_gw_fanout_destination_packets_total"); got != 2 {
@@ -115,13 +115,13 @@ func TestDestinationMetricsTrackARealFanoutLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	healthy := map[string]string{"dest": "writer[0]", "index": "0"}
+	healthy := map[string]string{"dest": "writer[0]", "target": "0"}
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_packets_total", healthy, packets)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_bytes_total", healthy, float64(packets*len(packet)))
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_drops_total", healthy, 0)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_write_errors_total", healthy, 0)
 
-	broken := map[string]string{"dest": "writer[1]", "index": "1"}
+	broken := map[string]string{"dest": "writer[1]", "target": "1"}
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_packets_total", broken, 0)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_drops_total", broken, packets)
 	assertMetric(t, families, "bcast_shred_gw_fanout_destination_write_errors_total", broken, packets)

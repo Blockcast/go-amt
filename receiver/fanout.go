@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -80,6 +81,60 @@ type queuedPacket struct {
 	packet []byte
 }
 
+// Target is one fan-out destination together with the stable identity that the
+// delivery ledger keys it by.
+//
+// ID and Address are separate because they answer different questions and
+// change independently. Address is where bytes go; ID is who is being served.
+// Under a static --dest-ip-ports list the two are interchangeable, which is why
+// the ledger originally keyed on slice position and the billing plane keys on
+// the address string. Under a broker-derived grant table they are not:
+//
+//   - A subscriber can be re-granted a different endpoint. Keyed by address it
+//     becomes a different billing subject mid-flight; keyed by ID its counters
+//     follow it.
+//   - Two grants can resolve to one address (a host behind NAT, or a hostname
+//     and its literal IP). Address is then not unique and cannot be a key.
+//   - Revoking a grant in the middle of the list shifts every later
+//     destination down one position. Keyed by position, every subscriber after
+//     the revoked one would inherit its neighbour's packet and byte totals.
+//     That is a silent mis-bill, not a metrics wart, which is why position is
+//     not a key here at all.
+type Target struct {
+	// ID is the stable identity of whoever is served — a broker grant or
+	// subscriber ID. It must be unique within a target set and non-empty.
+	ID string
+	// Address is the UDP destination, as host:port.
+	Address string
+}
+
+// destCounters is one destination's ledger. It is referenced by pointer so a
+// reconcile can carry a surviving target's counters into the new table by
+// copying the pointer, leaving the running totals untouched and monotonic.
+type destCounters struct {
+	packets atomic.Uint64
+	bytes   atomic.Uint64
+	drops   atomic.Uint64
+	errors  atomic.Uint64
+}
+
+// destination is one entry in a table: identity, where to write, and the
+// counters to charge.
+type destination struct {
+	id       string
+	name     string
+	addr     *net.UDPAddr
+	writer   io.WriteCloser
+	counters *destCounters
+}
+
+// destTable is an immutable snapshot of the destination set. Once published
+// through Fanout.table it is never mutated, so the worker can range over it
+// without synchronization; a reconcile builds a whole new one.
+type destTable struct {
+	entries []destination
+}
+
 // Fanout copies packets into a bounded ring and writes each packet to every
 // destination from a dedicated worker. Enqueue never blocks the ingress path.
 //
@@ -89,12 +144,10 @@ type queuedPacket struct {
 // single-socket loop holds p50 161 microseconds while 1-shard and 8-shard
 // variants degrade to 276 and 283 microseconds respectively.
 type Fanout struct {
-	writers  []io.WriteCloser
 	queue    chan queuedPacket
 	observer EgressObserver
 
 	udpConn *ipv4.PacketConn
-	udpDest []*net.UDPAddr
 	// next rotates which destination is served first. Without it the send
 	// order is fixed, which hands a persistent ~4 microsecond-per-position
 	// latency advantage to whichever subscriber sits early in the list. An
@@ -102,25 +155,33 @@ type Fanout struct {
 	// subscriber index.
 	next int
 
+	// table is the destination set the worker is currently serving. It is
+	// swapped wholesale by ReconcileDestinations rather than mutated in place,
+	// so the worker never holds a lock on the egress path: it loads the
+	// pointer once per packet and that snapshot cannot change underneath it.
+	//
+	// Loading once per packet is load-bearing, not incidental. Charging the
+	// ledger and building the rotated batch must agree on the same destination
+	// set, and a second Load mid-packet could observe a reconcile and
+	// attribute a send to the wrong subscriber.
+	table atomic.Pointer[destTable]
+
 	mu        sync.RWMutex
 	closed    bool
 	closeOnce sync.Once
 	closeErr  error
 	wg        sync.WaitGroup
 
+	// reconcileMu serialises reconciles against each other. The worker does
+	// not take it: it reads through table's atomic pointer. This exists only
+	// so two concurrent reconciles cannot both read the old table and each
+	// write a swap that loses the other's carried-over counters.
+	reconcileMu sync.Mutex
+
 	queuedPackets  atomic.Uint64
 	droppedPackets atomic.Uint64
 	egressPackets  atomic.Uint64
 	writeErrors    atomic.Uint64
-
-	// Per-destination ledger, indexed by destination position. Only the worker
-	// goroutine writes these; they are atomic because DestinationStats reads
-	// them from the caller's goroutine.
-	destNames   []string
-	destPackets []atomic.Uint64
-	destBytes   []atomic.Uint64
-	destDrops   []atomic.Uint64
-	destErrors  []atomic.Uint64
 
 	// sendBatch is writeUDPPacketBatch in production. It is a field so tests
 	// can drive partial sends, which is the only condition under which batch
@@ -150,6 +211,11 @@ type Fanout struct {
 // being attempted, and blaming them for a fault they did not cause would point
 // at the wrong subscriber.
 type DestinationStat struct {
+	// TargetID is the stable identity this destination is billed and charged
+	// under. It survives a reconcile that moves the destination's position or
+	// changes its address; the slice position does not, so nothing downstream
+	// should key on position.
+	TargetID    string
 	Destination string
 	Packets     uint64
 	Bytes       uint64
@@ -174,48 +240,54 @@ func NewFanout(writers []io.WriteCloser, queueCapacity int, observer EgressObser
 	}
 
 	f := &Fanout{
-		writers:  append([]io.WriteCloser(nil), writers...),
 		queue:    make(chan queuedPacket, queueCapacity),
 		observer: observer,
 	}
-	names := make([]string, len(writers))
-	for i := range writers {
-		names[i] = fmt.Sprintf("writer[%d]", i)
+	entries := make([]destination, len(writers))
+	for i, writer := range writers {
+		name := fmt.Sprintf("writer[%d]", i)
+		entries[i] = destination{
+			id:       strconv.Itoa(i),
+			name:     name,
+			writer:   writer,
+			counters: new(destCounters),
+		}
 	}
-	f.initDestinations(names)
+	f.publish(&destTable{entries: entries})
 	f.wg.Add(1)
 	go f.run()
 	return f, nil
 }
 
-// initDestinations sizes the per-destination ledger. It must be called before
-// the worker starts, because the worker indexes these slices without a lock.
-func (f *Fanout) initDestinations(names []string) {
-	f.destNames = names
-	f.destPackets = make([]atomic.Uint64, len(names))
-	f.destBytes = make([]atomic.Uint64, len(names))
-	f.destDrops = make([]atomic.Uint64, len(names))
-	f.destErrors = make([]atomic.Uint64, len(names))
+// publish installs a table and completes any one-time wiring the worker needs.
+// It must be called before the worker starts.
+func (f *Fanout) publish(table *destTable) {
+	f.table.Store(table)
 	if f.sendBatch == nil {
 		f.sendBatch = writeUDPPacketBatch
 	}
 }
 
-// DestinationStats returns the per-destination delivery ledger, indexed in
-// configured destination order.
+// DestinationStats returns the per-destination delivery ledger, in the current
+// table's order.
 //
 // This is the per-subscriber accounting surface: process-wide Stats cannot
 // answer "is destination 7 actually receiving its stream", and the per-feed
 // EgressObserver cannot either, because one feed fans out to every subscriber.
+//
+// The snapshot is of one table. A concurrent reconcile is not torn across it:
+// the whole set either predates the swap or follows it.
 func (f *Fanout) DestinationStats() []DestinationStat {
-	stats := make([]DestinationStat, len(f.destNames))
-	for i := range f.destNames {
+	entries := f.table.Load().entries
+	stats := make([]DestinationStat, len(entries))
+	for i, entry := range entries {
 		stats[i] = DestinationStat{
-			Destination: f.destNames[i],
-			Packets:     f.destPackets[i].Load(),
-			Bytes:       f.destBytes[i].Load(),
-			Drops:       f.destDrops[i].Load(),
-			WriteErrors: f.destErrors[i].Load(),
+			TargetID:    entry.id,
+			Destination: entry.name,
+			Packets:     entry.counters.packets.Load(),
+			Bytes:       entry.counters.bytes.Load(),
+			Drops:       entry.counters.drops.Load(),
+			WriteErrors: entry.counters.errors.Load(),
 		}
 	}
 	return stats
@@ -224,24 +296,31 @@ func (f *Fanout) DestinationStats() []DestinationStat {
 // NewUDPFanout starts a bounded fan-out worker over a single UDP socket. Each
 // packet is sent to every destination as one batch, with the destination order
 // rotated per packet so no subscriber holds a fixed position advantage.
+//
+// Destinations are addresses without a separate identity, so each is given a
+// target ID equal to its position in the list. That is the demo and
+// static-config shape. A caller with real subscriber identity — a broker grant
+// table — should use NewUDPFanoutTargets so the ledger keys on the grant.
 func NewUDPFanout(destinations []string, queueCapacity int, observer EgressObserver) (*Fanout, error) {
-	if len(destinations) == 0 {
+	targets := make([]Target, len(destinations))
+	for i, destination := range destinations {
+		targets[i] = Target{ID: strconv.Itoa(i), Address: destination}
+	}
+	return NewUDPFanoutTargets(targets, queueCapacity, observer)
+}
+
+// NewUDPFanoutTargets starts a bounded UDP fan-out over identified targets.
+func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObserver) (*Fanout, error) {
+	if len(targets) == 0 {
 		return nil, errors.New("fan-out requires at least one destination")
 	}
 	if queueCapacity <= 0 {
 		return nil, errors.New("fan-out queue capacity must be positive")
 	}
 
-	addresses := make([]*net.UDPAddr, 0, len(destinations))
-	for _, destination := range destinations {
-		address, err := net.ResolveUDPAddr("udp4", destination)
-		if err != nil {
-			return nil, fmt.Errorf("resolve UDP destination %q: %w", destination, err)
-		}
-		if address.IP == nil || address.IP.To4() == nil {
-			return nil, fmt.Errorf("UDP destination %q is not IPv4", destination)
-		}
-		addresses = append(addresses, address)
+	entries, err := resolveTargets(targets, nil)
+	if err != nil {
+		return nil, err
 	}
 
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
@@ -253,16 +332,120 @@ func NewUDPFanout(destinations []string, queueCapacity int, observer EgressObser
 		queue:    make(chan queuedPacket, queueCapacity),
 		observer: observer,
 		udpConn:  ipv4.NewPacketConn(conn),
-		udpDest:  addresses,
 	}
-	names := make([]string, len(addresses))
-	for i, address := range addresses {
-		names[i] = address.String()
-	}
-	f.initDestinations(names)
+	f.publish(&destTable{entries: entries})
 	f.wg.Add(1)
 	go f.run()
 	return f, nil
+}
+
+// ReconcileDestinations replaces the served target set and reports which
+// targets left it.
+//
+// This is the seam a broker-derived grant table drives: the destination set is
+// no longer fixed at construction, so a grant can be issued or revoked while
+// the sender runs. It is valid only on a UDP fan-out — the io.WriteCloser
+// constructor owns its writers' lifetimes, and swapping those out here would
+// leak or double-close them.
+//
+// Counters follow the TARGET, not its position. A target present in both the
+// old and new set keeps the identical *destCounters, so its totals stay
+// monotonic across a reconcile that inserts or removes its neighbours. Without
+// that, revoking one grant would renumber every later destination and hand
+// each one its neighbour's running totals.
+//
+// A departing target's counters are dropped rather than retained. That is
+// deliberate and safe: the delivery ledger is operational, not the billing
+// artifact (the WAL and the session records are), and delivery.Reporter
+// already treats a ledger that went backwards as "the ledger was rebuilt" and
+// takes the current value as the delta rather than underflowing.
+//
+// The returned targets are the ones that left. They are the sender's only
+// authenticated per-destination teardown signal: until this existed the set
+// never shrank, so delivery.CloseTicketExpired — "the broker grant backing the
+// session lapsed" — was a wire-contract value with no reachable producer, and
+// the only close the sender could attest to was CloseShutdown. The caller is
+// expected to close those sessions; this method does not reach into the
+// billing plane itself.
+func (f *Fanout) ReconcileDestinations(targets []Target) ([]Target, error) {
+	if f.udpConn == nil {
+		return nil, errors.New("fan-out: reconcile is only supported on a UDP fan-out")
+	}
+	if len(targets) == 0 {
+		// An empty grant table is refused rather than served. Accepting it
+		// would silently stop delivery to everyone while the process kept
+		// reporting healthy, and a broker returning nothing is far more often
+		// a broker fault than a genuine "no subscribers" state.
+		return nil, errors.New("fan-out requires at least one destination")
+	}
+
+	f.reconcileMu.Lock()
+	defer f.reconcileMu.Unlock()
+
+	// Read the old table under reconcileMu so two concurrent reconciles cannot
+	// both carry counters forward from the same pre-swap snapshot.
+	previous := f.table.Load().entries
+	carry := make(map[string]*destCounters, len(previous))
+	for _, entry := range previous {
+		carry[entry.id] = entry.counters
+	}
+
+	entries, err := resolveTargets(targets, carry)
+	if err != nil {
+		return nil, err
+	}
+
+	retained := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		retained[entry.id] = struct{}{}
+	}
+	var removed []Target
+	for _, entry := range previous {
+		if _, kept := retained[entry.id]; !kept {
+			removed = append(removed, Target{ID: entry.id, Address: entry.name})
+		}
+	}
+
+	f.table.Store(&destTable{entries: entries})
+	return removed, nil
+}
+
+// resolveTargets validates a target set and builds its table entries, reusing
+// counters from carry for targets that already existed.
+func resolveTargets(targets []Target, carry map[string]*destCounters) ([]destination, error) {
+	entries := make([]destination, 0, len(targets))
+	seen := make(map[string]struct{}, len(targets))
+	for _, target := range targets {
+		if target.ID == "" {
+			return nil, fmt.Errorf("fan-out target for %q has no ID", target.Address)
+		}
+		if _, duplicate := seen[target.ID]; duplicate {
+			// Two entries under one ID would share a ledger row, so their
+			// traffic would be summed and neither could be audited alone.
+			return nil, fmt.Errorf("fan-out target ID %q appears more than once", target.ID)
+		}
+		seen[target.ID] = struct{}{}
+
+		address, err := net.ResolveUDPAddr("udp4", target.Address)
+		if err != nil {
+			return nil, fmt.Errorf("resolve UDP destination %q: %w", target.Address, err)
+		}
+		if address.IP == nil || address.IP.To4() == nil {
+			return nil, fmt.Errorf("UDP destination %q is not IPv4", target.Address)
+		}
+
+		counters := carry[target.ID]
+		if counters == nil {
+			counters = new(destCounters)
+		}
+		entries = append(entries, destination{
+			id:       target.ID,
+			name:     address.String(),
+			addr:     address,
+			counters: counters,
+		})
+	}
+	return entries, nil
 }
 
 // Enqueue copies packet into the bounded ring, attributing it to feedID.
@@ -316,8 +499,8 @@ func (f *Fanout) Close() error {
 			return
 		}
 		var errs []error
-		for _, writer := range f.writers {
-			if err := writer.Close(); err != nil {
+		for _, entry := range f.table.Load().entries {
+			if err := entry.writer.Close(); err != nil {
 				errs = append(errs, err)
 			}
 		}
@@ -339,26 +522,30 @@ func (f *Fanout) run() {
 // deliver writes one packet to every destination and reports how many landed.
 func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
 	size := uint64(len(packet))
+	// One Load for the whole packet. Charging and batch construction must
+	// agree on the same destination set; re-loading would let a reconcile land
+	// mid-packet and attribute a send to the wrong subscriber.
+	entries := f.table.Load().entries
 	if f.udpConn == nil {
-		for i, writer := range f.writers {
-			n, err := writer.Write(packet)
+		for _, entry := range entries {
+			n, err := entry.writer.Write(packet)
 			if err != nil || n != len(packet) {
 				// This path attempts every writer, so a failure here is always
 				// attributable to the destination that produced it.
-				f.destDrops[i].Add(1)
-				f.destErrors[i].Add(1)
+				entry.counters.drops.Add(1)
+				entry.counters.errors.Add(1)
 				failed++
 				continue
 			}
-			f.destPackets[i].Add(1)
-			f.destBytes[i].Add(size)
+			entry.counters.packets.Add(1)
+			entry.counters.bytes.Add(size)
 			delivered++
 		}
 		return delivered, failed
 	}
 
-	count := len(f.udpDest)
-	messages, offset := f.rotatedMessages(packet)
+	count := len(entries)
+	messages, offset := f.rotatedMessages(entries, packet)
 
 	written, err := f.sendBatch(f.udpConn, messages, runtime.GOOS == "linux")
 	if written < 0 || written > count {
@@ -370,12 +557,12 @@ func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
 	// across every destination as the rotation walks, which is precisely the
 	// fault this ledger exists to localise.
 	for i := 0; i < written; i++ {
-		destination := (offset + i) % count
-		f.destPackets[destination].Add(1)
-		f.destBytes[destination].Add(size)
+		counters := entries[(offset+i)%count].counters
+		counters.packets.Add(1)
+		counters.bytes.Add(size)
 	}
 	for i := written; i < count; i++ {
-		f.destDrops[(offset+i)%count].Add(1)
+		entries[(offset+i)%count].counters.drops.Add(1)
 	}
 	// sendmmsg stops at the first failure and abandons the rest of the batch,
 	// so exactly one destination earns the write error; the rest were never
@@ -391,7 +578,7 @@ func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
 	// range, and the non-Linux loop below also leaves the failing message at
 	// index written, so this holds on both paths.
 	if written < count {
-		f.destErrors[(offset+written)%count].Add(1)
+		entries[(offset+written)%count].counters.errors.Add(1)
 	}
 
 	delivered = uint64(written)
@@ -422,9 +609,9 @@ func (f *Fanout) report(feedID string, delivered, failed uint64) {
 	}
 }
 
-// rotatedMessages builds the send batch for one packet, returning the batch
-// and the destination offset it starts at, and advances the rotation by
-// exactly one position.
+// rotatedMessages builds the send batch for one packet from entries, returning
+// the batch and the destination offset it starts at, and advances the rotation
+// by exactly one position.
 //
 // Every destination appears exactly once per batch, so rotation changes the
 // ORDER of a send, never its membership: no destination can be skipped or
@@ -434,19 +621,22 @@ func (f *Fanout) report(feedID string, delivered, failed uint64) {
 // The returned offset is what lets a caller map a batch slot back to the
 // destination it carried; without it a partial send cannot be attributed.
 //
+// f.next is taken modulo the CURRENT count rather than trusted, because a
+// reconcile can shrink the table between packets and leave next past its end.
+//
 // The caller must be the single fan-out worker goroutine; f.next is
 // deliberately unsynchronized because only that goroutine touches it.
-func (f *Fanout) rotatedMessages(packet []byte) ([]ipv4.Message, int) {
-	count := len(f.udpDest)
-	offset := f.next
+func (f *Fanout) rotatedMessages(entries []destination, packet []byte) ([]ipv4.Message, int) {
+	count := len(entries)
+	offset := f.next % count
 	messages := make([]ipv4.Message, count)
-	for i := range f.udpDest {
+	for i := range entries {
 		index := (offset + i) % count
-		messages[i] = ipv4.Message{Buffers: [][]byte{packet}, Addr: f.udpDest[index]}
+		messages[i] = ipv4.Message{Buffers: [][]byte{packet}, Addr: entries[index].addr}
 	}
 	// Advance once per packet, not once per destination, so the starting
 	// offset walks the destination list one position at a time.
-	f.next = (f.next + 1) % count
+	f.next = (offset + 1) % count
 	return messages, offset
 }
 

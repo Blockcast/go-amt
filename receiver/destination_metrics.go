@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -31,16 +30,22 @@ var _ DestinationLedger = (*Fanout)(nil)
 // destination count — which is precisely the process-wide average a
 // per-destination shortfall can hide inside.
 //
-// Series are labelled by both destination address and configured index. The
-// index is not redundant: destinations are not guaranteed unique, because
-// NewUDPFanout resolves each --dest-ip-ports entry independently and two
-// distinct entries can resolve to the same address (a hostname and its
-// literal IP, most obviously). Two metrics with identical label sets make
-// Gather fail, which would return 500 for the whole /metrics endpoint and take
-// the pre-existing feed series down with it. Index is the slice position, so
-// it is unique by construction. It also happens to be the key the send path
-// reasons in: the ledger is ordered by configured destination, and rotation
-// exists to stop any one index holding a fixed position advantage.
+// Series are labelled by destination address and by stable target ID. The
+// target ID is not redundant with the address: destinations are not guaranteed
+// unique, because targets are resolved independently and two distinct entries
+// can resolve to the same address (a hostname and its literal IP, most
+// obviously). Two metrics with identical label sets make Gather fail, which
+// would return 500 for the whole /metrics endpoint and take the pre-existing
+// feed series down with it. Target ID is unique within a table by
+// construction, because resolveTargets rejects a duplicate.
+//
+// The label carries the TARGET ID and not the slice position, even though
+// under a static --dest-ip-ports list the two have the same value (the target
+// ID assigned to the Nth entry is "N"). They diverge the moment the table is
+// reconciled: revoking one grant renumbers every later destination, so a
+// positional label would move a subscriber's whole history onto its
+// neighbour's series and read as a counter reset on both. The target ID
+// survives the reconcile, so the series does too.
 type DestinationMetrics struct {
 	ledger DestinationLedger
 
@@ -63,7 +68,7 @@ func NewDestinationMetrics(registerer prometheus.Registerer, ledger DestinationL
 		return nil, errors.New("destination metrics ledger is nil")
 	}
 
-	labels := []string{"dest", "index"}
+	labels := []string{"dest", "target"}
 	metrics := &DestinationMetrics{
 		ledger: ledger,
 		packetsDesc: prometheus.NewDesc(
@@ -130,11 +135,10 @@ func (m *DestinationMetrics) Describe(ch chan<- *prometheus.Desc) {
 // come from one DestinationStats snapshot, so a scrape cannot mix reads taken
 // either side of a counter update for the same destination.
 func (m *DestinationMetrics) Collect(ch chan<- prometheus.Metric) {
-	for index, stat := range m.ledger.DestinationStats() {
-		position := strconv.Itoa(index)
-		ch <- prometheus.MustNewConstMetric(m.packetsDesc, prometheus.CounterValue, float64(stat.Packets), stat.Destination, position)
-		ch <- prometheus.MustNewConstMetric(m.bytesDesc, prometheus.CounterValue, float64(stat.Bytes), stat.Destination, position)
-		ch <- prometheus.MustNewConstMetric(m.dropsDesc, prometheus.CounterValue, float64(stat.Drops), stat.Destination, position)
-		ch <- prometheus.MustNewConstMetric(m.writeErrorsDesc, prometheus.CounterValue, float64(stat.WriteErrors), stat.Destination, position)
+	for _, stat := range m.ledger.DestinationStats() {
+		ch <- prometheus.MustNewConstMetric(m.packetsDesc, prometheus.CounterValue, float64(stat.Packets), stat.Destination, stat.TargetID)
+		ch <- prometheus.MustNewConstMetric(m.bytesDesc, prometheus.CounterValue, float64(stat.Bytes), stat.Destination, stat.TargetID)
+		ch <- prometheus.MustNewConstMetric(m.dropsDesc, prometheus.CounterValue, float64(stat.Drops), stat.Destination, stat.TargetID)
+		ch <- prometheus.MustNewConstMetric(m.writeErrorsDesc, prometheus.CounterValue, float64(stat.WriteErrors), stat.Destination, stat.TargetID)
 	}
 }

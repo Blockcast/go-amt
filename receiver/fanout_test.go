@@ -5,6 +5,8 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -299,15 +301,12 @@ func equalPackets(a, b [][]byte) bool {
 // batch without ever changing its membership.
 func TestFanoutRotatesDestinationOrder(t *testing.T) {
 	const count = 4
-	fanout := &Fanout{udpDest: make([]*net.UDPAddr, count)}
-	for i := range fanout.udpDest {
-		fanout.udpDest[i] = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20000 + i}
-	}
+	fanout := newLoopbackFanout(count)
 
 	packet := []byte{0x01, 0x02}
 	leadCounts := make(map[int]int, count)
 	for round := 0; round < count*3; round++ {
-		messages, _ := fanout.rotatedMessages(packet)
+		messages, _ := fanout.rotatedMessages(fanout.table.Load().entries, packet)
 		if len(messages) != count {
 			t.Fatalf("round %d produced %d messages, want %d", round, len(messages), count)
 		}
@@ -603,7 +602,7 @@ func TestUDPFanoutLedgerLocalisesTheBrokenDestination(t *testing.T) {
 		{name: "non_linux_loop_reports_count_with_error", err: errors.New("destination unavailable")},
 	} {
 		t.Run(contract.name, func(t *testing.T) {
-			fanout := &Fanout{udpDest: make([]*net.UDPAddr, count)}
+			fanout := newLoopbackFanout(count)
 			// deliver branches on udpConn, so the UDP path needs a real socket
 			// even though the stubbed sendBatch never writes to it.
 			conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
@@ -613,11 +612,6 @@ func TestUDPFanoutLedgerLocalisesTheBrokenDestination(t *testing.T) {
 			defer conn.Close()
 			fanout.udpConn = ipv4.NewPacketConn(conn)
 
-			names := make([]string, count)
-			for i := range fanout.udpDest {
-				fanout.udpDest[i] = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20000 + i}
-				names[i] = fanout.udpDest[i].String()
-			}
 			// Stop the batch at whichever slot carries the broken destination,
 			// which is where both contracts agree the first failure lands.
 			fanout.sendBatch = func(_ *ipv4.PacketConn, messages []ipv4.Message, _ bool) (int, error) {
@@ -628,7 +622,6 @@ func TestUDPFanoutLedgerLocalisesTheBrokenDestination(t *testing.T) {
 				}
 				return len(messages), nil
 			}
-			fanout.initDestinations(names)
 
 			for round := 0; round < rounds; round++ {
 				fanout.deliver([]byte("shred"))
@@ -744,5 +737,321 @@ func TestCloseDeliversStillQueuedPacketsIntoTheLedger(t *testing.T) {
 	// sampling before draining.
 	if finalLedger.Packets <= queuedLedger.Packets {
 		t.Error("the ledger did not grow across Close; the ordering hazard this pins would not exist")
+	}
+}
+
+// newLoopbackFanout builds a Fanout serving count loopback destinations with
+// no socket and no worker, for tests that drive deliver and rotatedMessages
+// directly. Destination i is 127.0.0.1:2000i and carries target ID "i", which
+// matches what NewUDPFanout assigns a static list.
+func newLoopbackFanout(count int) *Fanout {
+	entries := make([]destination, count)
+	for i := range entries {
+		address := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 20000 + i}
+		entries[i] = destination{
+			id:       strconv.Itoa(i),
+			name:     address.String(),
+			addr:     address,
+			counters: new(destCounters),
+		}
+	}
+	fanout := &Fanout{}
+	fanout.publish(&destTable{entries: entries})
+	return fanout
+}
+
+// statsByTarget indexes a ledger snapshot by target ID, which is the only key
+// that survives a reconcile.
+func statsByTarget(fanout *Fanout) map[string]DestinationStat {
+	stats := fanout.DestinationStats()
+	byTarget := make(map[string]DestinationStat, len(stats))
+	for _, stat := range stats {
+		byTarget[stat.TargetID] = stat
+	}
+	return byTarget
+}
+
+// A reconcile that removes a target must not move any other target's totals.
+//
+// This is the regression that makes a dynamic grant table safe to bill on. The
+// ledger used to be indexed by slice position, so revoking the target at
+// position 1 shifted positions 2 and 3 down and each inherited its
+// neighbour's running totals — a silent mis-bill that no counter would have
+// flagged, because every value stayed monotonic.
+func TestReconcilePreservesSurvivingTargetCountersWhenATargetIsRevoked(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+		{ID: "grant-c", Address: "127.0.0.1:20003"},
+	}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	// Charge distinct, recognisable totals so a shifted row is obvious.
+	for _, entry := range fanout.table.Load().entries {
+		switch entry.id {
+		case "grant-a":
+			entry.counters.packets.Add(11)
+			entry.counters.bytes.Add(1100)
+		case "grant-b":
+			entry.counters.packets.Add(22)
+			entry.counters.bytes.Add(2200)
+		case "grant-c":
+			entry.counters.packets.Add(33)
+			entry.counters.bytes.Add(3300)
+		}
+	}
+
+	removed, err := fanout.ReconcileDestinations([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-c", Address: "127.0.0.1:20003"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(removed) != 1 || removed[0].ID != "grant-b" {
+		t.Fatalf("reconcile reported removed %+v, want exactly grant-b", removed)
+	}
+
+	after := statsByTarget(fanout)
+	if len(after) != 2 {
+		t.Fatalf("ledger holds %d targets after reconcile, want 2: %+v", len(after), after)
+	}
+	// grant-c moved from position 2 to position 1. Under positional keying it
+	// would now be reporting grant-b's 22/2200.
+	if got := after["grant-c"]; got.Packets != 33 || got.Bytes != 3300 {
+		t.Errorf("grant-c reports %d packets / %d bytes after moving position, want 33/3300 (%+v)", got.Packets, got.Bytes, got)
+	}
+	if got := after["grant-a"]; got.Packets != 11 || got.Bytes != 1100 {
+		t.Errorf("grant-a reports %d packets / %d bytes, want 11/1100 (%+v)", got.Packets, got.Bytes, got)
+	}
+	if _, present := after["grant-b"]; present {
+		t.Error("revoked grant-b is still exported in the ledger")
+	}
+}
+
+// A target whose endpoint is re-granted keeps its counters: it is the same
+// subscriber, so its series must stay monotonic rather than resetting.
+func TestReconcileCarriesCountersAcrossAnAddressChange(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{{ID: "grant-a", Address: "127.0.0.1:20001"}}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	fanout.table.Load().entries[0].counters.packets.Add(7)
+
+	if _, err := fanout.ReconcileDestinations([]Target{{ID: "grant-a", Address: "127.0.0.1:29999"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := fanout.DestinationStats()
+	if len(stats) != 1 {
+		t.Fatalf("ledger holds %d targets, want 1", len(stats))
+	}
+	if stats[0].Packets != 7 {
+		t.Errorf("re-granted target reset to %d packets, want 7 carried over", stats[0].Packets)
+	}
+	if stats[0].Destination != "127.0.0.1:29999" {
+		t.Errorf("target address is %q, want the re-granted 127.0.0.1:29999", stats[0].Destination)
+	}
+}
+
+// A newly granted target starts at zero rather than inheriting whatever sat at
+// its position before.
+func TestReconcileStartsANewTargetAtZero(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{{ID: "grant-a", Address: "127.0.0.1:20001"}}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	fanout.table.Load().entries[0].counters.packets.Add(5)
+
+	if _, err := fanout.ReconcileDestinations([]Target{
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	after := statsByTarget(fanout)
+	if got := after["grant-b"]; got.Packets != 0 {
+		t.Errorf("new grant-b starts at %d packets, want 0 (%+v)", got.Packets, got)
+	}
+	// grant-a moved from position 0 to position 1 and must still hold its own 5.
+	if got := after["grant-a"]; got.Packets != 5 {
+		t.Errorf("grant-a reports %d packets after moving position, want 5 (%+v)", got.Packets, got)
+	}
+}
+
+func TestReconcileRejectsUnusableTargetSets(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		targets []Target
+		wantErr string
+	}{
+		{name: "empty set", targets: nil, wantErr: "at least one destination"},
+		{
+			name:    "duplicate target ID",
+			targets: []Target{{ID: "dup", Address: "127.0.0.1:20001"}, {ID: "dup", Address: "127.0.0.1:20002"}},
+			wantErr: "appears more than once",
+		},
+		{
+			name:    "missing target ID",
+			targets: []Target{{ID: "", Address: "127.0.0.1:20001"}},
+			wantErr: "has no ID",
+		},
+		{
+			name:    "unresolvable address",
+			targets: []Target{{ID: "grant-a", Address: "not-an-address"}},
+			wantErr: "resolve UDP destination",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fanout, err := NewUDPFanoutTargets([]Target{{ID: "grant-a", Address: "127.0.0.1:20001"}}, 16, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fanout.Close()
+
+			_, err = fanout.ReconcileDestinations(testCase.targets)
+			if err == nil || !strings.Contains(err.Error(), testCase.wantErr) {
+				t.Fatalf("reconcile error = %v, want one containing %q", err, testCase.wantErr)
+			}
+			// A rejected reconcile must leave the served set untouched, or a
+			// malformed grant table would take delivery down.
+			if stats := fanout.DestinationStats(); len(stats) != 1 || stats[0].TargetID != "grant-a" {
+				t.Errorf("rejected reconcile disturbed the served set: %+v", stats)
+			}
+		})
+	}
+}
+
+// Reconcile is refused on the io.WriteCloser fan-out because that constructor
+// owns its writers' lifetimes; swapping them here would leak or double-close.
+func TestReconcileIsRefusedOnAWriterFanout(t *testing.T) {
+	fanout, err := NewFanout([]io.WriteCloser{&recordingWriter{}}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	if _, err := fanout.ReconcileDestinations([]Target{{ID: "grant-a", Address: "127.0.0.1:20001"}}); err == nil ||
+		!strings.Contains(err.Error(), "only supported on a UDP fan-out") {
+		t.Fatalf("reconcile on a writer fan-out returned %v, want a refusal", err)
+	}
+}
+
+// Rotation must stay in range when a reconcile shrinks the table. The worker
+// advances next once per packet, so a table that shrinks below the current
+// next would index past the end on the following packet.
+func TestReconcileShrinkKeepsRotationInRange(t *testing.T) {
+	fanout := newLoopbackFanout(4)
+	packet := []byte("shred")
+	for round := 0; round < 4; round++ {
+		fanout.rotatedMessages(fanout.table.Load().entries, packet)
+	}
+	// next now sits at 0..3; force it to the last position so a shrink to one
+	// destination leaves it out of range.
+	fanout.next = 3
+
+	entries := fanout.table.Load().entries[:1]
+	fanout.publish(&destTable{entries: entries})
+
+	messages, offset := fanout.rotatedMessages(fanout.table.Load().entries, packet)
+	if len(messages) != 1 {
+		t.Fatalf("produced %d messages after shrink, want 1", len(messages))
+	}
+	if offset != 0 {
+		t.Errorf("offset %d after shrink, want 0 — next must be taken modulo the current count", offset)
+	}
+}
+
+// Reconciling while the worker delivers must be race-free and must not lose a
+// packet. This is the test the CI `race` job exists to run: the whole reason
+// the table sits behind an atomic.Pointer rather than a mutex is that the
+// egress path must not take a lock, so the swap has to be safe without one.
+//
+// It also pins the accounting invariant across a swap. Every packet the worker
+// processes is charged to some destination as either a delivery or a drop, so
+// for a target present throughout, packets+drops must equal the number of
+// packets processed while it was in the table — never more, which is what
+// double-charging across a swap would look like.
+func TestReconcileIsSafeWhileTheWorkerDelivers(t *testing.T) {
+	listener, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	stable := listener.LocalAddr().String()
+
+	fanout, err := NewUDPFanoutTargets([]Target{{ID: "stable", Address: stable}}, 1024, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	// Drain the listener so a full socket buffer cannot stall the worker.
+	done := make(chan struct{})
+	go func() {
+		buffer := make([]byte, 2048)
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_ = listener.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+			_, _, _ = listener.ReadFromUDP(buffer)
+		}
+	}()
+	defer close(done)
+
+	var writers sync.WaitGroup
+	writers.Add(1)
+	go func() {
+		defer writers.Done()
+		for i := 0; i < 2000; i++ {
+			fanout.Enqueue("feed", []byte("shred"))
+		}
+	}()
+
+	writers.Add(1)
+	go func() {
+		defer writers.Done()
+		for i := 0; i < 200; i++ {
+			// Churn the set around a target that is always present, so the
+			// stable target's position moves underneath the running worker.
+			targets := []Target{{ID: "stable", Address: stable}}
+			if i%2 == 0 {
+				targets = append([]Target{{ID: "churn", Address: "127.0.0.1:20099"}}, targets...)
+			}
+			if _, err := fanout.ReconcileDestinations(targets); err != nil {
+				t.Errorf("reconcile %d failed: %v", i, err)
+				return
+			}
+		}
+	}()
+
+	writers.Wait()
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	after := statsByTarget(fanout)
+	stat, present := after["stable"]
+	if !present {
+		t.Fatalf("stable target vanished from the ledger: %+v", after)
+	}
+	// The stable target was in the table for every packet, so it must be
+	// charged exactly once per packet the worker processed.
+	processed := fanout.Stats().QueuedPackets
+	if got := stat.Packets + stat.Drops; got != processed {
+		t.Errorf("stable target charged %d packets+drops over %d processed; a swap either dropped or double-charged its accounting (%+v)",
+			got, processed, stat)
 	}
 }
