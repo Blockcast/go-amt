@@ -3,6 +3,7 @@ package amt
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"sync"
@@ -53,6 +54,64 @@ func TestFakeRelayCompletesHandshake(t *testing.T) {
 	}
 }
 
+// TestHandshakeAnswersQueryWithCurrentStateUpdate pins the invariant that a
+// handshake completes the Query -> Update exchange even with no subscriptions,
+// leaving the protocol in Active rather than parked in Querying.
+//
+// This is the regression guard for BLO-28805, and it is worth stating why it
+// asserts on the protocol state rather than on RelayManager.State(): the manager
+// reported Active throughout that bug. Only the protocol state distinguished a
+// keepalive-capable tunnel from one that would fail every keepalive with
+// InvalidState and reconnect every intervalTime*2 forever. On the cgo path this
+// mirrors amt-protocol's GatewayState (protocol_cgo.go), which is the state
+// request_membership actually gates on, so this assertion is what makes the
+// cgo/pure divergence visible instead of silent.
+//
+// It also pins the wire shape, because "the gateway reached Active" is
+// satisfiable by sending a malformed Update the relay would drop.
+func TestHandshakeAnswersQueryWithCurrentStateUpdate(t *testing.T) {
+	fr := newFakeRelay(t)
+	rm := newTestManager(t, fr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := rm.Open(ctx); err != nil {
+		t.Fatalf("Open against fake relay: %v", err)
+	}
+
+	// Deliberately no Subscribe: the empty current-state report is exactly the
+	// case that regressed, and the case amt-protocol's reference driver
+	// documents as well-formed (src/subscription/report.rs:48).
+	if got := rm.protocol.State(); got != AMTStateActive {
+		t.Errorf("protocol state after handshake with no subscription = %v, want %v: "+
+			"a gateway left in Querying cannot send keepalives", got, AMTStateActive)
+	}
+
+	update, err := fr.WaitForUpdate(5 * time.Second)
+	if err != nil {
+		t.Fatalf("handshake current-state membership update: %v", err)
+	}
+
+	// 12-byte AMT Update header (type/rsvd, response MAC, nonce), then the IPv4
+	// envelope, then the 8-byte IGMPv3 report header. Same layout, and same
+	// derivation of the offset, as WaitForLeaveRecord.
+	const igmpv3ReportHeaderLen = 8
+	const reportOffset = 12 + igmpIPHeaderLen
+	if len(update) != reportOffset+igmpv3ReportHeaderLen {
+		t.Fatalf("current-state update = %d bytes, want %d (zero group records)",
+			len(update), reportOffset+igmpv3ReportHeaderLen)
+	}
+	if update[0]&0x0F != 0x05 {
+		t.Errorf("update message type = %#x, want 0x05", update[0]&0x0F)
+	}
+	if got := update[reportOffset]; got != m.IGMPv3TypeMembershipReport {
+		t.Errorf("IGMP type = %#x, want %#x (v3 membership report)", got, m.IGMPv3TypeMembershipReport)
+	}
+	if got := binary.BigEndian.Uint16(update[reportOffset+6:]); got != 0 {
+		t.Errorf("group records = %d, want 0: the handshake holds no subscriptions", got)
+	}
+}
+
 // TestFakeRelaySubscribeEmitsMembershipUpdate covers the Membership Update leg.
 func TestFakeRelaySubscribeEmitsMembershipUpdate(t *testing.T) {
 	fr := newFakeRelay(t)
@@ -69,9 +128,24 @@ func TestFakeRelaySubscribeEmitsMembershipUpdate(t *testing.T) {
 		t.Fatalf("Subscribe: %v", err)
 	}
 
-	update, err := fr.WaitForUpdate(5 * time.Second)
-	if err != nil {
-		t.Fatalf("membership update: %v", err)
+	// The handshake itself now emits a Membership Update -- the zero-record
+	// current-state report that answers the Query and moves the gateway out of
+	// Querying (relay_manager.go, BLO-28805). So the subscribe's join is not
+	// necessarily the first Update the relay sees, and this test is about the
+	// join. Skip Updates that do not carry the group rather than draining after
+	// Open: the handshake Update is sent inside Open but recorded by the relay
+	// goroutine asynchronously, so a drain there races and can leave it queued.
+	var update []byte
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		u, err := fr.WaitForUpdate(time.Until(deadline))
+		if err != nil {
+			t.Fatalf("membership update carrying %s: %v", testHarnessGroup, err)
+		}
+		if len(u) >= 13 && bytes.Contains(u[12:], testHarnessGroup.AsSlice()) {
+			update = u
+			break
+		}
 	}
 
 	// [0]=V/Type [1]=rsvd [2..7]=response MAC [8..11]=nonce [12..]=IGMP report.

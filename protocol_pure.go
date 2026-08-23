@@ -243,6 +243,42 @@ func (p *PureGoProtocol) CreateIGMPSourceLeaveReport(source, group netip.Addr) (
 	return buildIGMPSourceLeaveReport(source, group, p.State())
 }
 
+// buildIGMPCurrentStateReport builds an IGMPv3 current-state Membership Report
+// carrying zero group records, wrapped in the standard IGMP IPv4 envelope.
+//
+// This is the report a gateway sends to answer a Membership Query when it holds
+// no subscriptions. RFC 3376 §4.2.12 permits a Report with no group records, and
+// amt-protocol's own reference driver relies on exactly that: handle_query is
+// followed unconditionally by send_current_state_update
+// (`src/subscription/mod.rs:278`), whose builder documents the empty case in so
+// many words -- "An empty current-state report is well-formed but rare; return
+// zero records" (`src/subscription/report.rs:48`).
+//
+// It is deliberately a free function rather than an AMTProtocol method: the
+// bytes depend on nothing but the wire format, so both implementations send the
+// identical packet instead of each encoding its own. That also keeps the
+// envelope in agreement with the Rust builder, which encodes source 0.0.0.0 and
+// destination 224.0.0.22 -- the same pair buildIGMPIPHeader writes.
+//
+// The result is never empty (24-byte IP envelope + 8-byte report header), which
+// matters because CreateMembershipUpdate's cgo path indexes &igmpReport[0] and
+// panics on an empty slice -- see the precondition on protocol.go.
+func buildIGMPCurrentStateReport() ([]byte, error) {
+	report := &m.IGMPv3MembershipReport{
+		Type:            m.IGMPv3TypeMembershipReport,
+		NumGroupRecords: 0,
+		GroupRecords:    nil,
+	}
+
+	igmpData, err := report.MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal current-state IGMP report: %w", err)
+	}
+
+	ipHeader := buildIGMPIPHeader(igmpData)
+	return append(ipHeader, igmpData...), nil
+}
+
 func buildIGMPLeaveReport(source, group netip.Addr, state AMTState) ([]byte, error) {
 	if !source.Is4() {
 		return nil, fmt.Errorf("source address must be IPv4: %s", source)
