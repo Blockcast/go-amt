@@ -46,13 +46,22 @@ var _ DestinationLedger = (*Fanout)(nil)
 // positional label would move a subscriber's whole history onto its
 // neighbour's series and read as a counter reset on both. The target ID
 // survives the reconcile, so the series does too.
+//
+// It also exports the unlabelled fanout_destinations gauge — N itself. That
+// series is not per-destination, so it could have been its own collector, but
+// it is emitted from this one on purpose: its value IS the length of the
+// snapshot the four ledger series are built from, so computing it here makes
+// the gauge and the series it summarises provably consistent, and it costs one
+// registration instead of two on the registry that also carries the feed
+// metrics. See fanout_bound.go for why N is a bounded quantity worth watching.
 type DestinationMetrics struct {
 	ledger DestinationLedger
 
-	packetsDesc     *prometheus.Desc
-	bytesDesc       *prometheus.Desc
-	dropsDesc       *prometheus.Desc
-	writeErrorsDesc *prometheus.Desc
+	packetsDesc      *prometheus.Desc
+	bytesDesc        *prometheus.Desc
+	dropsDesc        *prometheus.Desc
+	writeErrorsDesc  *prometheus.Desc
+	destinationsDesc *prometheus.Desc
 }
 
 // NewDestinationMetrics registers the per-destination ledger collector.
@@ -90,6 +99,16 @@ func NewDestinationMetrics(registerer prometheus.Registerer, ledger DestinationL
 			prometheus.BuildFQName(receiverMetricsNamespace, "", "fanout_destination_write_errors_total"),
 			"Writes for this destination that actively failed. A subset of drops: a partial sendmmsg abandons the rest of the batch, so those destinations are dropped without being attempted and are deliberately not blamed here. This is the column that localises a fault to one subscriber.",
 			labels, nil,
+		),
+		// Unlabelled, and deliberately not labelled by anything: an operator
+		// alerting on "N is approaching the crossover" wants one series to
+		// threshold, and any label here would split it into a set that has to be
+		// summed first. A sum() an alert forgets is a silent false negative.
+		destinationsDesc: prometheus.NewDesc(
+			prometheus.BuildFQName(receiverMetricsNamespace, "", "fanout_destinations"),
+			fmt.Sprintf("Unicast destinations currently configured in the fan-out table (N). The fan-out is designed to a bounded N: above %d this crosses the revisit threshold, and %d is the modelled point where one multicast tree beats N unicast streams. Alert on this exceeding %d; see BLO-25708 document n65-revisit-trigger. Follows a reconcile, so it is the live table size, not the count at startup.",
+				RevisitThresholdDestinations, MulticastCrossoverDestinations, RevisitThresholdDestinations),
+			nil, nil,
 		),
 	}
 	if err := registerer.Register(metrics); err != nil {
@@ -129,16 +148,25 @@ func (m *DestinationMetrics) Describe(ch chan<- *prometheus.Desc) {
 	ch <- m.bytesDesc
 	ch <- m.dropsDesc
 	ch <- m.writeErrorsDesc
+	ch <- m.destinationsDesc
 }
 
 // Collect implements prometheus.Collector. All four series for a destination
 // come from one DestinationStats snapshot, so a scrape cannot mix reads taken
 // either side of a counter update for the same destination.
+//
+// fanout_destinations is the length of that same snapshot rather than a
+// separately-read count, so the gauge can never disagree with the number of
+// per-destination series in the same scrape. It is emitted exactly once per
+// Collect: it carries no labels, and a second emission would be a duplicate
+// label set, which fails Gather for the whole registry.
 func (m *DestinationMetrics) Collect(ch chan<- prometheus.Metric) {
-	for _, stat := range m.ledger.DestinationStats() {
+	stats := m.ledger.DestinationStats()
+	for _, stat := range stats {
 		ch <- prometheus.MustNewConstMetric(m.packetsDesc, prometheus.CounterValue, float64(stat.Packets), stat.Destination, stat.TargetID)
 		ch <- prometheus.MustNewConstMetric(m.bytesDesc, prometheus.CounterValue, float64(stat.Bytes), stat.Destination, stat.TargetID)
 		ch <- prometheus.MustNewConstMetric(m.dropsDesc, prometheus.CounterValue, float64(stat.Drops), stat.Destination, stat.TargetID)
 		ch <- prometheus.MustNewConstMetric(m.writeErrorsDesc, prometheus.CounterValue, float64(stat.WriteErrors), stat.Destination, stat.TargetID)
 	}
+	ch <- prometheus.MustNewConstMetric(m.destinationsDesc, prometheus.GaugeValue, float64(len(stats)))
 }
