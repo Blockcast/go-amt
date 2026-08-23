@@ -206,6 +206,12 @@ func run(args []string) error {
 		fmt.Fprintln(os.Stderr, warning)
 	}
 	forwardTo := splitNonempty(destinations)
+	// Warns and continues, by design: N crossing the revisit threshold is a
+	// capacity-planning signal, and refusing to start would convert it into an
+	// outage for a configuration that still delivers correctly.
+	if warning := destinationCountWarning(len(forwardTo)); warning != "" {
+		fmt.Fprintln(os.Stderr, warning)
+	}
 	bill, err := billingOptions(*deliveryWAL, *deliveryRecords, forwardTo)
 	if err != nil {
 		return err
@@ -274,6 +280,41 @@ func retentionWarning(window time.Duration) string {
 			"long a set takes to complete. Check completions_above_ceiling on the "+
 			"receipt — nonzero means the stated %.2f%% error does not apply.",
 		window, shred.CompletionCeiling, shred.CompletionRelativeError*100)
+}
+
+// destinationCountWarning returns a startup warning when the configured
+// destination count crosses receiver.RevisitThresholdDestinations, or "".
+//
+// The fan-out was designed to a BOUNDED N with an explicit revisit trigger
+// (BLO-25708, document n65-revisit-trigger §6), and until this existed that
+// trigger lived only in the document — nothing in the binary bounded N, which
+// is exactly how a deliberate "unicast first" becomes an accidental "unicast
+// forever". Nobody fires a trigger they have to remember.
+//
+// It warns and continues. Above the threshold the configuration is still
+// correct and still delivers; what has changed is that the economics are
+// approaching a re-architecture, which is a planning input, not a fault. A
+// startup refusal here would take a working feed down over a capacity forecast.
+//
+// A pure function for the same reason retentionWarning is one: a large
+// destination list is a VALID configuration, so driving this through run would
+// parse, fall through to listenAndScore, bind sockets and block until the
+// package test timeout. Here it is assertable without opening a socket.
+func destinationCountWarning(count int) string {
+	if count <= receiver.RevisitThresholdDestinations {
+		return ""
+	}
+	return fmt.Sprintf(
+		"blockcast-shreds: warning: %d configured --dest-ip-ports destinations is "+
+			"above the N=%d revisit threshold for unicast fan-out. The measured "+
+			"crossover where one multicast tree beats N unicast streams is N~%d "+
+			"(BLO-25708, document n65-revisit-trigger). Starting anyway: this is a "+
+			"capacity-planning signal, not an error, and the feed still delivers "+
+			"correctly. Escalate the revisit before N reaches %d, and note the "+
+			"crossover itself is modelled on a dummy netdev and wants a real-NIC "+
+			"measurement before it is trusted as an absolute.",
+		count, receiver.RevisitThresholdDestinations,
+		receiver.MulticastCrossoverDestinations, receiver.MulticastCrossoverDestinations)
 }
 
 func selftest(args []string) error {
