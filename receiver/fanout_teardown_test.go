@@ -431,3 +431,124 @@ func TestRefusedReAdmissionDoesNotConsumeSettledDepartures(t *testing.T) {
 		}
 	}
 }
+
+// A reconcile the BROKER got wrong must not cost a departure either.
+//
+// The re-admission guard above is one of two rejections in ReconcileDestinations
+// that can fire after the caller has been told nothing happened. The other is
+// resolveTargets, which rejects a missing or duplicate target ID and an address
+// that will not resolve to IPv4 — none of them exotic, all of them things a
+// faulty or half-deployed broker emits on an ordinary reconcile.
+//
+// The trap is identical and the ordering fix is the same one: the harvest
+// CONSUMES, so any rejection that runs after it hands back samples that are the
+// last copy of those departures, and `if err != nil { retry }` drops them. The
+// retry cannot recover them — they are no longer parked, so neither a later
+// reconcile nor HarvestPendingTeardowns will ever produce them again. Their
+// sessions stay open and their tails go unbilled.
+//
+// This is strictly worse than the re-admission case, which at least leaves the
+// operator a wedged target to notice. A bad address is transient: the broker
+// corrects itself, the next reconcile succeeds, and nothing anywhere records
+// that a session was silently dropped on the failed one.
+//
+// So: every rejection shape returns no stats, and leaves every parked departure
+// recoverable.
+func TestRejectedTargetSetDoesNotConsumeSettledDepartures(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		targets []Target
+		wantErr string
+	}{
+		{
+			name: "duplicate target ID",
+			targets: []Target{
+				{ID: "grant-a", Address: "127.0.0.1:20001"},
+				{ID: "grant-a", Address: "127.0.0.1:20009"},
+			},
+			wantErr: "appears more than once",
+		},
+		{
+			name: "missing target ID",
+			targets: []Target{
+				{ID: "grant-a", Address: "127.0.0.1:20001"},
+				{ID: "", Address: "127.0.0.1:20009"},
+			},
+			wantErr: "has no ID",
+		},
+		{
+			name: "address that will not resolve",
+			targets: []Target{
+				{ID: "grant-a", Address: "127.0.0.1:20001"},
+				{ID: "grant-d", Address: "not-a-host:::9"},
+			},
+			wantErr: "resolve UDP destination",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			fanout, err := NewUDPFanoutTargets([]Target{
+				{ID: "grant-a", Address: "127.0.0.1:20001"},
+			}, 16, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fanout.Close()
+
+			// A departure that has already settled and merely has not been
+			// harvested yet. seq 0 is even, so isFinal holds for any reading:
+			// nothing can charge grant-c again, and the next reconcile to get
+			// as far as the harvest will hand it back.
+			settled := &destCounters{}
+			settled.packets.Store(3)
+			settled.bytes.Store(96)
+			fanout.reconcileMu.Lock()
+			fanout.pendingTeardown = append(fanout.pendingTeardown, pendingDeparture{
+				entry: destination{id: "grant-c", name: "127.0.0.1:20003", counters: settled},
+				seq:   0,
+			})
+			fanout.reconcileMu.Unlock()
+
+			removed, err := fanout.ReconcileDestinations(testCase.targets)
+			if err == nil {
+				t.Fatalf("reconcile with a %s was accepted, want rejection", testCase.name)
+			}
+			if !strings.Contains(err.Error(), testCase.wantErr) {
+				t.Fatalf("reconcile returned err %v, want one containing %q", err, testCase.wantErr)
+			}
+			if len(removed) != 0 {
+				t.Fatalf("rejected reconcile returned %d departure(s) %+v, want none; a retry loop that discards "+
+					"the error discards these too, and they are the only remaining record of those sessions",
+					len(removed), removed)
+			}
+
+			// Discard the rejection exactly as `if err != nil { retry }` would,
+			// then prove grant-c survived it. Before the fix the harvest ran
+			// ahead of resolveTargets and this came back empty.
+			harvested, remaining := fanout.HarvestPendingTeardowns()
+			var grantC *DestinationStat
+			for i := range harvested {
+				if harvested[i].TargetID == "grant-c" {
+					grantC = &harvested[i]
+				}
+			}
+			if grantC == nil {
+				t.Fatalf("grant-c is gone after a reconcile rejected for a %s (harvested %+v, %d remaining); the "+
+					"rejection consumed a settled departure, so its session is never closed and its tail never billed",
+					testCase.name, harvested, remaining)
+			}
+			if grantC.Packets != 3 || grantC.Bytes != 96 {
+				t.Errorf("grant-c settled at %d packets / %d bytes, want 3 / 96", grantC.Packets, grantC.Bytes)
+			}
+			if remaining != 0 {
+				t.Errorf("harvest left %d departures outstanding, want 0", remaining)
+			}
+
+			// The rejection still holds: the bad set was not applied, so the
+			// served table is untouched.
+			entries := fanout.table.Load().entries
+			if len(entries) != 1 || entries[0].id != "grant-a" {
+				t.Errorf("rejected reconcile mutated the served table to %+v, want grant-a alone", entries)
+			}
+		})
+	}
+}

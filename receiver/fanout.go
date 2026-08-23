@@ -513,33 +513,13 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 	// the same trade the boundary wait makes everywhere else here: a deferral
 	// the caller can resolve, never a number it cannot.
 	//
-	// This runs BEFORE the harvest, and that ordering is load-bearing. The
-	// harvest CONSUMES: it moves a settled departure out of pendingTeardown,
-	// and the returned sample becomes the only remaining record of it. Harvest
-	// first and a refusal has to hand those samples back alongside its error —
-	// which a caller written as the idiomatic `if err != nil { retry }` will
-	// discard, because a refusal is exactly the error that reads as "nothing
-	// happened". The departure is then gone from pendingTeardown with its
-	// session never closed, and, worse, its ID no longer collides, so the next
-	// retry re-admits it and bills the new generation into the still-open old
-	// session — the precise corruption this guard exists to prevent, reached
-	// through the guard itself.
-	//
-	// Checking first costs nothing, because settledness is a predicate:
-	// unsettledCollisions asks isFinal directly rather than inferring it from
-	// what the harvest left behind. A refusal therefore consumes nothing and
-	// mutates nothing, so discarding it is safe, and the settled departures it
-	// declined to harvest are still there for the retry or for
-	// HarvestPendingTeardowns.
+	// This runs BEFORE the harvest, and so does every other rejection in this
+	// method — see the note above the harvest for why validation must complete
+	// before anything is consumed.
 	if collisions := f.unsettledCollisions(targets); len(collisions) > 0 {
 		return nil, fmt.Errorf("%w: target(s) %s cannot be re-admitted until the previous generation's counters settle",
 			ErrTeardownPending, strings.Join(collisions, ", "))
 	}
-
-	// Settle whatever became final since the last reconcile. Every ID requested
-	// here is now known to be either absent from pendingTeardown or settled, so
-	// this frees exactly the departures that the swap below may re-admit.
-	settled := f.harvestFinalDepartures()
 
 	// Read the old table under reconcileMu so two concurrent reconciles cannot
 	// both carry counters forward from the same pre-swap snapshot.
@@ -553,6 +533,37 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 	if err != nil {
 		return nil, err
 	}
+
+	// EVERY rejection is now behind us, and that is the point: the harvest below
+	// consumes, so nothing that can still fail may run before it.
+	//
+	// This is the same trap the collision guard above is ordered to avoid,
+	// reached one validation later. resolveTargets rejects a missing or
+	// duplicate ID and an address that will not resolve to IPv4 — all of which a
+	// faulty broker can produce on any reconcile. Harvest first and such a
+	// rejection returns an error alongside samples that are the ONLY remaining
+	// record of those departures, because the harvest has already moved them out
+	// of pendingTeardown. The idiomatic `if err != nil { retry }` discards them,
+	// and the retry cannot recover them: they are no longer parked, so neither
+	// this call nor HarvestPendingTeardowns will ever hand them back. Their
+	// sessions stay open and their tail deltas go unbilled — the exact
+	// unrecoverable loss this method exists to close.
+	//
+	// Both guards are pure predicates over the request, so hoisting them costs
+	// nothing: unsettledCollisions asks isFinal directly, and resolveTargets only
+	// reads carry. Neither touches pendingTeardown, so a rejection from either
+	// consumes nothing and mutates nothing, and discarding it is safe.
+	//
+	// Harvesting here rather than earlier is free of ordering risk in the other
+	// direction too: pendingTeardown holds only entries absent from the live
+	// table, so the harvest cannot affect previous or carry, and isFinal is
+	// monotonic, so a departure settled at the collision check is still settled
+	// here.
+	//
+	// Every ID requested is now known to be either absent from pendingTeardown or
+	// settled, so this frees exactly the departures that the swap below may
+	// re-admit.
+	settled := f.harvestFinalDepartures()
 
 	retained := make(map[string]struct{}, len(entries))
 	for _, entry := range entries {
