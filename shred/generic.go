@@ -112,7 +112,14 @@ type GenericReceipt struct {
 	WindowP50         time.Duration `json:"window_p50_ns"`
 	WindowP95         time.Duration `json:"window_p95_ns"`
 	WindowP99         time.Duration `json:"window_p99_ns"`
-	Gaps              GapHistogram  `json:"gap_histogram"`
+	// Gaps is the same GapHistogram the shred receipt carries, so the two modes
+	// bucket identically. One field of it does not apply here: Reordered is
+	// structurally always 0 in generic mode, because nothing increments it —
+	// reordering is reported by RecordsOutOfOrder instead. A consumer who
+	// learned the field from the shred receipt would otherwise read that zero
+	// as "checked, none found" rather than "not computed in this mode", which
+	// is the more damaging of the two readings.
+	Gaps GapHistogram `json:"gap_histogram"`
 }
 
 type genericWindow struct {

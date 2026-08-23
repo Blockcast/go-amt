@@ -196,9 +196,9 @@ coding (`num_data+position`) shreds.
 ### Generic mode — a payload that isn't shreds
 
 The same client scores generic framed records: the same delivery receipt, on a
-payload that isn't shreds. It reports window completeness, arrival percentiles
-and arrival gaps, and reports no FEC erasure, because this mode does no erasure
-coding.
+payload that isn't shreds — here, a synthetic feed the tool generates itself. It
+reports window completeness, arrival percentiles and arrival gaps, and reports
+no FEC erasure, because this mode does no erasure coding.
 
 ```bash
 ./blockcast-shreds selftest --generic
