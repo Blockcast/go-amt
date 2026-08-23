@@ -249,6 +249,13 @@ func TestGenericScorerGapBucketsAndPercentilesAreDeterministic(t *testing.T) {
 	}
 }
 
+// Percentiles are the upper edge of the bucket the true fill landed in, not the
+// fill itself: BLO-28909 bounded the scorer's per-window state, and exact
+// per-window latencies cannot be retained under a bound. The expected values
+// below are therefore 2ms and 3ms rounded up to their bucket edges. See
+// completionHistogram, and
+// TestGenericWindowFillPercentilesAreBucketedUpperBounds for the error bound
+// asserted as a property rather than pinned as a constant.
 func TestGenericScorerPercentilesTrackWindowFillLatency(t *testing.T) {
 	scorer := NewGenericScorer("test", "test")
 	start := time.Unix(1, 0)
@@ -265,11 +272,11 @@ func TestGenericScorerPercentilesTrackWindowFillLatency(t *testing.T) {
 		}
 	}
 	receipt := scorer.Receipt()
-	if receipt.WindowP50 != 2*time.Millisecond {
-		t.Errorf("p50 = %s, want 2ms", receipt.WindowP50)
+	if want := completionBucketUpperEdge(completionBucket(2 * time.Millisecond)); receipt.WindowP50 != want {
+		t.Errorf("p50 = %s, want %s (2ms at its bucket edge)", receipt.WindowP50, want)
 	}
-	if receipt.WindowP99 != 3*time.Millisecond {
-		t.Errorf("p99 = %s, want 3ms", receipt.WindowP99)
+	if want := completionBucketUpperEdge(completionBucket(3 * time.Millisecond)); receipt.WindowP99 != want {
+		t.Errorf("p99 = %s, want %s (3ms at its bucket edge)", receipt.WindowP99, want)
 	}
 }
 
@@ -277,7 +284,7 @@ func TestGenericScorerPercentilesTrackWindowFillLatency(t *testing.T) {
 // on every run and every machine, or it cannot be quoted in an asset.
 func TestGenericFixtureReceiptIsDeterministic(t *testing.T) {
 	const want = `generic source=synthetic rights=synthetic-generated-no-third-party-content
-window_fill p50=27.9ms p95=29.7ms p99=29.7ms
+window_fill p50=27.903ms p95=29.823ms p99=29.823ms
 completeness windows=6 complete=4 expected=192 received=186 fraction=0.968750
 loss interior=3 trailing=3 duplicates=2 out_of_order=2
 gap_ms <1=187 1-2.4=0 2.4-7=0 7-32=0 >=32=0`
