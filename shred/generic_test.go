@@ -242,11 +242,137 @@ func TestGenericScorerGapBucketsAndPercentilesAreDeterministic(t *testing.T) {
 		t.Errorf("gaps = %+v, want %+v", gaps, want)
 	}
 	// The first record contributes no gap: an inter-arrival gap is only defined
-	// between two records this scorer actually saw.
-	total := gaps.LT1 + gaps.From1To2_4 + gaps.From2_4To7 + gaps.From7To32 + gaps.GTE32
+	// between two records this scorer actually saw. Reordered is summed in even
+	// though this ladder is strictly increasing and cannot produce one: omitting
+	// it is what let BLO-29880 hide, because folding a reordered arrival into
+	// LT1 leaves a bucket-only total correct and this assertion green.
+	total := gaps.LT1 + gaps.From1To2_4 + gaps.From2_4To7 + gaps.From7To32 + gaps.GTE32 + gaps.Reordered
 	if total != uint64(len(offsets)-1) {
 		t.Errorf("gap count = %d, want %d", total, len(offsets)-1)
 	}
+}
+
+// TestGenericScorerToleratesOutOfOrderArrivalTimestamps is the generic-mode
+// mirror of TestScorerToleratesOutOfOrderArrivalTimestamps. receivedAt is
+// captured at the read before any per-packet work, so concurrent feed goroutines
+// can reach Observe as t2, t1 — the premise GenericScorer's own doc comment
+// acknowledges. Before BLO-29880 this path had neither of the shred path's two
+// guards: the negative delta fell through the bucket ladder into LT1, and the
+// frontier was assigned unconditionally.
+func TestGenericScorerToleratesOutOfOrderArrivalTimestamps(t *testing.T) {
+	started := time.Unix(40, 0)
+	at := func(ms int) time.Time { return started.Add(time.Duration(ms) * time.Millisecond) }
+
+	scorer := NewGenericScorer("test", "test")
+	// One 32-record window with every pair of adjacent arrivals transposed, so
+	// the call order regresses 16 times. Timestamps are 2ms apart, so no honest
+	// gap can land in LT1 and any LT1 count is a charged regression.
+	const length = 32
+	for i := 0; i < length; i += 2 {
+		for _, index := range [2]int{i + 1, i} {
+			record := genericRecord(0, uint16(index), length, uint64(index))
+			if _, err := scorer.Observe(record, at(2*index)); err != nil {
+				t.Fatalf("observe index %d: %v", index, err)
+			}
+		}
+	}
+
+	gaps := scorer.Receipt().Gaps
+	if gaps.LT1 != 0 {
+		t.Fatalf("Gaps.LT1 = %d, want 0; reordered arrivals must not be charged to the sub-millisecond bucket", gaps.LT1)
+	}
+	// 31 non-first arrivals: 15 advance the frontier by 4ms (the leading element
+	// of each transposed pair after the opening one), and 16 regress — the 15
+	// trailing elements plus the opening pair's second element.
+	if gaps.Reordered != 16 {
+		t.Fatalf("Gaps.Reordered = %d, want 16", gaps.Reordered)
+	}
+	// Every non-first arrival is attributable to exactly one counter.
+	bucketed := gaps.LT1 + gaps.From1To2_4 + gaps.From2_4To7 + gaps.From7To32 + gaps.GTE32
+	if bucketed+gaps.Reordered != length-1 {
+		t.Fatalf("bucketed(%d) + reordered(%d) = %d, want %d non-first arrivals accounted for",
+			bucketed, gaps.Reordered, bucketed+gaps.Reordered, length-1)
+	}
+}
+
+// TestGenericScorerGapFrontierDoesNotRegress isolates the stale-frontier half of
+// BLO-29880: after a late arrival, the next honest gap must be measured from the
+// newest timestamp seen, not from the late one. In generic mode the frontier is
+// also the retention clock (retentionFloor is lastArrival minus the window), so a
+// regressing assignment would drag the eviction floor backwards as well.
+func TestGenericScorerGapFrontierDoesNotRegress(t *testing.T) {
+	started := time.Unix(50, 0)
+	at := func(ms int) time.Time { return started.Add(time.Duration(ms) * time.Millisecond) }
+
+	scorer := NewGenericScorer("test", "test")
+	const length = 4
+	// 0ms, then +30ms, then a regression to 10ms, then 31ms. The last gap must
+	// read +1ms from the 30ms frontier, not +21ms from the regressed 10ms.
+	for index, ms := range [length]int{0, 30, 10, 31} {
+		record := genericRecord(0, uint16(index), length, uint64(index))
+		if _, err := scorer.Observe(record, at(ms)); err != nil {
+			t.Fatalf("observe index %d: %v", index, err)
+		}
+	}
+
+	gaps := scorer.Receipt().Gaps
+	want := GapHistogram{From1To2_4: 1, From7To32: 1, Reordered: 1}
+	if gaps != want {
+		t.Errorf("gaps = %+v, want %+v; a 1-2.4ms gap means the frontier held at 30ms", gaps, want)
+	}
+	// Stated as its own assertion because it is the specific misreading the bug
+	// produced: measuring from the regressed 10ms yields +21ms, in From7To32.
+	if gaps.From7To32 != 1 {
+		t.Errorf("From7To32 = %d, want 1; a second entry here means the gap was measured from the regressed arrival", gaps.From7To32)
+	}
+	if gaps.Reordered+gaps.From1To2_4+gaps.From7To32 != length-1 {
+		t.Errorf("accounted %d of %d non-first arrivals", gaps.Reordered+gaps.From1To2_4+gaps.From7To32, length-1)
+	}
+}
+
+// TestGenericScorerReorderedAndOutOfOrderObserveDifferentAxes pins the reason
+// RecordsOutOfOrder was never a substitute for Gaps.Reordered, which is what the
+// pre-BLO-29880 doc comment claimed. Reordered observes the arrival clock;
+// RecordsOutOfOrder observes header.Sequence. Either can move without the other.
+func TestGenericScorerReorderedAndOutOfOrderObserveDifferentAxes(t *testing.T) {
+	started := time.Unix(60, 0)
+	at := func(ms int) time.Time { return started.Add(time.Duration(ms) * time.Millisecond) }
+
+	t.Run("arrival regresses, sequence monotonic", func(t *testing.T) {
+		scorer := NewGenericScorer("test", "test")
+		// Sequence 0,1,2 ascending; arrival 0ms, 30ms, 10ms regresses once.
+		for index, ms := range [3]int{0, 30, 10} {
+			record := genericRecord(0, uint16(index), 3, uint64(index))
+			if _, err := scorer.Observe(record, at(ms)); err != nil {
+				t.Fatalf("observe index %d: %v", index, err)
+			}
+		}
+		receipt := scorer.Receipt()
+		if receipt.Gaps.Reordered != 1 {
+			t.Errorf("Gaps.Reordered = %d, want 1; the arrival clock regressed", receipt.Gaps.Reordered)
+		}
+		if receipt.RecordsOutOfOrder != 0 {
+			t.Errorf("RecordsOutOfOrder = %d, want 0; sequence never regressed, so it cannot report this hazard", receipt.RecordsOutOfOrder)
+		}
+	})
+
+	t.Run("sequence regresses, arrival monotonic", func(t *testing.T) {
+		scorer := NewGenericScorer("test", "test")
+		// Arrival strictly increasing at 2ms spacing; sequence 0,2,1 regresses once.
+		for step, index := range [3]uint16{0, 2, 1} {
+			record := genericRecord(0, index, 3, uint64(index))
+			if _, err := scorer.Observe(record, at(2*step)); err != nil {
+				t.Fatalf("observe index %d: %v", index, err)
+			}
+		}
+		receipt := scorer.Receipt()
+		if receipt.RecordsOutOfOrder != 1 {
+			t.Errorf("RecordsOutOfOrder = %d, want 1; sequence regressed", receipt.RecordsOutOfOrder)
+		}
+		if receipt.Gaps.Reordered != 0 {
+			t.Errorf("Gaps.Reordered = %d, want 0; the arrival clock never regressed", receipt.Gaps.Reordered)
+		}
+	})
 }
 
 // Percentiles are the upper edge of the bucket the true fill landed in, not the

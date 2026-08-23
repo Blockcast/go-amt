@@ -124,13 +124,20 @@ type GenericReceipt struct {
 	WindowFillsAboveCeiling uint64 `json:"window_fills_above_ceiling"`
 	// WindowFillsTotal is the denominator for WindowFillsAboveCeiling.
 	WindowFillsTotal uint64 `json:"window_fills_total"`
-	// Gaps is the same GapHistogram the shred receipt carries, so the two modes
-	// bucket identically. One field of it does not apply here: Reordered is
-	// structurally always 0 in generic mode, because nothing increments it —
-	// reordering is reported by RecordsOutOfOrder instead. A consumer who
-	// learned the field from the shred receipt would otherwise read that zero
-	// as "checked, none found" rather than "not computed in this mode", which
-	// is the more damaging of the two readings.
+	// Gaps is the same GapHistogram the shred receipt carries, and every field of
+	// it — Reordered included — is populated on the same terms, so the two modes
+	// classify an identical arrival-timestamp sequence identically. That parity is
+	// asserted, not assumed: see TestGenericScorerToleratesOutOfOrderArrivalTimestamps
+	// and TestGenericScorerGapFrontierDoesNotRegress, which mirror the shred-path
+	// tests of the same names.
+	//
+	// Gaps.Reordered is NOT the same signal as RecordsOutOfOrder above, and the
+	// two are not substitutes for one another: Reordered counts arrival-CLOCK
+	// regressions (receivedAt behind the frontier), RecordsOutOfOrder counts
+	// SEQUENCE regressions (header.Sequence behind the high-water mark). A record
+	// can regress on either axis while monotonic on the other, so neither count
+	// bounds the other. TestGenericScorerReorderedAndOutOfOrderObserveDifferentAxes
+	// pins both directions.
 	Gaps GapHistogram `json:"gap_histogram"`
 }
 
@@ -241,13 +248,18 @@ func (s *GenericScorer) Observe(record []byte, receivedAt time.Time) (bool, erro
 
 	accepted, err := s.observeLocked(header, receivedAt)
 
-	// Reclaim on the frontier this record just advanced, after the window
-	// bookkeeping rather than before it: a window created earlier in this call
-	// has not had its `last` set yet, and a sweep at that point would read the
-	// zero time as infinitely stale and evict the window this very record
-	// created. The sweep also runs on the duplicate and framing-violation paths,
-	// because both advanced lastArrival — a feed that has degraded to nothing but
-	// duplicates still needs its older windows released.
+	// Reclaim on the frontier, after the window bookkeeping rather than before it:
+	// a window created earlier in this call has not had its `last` set yet, and a
+	// sweep at that point would read the zero time as infinitely stale and evict
+	// the window this very record created.
+	//
+	// The sweep is attempted on every path, including the ones that advanced
+	// nothing. A duplicate does advance the frontier — it arrived on the wire, and
+	// a feed degraded to nothing but duplicates still needs its older windows
+	// released. A framing violation returns before the frontier update, and so
+	// does an arrival that regressed behind it; for those the attempt is a no-op
+	// against an unmoved clock, which is why it is safe to run unconditionally
+	// rather than duplicating the path analysis here.
 	if sweepDue(&s.nextSweep, s.lastArrival, s.window) {
 		s.evict(s.retentionFloor())
 	}
@@ -278,10 +290,27 @@ func (s *GenericScorer) observeLocked(header GenericHeader, receivedAt time.Time
 	// intervals and systematically inflate the upper buckets under multi-path
 	// delivery, where duplication is routine rather than exceptional. Only the
 	// first record of a run contributes no gap, having nothing to measure from.
+	//
+	// receivedAt is a true arrival timestamp, captured at the read before any
+	// per-packet work, so it is NOT nondecreasing across calls: the concurrent
+	// feed goroutines this scorer documents can capture t1 < t2 and reach Observe
+	// as t2, t1. Both halves of that hazard are guarded, exactly as Scorer.observe
+	// guards them. A negative gap would otherwise fall through the bucket ladder
+	// into LT1 and inflate the sub-millisecond count, and an unconditional
+	// assignment would drag the frontier backwards so the *next* gap is measured
+	// from a stale origin and reads too large. The frontier is also this scorer's
+	// retention clock — retentionFloor is lastArrival minus the window — so a
+	// regressing assignment would move the eviction floor backwards too.
 	if !s.lastArrival.IsZero() {
-		s.gaps.observe(receivedAt.Sub(s.lastArrival))
+		if gap := receivedAt.Sub(s.lastArrival); gap > 0 {
+			s.gaps.observe(gap)
+		} else {
+			s.gaps.Reordered++
+		}
 	}
-	s.lastArrival = receivedAt
+	if receivedAt.After(s.lastArrival) {
+		s.lastArrival = receivedAt
+	}
 
 	if _, duplicate := window.seen[header.IndexInWindow]; duplicate {
 		s.duplicates++
