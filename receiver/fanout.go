@@ -454,6 +454,23 @@ func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObs
 // and a live entry counting from zero — which the billing plane, keyed on
 // TargetID, cannot separate. The caller retries; the wait is one packet long.
 //
+// # Consuming the result
+//
+// A non-empty stats slice must be consumed even when err is non-nil. The two
+// error shapes are distinguished by that slice, not by the error:
+//
+//   - REFUSAL — nil stats. Nothing was consumed, no table was swapped, no state
+//     changed. Discarding this result loses nothing; retry.
+//   - PARTIAL — non-nil stats plus ErrTeardownPending. The swap happened and
+//     the returned counters are final; only the departures still named by the
+//     error are missing. These stats exist nowhere else, so a caller that
+//     discards them on `err != nil` silently drops a session close and the
+//     billing tail that rides on it. Close them, then retry or call
+//     HarvestPendingTeardowns for the remainder.
+//
+// A refusal never carries stats, so `if err != nil { retry }` is only wrong for
+// the partial shape — and there the stats being non-empty is the signal.
+//
 // The counters ride on the return value because this is the last place they
 // exist. A departing target is absent from the new table, and DestinationStats
 // reads only the current one, so a caller told merely "grant-b left" can no
@@ -476,14 +493,6 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 	f.reconcileMu.Lock()
 	defer f.reconcileMu.Unlock()
 
-	// Settle whatever became final since the last reconcile BEFORE looking at
-	// the requested set. A departure parked by an earlier reconcile is usually
-	// final within one packet's delivery, so by now it almost always is;
-	// harvesting here is what keeps the re-admission guard below from refusing
-	// a re-grant whose previous generation is already done and merely
-	// unharvested.
-	settled := f.harvestFinalDepartures()
-
 	// A target ID whose previous generation has NOT settled cannot be
 	// re-admitted, because nothing downstream can tell the two lifecycles
 	// apart.
@@ -503,10 +512,34 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 	// Refusing costs a retry of a reconcile the caller already retries. It is
 	// the same trade the boundary wait makes everywhere else here: a deferral
 	// the caller can resolve, never a number it cannot.
+	//
+	// This runs BEFORE the harvest, and that ordering is load-bearing. The
+	// harvest CONSUMES: it moves a settled departure out of pendingTeardown,
+	// and the returned sample becomes the only remaining record of it. Harvest
+	// first and a refusal has to hand those samples back alongside its error —
+	// which a caller written as the idiomatic `if err != nil { retry }` will
+	// discard, because a refusal is exactly the error that reads as "nothing
+	// happened". The departure is then gone from pendingTeardown with its
+	// session never closed, and, worse, its ID no longer collides, so the next
+	// retry re-admits it and bills the new generation into the still-open old
+	// session — the precise corruption this guard exists to prevent, reached
+	// through the guard itself.
+	//
+	// Checking first costs nothing, because settledness is a predicate:
+	// unsettledCollisions asks isFinal directly rather than inferring it from
+	// what the harvest left behind. A refusal therefore consumes nothing and
+	// mutates nothing, so discarding it is safe, and the settled departures it
+	// declined to harvest are still there for the retry or for
+	// HarvestPendingTeardowns.
 	if collisions := f.unsettledCollisions(targets); len(collisions) > 0 {
-		return settled, fmt.Errorf("%w: target(s) %s cannot be re-admitted until the previous generation's counters settle",
+		return nil, fmt.Errorf("%w: target(s) %s cannot be re-admitted until the previous generation's counters settle",
 			ErrTeardownPending, strings.Join(collisions, ", "))
 	}
+
+	// Settle whatever became final since the last reconcile. Every ID requested
+	// here is now known to be either absent from pendingTeardown or settled, so
+	// this frees exactly the departures that the swap below may re-admit.
+	settled := f.harvestFinalDepartures()
 
 	// Read the old table under reconcileMu so two concurrent reconciles cannot
 	// both carry counters forward from the same pre-swap snapshot.
@@ -575,8 +608,19 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 }
 
 // unsettledCollisions reports which of targets are asking to re-use a target ID
-// whose previous generation is still parked in pendingTeardown. Callers must
-// hold reconcileMu.
+// whose previous generation is parked in pendingTeardown and has NOT yet
+// settled. Callers must hold reconcileMu.
+//
+// Settledness is asked directly, via the same isFinal predicate the harvest
+// uses, rather than inferred from a harvest having already run. That is what
+// lets the caller run this guard before consuming anything: a parked departure
+// whose bracket has closed is not a collision, because the harvest that follows
+// a passing check will free it and hand back its final sample in the same call.
+//
+// The two agree because isFinal is monotonic — once true it stays true, since
+// the target is absent from every table the worker can load from here on. So an
+// ID cleared here cannot be un-cleared by the time the harvest reaches it, and
+// no ID can slip through as neither a collision nor a harvested departure.
 //
 // Duplicates within targets are collapsed so the error names each ID once;
 // rejecting the duplicate itself is resolveTargets' job.
@@ -584,9 +628,16 @@ func (f *Fanout) unsettledCollisions(targets []Target) []string {
 	if len(f.pendingTeardown) == 0 {
 		return nil
 	}
+	now := f.deliverSeq.Load()
 	unsettled := make(map[string]struct{}, len(f.pendingTeardown))
 	for _, pending := range f.pendingTeardown {
+		if pending.isFinal(now) {
+			continue
+		}
 		unsettled[pending.entry.id] = struct{}{}
+	}
+	if len(unsettled) == 0 {
+		return nil
 	}
 
 	var collisions []string

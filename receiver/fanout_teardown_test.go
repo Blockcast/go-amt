@@ -332,3 +332,102 @@ func TestReconcileRefusesToReAdmitAnUnsettledTargetID(t *testing.T) {
 		}
 	}
 }
+
+// A refused re-admission must not consume the departures it happened to find
+// settled on its way in.
+//
+// The refusal is the error most likely to be written off as "nothing happened":
+// no swap occurred and the caller is told to retry, so the idiomatic
+// `if err != nil { continue }` reads as correct. It is only correct if the
+// refusal really did change nothing. When the guard harvested before it
+// checked, it did not — the harvest CONSUMES, moving a settled departure out of
+// pendingTeardown and making the returned sample the last copy of it. Handed
+// back with the refusal and dropped by the retry, that departure's session is
+// never closed and its tail is never billed.
+//
+// The second-order failure is worse than the lost bytes. A consumed departure
+// is gone from pendingTeardown, so its ID no longer collides — the very next
+// retry re-admits it, and the new generation bills into the old session that
+// nothing ever closed. The guard would be the thing that defeated the guard.
+//
+// So: a refusal returns no stats, and every parked departure it declined to
+// harvest is still recoverable afterwards.
+func TestRefusedReAdmissionDoesNotConsumeSettledDepartures(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+	}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	packet := []byte("shred")
+	release := wedgeFanoutInDeliver(t, fanout, packet)
+	defer release()
+
+	// Park grant-b unsettled: the worker holds the pre-swap snapshot, so its
+	// counters cannot be certified and it stays in pendingTeardown.
+	if _, err := fanout.ReconcileDestinations([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+	}); !errors.Is(err, ErrTeardownPending) {
+		t.Fatalf("removing reconcile returned err %v, want one wrapping ErrTeardownPending", err)
+	}
+
+	// Alongside it, a departure that has ALREADY settled and merely has not
+	// been harvested yet — the ordinary state whenever one target's delivery
+	// bracket closes before another's. seq 0 is even, so isFinal holds for any
+	// reading: nothing can charge grant-c again.
+	settled := &destCounters{}
+	settled.packets.Store(3)
+	settled.bytes.Store(96)
+	fanout.reconcileMu.Lock()
+	fanout.pendingTeardown = append(fanout.pendingTeardown, pendingDeparture{
+		entry: destination{id: "grant-c", name: "127.0.0.1:20003", counters: settled},
+		seq:   0,
+	})
+	fanout.reconcileMu.Unlock()
+
+	// Ask for grant-b back while its previous generation is still unsettled.
+	// This must be refused — and must not touch grant-c on the way out.
+	removed, err := fanout.ReconcileDestinations([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+	})
+	if !errors.Is(err, ErrTeardownPending) {
+		t.Fatalf("re-admitting an unsettled target ID returned err %v, want one wrapping ErrTeardownPending", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("refused reconcile returned %d departure(s) %+v, want none; a retry loop that discards the error "+
+			"discards these too, and they are the only remaining record of those sessions", len(removed), removed)
+	}
+
+	// Discard the refusal exactly as `if err != nil { retry }` would, then prove
+	// grant-c is still there to be closed. Before the fix it was consumed by the
+	// refusal and this harvest came back empty.
+	harvested, remaining := fanout.HarvestPendingTeardowns()
+	var grantC *DestinationStat
+	for i := range harvested {
+		if harvested[i].TargetID == "grant-c" {
+			grantC = &harvested[i]
+		}
+	}
+	if grantC == nil {
+		t.Fatalf("grant-c is gone after a refused reconcile (harvested %+v, %d remaining); the refusal consumed a "+
+			"settled departure, so its session is never closed and its tail never billed", harvested, remaining)
+	}
+	if grantC.Packets != 3 || grantC.Bytes != 96 {
+		t.Errorf("grant-c settled at %d packets / %d bytes, want 3 / 96", grantC.Packets, grantC.Bytes)
+	}
+	if remaining != 1 {
+		t.Errorf("harvest left %d departures outstanding, want 1 (grant-b, still wedged)", remaining)
+	}
+
+	// And the refusal it was mixed in with still holds: grant-b was not
+	// admitted, so nothing can bill into its unclosed old session.
+	for _, entry := range fanout.table.Load().entries {
+		if entry.id == "grant-b" {
+			t.Fatal("grant-b was admitted by a refused reconcile; the new generation would bill into the old session")
+		}
+	}
+}
