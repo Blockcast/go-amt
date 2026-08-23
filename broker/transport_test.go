@@ -508,6 +508,12 @@ func TestHeartbeatBodyFitsUnderCap(t *testing.T) {
 			FirstPacketAt: "2026-08-22T05:00:00.123456789Z",
 			LastPacketAt:  "2026-08-22T05:00:00.987654321Z",
 			Erasure: erasure.Window{
+				// Both at their maximal legal width, like every other field
+				// here: WindowStart takes the widest timestamp
+				// parseCanonicalUTCTimestamp accepts, WindowMS the widest
+				// integer validateErasureReport admits.
+				WindowStart:     "2026-08-22T05:00:00.123456789Z",
+				WindowMS:        MaxWindowMS,
 				SetsTotal:       MaxSetsTotal,
 				SetsErased:      setsErased,
 				ErasureFraction: erasure.Fraction(setsErased, MaxSetsTotal),
@@ -565,10 +571,10 @@ func TestHeartbeatBodyFitsUnderCap(t *testing.T) {
 	}
 
 	// Pin the documented figures. HeartbeatMaxBodyBytes quotes the byte count,
-	// the percentage, and a ~351-byte-per-feed spare budget that a proposed
+	// the percentage, and a ~283-byte-per-feed spare budget that a proposed
 	// per-feed field is meant to be sized against; a change here that leaves
 	// that prose stale is the drift this guards.
-	const wantBytes = 2_752_799
+	const wantBytes = 3_031_327
 	if widest != wantBytes {
 		t.Errorf("widest legal heartbeat = %d bytes (%.1f%% of cap, %.2fx headroom, "+
 			"%d bytes/feed spare), want %d — update the measurement at "+
