@@ -375,6 +375,63 @@ func TestGenericScorerReorderedAndOutOfOrderObserveDifferentAxes(t *testing.T) {
 	})
 }
 
+// TestGenericScorerRepeatedArrivalTimestampIsNotSubMillisecond covers the case
+// BLO-29918 singled out as the one reachable WITHOUT concurrency: a clock too
+// coarse to separate two arrivals yields a gap of exactly zero. The guard tests
+// `gap > 0`, so zero is charged to Reordered with the negatives rather than to
+// LT1. That distinction is the whole point — LT1 feeds the published latency
+// tail, and a zero gap is not evidence of sub-millisecond delivery.
+//
+// It also pins the retention half that the other guard tests do not assert
+// directly: Retention().Newest is s.lastArrival, so a frontier that regressed
+// would drag the eviction floor backwards with it.
+func TestGenericScorerRepeatedArrivalTimestampIsNotSubMillisecond(t *testing.T) {
+	started := time.Unix(70, 0)
+	at := func(ms int) time.Time { return started.Add(time.Duration(ms) * time.Millisecond) }
+
+	scorer := NewGenericScorer("test", "test")
+	// 0ms, +10ms, the SAME 10ms again (gap == 0), a regression to 5ms
+	// (gap < 0), then 12ms. The last gap must read +2ms from the held 10ms
+	// frontier, not +7ms from the regressed 5ms.
+	const length = 5
+	arrivals := [length]int{0, 10, 10, 5, 12}
+	var highWater time.Time
+	for index, ms := range arrivals {
+		record := genericRecord(0, uint16(index), length, uint64(index))
+		if _, err := scorer.Observe(record, at(ms)); err != nil {
+			t.Fatalf("observe index %d: %v", index, err)
+		}
+		// Asserted every step, not just at the end: a frontier that regressed
+		// and then recovered would be invisible to a final-value check.
+		newest := scorer.Retention().Newest
+		if newest.Before(highWater) {
+			t.Fatalf("after index %d (arrival %dms) Retention().Newest went backwards from %s to %s",
+				index, ms, highWater.Sub(started), newest.Sub(started))
+		}
+		highWater = newest
+	}
+
+	gaps := scorer.Receipt().Gaps
+	// Reordered = 2: the repeat (gap == 0) and the regression (gap < 0).
+	want := GapHistogram{From1To2_4: 1, From7To32: 1, Reordered: 2}
+	if gaps != want {
+		t.Errorf("gaps = %+v, want %+v", gaps, want)
+	}
+	// Stated separately because it is the specific misreading the unguarded code
+	// produced, and the one a reader of the receipt would be most misled by.
+	if gaps.LT1 != 0 {
+		t.Errorf("Gaps.LT1 = %d, want 0; a repeated timestamp is a zero gap, not a sub-millisecond delivery", gaps.LT1)
+	}
+	// The frontier held at 10ms, so the final arrival is +2ms and lands in
+	// From1To2_4. Measuring from the regressed 5ms would put it in From2_4To7.
+	if gaps.From2_4To7 != 0 {
+		t.Errorf("From2_4To7 = %d, want 0; the final gap was measured from the regressed arrival, not the frontier", gaps.From2_4To7)
+	}
+	if newest := scorer.Retention().Newest; !newest.Equal(at(12)) {
+		t.Errorf("Retention().Newest = %s, want %s after the frontier", newest.Sub(started), at(12).Sub(started))
+	}
+}
+
 // Percentiles are the upper edge of the bucket the true fill landed in, not the
 // fill itself: BLO-28909 bounded the scorer's per-window state, and exact
 // per-window latencies cannot be retained under a bound. The expected values

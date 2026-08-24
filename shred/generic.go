@@ -138,6 +138,14 @@ type GenericReceipt struct {
 	// can regress on either axis while monotonic on the other, so neither count
 	// bounds the other. TestGenericScorerReorderedAndOutOfOrderObserveDifferentAxes
 	// pins both directions.
+	//
+	// Read Reordered as "arrivals that did not advance the frontier", not strictly
+	// as "arrivals that were reordered". Two records the clock could not separate
+	// produce a gap of exactly zero and are counted here rather than in LT1, so on
+	// a coarse-clock host a nonzero Reordered may carry same-tick pairs and imply
+	// no reordering at all. The alternative was worse: a zero gap is not evidence
+	// of sub-millisecond delivery, and LT1 feeds the published latency tail.
+	// TestGenericScorerRepeatedArrivalTimestampIsNotSubMillisecond pins this.
 	Gaps GapHistogram `json:"gap_histogram"`
 }
 
@@ -301,6 +309,19 @@ func (s *GenericScorer) observeLocked(header GenericHeader, receivedAt time.Time
 	// from a stale origin and reads too large. The frontier is also this scorer's
 	// retention clock — retentionFloor is lastArrival minus the window — so a
 	// regressing assignment would move the eviction floor backwards too.
+	//
+	// The test is `gap > 0`, so a gap of exactly ZERO is charged to Reordered
+	// alongside the negative ones, and does not advance the frontier. That case
+	// is not exotic: it needs no concurrency at all, only a clock too coarse to
+	// separate two arrivals, so it is the one a single-goroutine feed will
+	// actually hit. Reordered therefore means "this arrival did not advance the
+	// frontier", which is a superset of "this arrival was reordered" — a
+	// same-tick pair is counted there despite nothing having been reordered.
+	// That is deliberate, and it is the lesser of the two available errors:
+	// a zero gap is not evidence of sub-millisecond delivery, so counting it in
+	// LT1 would overstate the tail of the latency distribution we publish, while
+	// counting it in Reordered at worst overstates a diagnostic. Both modes make
+	// the same choice — this is a mirror of score.go, not a divergence from it.
 	if !s.lastArrival.IsZero() {
 		if gap := receivedAt.Sub(s.lastArrival); gap > 0 {
 			s.gaps.observe(gap)
