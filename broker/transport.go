@@ -78,17 +78,21 @@ const (
 	// a measurement rather than an adjective: the widest heartbeat
 	// ValidateHeartbeat accepts — MaxFeeds (4096) feeds, each with a
 	// MaxFeedIDBytes id, a maximal packet/byte pair, a nanosecond-precision
-	// activity window, and a fully-populated erasure.Window at MaxSetsTotal —
-	// serializes to 2,752,799 bytes, or 65.6% of this cap. That is pinned by
+	// activity window, and a fully-populated erasure.Window at MaxSetsTotal
+	// carrying a maximal window_start/window_ms pair — serializes to 3,031,327
+	// bytes, or 72.3% of this cap. That is pinned by
 	// TestHeartbeatBodyFitsUnderCap, which fails if a future field erodes it.
 	//
-	// 1.52x of headroom against the legal maximum means a gateway that hits
+	// 1.38x of headroom against the legal maximum means a gateway that hits
 	// this cap has a bug rather than a large deployment, but the margin is thin
 	// enough that a per-feed field cannot be added without re-measuring: the
-	// spare budget is ~351 bytes per feed report at MaxFeeds, and that is the
-	// number a proposed field must be sized against. FeedReport's own doc
-	// contemplates a schema-2 window_ms for cross-gateway normalization; it
-	// lands on 65.6%, not on an empty cap.
+	// spare budget is ~283 bytes per feed report at MaxFeeds, and that is the
+	// number a proposed field must be sized against. The schema-2
+	// window_start/window_ms pair FeedReport's doc once contemplated has since
+	// landed (BLO-29493) and cost 68 of those bytes per feed, taking the
+	// measurement from 65.6% to the 72.3% above — which is what a field
+	// costing its budget looks like, and why the next one is measured before
+	// it lands rather than after.
 	//
 	// The fixture that pins this is required to pass ValidateHeartbeat and
 	// CanonicalBytes, which is not ceremony. The first version of that test
