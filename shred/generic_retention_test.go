@@ -419,3 +419,69 @@ func TestGenericWindowFillOverflowIsReported(t *testing.T) {
 		}
 	}
 }
+
+// TestGenericRetentionFrontierDoesNotRegress is the retention-surface half of the
+// monotonic-frontier fix, and the assertion Ally's review of #85 asked for by
+// name. The gap-histogram tests in generic_test.go pin what a regressing arrival
+// is COUNTED as; this one pins what it does to the eviction clock, which is the
+// defect class this file exists for. In generic mode the arrival frontier IS the
+// retention clock — retentionFloor is Newest minus the window — so an
+// unconditional `lastArrival = receivedAt` drags the floor backwards and lets
+// windows already past --retain stay tracked.
+//
+// Retention().Newest is asserted directly rather than inferred from TrackedWindows
+// because a regression only DELAYS eviction: the sweep schedule keys off the same
+// timestamp, so the stale window is reclaimed a sweep later and a count-only
+// assertion goes green on the unfixed code. The frontier is the thing that must
+// not move, so the frontier is what the test reads.
+func TestGenericRetentionFrontierDoesNotRegress(t *testing.T) {
+	const windowLength = 4
+	scorer := NewGenericScorerWithRetention("test", "test", testWindow)
+	started := time.Unix(7, 0)
+
+	// Window 0 in the distant past, then a frontier four windows ahead of it.
+	feedGenericWindow(t, scorer, 0, windowLength, started)
+	feedGenericWindow(t, scorer, 1, windowLength, started.Add(4*testWindow))
+
+	advanced := scorer.Retention()
+	if advanced.Newest.Before(started.Add(4 * testWindow)) {
+		t.Fatalf("setup did not advance the frontier: Newest = %s", advanced.Newest)
+	}
+
+	// A record whose arrival timestamp is a whole window behind the frontier —
+	// the concurrent-capture case GenericScorer's own doc comment describes.
+	if _, err := scorer.Observe(genericRecord(2, 0, windowLength, 99), started.Add(testWindow)); err != nil {
+		t.Fatalf("observe regressed arrival: %v", err)
+	}
+
+	regressed := scorer.Retention()
+	if regressed.Newest.Before(advanced.Newest) {
+		t.Fatalf("frontier regressed from %s to %s; retentionFloor moves with it, so windows past --retain stay tracked",
+			advanced.Newest.UTC(), regressed.Newest.UTC())
+	}
+	if !regressed.Newest.Equal(advanced.Newest) {
+		t.Fatalf("frontier = %s, want it held at %s; a late arrival must neither advance nor rewind the clock",
+			regressed.Newest.UTC(), advanced.Newest.UTC())
+	}
+
+	// The review's second half: the stale window is reclaimed once the monotonic
+	// frontier advances again. Window 0's last arrival is ~4 windows below the
+	// floor here, so it can only still be held if the floor followed the
+	// regressed timestamp down.
+	feedGenericWindow(t, scorer, 3, windowLength, started.Add(6*testWindow))
+	held := scorer.Retention()
+	if want := 2 * windowLength; held.TrackedRecords > want {
+		t.Fatalf("tracked records = %d, want at most two rounds' %d; a stale window survived the regression",
+			held.TrackedRecords, want)
+	}
+
+	// Eviction folds into the counters rather than discarding, so the reclaimed
+	// windows must still be on the receipt.
+	receipt := scorer.Receipt()
+	if receipt.Windows != 4 {
+		t.Fatalf("Windows = %d, want 4; reclaimed windows must survive as counters", receipt.Windows)
+	}
+	if receipt.Gaps.Reordered != 1 {
+		t.Fatalf("Gaps.Reordered = %d, want 1; the one regressing arrival must be charged, not bucketed", receipt.Gaps.Reordered)
+	}
+}
