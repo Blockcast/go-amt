@@ -4,10 +4,12 @@ package amt
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	m "github.com/blockcast/go-amt/messages"
 	"golang.org/x/net/ipv4"
@@ -233,4 +235,94 @@ func newIdleRustGateway(t *testing.T) *Gateway {
 		t.Fatalf("createRustGateway: %v", err)
 	}
 	return g
+}
+
+// TestRuntMulticastDataIsDroppedNotPanicked covers the half of the
+// received-length invariant that the BLO-29437 zero-length guard left open.
+//
+// determineAMTmessageType reads exactly one byte, at index 0 (gateway.go:570),
+// so once n >= 1 the type is decided by data the socket really delivered and
+// slicing the buffer cannot change the classification. What the length still
+// decides is whether the MulticastData arm's header slice is legal:
+// [m.DataMsgHdrLen:n] at n == 1 is [2:1], low > high, which panics for the same
+// reason n == 0 did. A single 1-byte 0x06 datagram reaches that arm.
+//
+// Both read paths are exercised because they slice differently and were fixed
+// separately: the batch path must additionally COMPACT the runt, so a runt
+// sharing a kernel batch with good data must not consume or hide it.
+func TestRuntMulticastDataIsDroppedNotPanicked(t *testing.T) {
+	// n == 1 is the panicking case (2:1). n == 0 is already covered above and
+	// is included so the two guards are seen to agree at the boundary.
+	for _, n := range []int{0, 1} {
+		t.Run(fmt.Sprintf("batch/n=%d", n), func(t *testing.T) {
+			gw := newIdleRustGateway(t)
+			mc := &MulticastConn{amtGw: gw, GroupAddr: netip.MustParseAddr("239.0.0.1")}
+
+			want := []byte("survives-the-runt")
+			good := multicastDataPacket(t, want)
+			good[0] = byte(m.MulticastDataType)
+
+			// The runt keeps a full-MTU backing array: the bug is reading past
+			// the reported length, so a short buffer would hide it.
+			runtBuf := make([]byte, 1500)
+			runtBuf[0] = byte(m.MulticastDataType)
+
+			messages := []ipv4.Message{
+				{Buffers: [][]byte{runtBuf}, N: n},
+				{Buffers: [][]byte{good}, N: len(good)},
+			}
+
+			got, err := mc.processAMTBatch(messages, len(messages))
+			if err != nil {
+				t.Fatalf("processAMTBatch error = %v, want nil", err)
+			}
+			if got != 1 {
+				t.Fatalf("processAMTBatch returned %d messages, want 1 (the runt must be compacted away, not counted)", got)
+			}
+			if !bytes.Equal(messages[0].Buffers[0], want) {
+				t.Fatalf("returned payload = %q, want %q", messages[0].Buffers[0], want)
+			}
+		})
+	}
+
+	t.Run("single/n=1", func(t *testing.T) {
+		// A real socket, not a fake: ReadFromWithControlMessage reads through a
+		// concrete *ipv4.PacketConn, and the defect is in how it slices what the
+		// kernel actually returned.
+		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("ListenPacket: %v", err)
+		}
+		defer pc.Close()
+
+		gw := newIdleRustGateway(t)
+		gw.conn = ipv4.NewPacketConn(pc)
+		mc := &MulticastConn{amtGw: gw, GroupAddr: netip.MustParseAddr("239.0.0.1")}
+
+		sender, err := net.Dial("udp4", pc.LocalAddr().String())
+		if err != nil {
+			t.Fatalf("Dial: %v", err)
+		}
+		defer sender.Close()
+		if _, err := sender.Write([]byte{byte(m.MulticastDataType)}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+
+		// The runt is dropped and the loop reads again, so the call is expected
+		// to end at the deadline. That timeout IS the pass condition: it proves
+		// the datagram was neither delivered upward nor fatal.
+		if err := gw.conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+			t.Fatalf("SetReadDeadline: %v", err)
+		}
+		got, _, _, err := mc.ReadFromWithControlMessage(make([]byte, 1500))
+		if got != 0 {
+			t.Fatalf("ReadFromWithControlMessage returned n=%d, want 0: a 1-byte datagram is not deliverable multicast data", got)
+		}
+		// Assert the timeout through net.Error rather than a specific sentinel:
+		// the error crosses x/net/ipv4 and is only guaranteed to stay a net.Error.
+		var netErr net.Error
+		if err == nil || !errors.As(err, &netErr) || !netErr.Timeout() {
+			t.Fatalf("err = %v, want a read timeout after the runt was dropped", err)
+		}
+	})
 }

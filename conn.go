@@ -252,6 +252,18 @@ func (mc *MulticastConn) processAMTBatch(ms []ipv4.Message, N int) (int, error) 
 		amtMessageType := determineAMTmessageType(cur.Buffers[0][:n])
 		switch amtMessageType {
 		case m.MulticastDataType:
+			// A data message must carry its 2-byte header. The n == 0 guard
+			// above does not cover n == 1: [m.DataMsgHdrLen:n] is then [2:1],
+			// low > high, which panics exactly like the zero-length case it
+			// was written for. One 1-byte 0x06 datagram on the tunnel socket
+			// is enough. RelayManager.routeDataToSubscription already drops
+			// these (relay_manager.go:848); this path never did.
+			if n < m.DataMsgHdrLen {
+				bad++
+				ms[i] = ms[N-bad]
+				i--
+				break
+			}
 			mc.amtGw.lastData.Store(time.Now())
 			p := gopacket.NewPacket(cur.Buffers[0][m.DataMsgHdrLen:n], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)
@@ -329,7 +341,14 @@ func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 		if n == 0 || err != nil {
 			return
 		}
-		amtMessageType := determineAMTmessageType(buf[:])
+		// n >= 1 is guaranteed by the return above, and determineAMTmessageType
+		// reads only index 0, so this slice does NOT change today's
+		// classification — buf[:] and buf[:n] are identical here for every
+		// n >= 1. It is passed anyway so the call site stops depending on that
+		// property of the callee: if the type read ever widens past byte 0,
+		// this path would otherwise start reading the reused buffer's stale
+		// tail while the batch path above stayed correct.
+		amtMessageType := determineAMTmessageType(buf[:n])
 		data := buf[:n]
 		switch amtMessageType {
 		case m.RelayAdvertisementType:
@@ -339,6 +358,14 @@ func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 			err = mc.amtGw.handleMembershipQuery(data)
 			n = 0
 		case m.MulticastDataType:
+			// Same received-length invariant as the batch path above. The
+			// n == 0 return at the top of this loop does not cover n == 1:
+			// data[m.DataMsgHdrLen:] is then a low > high slice and panics.
+			// Drop the runt and read the next datagram, as the mismatched-group
+			// case below does.
+			if n < m.DataMsgHdrLen {
+				break
+			}
 			mc.amtGw.lastData.Store(time.Now())
 			p := gopacket.NewPacket(data[m.DataMsgHdrLen:], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)
