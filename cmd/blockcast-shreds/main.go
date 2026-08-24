@@ -525,7 +525,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	}
 	var scorer sessionScorer
 	if mode.generic() {
-		scorer = shred.NewGenericFeedScorer(names, string(mode.sourceLabel), string(mode.rightsBasis))
+		scorer = shred.NewGenericFeedScorerWithRetention(names, string(mode.sourceLabel), string(mode.rightsBasis), retention)
 		// The provenance is announced at start, not only in the closing
 		// receipt, so a run that is interrupted still has its input labelled.
 		// It goes to stderr so --json keeps stdout a single JSON document.

@@ -18,11 +18,36 @@ type GenericFeedScorer struct {
 }
 
 func NewGenericFeedScorer(names []string, source, rightsBasis string) *GenericFeedScorer {
+	return NewGenericFeedScorerWithRetention(names, source, rightsBasis, DefaultRetention)
+}
+
+// NewGenericFeedScorerWithRetention builds one bounded scorer per feed. Each feed
+// gets its own retention frontier, unlike FeedScorer where every scorer ages
+// against the union's: there is no union in generic mode, so there is no shared
+// frontier to age against, and a feed that has gone quiet has no other feed whose
+// arrivals could speak for it.
+func NewGenericFeedScorerWithRetention(names []string, source, rightsBasis string, window time.Duration) *GenericFeedScorer {
 	feeds := make(map[string]*GenericScorer, len(names))
 	for _, name := range names {
-		feeds[name] = NewGenericScorer(source, rightsBasis)
+		feeds[name] = NewGenericScorerWithRetention(source, rightsBasis, window)
 	}
 	return &GenericFeedScorer{names: append([]string(nil), names...), feeds: feeds}
+}
+
+// Retention reports the per-window state held across every feed, so the bound can
+// be asserted on the scorer the demo command actually runs.
+func (s *GenericFeedScorer) Retention() GenericRetention {
+	var total GenericRetention
+	for _, name := range s.names {
+		held := s.feeds[name].Retention()
+		total.Window = held.Window
+		if held.Newest.After(total.Newest) {
+			total.Newest = held.Newest
+		}
+		total.TrackedWindows += held.TrackedWindows
+		total.TrackedRecords += held.TrackedRecords
+	}
+	return total
 }
 
 func (s *GenericFeedScorer) Observe(feed string, packet []byte, receivedAt time.Time) (bool, error) {

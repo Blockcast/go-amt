@@ -48,21 +48,33 @@ type Retention struct {
 	TrackedAttributions int
 }
 
-// sweepAt is when the next eviction pass runs, expressed as a fraction of the
-// window past the last one. Sweeping every arrival would make each one O(state);
-// sweeping once per window amortizes it to O(1) at the cost of holding at most
-// two windows rather than one. Rejecting is exact regardless — only reclamation
-// is lazy.
-func (s *Scorer) scheduleSweep(now time.Time) bool {
-	if s.nextSweep.IsZero() {
-		s.nextSweep = now.Add(s.window)
+// sweepDue reports whether an eviction pass is owed at now, advancing next when
+// it is. Sweeping every arrival would make each one O(state); sweeping once per
+// window amortizes it to O(1) at the cost of holding at most two windows rather
+// than one. Rejecting is exact regardless — only reclamation is lazy.
+//
+// It is a free function on a caller-owned deadline rather than a Scorer method
+// because GenericScorer bounds its state on the same schedule (see
+// GenericScorer's retention contract). Two copies of this would be two things
+// that can drift, and the whole reason generic.go reuses GapHistogram and the
+// percentile primitives is that the two modes must not report
+// differently-computed numbers.
+func sweepDue(next *time.Time, now time.Time, window time.Duration) bool {
+	if next.IsZero() {
+		*next = now.Add(window)
 		return false
 	}
-	if now.Before(s.nextSweep) {
+	if now.Before(*next) {
 		return false
 	}
-	s.nextSweep = now.Add(s.window)
+	*next = now.Add(window)
 	return true
+}
+
+// sweepAt is when the next eviction pass runs, expressed as a fraction of the
+// window past the last one.
+func (s *Scorer) scheduleSweep(now time.Time) bool {
+	return sweepDue(&s.nextSweep, now, s.window)
 }
 
 // retention reports this scorer's held state. FeedScorer.Retention aggregates it

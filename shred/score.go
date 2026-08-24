@@ -727,14 +727,22 @@ func (s *Scorer) receiptFor(keys []SetKey) Receipt {
 // what an operator reads in a dispute, and a percentile whose stated error bar
 // may not apply is worse than no percentile at all.
 func completionCaveat(aboveCeiling, total uint64) string {
+	return bucketedPercentileCaveat("time_to_32nd_shred", "completion", aboveCeiling, total)
+}
+
+// bucketedPercentileCaveat is completionCaveat generalized over the metric being
+// reported, because generic mode bounds its window-fill percentiles with the same
+// histogram and inherits the same overflow caveat verbatim. One renderer means
+// the two modes cannot come to disagree about how the same limitation is worded.
+func bucketedPercentileCaveat(metric, sample string, aboveCeiling, total uint64) string {
 	if aboveCeiling == 0 {
 		return ""
 	}
-	return fmt.Sprintf("time_to_32nd_shred WARNING: %d of %d completion(s) were at or "+
+	return fmt.Sprintf("%s WARNING: %d of %d %s(s) were at or "+
 		"above %s and recorded as that value, so a percentile that fell among them "+
 		"UNDERSTATES by an unbounded amount and the documented %.2f%% error does not "+
 		"apply to it. Percentiles below that point are unaffected.",
-		aboveCeiling, total, CompletionCeiling, CompletionRelativeError*100)
+		metric, aboveCeiling, total, sample, CompletionCeiling, CompletionRelativeError*100)
 }
 
 func (r UnionReceipt) String() string {
