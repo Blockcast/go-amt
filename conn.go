@@ -239,11 +239,16 @@ func (mc *MulticastConn) openTunnel() {
 	if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
 		gw.SourceAddr = mc.SrcAddr.AsSlice()
 	}
-	if err := gw.Open(); err != nil || mc.isClosed() {
-		_ = gw.Close()
+	if err := gw.Open(); err != nil {
+		gw.abortOpen()
 		return
 	}
 	mc.pathMu.Lock()
+	if mc.closed {
+		mc.pathMu.Unlock()
+		gw.abortOpen()
+		return
+	}
 	mc.amtGw = gw
 	mc.activeTunnel = mc.wantTunnel || (mc.conn4 == nil && mc.conn6 == nil)
 	mc.pathMu.Unlock()

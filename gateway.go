@@ -453,6 +453,22 @@ func (g *Gateway) stopKeepalive() {
 	g.leave.Store(true)
 }
 
+// abortOpen releases only resources that Open managed to initialize. It is
+// intentionally separate from Close: a failed setup may not have a socket or
+// Rust handle yet, so graceful teardown would try to exchange protocol
+// messages through a partially initialized gateway.
+func (g *Gateway) abortOpen() {
+	g.stopKeepalive()
+	if g.handle != nil {
+		C.amt_gateway_free(g.handle)
+		g.handle = nil
+	}
+	if g.conn != nil {
+		_ = g.conn.Close()
+		g.conn = nil
+	}
+}
+
 // handleRelayAdvertisement processes AMT Relay Advertisement.
 func (g *Gateway) handleRelayAdvertisement(data []byte) error {
 	// Pass to Rust library
