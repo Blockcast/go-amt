@@ -117,6 +117,28 @@ func TestMulticastConnNativeSelectionCancelsInFlightTunnel(t *testing.T) {
 	}
 }
 
+func TestMulticastConnDelayedTunnelOpenerHonorsNativeSelection(t *testing.T) {
+	// The probe can release tunnelStart before the opener goroutine is scheduled.
+	// Keep a native socket present so a delayed opener must not construct AMT after
+	// native arbitration has already won.
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen native socket: %v", err)
+	}
+	t.Cleanup(func() { _ = udp.Close() })
+	mc := &MulticastConn{conn4: ipv4.NewPacketConn(udp), wantTunnel: true, activeTunnel: true}
+	mc.prepareTunnel()
+	mc.setActiveTunnel(false)
+	mc.releaseTunnelStart()
+
+	if err := mc.openTunnel(); err != nil {
+		t.Fatalf("delayed opener returned an error: %v", err)
+	}
+	if mc.amtGw != nil {
+		t.Fatal("delayed opener constructed an AMT gateway after native selection")
+	}
+}
+
 // TestMulticastConnKeepsNativeWhenBothPathsAreLive is the "native and relay both
 // live" case on the live path: a reachable relay must not displace a native join
 // that is delivering.

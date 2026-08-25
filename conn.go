@@ -64,12 +64,14 @@ type MulticastConn struct {
 	conn6 *ipv6.PacketConn
 	amtGw *Gateway
 
-	pathMu       sync.RWMutex
-	activeTunnel bool
-	wantTunnel   bool
-	closed       bool
-	tunnelReady  chan struct{}
-	tunnelStart  chan struct{}
+	pathMu         sync.RWMutex
+	activeTunnel   bool
+	wantTunnel     bool
+	closed         bool
+	tunnelReady    chan struct{}
+	tunnelStart    chan struct{}
+	tunnelDecision chan struct{}
+	tunnelDecided  bool
 
 	// pending holds the datagram a successful probe consumed, so the first read
 	// after Open returns it instead of the caller waiting a whole signalling
@@ -168,6 +170,8 @@ func (mc *MulticastConn) prepareTunnel() {
 	mc.activeTunnel = false
 	mc.tunnelReady = make(chan struct{})
 	mc.tunnelStart = make(chan struct{})
+	mc.tunnelDecision = make(chan struct{})
+	mc.tunnelDecided = false
 	mc.pathMu.Unlock()
 }
 
@@ -237,6 +241,12 @@ func (mc *MulticastConn) probeNativeV6(window time.Duration) {
 
 func (mc *MulticastConn) releaseTunnelStart() {
 	mc.pathMu.Lock()
+	if !mc.tunnelDecided {
+		mc.tunnelDecided = true
+		if mc.tunnelDecision != nil {
+			close(mc.tunnelDecision)
+		}
+	}
 	if mc.tunnelStart != nil {
 		close(mc.tunnelStart)
 		mc.tunnelStart = nil
@@ -259,13 +269,14 @@ func (mc *MulticastConn) watchNativeV4() {
 
 func (mc *MulticastConn) openTunnel() (err error) {
 	mc.pathMu.RLock()
-	start := mc.tunnelStart
+	decision := mc.tunnelDecision
 	mc.pathMu.RUnlock()
-	if start != nil {
-		<-start
+	if decision != nil {
+		<-decision
 		mc.pathMu.RLock()
-		if mc.closed || !mc.activeTunnel {
-			mc.pathMu.RUnlock()
+		open := !mc.closed && (mc.activeTunnel || (mc.wantTunnel && mc.conn4 == nil && mc.conn6 == nil))
+		mc.pathMu.RUnlock()
+		if !open {
 			mc.pathMu.Lock()
 			if mc.tunnelReady != nil {
 				close(mc.tunnelReady)
@@ -274,7 +285,6 @@ func (mc *MulticastConn) openTunnel() (err error) {
 			mc.pathMu.Unlock()
 			return nil
 		}
-		mc.pathMu.RUnlock()
 	}
 	defer func() {
 		mc.pathMu.Lock()
@@ -618,6 +628,12 @@ func (mc *MulticastConn) Close() error {
 	mc.closed = true
 	gw := mc.amtGw
 	if mc.tunnelStart != nil {
+		if !mc.tunnelDecided {
+			mc.tunnelDecided = true
+			if mc.tunnelDecision != nil {
+				close(mc.tunnelDecision)
+			}
+		}
 		close(mc.tunnelStart)
 		mc.tunnelStart = nil
 	}
