@@ -275,6 +275,10 @@ func (mc *MulticastConn) isClosed() bool {
 func (mc *MulticastConn) setActiveTunnel(active bool) {
 	mc.pathMu.Lock()
 	mc.activeTunnel = active
+	// A native packet is authoritative for path selection. Clear the tunnel
+	// intent as well so an opener racing this decision cannot reactivate AMT
+	// when it publishes its gateway.
+	mc.wantTunnel = active
 	mc.pathMu.Unlock()
 }
 

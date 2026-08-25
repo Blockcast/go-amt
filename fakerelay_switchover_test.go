@@ -51,6 +51,24 @@ func newMulticastConnUnderTest(t *testing.T, fr *fakeRelay) *MulticastConn {
 	return mc
 }
 
+func TestMulticastConnNativeSelectionCancelsInFlightTunnel(t *testing.T) {
+	mc := &MulticastConn{wantTunnel: true, activeTunnel: true}
+
+	// This models the native probe winning while openTunnel is still between
+	// Gateway.Open and its pathMu publication section.
+	mc.setActiveTunnel(false)
+
+	mc.pathMu.RLock()
+	wantTunnel, activeTunnel := mc.wantTunnel, mc.activeTunnel
+	mc.pathMu.RUnlock()
+	if wantTunnel {
+		t.Fatal("native selection left the in-flight tunnel intent enabled")
+	}
+	if activeTunnel {
+		t.Fatal("native selection left AMT active")
+	}
+}
+
 // TestMulticastConnKeepsNativeWhenBothPathsAreLive is the "native and relay both
 // live" case on the live path: a reachable relay must not displace a native join
 // that is delivering.
