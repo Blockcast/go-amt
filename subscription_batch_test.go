@@ -73,6 +73,85 @@ func readBatchWithin(t *testing.T, mc *ManagedConn, ms []ipv4.Message, what stri
 	}
 }
 
+func readFromWithin(t *testing.T, mc *ManagedConn, buf []byte, what string) (int, net.Addr, error) {
+	t.Helper()
+	type result struct {
+		n    int
+		addr net.Addr
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, addr, err := mc.ReadFrom(buf)
+		ch <- result{n, addr, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.n, r.addr, r.err
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s blocked for 2s", what)
+		return 0, nil, nil
+	}
+}
+
+func readFromWithControlMessageWithin(t *testing.T, mc *ManagedConn, buf []byte, what string) (int, net.Addr, error) {
+	t.Helper()
+	type result struct {
+		n    int
+		addr net.Addr
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		n, _, addr, err := mc.ReadFromWithControlMessage(buf)
+		ch <- result{n, addr, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.n, r.addr, r.err
+	case <-time.After(2 * time.Second):
+		t.Fatalf("%s blocked for 2s", what)
+		return 0, nil, nil
+	}
+}
+
+func TestSinglePacketReadersKeepTunnelPacketForZeroLengthBuffer(t *testing.T) {
+	readers := []struct {
+		name string
+		read func(*testing.T, *ManagedConn, []byte, string) (int, net.Addr, error)
+	}{
+		{"ReadFrom", readFromWithin},
+		{"ReadFromWithControlMessage", readFromWithControlMessageWithin},
+	}
+
+	for _, tc := range readers {
+		t.Run(tc.name, func(t *testing.T) {
+			mc := tunnelConn(1)
+			mc.readBuffer <- testPacket("alpha")
+
+			n, addr, err := tc.read(t, mc, []byte{}, "zero-length "+tc.name)
+			if err != nil {
+				t.Fatalf("zero-length %s: unexpected error %v", tc.name, err)
+			}
+			if n != 0 || addr != nil {
+				t.Fatalf("zero-length %s = (%d, %v, nil), want (0, nil, nil)", tc.name, n, addr)
+			}
+
+			buf := make([]byte, 1500)
+			n, addr, err = tc.read(t, mc, buf, "follow-up "+tc.name)
+			if err != nil {
+				t.Fatalf("follow-up %s: unexpected error %v", tc.name, err)
+			}
+			if got := string(buf[:n]); got != "alpha" {
+				t.Fatalf("follow-up %s payload = %q, want %q", tc.name, got, "alpha")
+			}
+			if addr == nil {
+				t.Fatalf("follow-up %s returned nil source address", tc.name)
+			}
+		})
+	}
+}
+
 // A no-room message must not consume a packet. On the subscription path the
 // packet is taken off readBuffer and there is nowhere to put it back, so a room
 // check that happens after the receive destroys the packet outright — this is
