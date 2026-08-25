@@ -7,8 +7,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/blockcast/go-amt/broker"
 	"github.com/blockcast/go-amt/erasure"
@@ -38,10 +42,10 @@ func drainedWindow(t *testing.T) erasure.Window {
 	return window
 }
 
-func newTestProducer(t *testing.T, baseURL string, feeds []receiver.FeedSnapshot) *Producer {
+func newTestProducer(t *testing.T, baseURL string, feeds []receiver.FeedSnapshot, opts ...Option) *Producer {
 	t.Helper()
 	producer, err := NewProducer(testGWUUID, baseURL, fakeSource{feeds: feeds},
-		WithClock(func() time.Time { return time.Unix(1750000030, 0).UTC() }))
+		append([]Option{WithClock(func() time.Time { return time.Unix(1750000030, 0).UTC() })}, opts...)...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,7 +189,7 @@ func TestBuildRejectsANeverDrainedFeed(t *testing.T) {
 // append-only ledger.
 func TestSendReplaysIdenticalBytes(t *testing.T) {
 	var bodies [][]byte
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != broker.HeartbeatPath() {
 			t.Errorf("POST path = %q, want %q", r.URL.Path, broker.HeartbeatPath())
 		}
@@ -199,7 +203,7 @@ func TestSendReplaysIdenticalBytes(t *testing.T) {
 	producer := newTestProducer(t, server.URL, []receiver.FeedSnapshot{{
 		FeedID: "feed-a",
 		Window: drainedWindow(t),
-	}})
+	}}, WithHTTPClient(server.Client()))
 
 	heartbeat, err := producer.Build()
 	if err != nil {
@@ -226,6 +230,16 @@ func TestSendReplaysIdenticalBytes(t *testing.T) {
 	if string(bodies[0]) != string(bodies[1]) {
 		t.Errorf("replayed body differs from the original:\n first: %s\nsecond: %s",
 			bodies[0], bodies[1])
+	}
+}
+
+func TestNewProducerRejectsInsecureBrokerURL(t *testing.T) {
+	_, err := NewProducer(testGWUUID, "http://broker.example", fakeSource{})
+	if err == nil {
+		t.Fatal("NewProducer accepted an http broker URL")
+	}
+	if !strings.Contains(err.Error(), "must use https") {
+		t.Fatalf("NewProducer error = %v, want an https requirement", err)
 	}
 }
 
@@ -265,7 +279,7 @@ func TestSendClassifiesFailuresFromTheCodeTaxonomy(t *testing.T) {
 		},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				if testCase.retryAfter != "" {
 					w.Header().Set(broker.RetryAfterHeaderName, testCase.retryAfter)
 				}
@@ -280,7 +294,7 @@ func TestSendClassifiesFailuresFromTheCodeTaxonomy(t *testing.T) {
 			producer := newTestProducer(t, server.URL, []receiver.FeedSnapshot{{
 				FeedID: "feed-a",
 				Window: drainedWindow(t),
-			}})
+			}}, WithHTTPClient(server.Client()))
 
 			retry, err := producer.Send(context.Background(), []byte(`{}`))
 			if testCase.wantErr && err == nil {
@@ -310,5 +324,114 @@ func TestNewProducerRejectsBadConfigAtStartup(t *testing.T) {
 					testCase.gwUUID, testCase.baseURL)
 			}
 		})
+	}
+}
+
+// TestSendOnceIsRaceFreeAgainstLiveIngest exercises the producer's read of the
+// receiver's metrics *concurrently with the ingest path that writes them*, so
+// the CI race lane (`go test -race -tags purego ./...`) has something to
+// observe on this path.
+//
+// This test exists because the lane's green tick was previously meaningless
+// here: every other test in this file drives fakeSource, whose Snapshot is a
+// field read with no writer, so -race saw no concurrent access to report and
+// the ticker-vs-Snapshot concurrency was argued structurally rather than
+// observed. That is the same shape as this row's other silent-inert failures —
+// a check that passes while measuring nothing.
+//
+// It therefore uses the REAL *receiver.ReceiverMetrics rather than fakeSource:
+// the pairing under test is Snapshot's RLock against ObserveIngress's and
+// PublishWindow's Lock, and a fake cannot exercise a lock it does not have.
+// SendOnce is called in a loop rather than via Run because Run ticks on
+// broker.HeartbeatInterval (30s); SendOnce is exactly what that tick invokes,
+// so the loop covers the same read path without a 30-second test.
+//
+// Assertions are deliberately weak — counters are racing by construction, so
+// pinning a value would make this flaky. Correctness here is "the race detector
+// reports nothing and every beat validates", not a particular count.
+func TestSendOnceIsRaceFreeAgainstLiveIngest(t *testing.T) {
+	const feedID = "feed-a"
+
+	metrics, err := receiver.NewReceiverMetrics(prometheus.NewRegistry(), []string{feedID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed one valid window so the first beat validates: a zero window is
+	// schema 0, which ValidateHeartbeat rejects — the generic-mode failure
+	// this PR's other commit rejects at startup.
+	if err := metrics.PublishWindow(feedID, drainedWindow(t)); err != nil {
+		t.Fatal(err)
+	}
+
+	var accepted atomic.Int64
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var beat broker.Heartbeat
+		if err := json.NewDecoder(r.Body).Decode(&beat); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		// Validate server-side: a beat assembled from a torn read would fail
+		// here, so this is the assertion that a race would actually trip.
+		if err := broker.ValidateHeartbeat(beat); err != nil {
+			t.Errorf("server received an invalid heartbeat: %v", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		accepted.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+
+	producer, err := NewProducer(testGWUUID, server.URL, metrics, WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var writers sync.WaitGroup
+	// Two writer classes, because they take the write lock on different state:
+	// ObserveIngress mutates liveness, PublishWindow replaces the window.
+	writers.Add(2)
+	go func() {
+		defer writers.Done()
+		for i := 0; i < 300; i++ {
+			if err := metrics.ObserveIngress(feedID, 1316, time.Now()); err != nil {
+				t.Errorf("ObserveIngress: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer writers.Done()
+		window := drainedWindow(t)
+		for i := 0; i < 300; i++ {
+			if err := metrics.PublishWindow(feedID, window); err != nil {
+				t.Errorf("PublishWindow: %v", err)
+				return
+			}
+		}
+	}()
+
+	var readers sync.WaitGroup
+	readers.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() {
+			defer readers.Done()
+			for j := 0; j < 50; j++ {
+				if err := producer.SendOnce(ctx); err != nil {
+					t.Errorf("SendOnce: %v", err)
+					return
+				}
+			}
+		}()
+	}
+
+	writers.Wait()
+	readers.Wait()
+
+	if got := accepted.Load(); got != 100 {
+		t.Fatalf("accepted heartbeats = %d, want 100", got)
 	}
 }

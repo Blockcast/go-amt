@@ -134,6 +134,12 @@ func NewProducer(gwUUID, baseURL string, source FeedSource, opts ...Option) (*Pr
 	if err != nil {
 		return nil, fmt.Errorf("gwclient: parse broker base URL %q: %w", baseURL, err)
 	}
+	if parsed.Scheme != "https" {
+		return nil, fmt.Errorf("gwclient: broker base URL %q must use https", baseURL)
+	}
+	if parsed.User != nil {
+		return nil, fmt.Errorf("gwclient: broker base URL %q must not contain userinfo", baseURL)
+	}
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("gwclient: broker base URL %q needs a scheme and host", baseURL)
 	}
