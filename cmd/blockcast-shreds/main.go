@@ -76,7 +76,10 @@ the inputs are independently operated or share one tap.
 together: a broker URL without an identity produces heartbeats the broker
 rejects, and an identity without a URL is inert but looks configured. When
 enabled, the receiver POSTs a per-feed liveness and delivery report every 30s.
-Omitting both — the default — keeps demo mode heartbeat-free.
+Omitting both — the default — keeps demo mode heartbeat-free. They require
+--mode shred: the report carries a per-feed erasure window, and generic mode
+does no erasure scoring, so the pair is rejected at startup there rather than
+emitting a beat the broker discards.
 
 --version prints the build-stamped version reported in every heartbeat and
 exits, without requiring a valid receiver configuration.
@@ -250,7 +253,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	beat, err := heartbeatOptions(*brokerURL, *gwUUID)
+	beat, err := heartbeatOptions(*brokerURL, *gwUUID, *score)
 	if err != nil {
 		return err
 	}
@@ -279,14 +282,35 @@ type heartbeatConfig struct {
 
 func (h heartbeatConfig) enabled() bool { return h.brokerURL != "" }
 
-// heartbeatOptions validates the heartbeat flags as a set.
+// heartbeatOptions validates the heartbeat flags as a set, against the scoring
+// mode they will run under.
 //
 // Both or neither: a broker URL with no gateway identity produces heartbeats
 // the broker rejects for an invalid gw_uuid, and a gateway identity with no
 // broker URL is a silently inert configuration that looks configured. Failing
 // at startup is the point — the alternative surfaces 30 seconds later as a
 // rejected heartbeat with no obvious cause.
-func heartbeatOptions(brokerURL, gwUUID string) (heartbeatConfig, error) {
+//
+// Generic mode is rejected outright for the same reason, one layer deeper. The
+// heartbeat's FeedReport carries a mandatory erasure window, and erasure
+// scoring is shred-only: listenAndScore deliberately builds NO trackers in
+// generic mode, so nothing ever publishes a window, every feed keeps the zero
+// erasure.Window whose Schema is 0, and ValidateHeartbeat — whose floor is 1 —
+// rejects the whole beat. Producer.Run only logs that rejection, so the
+// gateway would send nothing at all while every flag read as configured. That
+// is the silent-inert shape this function already exists to prevent.
+//
+// The alternative — synthesizing a window to satisfy the schema — is refused
+// deliberately, and not only here: the pre-flight drain in listenAndScore
+// performs a REAL drain precisely so the producer never reports a delivery
+// figure it did not measure, and a zero erasure window reads as a PERFECT
+// feed. Fabricating one would turn an unmeasured feed into a clean SLA record,
+// which is the confusion the erasure contract exists to prevent.
+//
+// TestGenericModeHeartbeatIsUnsendable pins the underlying failure, so if
+// generic mode ever gains a real window this rejection can be revisited
+// against evidence rather than removed on assumption.
+func heartbeatOptions(brokerURL, gwUUID string, mode scoring) (heartbeatConfig, error) {
 	switch {
 	case brokerURL == "" && gwUUID == "":
 		return heartbeatConfig{}, nil
@@ -294,6 +318,11 @@ func heartbeatOptions(brokerURL, gwUUID string) (heartbeatConfig, error) {
 		return heartbeatConfig{}, errors.New("--gw-uuid requires --broker-url")
 	case gwUUID == "":
 		return heartbeatConfig{}, errors.New("--broker-url requires --gw-uuid")
+	case mode.generic():
+		return heartbeatConfig{}, errors.New(
+			"--broker-url and --gw-uuid require --mode shred: the heartbeat reports a " +
+				"per-feed erasure window, generic mode does no erasure scoring, and a " +
+				"synthesized zero window would report an unmeasured feed as a perfect one")
 	}
 	return heartbeatConfig{brokerURL: brokerURL, gwUUID: gwUUID}, nil
 }
