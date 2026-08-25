@@ -192,7 +192,7 @@ func TestProcessAMTBatchCompactsControlMessages(t *testing.T) {
 				messages[0], messages[1] = messages[1], messages[0]
 			}
 
-			n, err := mc.processAMTBatch(messages, len(messages))
+			n, err := mc.processAMTBatch(gw, messages, len(messages))
 			if n != 1 {
 				t.Fatalf("processAMTBatch returned %d messages, want 1", n)
 			}
@@ -272,7 +272,7 @@ func TestRuntMulticastDataIsDroppedNotPanicked(t *testing.T) {
 				{Buffers: [][]byte{good}, N: len(good)},
 			}
 
-			got, err := mc.processAMTBatch(messages, len(messages))
+			got, err := mc.processAMTBatch(gw, messages, len(messages))
 			if err != nil {
 				t.Fatalf("processAMTBatch error = %v, want nil", err)
 			}

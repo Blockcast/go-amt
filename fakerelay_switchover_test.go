@@ -51,6 +51,24 @@ func newMulticastConnUnderTest(t *testing.T, fr *fakeRelay) *MulticastConn {
 	return mc
 }
 
+func TestMulticastConnNativeSelectionCancelsInFlightTunnel(t *testing.T) {
+	mc := &MulticastConn{wantTunnel: true, activeTunnel: true}
+
+	// This models the native probe winning while openTunnel is still between
+	// Gateway.Open and its pathMu publication section.
+	mc.setActiveTunnel(false)
+
+	mc.pathMu.RLock()
+	wantTunnel, activeTunnel := mc.wantTunnel, mc.activeTunnel
+	mc.pathMu.RUnlock()
+	if wantTunnel {
+		t.Fatal("native selection left the in-flight tunnel intent enabled")
+	}
+	if activeTunnel {
+		t.Fatal("native selection left AMT active")
+	}
+}
+
 // TestMulticastConnKeepsNativeWhenBothPathsAreLive is the "native and relay both
 // live" case on the live path: a reachable relay must not displace a native join
 // that is delivering.
@@ -164,7 +182,10 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 	// here the probe window runs first, so a regression that made either leg
 	// unbounded — the #29 hang, or a probe deadline that outlived its window —
 	// shows up as an overrun rather than a slow pass.
-	if bound := MinUsefulProbeWindow + 2*time.Second + 8*time.Second; elapsed > bound {
+	if elapsed >= MinUsefulProbeWindow {
+		t.Errorf("Open took %s, want return before the native probe window %s", elapsed, MinUsefulProbeWindow)
+	}
+	if bound := 2*time.Second + 8*time.Second; elapsed > bound {
 		t.Errorf("Open took %s, over the %s bound (probe window + handshake timeout "+
 			"+ slack): one of the two legs is not bounding itself", elapsed, bound)
 	}
