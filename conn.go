@@ -12,6 +12,7 @@ import (
 	"golang.org/x/net/ipv6"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 )
 
@@ -63,6 +64,12 @@ type MulticastConn struct {
 	conn6 *ipv6.PacketConn
 	amtGw *Gateway
 
+	pathMu       sync.RWMutex
+	activeTunnel bool
+	wantTunnel   bool
+	closed       bool
+	tunnelReady  chan struct{}
+
 	// pending holds the datagram a successful probe consumed, so the first read
 	// after Open returns it instead of the caller waiting a whole signalling
 	// interval for the next one. Drained by ReadFromWithControlMessage and
@@ -102,31 +109,14 @@ func (mc *MulticastConn) Open() error {
 			}
 			mc.conn6 = conn
 
-			if plan.Probe {
-				var src net.Addr
-				pkt, native, err := probeNativeTraffic(mc.conn6, plan.Window, mc.IFace.MTU, func(b []byte) (int, error) {
-					n, _, s, err := mc.conn6.ReadFrom(b)
-					src = s
-					return n, err
-				})
-				if err != nil {
-					return err
-				}
-				if native {
-					// cm stays nil: the v6 read path drops the control message
-					// anyway, since ipv6.ControlMessage is a different type.
-					mc.pending.put(&pendingPacket{buf: pkt, src: src})
-					return nil
-				}
+			if plan.Probe && plan.TunnelOnFailure {
+				go mc.probeNativeV6(plan.Window)
 			}
 			if !plan.TunnelOnFailure {
 				return nil
 			}
-
-			if err := mc.conn6.Close(); err != nil {
-				return err
-			}
-			mc.conn6 = nil
+			mc.startTunnel()
+			return nil
 		}
 
 		// Native v6 produced no traffic — or was never attempted, because the
@@ -150,36 +140,95 @@ func (mc *MulticastConn) Open() error {
 		}
 		mc.conn4 = conn
 
-		if plan.Probe {
-			var cm *ipv4.ControlMessage
-			var src net.Addr
-			pkt, native, err := probeNativeTraffic(mc.conn4, plan.Window, mc.IFace.MTU, func(b []byte) (int, error) {
-				n, c, s, err := mc.conn4.ReadFrom(b)
-				cm, src = c, s
-				return n, err
-			})
-			if err != nil {
-				return err
-			}
-			if native {
-				mc.pending.put(&pendingPacket{buf: pkt, cm: cm, src: src})
-				return nil
-			}
+		if plan.Probe && plan.TunnelOnFailure {
+			go mc.probeNativeV4(plan.Window)
 		}
 		if !plan.TunnelOnFailure {
 			return nil
 		}
-
-		// Hand the group over to an AMT tunnel. The native join is dropped only here,
-		// once the plan has actually concluded native is not deliverable — never on
-		// the strength of a window too short to be evidence (BLO-28640).
-		if err := mc.conn4.Close(); err != nil {
-			return err
-		}
-		mc.conn4 = nil
+		mc.startTunnel()
+		return nil
 	}
+	mc.startTunnel()
+	return nil
+}
 
-	mc.amtGw = &Gateway{
+func (mc *MulticastConn) startTunnel() {
+	mc.pathMu.Lock()
+	mc.wantTunnel = true
+	mc.activeTunnel = true
+	mc.tunnelReady = make(chan struct{})
+	mc.pathMu.Unlock()
+	go mc.openTunnel()
+}
+
+func (mc *MulticastConn) probeNativeV4(window time.Duration) {
+	var cm *ipv4.ControlMessage
+	var src net.Addr
+	pkt, native, err := probeNativeTraffic(mc.conn4, window, mc.IFace.MTU, func(b []byte) (int, error) {
+		n, c, s, err := mc.conn4.ReadFrom(b)
+		cm, src = c, s
+		return n, err
+	})
+	if err != nil || mc.isClosed() {
+		return
+	}
+	if native {
+		mc.pending.put(&pendingPacket{buf: pkt, cm: cm, src: src})
+		mc.setActiveTunnel(false)
+		return
+	}
+	mc.pathMu.Lock()
+	mc.wantTunnel = true
+	mc.pathMu.Unlock()
+	mc.watchNativeV4()
+}
+
+func (mc *MulticastConn) probeNativeV6(window time.Duration) {
+	var src net.Addr
+	pkt, native, err := probeNativeTraffic(mc.conn6, window, mc.IFace.MTU, func(b []byte) (int, error) {
+		n, _, s, err := mc.conn6.ReadFrom(b)
+		src = s
+		return n, err
+	})
+	if err != nil || mc.isClosed() {
+		return
+	}
+	if native {
+		mc.pending.put(&pendingPacket{buf: pkt, src: src})
+		mc.setActiveTunnel(false)
+		return
+	}
+	mc.pathMu.Lock()
+	mc.wantTunnel = true
+	mc.pathMu.Unlock()
+}
+
+func (mc *MulticastConn) watchNativeV4() {
+	buf := make([]byte, mc.IFace.MTU)
+	for !mc.isClosed() && mc.IsUsingTunnel() {
+		n, cm, src, err := mc.conn4.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		mc.pending.put(&pendingPacket{buf: append([]byte(nil), buf[:n]...), cm: cm, src: src})
+		mc.setActiveTunnel(false)
+		return
+	}
+}
+
+func (mc *MulticastConn) openTunnel() {
+	defer func() {
+		mc.pathMu.Lock()
+		if mc.tunnelReady != nil {
+			close(mc.tunnelReady)
+			mc.tunnelReady = nil
+		}
+		mc.pathMu.Unlock()
+	}()
+	dstAddr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort))
+
+	gw := &Gateway{
 		RelayAddr:   &mc.RelayAddr,
 		GroupAddr:   dstAddr.IP,
 		MTU:         mc.IFace.MTU,
@@ -188,16 +237,46 @@ func (mc *MulticastConn) Open() error {
 		Timeout:     gatewayOpenTimeout(mc.Timeout),
 	}
 	if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
-		mc.amtGw.SourceAddr = mc.SrcAddr.AsSlice()
+		gw.SourceAddr = mc.SrcAddr.AsSlice()
 	}
-	if err := mc.amtGw.Open(); err != nil {
-		return fmt.Errorf("Error setting up socket: %w", err)
+	if err := gw.Open(); err != nil || mc.isClosed() {
+		_ = gw.Close()
+		return
 	}
-	return nil
+	mc.pathMu.Lock()
+	mc.amtGw = gw
+	mc.activeTunnel = mc.wantTunnel || (mc.conn4 == nil && mc.conn6 == nil)
+	mc.pathMu.Unlock()
+}
+
+func (mc *MulticastConn) waitTunnel() *Gateway {
+	for {
+		mc.pathMu.RLock()
+		gw, ready := mc.amtGw, mc.tunnelReady
+		mc.pathMu.RUnlock()
+		if gw != nil || ready == nil {
+			return gw
+		}
+		<-ready
+	}
+}
+
+func (mc *MulticastConn) isClosed() bool {
+	mc.pathMu.RLock()
+	defer mc.pathMu.RUnlock()
+	return mc.closed
+}
+
+func (mc *MulticastConn) setActiveTunnel(active bool) {
+	mc.pathMu.Lock()
+	mc.activeTunnel = active
+	mc.pathMu.Unlock()
 }
 
 func (mc *MulticastConn) IsUsingTunnel() bool {
-	return mc.amtGw != nil
+	mc.pathMu.RLock()
+	defer mc.pathMu.RUnlock()
+	return mc.activeTunnel
 }
 func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	// A packet the probe consumed is owed to the caller before anything read
@@ -233,10 +312,14 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 		}
 		return mc.conn4.ReadBatch(ms, flags)
 	}
-	if err := mc.amtGw.loopErr.Swap(nil); err != nil {
+	gw := mc.waitTunnel()
+	if gw == nil {
+		return 0, net.ErrClosed
+	}
+	if err := gw.loopErr.Swap(nil); err != nil {
 		return 0, err
 	}
-	N, err := mc.amtGw.conn.ReadBatch(ms, flags)
+	N, err := gw.conn.ReadBatch(ms, flags)
 	if err != nil {
 		return 0, fmt.Errorf("error reading from connection: %w", err)
 	}
@@ -305,7 +388,7 @@ func (mc *MulticastConn) processAMTBatch(ms []ipv4.Message, N int) (int, error) 
 				i--
 				break
 			}
-			mc.amtGw.lastData.Store(time.Now())
+			gw.lastData.Store(time.Now())
 			p := gopacket.NewPacket(cur.Buffers[0][m.DataMsgHdrLen:n], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)
 			udpHdr, ok := p.TransportLayer().(*layers.UDP)
@@ -378,11 +461,15 @@ func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 		}
 		return mc.conn4.ReadFrom(buf)
 	}
-	if err := mc.amtGw.loopErr.Swap(nil); err != nil {
+	gw := mc.waitTunnel()
+	if gw == nil {
+		return 0, nil, nil, net.ErrClosed
+	}
+	if err := gw.loopErr.Swap(nil); err != nil {
 		return 0, nil, nil, err
 	}
 	for {
-		n, cm, src, err = mc.amtGw.conn.ReadFrom(buf)
+		n, cm, src, err = gw.conn.ReadFrom(buf)
 		if n == 0 || err != nil {
 			return
 		}
@@ -397,10 +484,10 @@ func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 		data := buf[:n]
 		switch amtMessageType {
 		case m.RelayAdvertisementType:
-			err = mc.amtGw.handleRelayAdvertisement(data)
+			err = gw.handleRelayAdvertisement(data)
 			n = 0
 		case m.MembershipQueryType:
-			err = mc.amtGw.handleMembershipQuery(data)
+			err = gw.handleMembershipQuery(data)
 			n = 0
 		case m.MulticastDataType:
 			// Same received-length invariant as the batch path above. The
@@ -453,43 +540,82 @@ func (mc *MulticastConn) WriteToWithControlMessage(b []byte, cm *ipv4.ControlMes
 }
 
 func (mc *MulticastConn) Close() error {
-	if !mc.IsUsingTunnel() {
-		if c := mc.activeConn(); c != nil {
-			return c.Close()
+	mc.pathMu.Lock()
+	mc.closed = true
+	gw := mc.amtGw
+	if mc.tunnelReady != nil {
+		close(mc.tunnelReady)
+		mc.tunnelReady = nil
+	}
+	conn4, conn6 := mc.conn4, mc.conn6
+	mc.pathMu.Unlock()
+	var closeErr error
+	if conn4 != nil {
+		closeErr = conn4.Close()
+	}
+	if conn6 != nil {
+		if err := conn6.Close(); closeErr == nil {
+			closeErr = err
 		}
 	}
-	if mc.amtGw != nil {
-		return mc.amtGw.Close()
+	if gw != nil {
+		if err := gw.Close(); closeErr == nil {
+			closeErr = err
+		}
 	}
-	return nil
+	return closeErr
 }
 
 func (mc *MulticastConn) LocalAddr() net.Addr {
 	if !mc.IsUsingTunnel() {
-		return mc.activeConn().LocalAddr()
+		if c := mc.activeConn(); c != nil {
+			return c.LocalAddr()
+		}
+		return nil
 	}
-	return mc.amtGw.conn.LocalAddr()
+	if gw := mc.waitTunnel(); gw != nil {
+		return gw.conn.LocalAddr()
+	}
+	return nil
 }
 
 func (mc *MulticastConn) SetDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
-		return mc.activeConn().SetDeadline(t)
+		if c := mc.activeConn(); c != nil {
+			return c.SetDeadline(t)
+		}
+		return net.ErrClosed
 	}
-	return mc.amtGw.conn.SetDeadline(t)
+	if gw := mc.waitTunnel(); gw != nil {
+		return gw.conn.SetDeadline(t)
+	}
+	return net.ErrClosed
 }
 
 func (mc *MulticastConn) SetReadDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
-		return mc.activeConn().SetReadDeadline(t)
+		if c := mc.activeConn(); c != nil {
+			return c.SetReadDeadline(t)
+		}
+		return net.ErrClosed
 	}
-	return mc.amtGw.conn.SetReadDeadline(t)
+	if gw := mc.waitTunnel(); gw != nil {
+		return gw.conn.SetReadDeadline(t)
+	}
+	return net.ErrClosed
 }
 
 func (mc *MulticastConn) SetWriteDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
-		return mc.activeConn().SetWriteDeadline(t)
+		if c := mc.activeConn(); c != nil {
+			return c.SetWriteDeadline(t)
+		}
+		return net.ErrClosed
 	}
-	return mc.amtGw.conn.SetWriteDeadline(t)
+	if gw := mc.waitTunnel(); gw != nil {
+		return gw.conn.SetWriteDeadline(t)
+	}
+	return net.ErrClosed
 }
 
 func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {

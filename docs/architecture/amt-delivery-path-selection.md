@@ -1,7 +1,8 @@
 # AMT delivery-path selection: from a startup guess to a reversible decision
 
-Status: **proposed**. Item 2 (deliver the probe packet) is implemented in this
-change; item 1 (reversible path selection) is specified here and not yet built.
+Status: **phase 2 implemented**. Item 2 (deliver the probe packet) and the
+non-blocking two-path arbiter are implemented; conditional standby teardown is
+still deliberately deferred until telemetry exists.
 
 Tracking: [BLO-28740]. Background: [BLO-28640] (the 2026-08-18 outage),
 go-amt#49 (the window-sizing fix this builds on).
@@ -199,6 +200,7 @@ it stops being load-bearing for correctness inside the package.
    above, and it retires roughly one signalling interval (>=5s) of startup
    latency on the signalling channel. The `pendingStore` seam it introduces is
    reused by the switchover drain in item 1.
+
 2. **Arbiter, native-vs-AMT, no teardown.** Both paths up, one active, standby
    watched. Ship with the conditional teardown disabled so the steady state is
    observable before it is optimised. Note what that configuration *is*: both
