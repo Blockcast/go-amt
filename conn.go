@@ -155,7 +155,10 @@ func (mc *MulticastConn) Open() error {
 func (mc *MulticastConn) prepareTunnel() {
 	mc.pathMu.Lock()
 	mc.wantTunnel = true
-	mc.activeTunnel = true
+	// Native delivery remains the preferred path until the probe proves it
+	// silent. The AMT opener may run in parallel, but it is only active after
+	// arbitration selects it.
+	mc.activeTunnel = false
 	mc.tunnelReady = make(chan struct{})
 	mc.pathMu.Unlock()
 }
@@ -188,6 +191,7 @@ func (mc *MulticastConn) probeNativeV4(window time.Duration) {
 	}
 	mc.pathMu.Lock()
 	mc.wantTunnel = true
+	mc.activeTunnel = true
 	mc.pathMu.Unlock()
 	mc.watchNativeV4()
 }
@@ -209,6 +213,7 @@ func (mc *MulticastConn) probeNativeV6(window time.Duration) {
 	}
 	mc.pathMu.Lock()
 	mc.wantTunnel = true
+	mc.activeTunnel = true
 	mc.pathMu.Unlock()
 }
 
@@ -258,7 +263,10 @@ func (mc *MulticastConn) openTunnel() (err error) {
 		return net.ErrClosed
 	}
 	mc.amtGw = gw
-	mc.activeTunnel = mc.wantTunnel || (mc.conn4 == nil && mc.conn6 == nil)
+	// Keep a native-preferred arbitration decision intact when AMT finishes
+	// opening first. AMT-only construction has no native socket, so it still
+	// becomes active immediately.
+	mc.activeTunnel = mc.activeTunnel || (mc.wantTunnel && mc.conn4 == nil && mc.conn6 == nil)
 	mc.pathMu.Unlock()
 	return nil
 }
