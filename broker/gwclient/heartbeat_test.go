@@ -243,6 +243,20 @@ func TestNewProducerRejectsInsecureBrokerURL(t *testing.T) {
 	}
 }
 
+func TestNewProducerRejectsBrokerURLComponents(t *testing.T) {
+	for _, baseURL := range []string{
+		"https://broker.example/ignored",
+		"https://broker.example/?token=secret",
+		"https://broker.example/#ignored",
+	} {
+		if _, err := NewProducer(testGWUUID, baseURL, fakeSource{}); err == nil {
+			t.Fatalf("NewProducer accepted broker URL with non-authority components: %q", baseURL)
+		} else if !strings.Contains(err.Error(), "only scheme and authority") {
+			t.Fatalf("NewProducer(%q) error = %v, want component rejection", baseURL, err)
+		}
+	}
+}
+
 // TestSendClassifiesFailuresFromTheCodeTaxonomy checks that the retry class
 // comes from the response's Code rather than its status, and that an
 // unrecognized code is not guessed safe to repeat.

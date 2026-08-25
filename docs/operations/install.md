@@ -154,6 +154,9 @@ remaining checks and reports the delivery assertion as `UNVERIFIED`.
 | `--delivery-records` | *(none)* | Path to the delivery-session record file, one JSON record per line, appended and fsynced. Requires `--delivery-wal`. Created `0600` — records name subscribers and their traffic volumes. `bytes_out`/`packets_out` are **deltas** covering only the interval since the previous record; `duration_ms` is **cumulative** from session open. The rollup is therefore `SUM(bytes_out)` but `MAX(duration_ms)`; swapping them silently mis-bills. |
 | `--broker-url` | *(none)* | Session broker base URL, e.g. `https://broker.example`. Setting it enables the gateway heartbeat; requires `--gw-uuid`. The heartbeat route is appended from the shared contract constant, so only the scheme and host belong here. Omitting it — the default — leaves the receiver heartbeat-free, which is what demo mode and the install smoke test run. |
 | `--gw-uuid` | *(none)* | This gateway's identity, reported as `gw_uuid` in every heartbeat. Requires `--broker-url`, and vice versa: a URL without an identity produces heartbeats the broker rejects, and an identity without a URL is inert but looks configured, so the pair is validated at startup rather than 30s later. Must be a canonical lowercase, non-nil UUID — an uppercase or nil UUID is rejected at startup. |
+| `--broker-client-cert` | *(none)* | PEM client certificate for the HTTPS session broker. Required with `--broker-url` and `--gw-uuid`. |
+| `--broker-client-key` | *(none)* | PEM private key matching `--broker-client-cert`. Required with `--broker-client-cert`; the pair configures the client's mTLS identity. |
+| `--broker-ca` | *(none)* | Optional PEM CA bundle appended to the system trust roots for the HTTPS session broker. |
 
 These are all of them. The binary parses flags with `flag.ContinueOnError`, so any
 flag not in this table is a parse error that exits non-zero — under the systemd

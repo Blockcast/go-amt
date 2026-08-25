@@ -70,7 +70,7 @@ func TestHeartbeatOptionsRejectsGenericMode(t *testing.T) {
 	shred := scoring{mode: "shred"}
 
 	t.Run("generic mode with heartbeat flags is rejected", func(t *testing.T) {
-		_, err := heartbeatOptions(brokerURL, gwUUID, generic)
+		_, err := heartbeatOptions(brokerURL, gwUUID, "cert.pem", "key.pem", "", generic)
 		if err == nil {
 			t.Fatal("heartbeatOptions accepted --mode generic with the heartbeat " +
 				"flags; the producer would send nothing while reading as configured")
@@ -84,7 +84,7 @@ func TestHeartbeatOptionsRejectsGenericMode(t *testing.T) {
 	})
 
 	t.Run("generic mode without heartbeat flags still starts", func(t *testing.T) {
-		beat, err := heartbeatOptions("", "", generic)
+		beat, err := heartbeatOptions("", "", "", "", "", generic)
 		if err != nil {
 			t.Fatalf("generic mode without heartbeat flags must remain valid: %v", err)
 		}
@@ -94,7 +94,7 @@ func TestHeartbeatOptionsRejectsGenericMode(t *testing.T) {
 	})
 
 	t.Run("shred mode with heartbeat flags is accepted", func(t *testing.T) {
-		beat, err := heartbeatOptions(brokerURL, gwUUID, shred)
+		beat, err := heartbeatOptions(brokerURL, gwUUID, "cert.pem", "key.pem", "", shred)
 		if err != nil {
 			t.Fatalf("shred mode is the supported heartbeat configuration: %v", err)
 		}
@@ -107,10 +107,10 @@ func TestHeartbeatOptionsRejectsGenericMode(t *testing.T) {
 	// modes: the mode check is additional to it, not a replacement.
 	for _, mode := range []scoring{shred, generic} {
 		t.Run("incomplete pair rejected in "+string(mode.mode)+" mode", func(t *testing.T) {
-			if _, err := heartbeatOptions(brokerURL, "", mode); err == nil {
+			if _, err := heartbeatOptions(brokerURL, "", "cert.pem", "key.pem", "", mode); err == nil {
 				t.Error("--broker-url without --gw-uuid was accepted")
 			}
-			if _, err := heartbeatOptions("", gwUUID, mode); err == nil {
+			if _, err := heartbeatOptions("", gwUUID, "cert.pem", "key.pem", "", mode); err == nil {
 				t.Error("--gw-uuid without --broker-url was accepted")
 			}
 		})

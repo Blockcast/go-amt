@@ -143,10 +143,13 @@ func NewProducer(gwUUID, baseURL string, source FeedSource, opts ...Option) (*Pr
 	if parsed.Scheme == "" || parsed.Host == "" {
 		return nil, fmt.Errorf("gwclient: broker base URL %q needs a scheme and host", baseURL)
 	}
+	if (parsed.Path != "" && parsed.Path != "/") || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return nil, fmt.Errorf("gwclient: broker base URL %q must contain only scheme and authority", baseURL)
+	}
 
 	producer := &Producer{
 		gwUUID:   gwUUID,
-		endpoint: strings.TrimRight(parsed.String(), "/") + broker.HeartbeatPath(),
+		endpoint: strings.TrimRight(parsed.Scheme+"://"+parsed.Host, "/") + broker.HeartbeatPath(),
 		client:   &http.Client{Timeout: broker.HeartbeatInterval - 5*time.Second},
 		source:   source,
 		now:      time.Now,

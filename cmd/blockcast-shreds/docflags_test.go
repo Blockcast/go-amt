@@ -172,8 +172,11 @@ func TestDocumentedFlagsAreAccepted(t *testing.T) {
 		// values would parse, fall through to listenAndScore and hang the
 		// package. Probing one of the pair with no value fails in the parser,
 		// before heartbeatOptions ever runs.
-		"broker-url": {"--broker-url"},
-		"gw-uuid":    {"--gw-uuid"},
+		"broker-url":         {"--broker-url"},
+		"gw-uuid":            {"--gw-uuid"},
+		"broker-client-cert": {"--broker-client-cert"},
+		"broker-client-key":  {"--broker-client-key"},
+		"broker-ca":          {"--broker-ca"},
 	}
 
 	for _, name := range docTableFlags(t) {

@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -59,7 +61,7 @@ const help = `blockcast-shreds demo mode
 
 Usage:
   blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
-  blockcast-shreds [--broker-url URL --gw-uuid UUID]
+   blockcast-shreds [--broker-url URL --gw-uuid UUID --broker-client-cert FILE --broker-client-key FILE]
   blockcast-shreds selftest --fixture [--json]
   blockcast-shreds selftest --generic [--json]
   blockcast-shreds gensend --to IP:PORT [--iface IP] [--pace=false]
@@ -76,6 +78,8 @@ the inputs are independently operated or share one tap.
 together: a broker URL without an identity produces heartbeats the broker
 rejects, and an identity without a URL is inert but looks configured. When
 enabled, the receiver POSTs a per-feed liveness and delivery report every 30s.
+--broker-client-cert and --broker-client-key are required together with the
+heartbeat flags; --broker-ca may add the broker's issuing CA to system roots.
 Omitting both — the default — keeps demo mode heartbeat-free. They require
 --mode shred: the report carries a per-feed erasure window, and generic mode
 does no erasure scoring, so the pair is rejected at startup there rather than
@@ -186,6 +190,9 @@ func run(args []string) error {
 		"session broker base URL; enables the gateway heartbeat, requires --gw-uuid")
 	gwUUID := flags.String("gw-uuid", "",
 		"this gateway's canonical lowercase UUID, reported in every heartbeat; requires --broker-url")
+	brokerClientCert := flags.String("broker-client-cert", "", "PEM client certificate for the HTTPS session broker")
+	brokerClientKey := flags.String("broker-client-key", "", "PEM private key for --broker-client-cert")
+	brokerCA := flags.String("broker-ca", "", "PEM CA bundle for the HTTPS session broker")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -253,7 +260,7 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
-	beat, err := heartbeatOptions(*brokerURL, *gwUUID, *score)
+	beat, err := heartbeatOptions(*brokerURL, *gwUUID, *brokerClientCert, *brokerClientKey, *brokerCA, *score)
 	if err != nil {
 		return err
 	}
@@ -276,8 +283,11 @@ func (b billing) enabled() bool { return b.walPath != "" }
 // receiver that failed to start because it could not reach one would be a
 // regression for them.
 type heartbeatConfig struct {
-	brokerURL string
-	gwUUID    string
+	brokerURL  string
+	gwUUID     string
+	clientCert string
+	clientKey  string
+	caBundle   string
 }
 
 func (h heartbeatConfig) enabled() bool { return h.brokerURL != "" }
@@ -310,21 +320,54 @@ func (h heartbeatConfig) enabled() bool { return h.brokerURL != "" }
 // TestGenericModeHeartbeatIsUnsendable pins the underlying failure, so if
 // generic mode ever gains a real window this rejection can be revisited
 // against evidence rather than removed on assumption.
-func heartbeatOptions(brokerURL, gwUUID string, mode scoring) (heartbeatConfig, error) {
+func heartbeatOptions(brokerURL, gwUUID, clientCert, clientKey, caBundle string, mode scoring) (heartbeatConfig, error) {
 	switch {
 	case brokerURL == "" && gwUUID == "":
+		if clientCert != "" || clientKey != "" || caBundle != "" {
+			return heartbeatConfig{}, errors.New("broker TLS flags require --broker-url and --gw-uuid")
+		}
 		return heartbeatConfig{}, nil
 	case brokerURL == "":
 		return heartbeatConfig{}, errors.New("--gw-uuid requires --broker-url")
 	case gwUUID == "":
 		return heartbeatConfig{}, errors.New("--broker-url requires --gw-uuid")
+	case clientCert == "" || clientKey == "":
+		return heartbeatConfig{}, errors.New("--broker-client-cert and --broker-client-key are required for broker mTLS")
 	case mode.generic():
 		return heartbeatConfig{}, errors.New(
 			"--broker-url and --gw-uuid require --mode shred: the heartbeat reports a " +
 				"per-feed erasure window, generic mode does no erasure scoring, and a " +
 				"synthesized zero window would report an unmeasured feed as a perfect one")
 	}
-	return heartbeatConfig{brokerURL: brokerURL, gwUUID: gwUUID}, nil
+	return heartbeatConfig{brokerURL: brokerURL, gwUUID: gwUUID, clientCert: clientCert, clientKey: clientKey, caBundle: caBundle}, nil
+}
+
+func heartbeatHTTPClient(beat heartbeatConfig) (*http.Client, error) {
+	cert, err := tls.LoadX509KeyPair(beat.clientCert, beat.clientKey)
+	if err != nil {
+		return nil, fmt.Errorf("load broker client certificate: %w", err)
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("load system certificate pool: %w", err)
+	}
+	if beat.caBundle != "" {
+		pem, err := os.ReadFile(beat.caBundle)
+		if err != nil {
+			return nil, fmt.Errorf("read broker CA bundle: %w", err)
+		}
+		if ok := roots.AppendCertsFromPEM(pem); !ok {
+			return nil, fmt.Errorf("broker CA bundle %q contains no certificates", beat.caBundle)
+		}
+	}
+	return &http.Client{
+		Timeout: broker.HeartbeatInterval - 5*time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      roots,
+		}},
+	}, nil
 }
 
 // billingOptions validates the delivery-session flags as a set.
@@ -778,7 +821,11 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		// consequence if this is ever removed.
 		publishWindows(trackers, metrics, time.Now())
 
-		producer, err := gwclient.NewProducer(beat.gwUUID, beat.brokerURL, metrics)
+		client, err := heartbeatHTTPClient(beat)
+		if err != nil {
+			return err
+		}
+		producer, err := gwclient.NewProducer(beat.gwUUID, beat.brokerURL, metrics, gwclient.WithHTTPClient(client))
 		if err != nil {
 			return err
 		}
