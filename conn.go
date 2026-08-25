@@ -185,7 +185,12 @@ func (mc *MulticastConn) probeNativeV4(window time.Duration) {
 		cm, src = c, s
 		return n, err
 	})
-	if err != nil || mc.isClosed() {
+	if err != nil {
+		mc.setActiveTunnel(true)
+		mc.releaseTunnelStart()
+		return
+	}
+	if mc.isClosed() {
 		return
 	}
 	if native {
@@ -209,7 +214,12 @@ func (mc *MulticastConn) probeNativeV6(window time.Duration) {
 		src = s
 		return n, err
 	})
-	if err != nil || mc.isClosed() {
+	if err != nil {
+		mc.setActiveTunnel(true)
+		mc.releaseTunnelStart()
+		return
+	}
+	if mc.isClosed() {
 		return
 	}
 	if native {

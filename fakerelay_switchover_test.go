@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // MulticastConn switchover, driven against fakeRelay and fakeNativeSource.
@@ -53,9 +55,47 @@ func newMulticastConnUnderTest(t *testing.T, fr *fakeRelay) *MulticastConn {
 
 func waitForRelayDiscovery(t *testing.T, fr *fakeRelay) {
 	t.Helper()
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(MinUsefulProbeWindow + time.Second)
 	for fr.advertised.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestMulticastConnProbeErrorReleasesTunnelStart(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen probe socket: %v", err)
+	}
+	conn := ipv4.NewPacketConn(udp)
+
+	mc := &MulticastConn{
+		conn4: conn,
+		IFace: &net.Interface{MTU: 1500},
+	}
+	mc.prepareTunnel()
+
+	gate := mc.tunnelStart
+	gateReleased := make(chan struct{})
+	go func() {
+		<-gate
+		close(gateReleased)
+	}()
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close probe socket: %v", err)
+	}
+
+	mc.probeNativeV4(time.Second)
+	select {
+	case <-gateReleased:
+	case <-time.After(time.Second):
+		t.Fatal("probe error left tunnelStart blocked")
+	}
+
+	mc.pathMu.RLock()
+	wantTunnel, activeTunnel := mc.wantTunnel, mc.activeTunnel
+	mc.pathMu.RUnlock()
+	if !wantTunnel || !activeTunnel {
+		t.Fatalf("probe error selected wantTunnel=%t activeTunnel=%t, want both true", wantTunnel, activeTunnel)
 	}
 }
 
