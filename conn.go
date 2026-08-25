@@ -328,7 +328,7 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("error reading from connection: %w", err)
 	}
-	return mc.processAMTBatch(ms, N)
+	return mc.processAMTBatch(gw, ms, N)
 }
 
 // processAMTBatch dispatches and compacts the messages returned by an AMT
@@ -337,7 +337,7 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 // the next iteration. Keeping this separate from the socket read makes the
 // compaction invariant directly testable without depending on platform-specific
 // ReadBatch batching behavior.
-func (mc *MulticastConn) processAMTBatch(ms []ipv4.Message, N int) (int, error) {
+func (mc *MulticastConn) processAMTBatch(gw *Gateway, ms []ipv4.Message, N int) (int, error) {
 	var i, bad int
 	var err error
 	// The live portion is [i, N-bad). A dropped message is replaced from the
