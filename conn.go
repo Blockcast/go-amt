@@ -240,13 +240,71 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("error reading from connection: %w", err)
 	}
+	return mc.processAMTBatch(ms, N)
+}
+
+// processAMTBatch dispatches and compacts the messages returned by an AMT
+// socket read. The active portion of ms is [i, N-bad): control and unwanted
+// messages are moved to the tail, while the replacement at i is examined on
+// the next iteration. Keeping this separate from the socket read makes the
+// compaction invariant directly testable without depending on platform-specific
+// ReadBatch batching behavior.
+func (mc *MulticastConn) processAMTBatch(ms []ipv4.Message, N int) (int, error) {
 	var i, bad int
-	for i = 0; i < N && N > bad; i++ {
+	var err error
+	// The live portion is [i, N-bad). A dropped message is replaced from the
+	// tail and the same index is examined again; shrinking the loop bound with
+	// bad is what prevents re-dispatching a message that was already at that
+	// tail.
+	for i = 0; i < N-bad; i++ {
 		cur := ms[i]
 		n := cur.N
-		amtMessageType := determineAMTmessageType(cur.Buffers[0])
+		// Drop a zero-length datagram before dispatch, and read the type from
+		// the bytes actually received rather than from the buffer's stale tail.
+		// This is the same guard Gateway.Open carries, for the same reason; it
+		// was not mirrored here when the [:n] slicing below was introduced.
+		//
+		// A zero-length UDP datagram is legal and carries no type byte. Two
+		// things then go wrong, and neither is visible in the tests:
+		//
+		//  1. determineAMTmessageType was handed cur.Buffers[0] UNSLICED, so it
+		//     read whatever byte was left at offset 0 of this reused buffer by
+		//     an earlier ReadBatch. After any batch that carried an
+		//     advertisement (0x02) or a query (0x04), that stale byte routes the
+		//     empty datagram into one of the control arms below.
+		//  2. Those arms pass cur.Buffers[0][:n] — a len-0 slice — to
+		//     handleRelayAdvertisement / handleMembershipQuery, which both take
+		//     &data[0] unconditionally to reach the FFI. That panics with
+		//     "index out of range [0] with length 0".
+		//
+		// Before the [:n] change the handlers got the whole caller-allocated
+		// buffer, so &data[0] was always valid. A freshly zeroed buffer reads
+		// type 0 and falls to default:, which is why a test never sees this.
+		//
+		// The MulticastDataType arm is covered too: [m.DataMsgHdrLen:n] at n == 0
+		// is an invalid slice (low > high) and panics as well. That one predates
+		// this change; the same guard closes it.
+		if n == 0 {
+			bad++
+			ms[i] = ms[N-bad]
+			i--
+			continue
+		}
+		amtMessageType := determineAMTmessageType(cur.Buffers[0][:n])
 		switch amtMessageType {
 		case m.MulticastDataType:
+			// A data message must carry its 2-byte header. The n == 0 guard
+			// above does not cover n == 1: [m.DataMsgHdrLen:n] is then [2:1],
+			// low > high, which panics exactly like the zero-length case it
+			// was written for. One 1-byte 0x06 datagram on the tunnel socket
+			// is enough. RelayManager.routeDataToSubscription already drops
+			// these (relay_manager.go:848); this path never did.
+			if n < m.DataMsgHdrLen {
+				bad++
+				ms[i] = ms[N-bad]
+				i--
+				break
+			}
 			mc.amtGw.lastData.Store(time.Now())
 			p := gopacket.NewPacket(cur.Buffers[0][m.DataMsgHdrLen:n], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)
@@ -257,8 +315,7 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			}
 			if !ok || !ipHdr.DstIP.Equal(mc.GroupAddr.AsSlice()) {
 				bad++
-				cur = ms[N-bad]
-				ms[N-bad] = cur
+				ms[i] = ms[N-bad]
 				i--
 				break
 			}
@@ -275,21 +332,26 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			ms[i].N = len(stream.Payload())
 			ms[i].Buffers[0] = stream.Payload()
 		case m.MembershipQueryType:
-			err = mc.amtGw.handleMembershipQuery(cur.Buffers[0])
+			// [:n], not the whole buffer — see the slicing note in Gateway.Open.
+			// The Rust Relay Advertisement decoder matches on EXACT length (12
+			// or 24), so handing it a full-MTU buffer makes re-discovery in
+			// steady state fail the same way the initial handshake did under
+			// BLO-29437. The Query decoder is length-tolerant, but is sliced
+			// here too so the "decode what you received" invariant holds
+			// uniformly and nobody has to re-derive which decoders forgive
+			// padding.
+			err = mc.amtGw.handleMembershipQuery(cur.Buffers[0][:n])
 			bad++
-			cur = ms[N-bad]
-			ms[N-bad] = cur
+			ms[i] = ms[N-bad]
 			i--
 		case m.RelayAdvertisementType:
-			err = mc.amtGw.handleRelayAdvertisement(cur.Buffers[0])
+			err = mc.amtGw.handleRelayAdvertisement(cur.Buffers[0][:n])
 			bad++
-			cur = ms[N-bad]
-			ms[N-bad] = cur
+			ms[i] = ms[N-bad]
 			i--
 		default:
 			bad++
-			cur = ms[N-bad]
-			ms[N-bad] = cur
+			ms[i] = ms[N-bad]
 			i--
 			err = fmt.Errorf("unknown data type: %d", amtMessageType) // TODO: see how to handle
 			break
@@ -324,7 +386,14 @@ func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 		if n == 0 || err != nil {
 			return
 		}
-		amtMessageType := determineAMTmessageType(buf[:])
+		// n >= 1 is guaranteed by the return above, and determineAMTmessageType
+		// reads only index 0, so this slice does NOT change today's
+		// classification — buf[:] and buf[:n] are identical here for every
+		// n >= 1. It is passed anyway so the call site stops depending on that
+		// property of the callee: if the type read ever widens past byte 0,
+		// this path would otherwise start reading the reused buffer's stale
+		// tail while the batch path above stayed correct.
+		amtMessageType := determineAMTmessageType(buf[:n])
 		data := buf[:n]
 		switch amtMessageType {
 		case m.RelayAdvertisementType:
@@ -334,6 +403,14 @@ func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 			err = mc.amtGw.handleMembershipQuery(data)
 			n = 0
 		case m.MulticastDataType:
+			// Same received-length invariant as the batch path above. The
+			// n == 0 return at the top of this loop does not cover n == 1:
+			// data[m.DataMsgHdrLen:] is then a low > high slice and panics.
+			// Drop the runt and read the next datagram, as the mismatched-group
+			// case below does.
+			if n < m.DataMsgHdrLen {
+				break
+			}
 			mc.amtGw.lastData.Store(time.Now())
 			p := gopacket.NewPacket(data[m.DataMsgHdrLen:], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)

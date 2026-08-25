@@ -3,7 +3,6 @@
 package amt
 
 import (
-	"errors"
 	"net"
 	"testing"
 	"time"
@@ -96,34 +95,39 @@ func TestMulticastConnKeepsNativeWhenBothPathsAreLive(t *testing.T) {
 }
 
 // TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent is the fallback leg: the
-// probe concludes native is not deliverable, the native join is released, and the
-// group is handed to an AMT tunnel through Gateway — the production path.
+// probe concludes native is not deliverable, the native join is released, the
+// group is handed to an AMT tunnel through Gateway — the production path — and
+// data arrives through that tunnel with tunnel provenance.
 //
-// THE UNCONDITIONAL CLAIM is that the handover reached the relay: fakeRelay
-// received a Relay Discovery and answered it. That is what "reaching AMT via
-// Gateway as production does" means here, and it holds whether or not the
-// handshake then completes.
+// THE CLAIM IS NOW END-TO-END. It used to stop at "the relay saw a discovery",
+// because the handshake could not complete and the test pinned that failure to
+// its timeout shape. BLO-29437 found why, and the cause was NOT the one that
+// ticket assumed. fakeRelay's advertisement was never wrong: its 12 bytes are
+// byte-for-byte what amt-protocol's own RelayAdvertisement encoder emits for
+// IPv4. The defect was in gateway.go, which discarded the read length and handed
+// the Rust decoder the whole MTU-sized buffer. Relay Advertisement is the one
+// AMT message decoded by EXACT length (messages.rs:213 — 12 for IPv4, 24 for
+// IPv6, error otherwise), so it failed on every handshake, against every relay,
+// real or fake. The cgo AMT path had never completed a handshake at all.
 //
-// It does not complete, and that is now measured rather than assumed. On the
-// cgo-test lane (run 32420713736, 2026-08-20) Open returned in 12.001s — the 10s
-// probe window plus the 2s handshake bound — with `Error setting up socket:
-// error reading from connection: read udp 0.0.0.0:0: raw-read udp 0.0.0.0:0:
-// i/o timeout`. fakeRelay answers the discovery, so the counter below is
-// satisfied, but the Rust amt_protocol decoder does not carry the gateway to the
-// next leg: fakeRelay's advertisement is hand-built to what this package's Go
-// HandleAdvertisement accepts (see its buildQuery note), and the Rust side is
-// not equally permissive. So the MulticastConn tunnel-DATA leg remains
-// untestable, tracked as BLO-29437 — teaching fakeRelay the Rust wire format is
-// its own piece of work and BLO-28740 item 1 step 2 needs it.
-//
-// The failure is therefore pinned to its known SHAPE — a timeout — rather than
-// accepted as any error at all. A different failure here (a panic, a decode
-// error, a refusal before the socket read) is new information and must fail the
-// test rather than pass as "still does not complete". The completed branch is
-// kept live so that fixing fakeRelay starts asserting the data leg rather than
-// silently skipping it.
+// So this test now asserts what it could not before, and there is no timeout
+// branch to fall back to: a timeout here is a failure, which is the only way the
+// completed-path assertions below can carry weight.
 func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
-	fr := newFakeRelay(t)
+	// Pin the query interval high (0x7f = 12.7s) so the keepalive cannot fire
+	// during the burst below. Two distinct hazards, both real:
+	//
+	//   - A keepalive Request draws a second Membership Query, and send_update
+	//     is single-shot per query on the Rust path (BLO-28805): the second call
+	//     re-enters gateway.rs:252 in state Active, fails the guard and returns
+	//     InvalidState, which ReadBatch would surface mid-burst.
+	//   - fakeRelay's default code is 0x0a = 1s, which is well inside the time
+	//     this test spends reading, so that is not a theoretical window.
+	//
+	// This pins the relay's advertised interval rather than
+	// RelayManagerConfig.KeepaliveInterval because the handshake overwrites the
+	// latter — see withQueryIntervalCode.
+	fr := newFakeRelay(t, withQueryIntervalCode(0x7f))
 	nat := installFakeNativeSource(t)
 	// Never enabled: native delivery is off by default, so silence is the
 	// harness's resting state rather than something arranged here.
@@ -145,8 +149,11 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 			"enabled; this test is not exercising a silent native path", nat.Delivered())
 	}
 
-	// The claim. Gateway sends Relay Discovery as the first leg of Open, so a
-	// relay that answered one necessarily saw the gateway come up.
+	// The handover reached the relay. Gateway sends Relay Discovery as the first
+	// leg of Open, so a relay that answered one necessarily saw the gateway come
+	// up. Kept as a separate, earlier assertion than the handshake result: if
+	// this one fails the group never reached AMT at all, which is a different
+	// diagnosis from a handshake that started and then broke.
 	if n := fr.advertised.Load(); n < 1 {
 		t.Fatalf("relay received no Relay Discovery (advertisements sent = %d): the "+
 			"probe timed out but the group was never handed to an AMT gateway", n)
@@ -162,28 +169,25 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 			"+ slack): one of the two legs is not bounding itself", elapsed, bound)
 	}
 
+	// No timeout branch. A handshake that does not complete is the BLO-29437
+	// regression returning, and the burst below is what proves the tunnel
+	// carries data rather than merely having been constructed.
 	if err != nil {
-		// Pinned to the known shape. See the header: anything other than a
-		// timeout is new behaviour and should be looked at, not absorbed.
-		var netErr net.Error
-		if !errors.As(err, &netErr) || !netErr.Timeout() {
-			t.Errorf("Gateway.Open failed with a NON-timeout error: %v. The known "+
-				"behaviour is that fakeRelay's advertisement does not satisfy the Rust "+
-				"amt_protocol decoder, so the gateway times out waiting for the next "+
-				"leg. A different failure means something else changed.", err)
-		}
-		t.Logf("Gateway.Open did not complete against fakeRelay (expected, timeout): "+
-			"%v. The handover reached the relay, which is what this test asserts; the "+
-			"tunnel data leg needs fakeRelay taught the Rust wire format.", err)
-		return
+		t.Fatalf("Gateway.Open did not complete against fakeRelay: %v. The relay "+
+			"answered the discovery, so this is the handshake breaking after it "+
+			"started. If this is an i/o timeout, suspect the advertisement decode "+
+			"first: BLO-29437 was gateway.go handing the Rust decoder a full-MTU "+
+			"buffer for a message whose decoder matches on exact length.", err)
 	}
 
 	if !mc.IsUsingTunnel() {
 		t.Fatal("Open succeeded with native silent but the connection does not " +
 			"report tunnelling; the group is on neither path")
 	}
-	t.Log("Gateway.Open COMPLETED against fakeRelay — the tunnel data leg below " +
-		"is live, and this test can be tightened to require it")
+	// The log line the cgo-test lane greps for. A bare --- PASS is not evidence
+	// on its own: that is what the old timeout branch produced too, so CI
+	// asserts on this string specifically.
+	t.Log("Gateway.Open COMPLETED against fakeRelay")
 
 	const burst = 8
 	for i := 1; i <= burst; i++ {
@@ -195,9 +199,9 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 			t.Fatalf("tunnel read %d/%d: %v", i, burst, err)
 		}
 		if got := provenanceOf(payload); got != tunnelProvenanceTag {
-			t.Fatalf("packet %d has provenance %q, want %q: native is silent, so "+
+			t.Fatalf("packet %d (%q) has provenance %q, want %q: native is silent, so "+
 				"anything arriving must have come through the tunnel",
-				i, got, tunnelProvenanceTag)
+				i, payload, got, tunnelProvenanceTag)
 		}
 	}
 }
