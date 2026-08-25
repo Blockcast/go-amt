@@ -115,7 +115,7 @@ func (mc *MulticastConn) Open() error {
 			if !plan.TunnelOnFailure {
 				return nil
 			}
-			mc.startTunnel()
+			mc.startTunnelAsync()
 			return nil
 		}
 
@@ -146,20 +146,28 @@ func (mc *MulticastConn) Open() error {
 		if !plan.TunnelOnFailure {
 			return nil
 		}
-		mc.startTunnel()
+		mc.startTunnelAsync()
 		return nil
 	}
-	mc.startTunnel()
-	return nil
+	return mc.startTunnel()
 }
 
-func (mc *MulticastConn) startTunnel() {
+func (mc *MulticastConn) prepareTunnel() {
 	mc.pathMu.Lock()
 	mc.wantTunnel = true
 	mc.activeTunnel = true
 	mc.tunnelReady = make(chan struct{})
 	mc.pathMu.Unlock()
+}
+
+func (mc *MulticastConn) startTunnelAsync() {
+	mc.prepareTunnel()
 	go mc.openTunnel()
+}
+
+func (mc *MulticastConn) startTunnel() error {
+	mc.prepareTunnel()
+	return mc.openTunnel()
 }
 
 func (mc *MulticastConn) probeNativeV4(window time.Duration) {
@@ -217,7 +225,7 @@ func (mc *MulticastConn) watchNativeV4() {
 	}
 }
 
-func (mc *MulticastConn) openTunnel() {
+func (mc *MulticastConn) openTunnel() (err error) {
 	defer func() {
 		mc.pathMu.Lock()
 		if mc.tunnelReady != nil {
@@ -241,17 +249,18 @@ func (mc *MulticastConn) openTunnel() {
 	}
 	if err := gw.Open(); err != nil {
 		gw.abortOpen()
-		return
+		return err
 	}
 	mc.pathMu.Lock()
 	if mc.closed {
 		mc.pathMu.Unlock()
 		gw.abortOpen()
-		return
+		return net.ErrClosed
 	}
 	mc.amtGw = gw
 	mc.activeTunnel = mc.wantTunnel || (mc.conn4 == nil && mc.conn6 == nil)
 	mc.pathMu.Unlock()
+	return nil
 }
 
 func (mc *MulticastConn) waitTunnel() *Gateway {
@@ -285,7 +294,10 @@ func (mc *MulticastConn) setActiveTunnel(active bool) {
 func (mc *MulticastConn) IsUsingTunnel() bool {
 	mc.pathMu.RLock()
 	defer mc.pathMu.RUnlock()
-	return mc.activeTunnel
+	// A gateway-backed connection with no native socket is tunnel-active even
+	// when it was constructed by an older call site that did not set the path
+	// flag explicitly.
+	return mc.activeTunnel || (mc.amtGw != nil && mc.conn4 == nil && mc.conn6 == nil)
 }
 func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	// A packet the probe consumed is owed to the caller before anything read
