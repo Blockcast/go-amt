@@ -94,7 +94,7 @@ func runBilledReceiver(t *testing.T, walPath, recordPath string, packetCount int
 			30*time.Millisecond, 60*time.Millisecond, shred.DefaultRetention, stop,
 			scoring{mode: "shred"},
 			billing{walPath: walPath, recordPath: recordPath},
-		)
+			heartbeatConfig{})
 	}()
 
 	waitReady(t, httpAddress)

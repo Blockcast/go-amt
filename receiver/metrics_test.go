@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/blockcast/go-amt/erasure"
 	"github.com/prometheus/client_golang/prometheus"
@@ -18,7 +19,7 @@ func TestReceiverMetricsExposePacketCountersAndExactWindow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := metrics.IncIngress("feed-a"); err != nil {
+	if err := metrics.ObserveIngress("feed-a", 1200, time.Unix(1750000000, 0).UTC()); err != nil {
 		t.Fatal(err)
 	}
 	if err := metrics.AddEgress("feed-a", 2); err != nil {
@@ -83,8 +84,8 @@ func TestReceiverMetricsRejectUnknownFeedWithoutCreatingSeries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := metrics.IncIngress("attacker-controlled"); !errors.Is(err, ErrUnknownFeed) {
-		t.Fatalf("IncIngress() error = %v, want %v", err, ErrUnknownFeed)
+	if err := metrics.ObserveIngress("attacker-controlled", 1, time.Unix(1750000000, 0).UTC()); !errors.Is(err, ErrUnknownFeed) {
+		t.Fatalf("ObserveIngress() error = %v, want %v", err, ErrUnknownFeed)
 	}
 	if err := metrics.AddEgress("attacker-controlled", 1); !errors.Is(err, ErrUnknownFeed) {
 		t.Fatalf("AddEgress() error = %v, want %v", err, ErrUnknownFeed)

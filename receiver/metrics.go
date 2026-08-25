@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/blockcast/go-amt/erasure"
 	"github.com/prometheus/client_golang/prometheus"
@@ -26,6 +27,14 @@ type ReceiverMetrics struct {
 	feedIDs []string
 	feeds   map[string]feedMetrics
 	windows map[string]erasure.Window
+	// liveness holds the per-feed ingress activity the broker heartbeat
+	// reports. It is kept here, beside the prometheus counters and written on
+	// the same call, because the heartbeat's packet count and
+	// ingress_packets_total state the same fact: a second entry point that
+	// moved one without the other would let /metrics and the heartbeat
+	// disagree about a feed, which is the divergence PublishWindow's comment
+	// already argues against for the delivery report.
+	liveness map[string]FeedLiveness
 	// guards holds cumulative slot-guard state, kept separate from windows
 	// because it is process-lifetime totals rather than a per-window snapshot.
 	guards map[string]erasure.Stats
@@ -75,10 +84,11 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string) (*Re
 	}
 
 	metrics := &ReceiverMetrics{
-		feedIDs: append([]string(nil), feedIDs...),
-		feeds:   make(map[string]feedMetrics, len(feedIDs)),
-		windows: make(map[string]erasure.Window, len(feedIDs)),
-		guards:  make(map[string]erasure.Stats, len(feedIDs)),
+		feedIDs:  append([]string(nil), feedIDs...),
+		feeds:    make(map[string]feedMetrics, len(feedIDs)),
+		windows:  make(map[string]erasure.Window, len(feedIDs)),
+		liveness: make(map[string]FeedLiveness, len(feedIDs)),
+		guards:   make(map[string]erasure.Stats, len(feedIDs)),
 	}
 	metrics.ingress = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: receiverMetricsNamespace,
@@ -214,13 +224,54 @@ func (m *ReceiverMetrics) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
-// IncIngress records a successfully received unicast packet.
-func (m *ReceiverMetrics) IncIngress(feedID string) error {
+// ObserveIngress records a successfully received unicast packet of size bytes
+// that arrived at at.
+//
+// This is the single ingress entry point on purpose. It moves
+// ingress_packets_total and the heartbeat's per-feed liveness together, so the
+// two surfaces cannot report different packet counts for the same feed. An
+// IncIngress that touched only the counter used to exist; it was removed rather
+// than kept alongside this, because a caller reaching for the shorter name
+// would silently under-report every heartbeat while /metrics looked correct.
+//
+// bytes is the datagram's payload length and may legally be 0 — a zero-length
+// UDP datagram is a packet that carried no bytes, which is why the heartbeat
+// contract requires Bytes == 0 when Packets == 0 but never the converse.
+//
+// at is the arrival timestamp captured before any per-packet work, so first/last
+// bound observed traffic rather than lock-acquisition order. A zero at is
+// rejected: it would produce a feed claiming packets with no first-packet time,
+// which broker.ValidateHeartbeat rejects at the far end, and failing here names
+// the feed instead.
+func (m *ReceiverMetrics) ObserveIngress(feedID string, bytes int, at time.Time) error {
 	feed, err := m.feed(feedID)
 	if err != nil {
 		return err
 	}
+	if bytes < 0 {
+		return fmt.Errorf("receiver metrics feed %q: ingress bytes is negative (%d)", feedID, bytes)
+	}
+	if at.IsZero() {
+		return fmt.Errorf("receiver metrics feed %q: ingress timestamp is zero", feedID)
+	}
+
 	feed.ingress.Inc()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	live := m.liveness[feedID]
+	live.Packets++
+	live.Bytes += uint64(bytes)
+	// Guard against a non-monotonic clock rather than assuming arrival order:
+	// time.Now() is not guaranteed monotonic across a wall-clock step, and the
+	// heartbeat contract rejects last_packet_at preceding first_packet_at.
+	if live.FirstAt.IsZero() || at.Before(live.FirstAt) {
+		live.FirstAt = at
+	}
+	if at.After(live.LastAt) {
+		live.LastAt = at
+	}
+	m.liveness[feedID] = live
 	return nil
 }
 
@@ -299,4 +350,55 @@ func (m *ReceiverMetrics) feed(feedID string) (feedMetrics, error) {
 		return feedMetrics{}, fmt.Errorf("%w: %q", ErrUnknownFeed, feedID)
 	}
 	return feed, nil
+}
+
+// FeedLiveness is one feed's observed ingress activity: the counters and the
+// arrival bounds a gateway heartbeat reports per feed.
+//
+// FirstAt and LastAt are arrival timestamps, not window boundaries — they bound
+// traffic actually seen, and are both zero for a feed that has received
+// nothing. Packets and Bytes are process-lifetime cumulative totals, which is
+// deliberate and is NOT the same shape as the erasure window beside them: that
+// window is a per-drain counter delta the broker deduplicates on
+// (feed_id, window_start). Do not read the two as though they covered the same
+// interval.
+type FeedLiveness struct {
+	Packets uint64
+	Bytes   uint64
+	FirstAt time.Time
+	LastAt  time.Time
+}
+
+// FeedSnapshot is everything the heartbeat producer reports for one feed, read
+// under a single lock acquisition.
+//
+// Liveness and Window are captured together so a heartbeat cannot pair one
+// feed's counters with another drain's delivery report. Window is the last
+// window PublishWindow recorded, republished on every heartbeat until the next
+// drain replaces it — see the FeedReport doc in package broker for why that
+// repetition is safe and why the broker deduplicates rather than sums.
+type FeedSnapshot struct {
+	FeedID   string
+	Liveness FeedLiveness
+	Window   erasure.Window
+}
+
+// Snapshot returns one entry per configured feed, in configured order.
+//
+// Feeds that have received nothing are included with a zero FeedLiveness rather
+// than omitted: a silent feed is the case an SLA dispute is about, and omitting
+// it would make "received nothing" indistinguishable from "not configured" at
+// the broker.
+func (m *ReceiverMetrics) Snapshot() []FeedSnapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	snapshot := make([]FeedSnapshot, 0, len(m.feedIDs))
+	for _, feedID := range m.feedIDs {
+		snapshot = append(snapshot, FeedSnapshot{
+			FeedID:   feedID,
+			Liveness: m.liveness[feedID],
+			Window:   m.windows[feedID],
+		})
+	}
+	return snapshot
 }

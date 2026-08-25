@@ -30,14 +30,25 @@ builds:
       - -trimpath
     # goreleaser's default ldflags inject -X main.version/-X main.commit.
     # Package main declares none of those symbols, and the Go linker discards an
-    # -X for an unknown symbol *silently* — the release would advertise a
-    # version it has no way to report. The version string is the deployed
-    # binary's only field-rollback lever (W4 enforces a minimum supported
-    # version at the billing edge), so a silently-dropped stamp is worse than an
-    # absent one. It lands with the broker lane, go-amt#45, which owns that
-    # field; wire the -X here in the same change.
+    # -X for an unknown symbol *silently*. The stamp below therefore names the
+    # fully-qualified package path of the variable that actually exists,
+    # broker.version, and NOT main.version — the two differ by a silent no-op
+    # rather than by an error, which is why the path is spelled out here rather
+    # than shortened.
+    #
+    # The version string is the deployed binary's only field-rollback lever (W4
+    # enforces a minimum supported version at the billing edge), and the
+    # heartbeat producer reports it via broker.Version() on every beat
+    # (broker/gwclient). An unstamped release advertises "dev-unstamped" on
+    # every heartbeat and collapses the fleet into one indistinguishable bucket
+    # for the report_schema census, so this is load-bearing rather than cosmetic.
+    #
+    # TestReleaseStampIsNotDevUnstamped in cmd/blockcast-shreds guards the
+    # symbol path: it builds a release-shaped binary and fails if it still
+    # reports dev-unstamped.
     ldflags:
       - -s -w
+      - -X github.com/blockcast/go-amt/broker.version={{ .Version }}
 
 archives:
   - id: blockcast-shreds

@@ -32,14 +32,22 @@ COPY . .
 # the symbol and DWARF tables, which is safe here because the receiver reports
 # faults through slog and metrics rather than through core dumps.
 #
-# No -X version stamp is set. goreleaser's default ldflags would inject
-# -X main.version, and package main has no such symbol, so the linker would
-# silently discard it and the image would claim a version it cannot report.
-# The version string lands with the broker lane (go-amt#45), which owns the
-# field-rollback lever; see docs/operations/install.md.
+# VERSION stamps broker.version, which the heartbeat producer reports on every
+# beat via broker.Version(). Note the fully-qualified path: goreleaser's default
+# would be -X main.version, package main has no such symbol, and the Go linker
+# discards an -X for an unknown symbol *silently* — so a mis-spelled path yields
+# a build that claims a version it cannot report, with no error anywhere.
+#
+# The default is deliberately the same "dev-unstamped" the Go source defaults
+# to, rather than a plausible-looking version: an image built without
+# --build-arg VERSION=<release> must be obvious in the broker's records instead
+# of blending in with released ones.
+ARG VERSION=dev-unstamped
 ARG TARGETARCH=amd64
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags="-s -w" -o /out/blockcast-shreds ./cmd/blockcast-shreds
+    go build -trimpath \
+      -ldflags="-s -w -X github.com/blockcast/go-amt/broker.version=${VERSION}" \
+      -o /out/blockcast-shreds ./cmd/blockcast-shreds
 
 # distroless/static carries CA certificates and /etc/passwd. The receiver needs
 # neither today, but the broker lane terminates mTLS to a public endpoint, so

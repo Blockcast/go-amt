@@ -167,6 +167,13 @@ func TestDocumentedFlagsAreAccepted(t *testing.T) {
 		"delivery-records": {"--delivery-records"},
 		"erasure-grace-ms": {"--erasure-grace-ms"},
 		"report-interval":  {"--report-interval"},
+		// Probed with no value for the same reason as --delivery-wal above: the
+		// pair is validated together at startup, so a probe supplying both real
+		// values would parse, fall through to listenAndScore and hang the
+		// package. Probing one of the pair with no value fails in the parser,
+		// before heartbeatOptions ever runs.
+		"broker-url": {"--broker-url"},
+		"gw-uuid":    {"--gw-uuid"},
 	}
 
 	for _, name := range docTableFlags(t) {
