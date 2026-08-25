@@ -51,6 +51,14 @@ func newMulticastConnUnderTest(t *testing.T, fr *fakeRelay) *MulticastConn {
 	return mc
 }
 
+func waitForRelayDiscovery(t *testing.T, fr *fakeRelay) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for fr.advertised.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestMulticastConnNativeSelectionCancelsInFlightTunnel(t *testing.T) {
 	mc := &MulticastConn{wantTunnel: true, activeTunnel: true}
 
@@ -172,6 +180,7 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 	// up. Kept as a separate, earlier assertion than the handshake result: if
 	// this one fails the group never reached AMT at all, which is a different
 	// diagnosis from a handshake that started and then broke.
+	waitForRelayDiscovery(t, fr)
 	if n := fr.advertised.Load(); n < 1 {
 		t.Fatalf("relay received no Relay Discovery (advertisements sent = %d): the "+
 			"probe timed out but the group was never handed to an AMT gateway", n)
@@ -241,6 +250,7 @@ func TestMulticastConnPicksNativeAgainAfterItRecovers(t *testing.T) {
 	// Leg 1: native silent, so the group is handed away.
 	givenUp := newMulticastConnUnderTest(t, fr)
 	_ = givenUp.Open() // outcome asserted by the handover test above
+	waitForRelayDiscovery(t, fr)
 	if n := fr.advertised.Load(); n < 1 {
 		t.Fatalf("relay received no discovery on the first open (advertisements = %d); "+
 			"the group was never given up, so there is nothing to recover from", n)
