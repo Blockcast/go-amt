@@ -2,6 +2,9 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +18,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/blockcast/go-amt/broker"
+	"github.com/blockcast/go-amt/broker/gwclient"
 	"github.com/blockcast/go-amt/erasure"
 	"github.com/blockcast/go-amt/receiver"
 	"github.com/blockcast/go-amt/receiver/config"
@@ -56,16 +61,32 @@ const help = `blockcast-shreds demo mode
 
 Usage:
   blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
+   blockcast-shreds [--broker-url URL --gw-uuid UUID --broker-client-cert FILE --broker-client-key FILE]
   blockcast-shreds selftest --fixture [--json]
   blockcast-shreds selftest --generic [--json]
   blockcast-shreds gensend --to IP:PORT [--iface IP] [--pace=false]
+  blockcast-shreds --version
 
-Demo mode has no broker, certificates, accounts, or heartbeats. --feed is
-repeatable for first-arrival-wins scoring across multiple unicast UDP feeds.
-With two or more feeds the receipt reports the measured worth of a second
-feed: each feed's own erasure fraction, the union's, and the FEC sets the
-extra feeds rescued. It measures this run only — it cannot tell whether the
-inputs are independently operated or share one tap.
+Demo mode has no broker, certificates or accounts, and sends no heartbeats.
+--feed is repeatable for first-arrival-wins scoring across multiple unicast
+UDP feeds. With two or more feeds the receipt reports the measured worth of a
+second feed: each feed's own erasure fraction, the union's, and the FEC sets
+the extra feeds rescued. It measures this run only — it cannot tell whether
+the inputs are independently operated or share one tap.
+
+--broker-url and --gw-uuid opt into the gateway heartbeat and must be given
+together: a broker URL without an identity produces heartbeats the broker
+rejects, and an identity without a URL is inert but looks configured. When
+enabled, the receiver POSTs a per-feed liveness and delivery report every 30s.
+--broker-client-cert and --broker-client-key are required together with the
+heartbeat flags; --broker-ca may add the broker's issuing CA to system roots.
+Omitting both — the default — keeps demo mode heartbeat-free. They require
+--mode shred: the report carries a per-feed erasure window, and generic mode
+does no erasure scoring, so the pair is rejected at startup there rather than
+emitting a beat the broker discards.
+
+--version prints the build-stamped version reported in every heartbeat and
+exits, without requiring a valid receiver configuration.
 
 --mode generic scores generic framed records instead of shreds: the same
 delivery receipt, on a payload that isn't shreds. It reports no FEC erasure,
@@ -121,6 +142,22 @@ func main() {
 }
 
 func run(args []string) error {
+	// Handled before flag parsing, alongside the subcommands, rather than as a
+	// flag: every other invocation requires at least one --feed, so a
+	// --version registered on the FlagSet would still fall through to config
+	// validation and exit non-zero with "no feeds configured". A release
+	// pipeline asking a binary what it is must not need a valid receiver
+	// configuration to get an answer.
+	//
+	// This prints broker.Version() — the Go build-stamped symbol the heartbeat
+	// reports — and is what the packaging workflow asserts is not
+	// "dev-unstamped". It is deliberately NOT amt.Version(), which is the Rust
+	// library's version behind CGO and does not exist in this CGO_ENABLED=0
+	// binary at all.
+	if len(args) != 0 && (args[0] == "--version" || args[0] == "-version" || args[0] == "version") {
+		fmt.Println(broker.Version())
+		return nil
+	}
 	if len(args) != 0 && args[0] == "selftest" {
 		return selftest(args[1:])
 	}
@@ -149,6 +186,13 @@ func run(args []string) error {
 		"path to the delivery-session sequence WAL; enables per-destination billing records, requires --delivery-records")
 	deliveryRecords := flags.String("delivery-records", "",
 		"path to the delivery-session record file (JSON lines); requires --delivery-wal")
+	brokerURL := flags.String("broker-url", "",
+		"session broker base URL; enables the gateway heartbeat, requires --gw-uuid")
+	gwUUID := flags.String("gw-uuid", "",
+		"this gateway's canonical lowercase UUID, reported in every heartbeat; requires --broker-url")
+	brokerClientCert := flags.String("broker-client-cert", "", "PEM client certificate for the HTTPS session broker")
+	brokerClientKey := flags.String("broker-client-key", "", "PEM private key for --broker-client-cert")
+	brokerCA := flags.String("broker-ca", "", "PEM CA bundle for the HTTPS session broker")
 	if err := flags.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return nil
@@ -216,8 +260,12 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	beat, err := heartbeatOptions(*brokerURL, *gwUUID, *brokerClientCert, *brokerClientKey, *brokerCA, *score)
+	if err != nil {
+		return err
+	}
 	return listenAndScore(configured, forwardTo, httpAddress, healthMaxAge, *asJSON,
-		time.Duration(*graceMS)*time.Millisecond, *reportInterval, *retention, nil, *score, bill)
+		time.Duration(*graceMS)*time.Millisecond, *reportInterval, *retention, nil, *score, bill, beat)
 }
 
 // billing holds the delivery-session record configuration. A zero value
@@ -228,6 +276,99 @@ type billing struct {
 }
 
 func (b billing) enabled() bool { return b.walPath != "" }
+
+// heartbeatConfig holds the gateway heartbeat producer's configuration. A zero
+// value disables the heartbeat, which is what every existing invocation gets:
+// the demo receiver and the smoke test have no broker to report to, and a
+// receiver that failed to start because it could not reach one would be a
+// regression for them.
+type heartbeatConfig struct {
+	brokerURL  string
+	gwUUID     string
+	clientCert string
+	clientKey  string
+	caBundle   string
+}
+
+func (h heartbeatConfig) enabled() bool { return h.brokerURL != "" }
+
+// heartbeatOptions validates the heartbeat flags as a set, against the scoring
+// mode they will run under.
+//
+// Both or neither: a broker URL with no gateway identity produces heartbeats
+// the broker rejects for an invalid gw_uuid, and a gateway identity with no
+// broker URL is a silently inert configuration that looks configured. Failing
+// at startup is the point — the alternative surfaces 30 seconds later as a
+// rejected heartbeat with no obvious cause.
+//
+// Generic mode is rejected outright for the same reason, one layer deeper. The
+// heartbeat's FeedReport carries a mandatory erasure window, and erasure
+// scoring is shred-only: listenAndScore deliberately builds NO trackers in
+// generic mode, so nothing ever publishes a window, every feed keeps the zero
+// erasure.Window whose Schema is 0, and ValidateHeartbeat — whose floor is 1 —
+// rejects the whole beat. Producer.Run only logs that rejection, so the
+// gateway would send nothing at all while every flag read as configured. That
+// is the silent-inert shape this function already exists to prevent.
+//
+// The alternative — synthesizing a window to satisfy the schema — is refused
+// deliberately, and not only here: the pre-flight drain in listenAndScore
+// performs a REAL drain precisely so the producer never reports a delivery
+// figure it did not measure, and a zero erasure window reads as a PERFECT
+// feed. Fabricating one would turn an unmeasured feed into a clean SLA record,
+// which is the confusion the erasure contract exists to prevent.
+//
+// TestGenericModeHeartbeatIsUnsendable pins the underlying failure, so if
+// generic mode ever gains a real window this rejection can be revisited
+// against evidence rather than removed on assumption.
+func heartbeatOptions(brokerURL, gwUUID, clientCert, clientKey, caBundle string, mode scoring) (heartbeatConfig, error) {
+	switch {
+	case brokerURL == "" && gwUUID == "":
+		if clientCert != "" || clientKey != "" || caBundle != "" {
+			return heartbeatConfig{}, errors.New("broker TLS flags require --broker-url and --gw-uuid")
+		}
+		return heartbeatConfig{}, nil
+	case brokerURL == "":
+		return heartbeatConfig{}, errors.New("--gw-uuid requires --broker-url")
+	case gwUUID == "":
+		return heartbeatConfig{}, errors.New("--broker-url requires --gw-uuid")
+	case clientCert == "" || clientKey == "":
+		return heartbeatConfig{}, errors.New("--broker-client-cert and --broker-client-key are required for broker mTLS")
+	case mode.generic():
+		return heartbeatConfig{}, errors.New(
+			"--broker-url and --gw-uuid require --mode shred: the heartbeat reports a " +
+				"per-feed erasure window, generic mode does no erasure scoring, and a " +
+				"synthesized zero window would report an unmeasured feed as a perfect one")
+	}
+	return heartbeatConfig{brokerURL: brokerURL, gwUUID: gwUUID, clientCert: clientCert, clientKey: clientKey, caBundle: caBundle}, nil
+}
+
+func heartbeatHTTPClient(beat heartbeatConfig) (*http.Client, error) {
+	cert, err := tls.LoadX509KeyPair(beat.clientCert, beat.clientKey)
+	if err != nil {
+		return nil, fmt.Errorf("load broker client certificate: %w", err)
+	}
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("load system certificate pool: %w", err)
+	}
+	if beat.caBundle != "" {
+		pem, err := os.ReadFile(beat.caBundle)
+		if err != nil {
+			return nil, fmt.Errorf("read broker CA bundle: %w", err)
+		}
+		if ok := roots.AppendCertsFromPEM(pem); !ok {
+			return nil, fmt.Errorf("broker CA bundle %q contains no certificates", beat.caBundle)
+		}
+	}
+	return &http.Client{
+		Timeout: broker.HeartbeatInterval - 5*time.Second,
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{cert},
+			RootCAs:      roots,
+		}},
+	}, nil
+}
 
 // billingOptions validates the delivery-session flags as a set.
 //
@@ -518,7 +659,7 @@ func (s scoring) generic() bool { return s.mode == "generic" }
 
 // listenAndScore serves every configured feed until stop is closed or a socket
 // fails. stop may be nil, in which case only a signal or a socket error ends it.
-func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, grace, reportInterval, retention time.Duration, stop <-chan struct{}, mode scoring, bill billing) error {
+func listenAndScore(feeds []feed, destinations []string, httpAddress string, healthMaxAge time.Duration, asJSON bool, grace, reportInterval, retention time.Duration, stop <-chan struct{}, mode scoring, bill billing, beat heartbeatConfig) error {
 	names := make([]string, 0, len(feeds))
 	for _, feed := range feeds {
 		names = append(names, feed.name)
@@ -655,6 +796,54 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	})
 	defer stopReporter()
 
+	if beat.enabled() {
+		// Drain every feed once BEFORE the first heartbeat can be built.
+		//
+		// A feed whose window has never been drained holds the zero
+		// erasure.Window, whose Schema is 0, and broker.ValidateHeartbeat
+		// rejects any schema outside [1,2]. That rejection is whole-heartbeat,
+		// so a single never-drained feed discards the liveness of every other
+		// feed in the beat. The reporter above is a plain ticker whose first
+		// tick is one --report-interval away, and that interval is legal up to
+		// five minutes, so without this drain a gateway would emit nothing
+		// valid for up to ten consecutive heartbeats at startup -- exactly the
+		// silent-feed window an SLA dispute is about.
+		//
+		// This is the same argument the final drain below already makes, at the
+		// other end of the process: a run shorter than one report interval must
+		// not report nothing but zeros. Draining here costs one extra window
+		// whose span is microseconds (window_ms floors at 1ms) and whose counts
+		// are zero, which the contract explicitly admits -- and it is a REAL
+		// drain rather than a synthesized report, so the producer never has to
+		// fabricate a delivery figure it did not measure.
+		//
+		// TestBuildRejectsANeverDrainedFeed in broker/gwclient states the
+		// consequence if this is ever removed.
+		publishWindows(trackers, metrics, time.Now())
+
+		client, err := heartbeatHTTPClient(beat)
+		if err != nil {
+			return err
+		}
+		producer, err := gwclient.NewProducer(beat.gwUUID, beat.brokerURL, metrics, gwclient.WithHTTPClient(client))
+		if err != nil {
+			return err
+		}
+		// Cancelled by the deferred stop below, which runs on every exit path,
+		// so the producer cannot outlive the receiver whose feeds it reports.
+		heartbeatCtx, stopHeartbeat := context.WithCancel(context.Background())
+		defer stopHeartbeat()
+		heartbeatDone := make(chan struct{})
+		go func() {
+			defer close(heartbeatDone)
+			_ = producer.Run(heartbeatCtx)
+		}()
+		defer func() {
+			stopHeartbeat()
+			<-heartbeatDone
+		}()
+	}
+
 	// closeSessions emits the final record per destination. It runs after
 	// stopReporter has joined the reporter goroutine, so the Reporter is only
 	// ever touched from one goroutine at a time and needs no lock.
@@ -725,7 +914,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 				// lock-ordered one.
 				mu.Lock()
 				health.MarkReceived(receivedAt)
-				_ = metrics.IncIngress(feedName)
+				_ = metrics.ObserveIngress(feedName, n, receivedAt)
 				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics, trackers[feedName])
 				mu.Unlock()
 			}

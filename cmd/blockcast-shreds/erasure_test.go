@@ -173,7 +173,7 @@ func TestListenAndScorePublishesRealErasureToMetrics(t *testing.T) {
 			[]string{destination.LocalAddr().String()},
 			httpAddress, 30*time.Second, true, grace, reportInterval, shred.DefaultRetention, stop, scoring{mode: "shred"},
 			billing{},
-		)
+			heartbeatConfig{})
 	}()
 
 	waitReady(t, httpAddress)
@@ -379,7 +379,7 @@ func TestDefaultGraceReachesMetrics(t *testing.T) {
 			[]feed{{name: "default", address: feedAddress}}, nil, httpAddress, 30*time.Second, true,
 			config.DefaultErasureGrace, 40*time.Millisecond, shred.DefaultRetention, stop, scoring{mode: "shred"},
 			billing{},
-		)
+			heartbeatConfig{})
 	}()
 
 	var graceMS float64

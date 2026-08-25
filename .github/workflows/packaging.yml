@@ -19,7 +19,28 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Build the shipped static binary
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o blockcast-shreds ./cmd/blockcast-shreds
+        # The -X path is fully qualified because the Go linker discards an -X for
+        # an unknown symbol silently: -X main.version would build clean and
+        # report dev-unstamped forever. github.ref_name stands in for the
+        # release tag so this lane exercises the same stamped shape a release
+        # takes, rather than leaving the stamp untested until tag day.
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags="-s -w -X github.com/blockcast/go-amt/broker.version=${GITHUB_REF_NAME}" \
+            -o blockcast-shreds ./cmd/blockcast-shreds
+      - name: Assert the version stamp resolved
+        # Guards the silent-discard failure directly: if the symbol path above
+        # ever drifts, the binary still builds and this is the only thing that
+        # notices.
+        run: |
+          reported="$(./blockcast-shreds --version)"
+          echo "reported version: ${reported}"
+          if [ "${reported}" = "dev-unstamped" ]; then
+            echo "::error::-X stamp was silently discarded: the binary still reports dev-unstamped." \
+                 "Check the symbol path github.com/blockcast/go-amt/broker.version in this workflow," \
+                 ".goreleaser.yaml and the Dockerfile."
+            exit 1
+          fi
       - name: Install smoke test
         run: packaging/smoke-test.sh ./blockcast-shreds
 
