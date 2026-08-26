@@ -341,7 +341,13 @@ func (mc *ManagedConn) waitOpen() {
 	}
 }
 
-// ReadFrom reads a packet from the connection
+// ReadFrom reads a packet from the connection.
+//
+// On the AMT tunnel path, a zero-length buffer returns (0, nil) without
+// consuming the queued packet. A non-zero buffer that is shorter than the
+// packet follows net.PacketConn semantics: the packet is consumed and its
+// payload is truncated to fit. The native path delegates to the underlying
+// connection and retains its standard-library behavior.
 func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	mc.waitOpen()
 	mc.mu.RLock()
@@ -358,16 +364,6 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	// the two and leave a closed connection serving a packet it still holds. A
 	// closed connection owes the caller an error, not a packet.
 	//
-	// Unlike ReadBatch this takes unconditionally, even when p is too short or
-	// empty, and that asymmetry is deliberate. A short buffer truncating a
-	// datagram is what the underlying socket does and what net.PacketConn
-	// documents, so matching it keeps the pending path and the socket path
-	// indistinguishable to the caller. ReadBatch can do better only because it
-	// has a way to say "no room, nothing consumed" — zero messages returned.
-	// ReadFrom has none: (0, addr, nil) with the packet retained is
-	// indistinguishable from a zero-length datagram, so a caller looping on a
-	// short buffer would spin forever instead of making progress. Do not
-	// "align" this with ReadBatch.
 	pending := mc.pending.take()
 	mc.mu.RUnlock()
 
@@ -379,7 +375,9 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		n, _, src, err := nativeConn.ReadFrom(p)
 		return n, src, err
 	}
-
+	if len(p) == 0 {
+		return 0, nil, nil
+	}
 	// Read from subscription channel
 	select {
 	case <-done:
@@ -393,7 +391,13 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	}
 }
 
-// ReadFromWithControlMessage reads a packet with control message
+// ReadFromWithControlMessage reads a packet with control message.
+//
+// On the AMT tunnel path, a zero-length buffer returns (0, nil, nil) without
+// consuming the queued packet. A non-zero buffer that is shorter than the
+// packet follows net.PacketConn semantics: the packet is consumed and its
+// payload is truncated to fit. The native path delegates to the underlying
+// connection and retains its standard-library behavior.
 func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.ControlMessage, src net.Addr, err error) {
 	mc.waitOpen()
 	mc.mu.RLock()
@@ -416,7 +420,9 @@ func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.C
 	if !usingTunnel && nativeConn != nil {
 		return nativeConn.ReadFrom(buf)
 	}
-
+	if len(buf) == 0 {
+		return 0, nil, nil, nil
+	}
 	// Read from subscription channel (no control message available for AMT)
 	select {
 	case <-done:
