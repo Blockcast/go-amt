@@ -755,6 +755,58 @@ func TestReGrantedTargetOpensDistinctSession(t *testing.T) {
 	}
 }
 
+// TestReGrantedTargetCanBillBeforeTheOldGenerationCloses covers the reconcile
+// handoff where the new table starts delivering before its caller has consumed
+// the old generation's final sample. The two generations must remain separate:
+// closing the old sample later must not close or bill the new session.
+func TestReGrantedTargetCanBillBeforeTheOldGenerationCloses(t *testing.T) {
+	reporter, sink := newTestReporter(t)
+
+	oldPeriodic := LedgerSample{TargetID: "grant-a", Generation: 1, Destination: "10.0.0.1:8000", Bytes: 1000, Packets: 10}
+	if err := reporter.Tick([]LedgerSample{oldPeriodic}); err != nil {
+		t.Fatalf("Tick old generation: %v", err)
+	}
+
+	// Reconcile has returned old's final sample but the caller has not closed it
+	// yet. A re-granted target can already deliver through the new table.
+	old := LedgerSample{TargetID: "grant-a", Generation: 1, Destination: "10.0.0.1:8000", Bytes: 1500, Packets: 15}
+	new := LedgerSample{TargetID: "grant-a", Generation: 2, Destination: "10.0.0.2:8000", Bytes: 400, Packets: 4}
+	if err := reporter.Tick([]LedgerSample{new}); err != nil {
+		t.Fatalf("Tick new generation before old close: %v", err)
+	}
+	if err := reporter.CloseRemoved([]LedgerSample{old}); err != nil {
+		t.Fatalf("CloseRemoved old generation: %v", err)
+	}
+
+	records := sink.forTarget("grant-a")
+	var oldFinal Record
+	var haveOldFinal bool
+	sessions := make(map[string]struct{})
+	var billed uint64
+	for _, record := range records {
+		sessions[record.SessionID] = struct{}{}
+		billed += record.BytesOut
+		if record.Final {
+			oldFinal, haveOldFinal = record, true
+		}
+	}
+	if !haveOldFinal {
+		t.Fatal("old generation emitted no final record")
+	}
+	if oldFinal.Destination != old.Destination || oldFinal.BytesOut != old.Bytes-oldPeriodic.Bytes {
+		t.Errorf("old final = destination %q, bytes %d; want old generation %q / %d tail", oldFinal.Destination, oldFinal.BytesOut, old.Destination, old.Bytes-oldPeriodic.Bytes)
+	}
+	if _, open := reporter.tracker.SessionIDForGeneration("grant-a", 2); !open {
+		t.Error("closing the old generation also closed the new generation")
+	}
+	if len(sessions) != 2 {
+		t.Errorf("records use %d sessions, want distinct old and new sessions", len(sessions))
+	}
+	if billed != old.Bytes+new.Bytes {
+		t.Errorf("records billed %d bytes, want exactly %d", billed, old.Bytes+new.Bytes)
+	}
+}
+
 // A close that the sink refuses must not be silently dropped: the final record
 // is the interval nothing will ever restate, so it is retained for verbatim
 // retransmission and reported as owed.

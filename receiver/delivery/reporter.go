@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strconv"
+	"strings"
 )
 
 // LedgerSample is one target's delivery counters as read from the fan-out
@@ -28,7 +30,8 @@ import (
 type LedgerSample struct {
 	// TargetID is the stable billing identity — a broker grant or subscriber
 	// ID, from DestinationStat.TargetID. It is required.
-	TargetID string
+	TargetID   string
+	Generation uint64
 	// Destination is the resolved UDP address, carried through onto the record
 	// as endpoint metadata. It is not an identity and must not be used as one.
 	Destination string
@@ -83,6 +86,10 @@ type Reporter struct {
 	pending map[string]Record
 }
 
+func sampleKey(targetID string, generation uint64) string {
+	return fmt.Sprintf("%s\x00%d", targetID, generation)
+}
+
 // NewReporter returns a Reporter feeding tracker from ledger samples and
 // shipping the resulting records to sink.
 func NewReporter(tracker *Tracker, sink Sink) (*Reporter, error) {
@@ -117,7 +124,7 @@ func (r *Reporter) Tick(samples []LedgerSample) error {
 		// behind it any more, so observing first would fail with ErrNoSession
 		// and strand that record forever -- and it is the interval least
 		// affordable to lose, being the one nothing will ever restate.
-		if err := r.drainPending(sample.TargetID); err != nil {
+		if err := r.drainPending(sample.TargetID, sample.Generation); err != nil {
 			errs = append(errs, err)
 			continue
 		}
@@ -141,7 +148,7 @@ func (r *Reporter) Tick(samples []LedgerSample) error {
 func (r *Reporter) CloseAll(samples []LedgerSample, reason CloseReason) error {
 	byTarget := make(map[string]LedgerSample, len(samples))
 	for _, sample := range samples {
-		byTarget[sample.TargetID] = sample
+		byTarget[sampleKey(sample.TargetID, sample.Generation)] = sample
 	}
 
 	// The union of three sets, because each can hold a target the others do
@@ -154,11 +161,11 @@ func (r *Reporter) CloseAll(samples []LedgerSample, reason CloseReason) error {
 	for targetID := range byTarget {
 		names[targetID] = struct{}{}
 	}
-	for targetID := range r.last {
-		names[targetID] = struct{}{}
+	for key := range r.last {
+		names[key] = struct{}{}
 	}
-	for targetID := range r.pending {
-		names[targetID] = struct{}{}
+	for key := range r.pending {
+		names[key] = struct{}{}
 	}
 
 	targetIDs := make([]string, 0, len(names))
@@ -170,8 +177,8 @@ func (r *Reporter) CloseAll(samples []LedgerSample, reason CloseReason) error {
 	sort.Strings(targetIDs)
 
 	var errs []error
-	for _, targetID := range targetIDs {
-		sample, ok := byTarget[targetID]
+	for _, key := range targetIDs {
+		sample, ok := byTarget[key]
 		if !ok {
 			// No final reading for a target we were tracking. Close on the
 			// watermark rather than skipping the close, so the session still
@@ -179,19 +186,33 @@ func (r *Reporter) CloseAll(samples []LedgerSample, reason CloseReason) error {
 			// so the closing delta is zero instead of re-billing the ledger.
 			// The watermark's address rides along as the record's endpoint
 			// metadata: it is the last place this target's bytes actually went.
-			previous := r.last[targetID]
+			previous := r.last[key]
+			targetID, generation := sampleKeyParts(key)
 			sample = LedgerSample{
 				TargetID:    targetID,
+				Generation:  generation,
 				Destination: previous.Destination,
 				Bytes:       previous.Bytes,
 				Packets:     previous.Packets,
 			}
 		}
-		if err := r.CloseDestination(sample, reason); err != nil {
+		if err := r.closeDestination(sample, reason); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func sampleKeyParts(key string) (string, uint64) {
+	i := strings.LastIndexByte(key, 0)
+	if i < 0 {
+		return key, 0
+	}
+	generation, err := strconv.ParseUint(key[i+1:], 10, 64)
+	if err != nil {
+		return key[:i], 0
+	}
+	return key[:i], generation
 }
 
 // CloseRemoved closes the sessions of targets that a reconcile removed from the
@@ -216,7 +237,7 @@ func (r *Reporter) CloseAll(samples []LedgerSample, reason CloseReason) error {
 func (r *Reporter) CloseRemoved(samples []LedgerSample) error {
 	var errs []error
 	for _, sample := range samples {
-		if err := r.CloseDestination(sample, CloseTicketExpired); err != nil {
+		if err := r.closeDestination(sample, CloseTicketExpired); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -234,6 +255,10 @@ func (r *Reporter) CloseRemoved(samples []LedgerSample) error {
 // which is the same class of error as the forgeable AMT Teardown that
 // Tracker.Teardown refuses to treat as a close.
 func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) error {
+	return r.closeDestination(sample, reason)
+}
+
+func (r *Reporter) closeDestination(sample LedgerSample, reason CloseReason) error {
 	if !reason.Valid() {
 		return fmt.Errorf("delivery: invalid close reason %q", string(reason))
 	}
@@ -245,11 +270,11 @@ func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) err
 	// once Tracker.Close has removed a session, a retained final record can no
 	// longer be regenerated, and observing first would fail with ErrNoSession
 	// and strand it.
-	if err := r.drainPending(sample.TargetID); err != nil {
+	if err := r.drainPending(sample.TargetID, sample.Generation); err != nil {
 		return err
 	}
 
-	if _, open := r.tracker.SessionID(sample.TargetID); !open {
+	if _, open := r.tracker.SessionIDForGeneration(sample.TargetID, sample.Generation); !open {
 		// No open session. Two very different situations, told apart by whether
 		// a watermark exists, and conflating them loses records either way:
 		//
@@ -264,7 +289,7 @@ func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) err
 		//     run-shorter-than-one-report-interval case, and it is the one that
 		//     must fall through: the close is where that run's entire traffic
 		//     gets billed, so returning early here would discard all of it.
-		if _, tracked := r.last[sample.TargetID]; tracked {
+		if _, tracked := r.last[sampleKey(sample.TargetID, sample.Generation)]; tracked {
 			// The watermark itself is deliberately NOT dropped. It belongs to
 			// the ledger, not the session: the ledger is cumulative over the
 			// whole process and does not reset when a session ends, so
@@ -278,7 +303,7 @@ func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) err
 		return err
 	}
 
-	record, err := r.tracker.Close(sample.TargetID, reason)
+	record, err := r.tracker.CloseForGeneration(sample.TargetID, sample.Generation, reason)
 	if err != nil {
 		return fmt.Errorf("delivery: close session for %s: %w", sample.TargetID, err)
 	}
@@ -288,7 +313,7 @@ func (r *Reporter) CloseDestination(sample LedgerSample, reason CloseReason) err
 	// top of this method and of Tick is what eventually ships it -- and keep
 	// the ledger watermark, so the retry cannot be mistaken for fresh traffic.
 	if err := r.sink.Ship(record); err != nil {
-		r.pending[sample.TargetID] = record
+		r.pending[sampleKey(sample.TargetID, sample.Generation)] = record
 		return fmt.Errorf("delivery: ship final record for %s: %w", sample.TargetID, err)
 	}
 	// The watermark stays, for the reason given above: it tracks the ledger,
@@ -318,9 +343,10 @@ func (r *Reporter) observe(sample LedgerSample) error {
 	// whole process and does not reset when a session ends. Keying the Open on
 	// the watermark instead would re-bill every byte since process start into
 	// the first record of the reopened session.
-	previous := r.last[sample.TargetID]
-	if _, open := r.tracker.SessionID(sample.TargetID); !open {
-		if _, err := r.tracker.Open(sample.TargetID); err != nil {
+	key := sampleKey(sample.TargetID, sample.Generation)
+	previous := r.last[key]
+	if _, open := r.tracker.SessionIDForGeneration(sample.TargetID, sample.Generation); !open {
+		if _, err := r.tracker.OpenForGeneration(sample.TargetID, sample.Generation); err != nil {
 			return fmt.Errorf("delivery: open session for %s: %w", sample.TargetID, err)
 		}
 	}
@@ -351,19 +377,19 @@ func (r *Reporter) observe(sample LedgerSample) error {
 		packetsDelta = sample.Packets
 	}
 
-	if err := r.tracker.Observe(sample.TargetID, bytesDelta, packetsDelta); err != nil {
+	if err := r.tracker.ObserveForGeneration(sample.TargetID, sample.Generation, bytesDelta, packetsDelta); err != nil {
 		return fmt.Errorf("delivery: observe %s: %w", sample.TargetID, err)
 	}
 	// Advance the watermark only after Observe succeeded, so a failed Observe
 	// leaves the delta to be retried on the next sample instead of dropping it.
-	r.last[sample.TargetID] = sample
+	r.last[key] = sample
 	return nil
 }
 
 // emitOne emits and ships a new periodic record, provided nothing is owed for
 // the target.
 func (r *Reporter) emitOne(sample LedgerSample) error {
-	if record, owed := r.pending[sample.TargetID]; owed {
+	if record, owed := r.pending[sampleKey(sample.TargetID, sample.Generation)]; owed {
 		// Do not emit while a record is owed: a new Emit would advance the
 		// watermark past traffic whose record has not shipped, and the retained
 		// record's bytes would never be restated. The delta stays in the
@@ -372,7 +398,7 @@ func (r *Reporter) emitOne(sample LedgerSample) error {
 		return fmt.Errorf("delivery: record seq %d for %s still owed; not emitting", record.Seq, sample.TargetID)
 	}
 
-	record, err := r.tracker.Emit(sample.TargetID)
+	record, err := r.tracker.EmitForGeneration(sample.TargetID, sample.Generation)
 	if err != nil {
 		return fmt.Errorf("delivery: emit for %s: %w", sample.TargetID, err)
 	}
@@ -382,7 +408,7 @@ func (r *Reporter) emitOne(sample LedgerSample) error {
 	// target's current endpoint.
 	record.Destination = sample.Destination
 	if err := r.sink.Ship(record); err != nil {
-		r.pending[sample.TargetID] = record
+		r.pending[sampleKey(sample.TargetID, sample.Generation)] = record
 		return fmt.Errorf("delivery: ship record for %s: %w", sample.TargetID, err)
 	}
 	return nil
@@ -390,14 +416,15 @@ func (r *Reporter) emitOne(sample LedgerSample) error {
 
 // drainPending retransmits a retained record verbatim. It returns nil when
 // nothing is owed for the target.
-func (r *Reporter) drainPending(targetID string) error {
-	record, owed := r.pending[targetID]
+func (r *Reporter) drainPending(targetID string, generation uint64) error {
+	key := sampleKey(targetID, generation)
+	record, owed := r.pending[key]
 	if !owed {
 		return nil
 	}
 	if err := r.sink.Ship(record); err != nil {
 		return fmt.Errorf("delivery: retransmit record seq %d for %s: %w", record.Seq, targetID, err)
 	}
-	delete(r.pending, targetID)
+	delete(r.pending, key)
 	return nil
 }

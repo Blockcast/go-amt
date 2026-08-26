@@ -123,11 +123,12 @@ type destCounters struct {
 // destination is one entry in a table: identity, where to write, and the
 // counters to charge.
 type destination struct {
-	id       string
-	name     string
-	addr     *net.UDPAddr
-	writer   io.WriteCloser
-	counters *destCounters
+	id         string
+	generation uint64
+	name       string
+	addr       *net.UDPAddr
+	writer     io.WriteCloser
+	counters   *destCounters
 }
 
 // destTable is an immutable snapshot of the destination set. Once published
@@ -201,7 +202,8 @@ type Fanout struct {
 	// latency advantage to whichever subscriber sits early in the list. An
 	// auditable-SLA product cannot ship a delivery order correlated with
 	// subscriber index.
-	next int
+	next           int
+	nextGeneration atomic.Uint64
 
 	// table is the destination set the worker is currently serving. It is
 	// swapped wholesale by ReconcileDestinations rather than mutated in place,
@@ -292,6 +294,7 @@ type DestinationStat struct {
 	// changes its address; the slice position does not, so nothing downstream
 	// should key on position.
 	TargetID    string
+	Generation  uint64
 	Destination string
 	Packets     uint64
 	Bytes       uint64
@@ -328,6 +331,7 @@ func NewFanout(writers []io.WriteCloser, queueCapacity int, observer EgressObser
 			writer:   writer,
 			counters: new(destCounters),
 		}
+		entries[i].generation = uint64(i + 1)
 	}
 	f.publish(&destTable{entries: entries})
 	f.wg.Add(1)
@@ -359,6 +363,7 @@ func (f *Fanout) DestinationStats() []DestinationStat {
 	for i, entry := range entries {
 		stats[i] = DestinationStat{
 			TargetID:    entry.id,
+			Generation:  entry.generation,
 			Destination: entry.name,
 			Packets:     entry.counters.packets.Load(),
 			Bytes:       entry.counters.bytes.Load(),
@@ -408,6 +413,9 @@ func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObs
 		queue:    make(chan queuedPacket, queueCapacity),
 		observer: observer,
 		udpConn:  ipv4.NewPacketConn(conn),
+	}
+	for i := range entries {
+		entries[i].generation = f.nextGeneration.Add(1)
 	}
 	f.publish(&destTable{entries: entries})
 	f.wg.Add(1)
@@ -532,6 +540,17 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 	entries, err := resolveTargets(targets, carry)
 	if err != nil {
 		return nil, err
+	}
+	for i := range entries {
+		for _, previousEntry := range previous {
+			if previousEntry.id == entries[i].id {
+				entries[i].generation = previousEntry.generation
+				break
+			}
+		}
+		if entries[i].generation == 0 {
+			entries[i].generation = f.nextGeneration.Add(1)
+		}
 	}
 
 	// EVERY rejection is now behind us, and that is the point: the harvest below
@@ -688,6 +707,7 @@ func (f *Fanout) harvestFinalDepartures() []DestinationStat {
 		entry := pending.entry
 		removed = append(removed, DestinationStat{
 			TargetID:    entry.id,
+			Generation:  entry.generation,
 			Destination: entry.name,
 			Packets:     entry.counters.packets.Load(),
 			Bytes:       entry.counters.bytes.Load(),

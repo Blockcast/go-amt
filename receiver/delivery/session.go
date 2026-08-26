@@ -139,6 +139,13 @@ type Tracker struct {
 	now      func() time.Time
 }
 
+func sessionKey(subscriberID string, generation uint64) string {
+	if generation == 0 {
+		return subscriberID
+	}
+	return fmt.Sprintf("%s\x00%d", subscriberID, generation)
+}
+
 // TrackerOption customizes a Tracker. Options exist so tests can pin time and
 // session identity; production callers need none of them.
 type TrackerOption func(*Tracker)
@@ -176,6 +183,10 @@ func NewTracker(seqs SeqStore, options ...TrackerOption) (*Tracker, error) {
 // close. Sessions are never identified by subscriber alone, so two consecutive
 // sessions for the same subscriber can never be merged into one billing row.
 func (t *Tracker) Open(subscriberID string) (string, error) {
+	return t.OpenForGeneration(subscriberID, 0)
+}
+
+func (t *Tracker) OpenForGeneration(subscriberID string, generation uint64) (string, error) {
 	if subscriberID == "" {
 		return "", errors.New("delivery: subscriber ID is empty")
 	}
@@ -183,14 +194,15 @@ func (t *Tracker) Open(subscriberID string) (string, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if _, exists := t.sessions[subscriberID]; exists {
+	key := sessionKey(subscriberID, generation)
+	if _, exists := t.sessions[key]; exists {
 		return "", fmt.Errorf("%w: %s", ErrSessionOpen, subscriberID)
 	}
 	id, err := t.newID()
 	if err != nil {
 		return "", fmt.Errorf("delivery: mint session ID: %w", err)
 	}
-	t.sessions[subscriberID] = &session{
+	t.sessions[key] = &session{
 		id:           id,
 		subscriberID: subscriberID,
 		openedAt:     t.now(),
@@ -201,10 +213,14 @@ func (t *Tracker) Open(subscriberID string) (string, error) {
 // Observe accumulates delivered bytes and packets against the open session.
 // It is called on the egress path, so it never allocates or does I/O.
 func (t *Tracker) Observe(subscriberID string, bytes, packets uint64) error {
+	return t.ObserveForGeneration(subscriberID, 0, bytes, packets)
+}
+
+func (t *Tracker) ObserveForGeneration(subscriberID string, generation uint64, bytes, packets uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	current, ok := t.sessions[subscriberID]
+	current, ok := t.sessions[sessionKey(subscriberID, generation)]
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrNoSession, subscriberID)
 	}
@@ -248,9 +264,13 @@ func (t *Tracker) Teardown(subscriberID string) bool {
 // (SessionID, Seq), so a duplicate is discarded rather than counted twice, and
 // DurationMS is cumulative so it collapses correctly under MAX.
 func (t *Tracker) Emit(subscriberID string) (Record, error) {
+	return t.EmitForGeneration(subscriberID, 0)
+}
+
+func (t *Tracker) EmitForGeneration(subscriberID string, generation uint64) (Record, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.emitLocked(subscriberID, "", false)
+	return t.emitLocked(sessionKey(subscriberID, generation), "", false)
 }
 
 // Close produces the final record for the open session and retires it. A
@@ -261,6 +281,10 @@ func (t *Tracker) Emit(subscriberID string) (Record, error) {
 // afterwards, so there is nothing left to re-emit from. Retransmit the
 // returned Record verbatim until the sink accepts it.
 func (t *Tracker) Close(subscriberID string, reason CloseReason) (Record, error) {
+	return t.CloseForGeneration(subscriberID, 0, reason)
+}
+
+func (t *Tracker) CloseForGeneration(subscriberID string, generation uint64, reason CloseReason) (Record, error) {
 	if !reason.Valid() {
 		return Record{}, fmt.Errorf("delivery: invalid close reason %q", string(reason))
 	}
@@ -268,11 +292,11 @@ func (t *Tracker) Close(subscriberID string, reason CloseReason) (Record, error)
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	record, err := t.emitLocked(subscriberID, reason, true)
+	record, err := t.emitLocked(sessionKey(subscriberID, generation), reason, true)
 	if err != nil {
 		return Record{}, err
 	}
-	delete(t.sessions, subscriberID)
+	delete(t.sessions, sessionKey(subscriberID, generation))
 	// The sequence number has already been issued and put in the record, so
 	// releasing the store's state for it now cannot lose anything. Doing it
 	// here rather than leaving it to the caller is what keeps the store from
@@ -329,10 +353,14 @@ func (t *Tracker) emitLocked(subscriberID string, reason CloseReason, final bool
 
 // SessionID returns the open session UUID for subscriberID.
 func (t *Tracker) SessionID(subscriberID string) (string, bool) {
+	return t.SessionIDForGeneration(subscriberID, 0)
+}
+
+func (t *Tracker) SessionIDForGeneration(subscriberID string, generation uint64) (string, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	current, ok := t.sessions[subscriberID]
+	current, ok := t.sessions[sessionKey(subscriberID, generation)]
 	if !ok {
 		return "", false
 	}
