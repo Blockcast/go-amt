@@ -219,6 +219,26 @@ func TestForgedTeardownDoesNotShortenDuration(t *testing.T) {
 	}
 }
 
+// TestTeardownForGenerationTargetsTheGenerationKey pins the generation-aware
+// teardown lookup. A nonzero-generation session must not be mistaken for the
+// legacy generation-zero key, or its accelerated liveness path silently does
+// nothing for every broker-target session.
+func TestTeardownForGenerationTargetsTheGenerationKey(t *testing.T) {
+	clock := &fakeClock{now: time.Unix(1_700_000_000, 0).UTC()}
+	tracker := newTestTracker(t, clock, nil)
+
+	const generation = 7
+	if _, err := tracker.OpenForGeneration("subscriber-a", generation); err != nil {
+		t.Fatalf("OpenForGeneration: %v", err)
+	}
+	if tracker.Teardown("subscriber-a") {
+		t.Fatal("legacy Teardown unexpectedly found a nonzero-generation session")
+	}
+	if !tracker.TeardownForGeneration("subscriber-a", generation) {
+		t.Fatal("TeardownForGeneration did not find the nonzero-generation session")
+	}
+}
+
 // TestCloseReasonIsOnTheWire pins that every close carries a reason, and that
 // TEARDOWN is not an accepted one.
 func TestCloseReasonIsOnTheWire(t *testing.T) {

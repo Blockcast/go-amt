@@ -234,10 +234,19 @@ func (t *Tracker) ObserveForGeneration(subscriberID string, generation uint64, b
 // forgeable. Callers should treat a true return as a prompt to run an
 // accelerated liveness probe, then close through Close if that probe fails.
 func (t *Tracker) Teardown(subscriberID string) bool {
+	return t.TeardownForGeneration(subscriberID, 0)
+}
+
+// TeardownForGeneration records an unauthenticated teardown hint for one
+// generation. It deliberately does NOT close the session and does NOT affect
+// duration, because an AMT Teardown is forgeable. Callers should treat a true
+// return as a prompt to run an accelerated liveness probe, then close through
+// CloseForGeneration if that probe fails.
+func (t *Tracker) TeardownForGeneration(subscriberID string, generation uint64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	current, ok := t.sessions[subscriberID]
+	current, ok := t.sessions[sessionKey(subscriberID, generation)]
 	if !ok {
 		return false
 	}
