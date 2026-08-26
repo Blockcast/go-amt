@@ -968,6 +968,7 @@ func ledgerSamples(fanout *receiver.Fanout) []delivery.LedgerSample {
 			// keeps two subscribers sharing an address on two. The address
 			// rides along as endpoint metadata only.
 			TargetID:    stat.TargetID,
+			Generation:  stat.Generation,
 			Destination: stat.Destination,
 			// These are cumulative process-lifetime totals. The Reporter is
 			// what turns them into the per-interval deltas the record carries;
