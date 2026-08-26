@@ -331,7 +331,7 @@ func NewFanout(writers []io.WriteCloser, queueCapacity int, observer EgressObser
 			writer:   writer,
 			counters: new(destCounters),
 		}
-		entries[i].generation = uint64(i + 1)
+		entries[i].generation = f.nextGeneration.Add(1)
 	}
 	f.publish(&destTable{entries: entries})
 	f.wg.Add(1)

@@ -119,11 +119,22 @@ func runBilledReceiver(t *testing.T, walPath, recordPath string, packetCount int
 	// quietly stop testing the shutdown ordering. Shutdown has to drain the
 	// fan-out before it samples the ledger for the final record.
 	deadline := time.Now().Add(15 * time.Second)
+	var ingress float64
 	for time.Now().Before(deadline) {
-		if ingress, ok := scrape(t, httpAddress, "bcast_shred_gw_ingress_packets_total", `feed="default"`); ok && int(ingress) >= packetCount {
-			break
+		if observed, ok := scrape(t, httpAddress, "bcast_shred_gw_ingress_packets_total", `feed="default"`); ok {
+			ingress = observed
+			if int(ingress) >= packetCount {
+				break
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+	if int(ingress) < packetCount {
+		close(stop)
+		if err := <-finished; err != nil {
+			t.Fatalf("listenAndScore after incomplete ingress: %v", err)
+		}
+		t.Fatalf("receiver accepted %d/%d packets before shutdown", int(ingress), packetCount)
 	}
 
 	close(stop)

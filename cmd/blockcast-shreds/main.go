@@ -750,21 +750,6 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		}
 	}
 
-	health, err := receiver.NewHealth(healthMaxAge)
-	if err != nil {
-		return err
-	}
-	httpServer, err := startHTTP(httpAddress, registry, health)
-	if err != nil {
-		return err
-	}
-	if httpServer != nil {
-		defer func() { _ = httpServer.Close() }()
-	}
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(signals)
-
 	// Drain each feed's window into /metrics on the heartbeat cadence. The
 	// tracker carries its own mutex, so this runs off the read path and cannot
 	// hold up ingress or delivery.
@@ -883,25 +868,58 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	})
 	defer closeSessions()
 
-	errCh := make(chan error, len(feeds))
+	health, err := receiver.NewHealth(healthMaxAge)
+	if err != nil {
+		return err
+	}
+
+	// Bind every ingress socket before publishing HTTP. The metrics endpoint is
+	// used as startup readiness by callers, so serving it before the UDP sockets
+	// exist creates a false-ready interval in which a sender can lose its first
+	// datagrams. Binding the whole set first also means a failure leaves no
+	// half-started receiver visible to a caller.
 	var sockets []*net.UDPConn
-	var mu sync.Mutex
 	for _, feed := range feeds {
 		udpAddress, err := net.ResolveUDPAddr("udp", feed.address)
 		if err != nil {
+			closeFeedSockets(sockets)
 			return fmt.Errorf("resolve feed %q: %w", feed.name, err)
 		}
 		conn, err := net.ListenUDP("udp", udpAddress)
 		if err != nil {
+			closeFeedSockets(sockets)
 			return fmt.Errorf("listen feed %q at %q: %w", feed.name, feed.address, err)
 		}
 		sockets = append(sockets, conn)
+	}
+
+	errCh := make(chan error, len(feeds))
+	var mu sync.Mutex
+	var readers sync.WaitGroup
+	var readersReady sync.WaitGroup
+	readersReady.Add(len(feeds))
+	for i, feed := range feeds {
+		conn := sockets[i]
+		readers.Add(1)
 		go func(feedName string, conn *net.UDPConn) {
+			defer readers.Done()
 			packet := make([]byte, 2048)
+			// Do not publish HTTP readiness until this goroutine is immediately
+			// about to block in ReadFromUDP. The sockets are already bound, so a
+			// datagram cannot be refused during this hand-off; the barrier makes
+			// the readiness contract literal and avoids the first-packet race in
+			// callers that start sending as soon as /metrics responds.
+			readersReady.Done()
 			for {
 				n, _, err := conn.ReadFromUDP(packet)
 				if err != nil {
-					errCh <- err
+					// Closing sockets is the normal shutdown path. It must not
+					// race a later send into the error channel after the caller has
+					// stopped selecting on it.
+					select {
+					case errCh <- err:
+					default:
+					}
 					return
 				}
 				// receivedAt is captured here, before any per-packet work, so it
@@ -920,19 +938,36 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 			}
 		}(feed.name, conn)
 	}
+	readersReady.Wait()
+	stopReaders := sync.OnceFunc(func() {
+		closeFeedSockets(sockets)
+		readers.Wait()
+	})
+	defer stopReaders()
+
+	// A bound socket can buffer a datagram before its reader starts, but this is
+	// the actual readiness boundary: all readers are running before HTTP lets a
+	// caller begin sending. The error channel is already live, so an immediate
+	// socket failure is retained until the select below.
+	httpServer, err := startHTTP(httpAddress, registry, health)
+	if err != nil {
+		return err
+	}
+	if httpServer != nil {
+		defer func() { _ = httpServer.Close() }()
+	}
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
 
 	select {
 	case <-signals:
 	case <-stop:
 	case err := <-errCh:
-		for _, conn := range sockets {
-			_ = conn.Close()
-		}
+		stopReaders()
 		return err
 	}
-	for _, conn := range sockets {
-		_ = conn.Close()
-	}
+	stopReaders()
 	mu.Lock()
 	defer mu.Unlock()
 	// Stop the periodic reporter before the last drain so the two cannot split
@@ -946,10 +981,9 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	// delivered bytes and emitted no record, so the final close is where its
 	// entire traffic gets billed.
 	closeSessions()
-	// Sockets are closed, but a reader goroutine can still be mid-packet: it may
-	// be blocked in Enqueue or between the read and Observe. Both scorers behind
-	// sessionScorer take their own lock in Receipt, so the receipt is a
-	// consistent snapshot even if a late Observe lands after it.
+	// stopReaders joined every ingress goroutine before this final drain, so no
+	// late Observe can race the receipt or add traffic after billing has sampled
+	// the drained fan-out.
 	return printReceipt(scorer.SessionReceipt(), asJSON)
 }
 
@@ -1080,6 +1114,15 @@ func startHTTP(address string, registry *prometheus.Registry, health http.Handle
 		}
 	}()
 	return server, nil
+}
+
+// closeFeedSockets closes every bound ingress socket. It is deliberately
+// idempotent: startup failures, clean shutdown, and deferred cleanup all share
+// this path, and net.UDPConn.Close safely reports an already-closed socket.
+func closeFeedSockets(sockets []*net.UDPConn) {
+	for _, conn := range sockets {
+		_ = conn.Close()
+	}
 }
 
 func splitNonempty(value string) []string {

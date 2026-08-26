@@ -86,6 +86,10 @@ type Reporter struct {
 	pending map[string]Record
 }
 
+// sampleKey is deliberately a Reporter-private key space, distinct from
+// Tracker's sessionKey. It always includes a generation so CloseAll can decode
+// its union-of-state keys back into a LedgerSample; no caller may exchange the
+// two encodings.
 func sampleKey(targetID string, generation uint64) string {
 	return fmt.Sprintf("%s\x00%d", targetID, generation)
 }

@@ -219,23 +219,51 @@ func TestForgedTeardownDoesNotShortenDuration(t *testing.T) {
 	}
 }
 
-// TestTeardownForGenerationTargetsTheGenerationKey pins the generation-aware
-// teardown lookup. A nonzero-generation session must not be mistaken for the
-// legacy generation-zero key, or its accelerated liveness path silently does
-// nothing for every broker-target session.
-func TestTeardownForGenerationTargetsTheGenerationKey(t *testing.T) {
+// TestTeardownHintsEveryGenerationForSubscriber drives the subscriber-ID API
+// with the same nonzero generations produced by Fanout. A re-grant can
+// temporarily leave two live lifecycles under one subscriber ID; a forgeable
+// teardown cannot safely choose one, so it must hint both rather than silently
+// doing nothing for every broker-target session.
+func TestTeardownHintsEveryGenerationForSubscriber(t *testing.T) {
 	clock := &fakeClock{now: time.Unix(1_700_000_000, 0).UTC()}
 	tracker := newTestTracker(t, clock, nil)
 
-	const generation = 7
-	if _, err := tracker.OpenForGeneration("subscriber-a", generation); err != nil {
-		t.Fatalf("OpenForGeneration: %v", err)
+	const (
+		oldGeneration = 7
+		newGeneration = 8
+	)
+	if _, err := tracker.OpenForGeneration("subscriber-a", oldGeneration); err != nil {
+		t.Fatalf("OpenForGeneration old: %v", err)
 	}
-	if tracker.Teardown("subscriber-a") {
-		t.Fatal("legacy Teardown unexpectedly found a nonzero-generation session")
+	if _, err := tracker.OpenForGeneration("subscriber-a", newGeneration); err != nil {
+		t.Fatalf("OpenForGeneration new: %v", err)
 	}
-	if !tracker.TeardownForGeneration("subscriber-a", generation) {
-		t.Fatal("TeardownForGeneration did not find the nonzero-generation session")
+	clock.Add(time.Second)
+	if !tracker.TeardownForGeneration("subscriber-a", oldGeneration) {
+		t.Fatal("TeardownForGeneration did not find the requested generation")
+	}
+	if got := tracker.sessions[sessionKey("subscriber-a", oldGeneration)].lastTeardown; !got.Equal(clock.Now()) {
+		t.Errorf("old generation lastTeardown = %s, want %s", got, clock.Now())
+	}
+	if got := tracker.sessions[sessionKey("subscriber-a", newGeneration)].lastTeardown; !got.IsZero() {
+		t.Errorf("new generation lastTeardown = %s after old-generation hint, want zero", got)
+	}
+
+	clock.Add(time.Second)
+	if !tracker.Teardown("subscriber-a") {
+		t.Fatal("Teardown did not find the generation-aware sessions")
+	}
+	for _, generation := range []uint64{oldGeneration, newGeneration} {
+		current := tracker.sessions[sessionKey("subscriber-a", generation)]
+		if current == nil {
+			t.Fatalf("generation %d session disappeared", generation)
+		}
+		if !current.lastTeardown.Equal(clock.Now()) {
+			t.Errorf("generation %d lastTeardown = %s, want %s", generation, current.lastTeardown, clock.Now())
+		}
+	}
+	if tracker.TeardownForGeneration("subscriber-a", 9) {
+		t.Fatal("TeardownForGeneration found an unknown generation")
 	}
 }
 

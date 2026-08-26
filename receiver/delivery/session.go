@@ -229,19 +229,44 @@ func (t *Tracker) ObserveForGeneration(subscriberID string, generation uint64, b
 	return nil
 }
 
-// Teardown records an unauthenticated teardown hint. It deliberately does NOT
-// close the session and does NOT affect duration, because an AMT Teardown is
-// forgeable. Callers should treat a true return as a prompt to run an
-// accelerated liveness probe, then close through Close if that probe fails.
+// Teardown records an unauthenticated subscriber-ID teardown hint for every
+// live generation of subscriberID. It deliberately does NOT close a session
+// and does NOT affect duration, because a teardown signal can be forgeable.
+//
+// This is the production-safe path for callers that only have a stable broker
+// target ID. During a re-grant, old and new generations can briefly coexist;
+// without an authenticated generation a caller cannot safely choose one, so it
+// conservatively asks the liveness layer to probe both. A hint can only cause
+// extra probes, never a billing close. This API intentionally accepts an
+// already-resolved broker target ID; it does not decode AMT wire messages or
+// invent a target-generation mapping from their IP, port, nonce, or response
+// MAC.
+//
+// Callers should treat a true return as a prompt to run an accelerated liveness
+// probe, then close through Close or CloseForGeneration if that probe fails.
 func (t *Tracker) Teardown(subscriberID string) bool {
-	return t.TeardownForGeneration(subscriberID, 0)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := t.now()
+	hinted := false
+	for _, current := range t.sessions {
+		if current.subscriberID != subscriberID {
+			continue
+		}
+		current.lastTeardown = now
+		hinted = true
+	}
+	return hinted
 }
 
 // TeardownForGeneration records an unauthenticated teardown hint for one
 // generation. It deliberately does NOT close the session and does NOT affect
-// duration, because an AMT Teardown is forgeable. Callers should treat a true
-// return as a prompt to run an accelerated liveness probe, then close through
-// CloseForGeneration if that probe fails.
+// duration, because a teardown signal can be forgeable. The caller is
+// responsible for obtaining TargetID and Generation from an authenticated
+// target-source path; this is not an AMT wire-message decoder. Callers should
+// treat a true return as a prompt to run an accelerated liveness probe, then
+// close through CloseForGeneration if that probe fails.
 func (t *Tracker) TeardownForGeneration(subscriberID string, generation uint64) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
