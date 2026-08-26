@@ -693,3 +693,22 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: GOOS=android GOARCH=arm64 go vet ./...
+
+  # Android and iOS select the mobile/native files because their GOOS values
+  # satisfy linux or darwin. Windows is the intentional non-native selection:
+  # it compiles managed_conn_non_native.go and catches signature drift at the
+  # untagged managed_conn.go call site.
+  cross-build:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build Windows non-native selection
+        run: GOOS=windows GOARCH=amd64 go build ./...
+      - name: Build js/wasm non-native selection
+        run: GOOS=js GOARCH=wasm go build ./...
