@@ -64,11 +64,14 @@ type MulticastConn struct {
 	conn6 *ipv6.PacketConn
 	amtGw *Gateway
 
-	pathMu       sync.RWMutex
-	activeTunnel bool
-	wantTunnel   bool
-	closed       bool
-	tunnelReady  chan struct{}
+	pathMu         sync.RWMutex
+	activeTunnel   bool
+	wantTunnel     bool
+	closed         bool
+	tunnelReady    chan struct{}
+	tunnelStart    chan struct{}
+	tunnelDecision chan struct{}
+	tunnelDecided  bool
 
 	// pending holds the datagram a successful probe consumed, so the first read
 	// after Open returns it instead of the caller waiting a whole signalling
@@ -109,13 +112,16 @@ func (mc *MulticastConn) Open() error {
 			}
 			mc.conn6 = conn
 
+			if plan.TunnelOnFailure {
+				mc.prepareTunnel()
+				go mc.openTunnel()
+			}
 			if plan.Probe && plan.TunnelOnFailure {
 				go mc.probeNativeV6(plan.Window)
 			}
 			if !plan.TunnelOnFailure {
 				return nil
 			}
-			mc.startTunnelAsync()
 			return nil
 		}
 
@@ -140,13 +146,16 @@ func (mc *MulticastConn) Open() error {
 		}
 		mc.conn4 = conn
 
+		if plan.TunnelOnFailure {
+			mc.prepareTunnel()
+			go mc.openTunnel()
+		}
 		if plan.Probe && plan.TunnelOnFailure {
 			go mc.probeNativeV4(plan.Window)
 		}
 		if !plan.TunnelOnFailure {
 			return nil
 		}
-		mc.startTunnelAsync()
 		return nil
 	}
 	return mc.startTunnel()
@@ -160,16 +169,15 @@ func (mc *MulticastConn) prepareTunnel() {
 	// arbitration selects it.
 	mc.activeTunnel = false
 	mc.tunnelReady = make(chan struct{})
+	mc.tunnelStart = make(chan struct{})
+	mc.tunnelDecision = make(chan struct{})
+	mc.tunnelDecided = false
 	mc.pathMu.Unlock()
-}
-
-func (mc *MulticastConn) startTunnelAsync() {
-	mc.prepareTunnel()
-	go mc.openTunnel()
 }
 
 func (mc *MulticastConn) startTunnel() error {
 	mc.prepareTunnel()
+	mc.releaseTunnelStart()
 	return mc.openTunnel()
 }
 
@@ -181,18 +189,25 @@ func (mc *MulticastConn) probeNativeV4(window time.Duration) {
 		cm, src = c, s
 		return n, err
 	})
-	if err != nil || mc.isClosed() {
+	if err != nil {
+		mc.setActiveTunnel(true)
+		mc.releaseTunnelStart()
+		return
+	}
+	if mc.isClosed() {
 		return
 	}
 	if native {
 		mc.pending.put(&pendingPacket{buf: pkt, cm: cm, src: src})
 		mc.setActiveTunnel(false)
+		mc.releaseTunnelStart()
 		return
 	}
 	mc.pathMu.Lock()
 	mc.wantTunnel = true
 	mc.activeTunnel = true
 	mc.pathMu.Unlock()
+	mc.releaseTunnelStart()
 	mc.watchNativeV4()
 }
 
@@ -203,17 +218,39 @@ func (mc *MulticastConn) probeNativeV6(window time.Duration) {
 		src = s
 		return n, err
 	})
-	if err != nil || mc.isClosed() {
+	if err != nil {
+		mc.setActiveTunnel(true)
+		mc.releaseTunnelStart()
+		return
+	}
+	if mc.isClosed() {
 		return
 	}
 	if native {
 		mc.pending.put(&pendingPacket{buf: pkt, src: src})
 		mc.setActiveTunnel(false)
+		mc.releaseTunnelStart()
 		return
 	}
 	mc.pathMu.Lock()
 	mc.wantTunnel = true
 	mc.activeTunnel = true
+	mc.pathMu.Unlock()
+	mc.releaseTunnelStart()
+}
+
+func (mc *MulticastConn) releaseTunnelStart() {
+	mc.pathMu.Lock()
+	if !mc.tunnelDecided {
+		mc.tunnelDecided = true
+		if mc.tunnelDecision != nil {
+			close(mc.tunnelDecision)
+		}
+	}
+	if mc.tunnelStart != nil {
+		close(mc.tunnelStart)
+		mc.tunnelStart = nil
+	}
 	mc.pathMu.Unlock()
 }
 
@@ -231,6 +268,24 @@ func (mc *MulticastConn) watchNativeV4() {
 }
 
 func (mc *MulticastConn) openTunnel() (err error) {
+	mc.pathMu.RLock()
+	decision := mc.tunnelDecision
+	mc.pathMu.RUnlock()
+	if decision != nil {
+		<-decision
+		mc.pathMu.RLock()
+		open := !mc.closed && (mc.activeTunnel || (mc.wantTunnel && mc.conn4 == nil && mc.conn6 == nil))
+		mc.pathMu.RUnlock()
+		if !open {
+			mc.pathMu.Lock()
+			if mc.tunnelReady != nil {
+				close(mc.tunnelReady)
+				mc.tunnelReady = nil
+			}
+			mc.pathMu.Unlock()
+			return nil
+		}
+	}
 	defer func() {
 		mc.pathMu.Lock()
 		if mc.tunnelReady != nil {
@@ -572,6 +627,16 @@ func (mc *MulticastConn) Close() error {
 	mc.pathMu.Lock()
 	mc.closed = true
 	gw := mc.amtGw
+	if mc.tunnelStart != nil {
+		if !mc.tunnelDecided {
+			mc.tunnelDecided = true
+			if mc.tunnelDecision != nil {
+				close(mc.tunnelDecision)
+			}
+		}
+		close(mc.tunnelStart)
+		mc.tunnelStart = nil
+	}
 	if mc.tunnelReady != nil {
 		close(mc.tunnelReady)
 		mc.tunnelReady = nil

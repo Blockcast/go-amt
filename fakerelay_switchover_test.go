@@ -6,6 +6,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"golang.org/x/net/ipv4"
 )
 
 // MulticastConn switchover, driven against fakeRelay and fakeNativeSource.
@@ -51,6 +53,52 @@ func newMulticastConnUnderTest(t *testing.T, fr *fakeRelay) *MulticastConn {
 	return mc
 }
 
+func waitForRelayDiscovery(t *testing.T, fr *fakeRelay) {
+	t.Helper()
+	deadline := time.Now().Add(MinUsefulProbeWindow + time.Second)
+	for fr.advertised.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestMulticastConnProbeErrorReleasesTunnelStart(t *testing.T) {
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen probe socket: %v", err)
+	}
+	conn := ipv4.NewPacketConn(udp)
+
+	mc := &MulticastConn{
+		conn4: conn,
+		IFace: &net.Interface{MTU: 1500},
+	}
+	mc.prepareTunnel()
+
+	gate := mc.tunnelStart
+	gateReleased := make(chan struct{})
+	go func() {
+		<-gate
+		close(gateReleased)
+	}()
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close probe socket: %v", err)
+	}
+
+	mc.probeNativeV4(time.Second)
+	select {
+	case <-gateReleased:
+	case <-time.After(time.Second):
+		t.Fatal("probe error left tunnelStart blocked")
+	}
+
+	mc.pathMu.RLock()
+	wantTunnel, activeTunnel := mc.wantTunnel, mc.activeTunnel
+	mc.pathMu.RUnlock()
+	if !wantTunnel || !activeTunnel {
+		t.Fatalf("probe error selected wantTunnel=%t activeTunnel=%t, want both true", wantTunnel, activeTunnel)
+	}
+}
+
 func TestMulticastConnNativeSelectionCancelsInFlightTunnel(t *testing.T) {
 	mc := &MulticastConn{wantTunnel: true, activeTunnel: true}
 
@@ -66,6 +114,28 @@ func TestMulticastConnNativeSelectionCancelsInFlightTunnel(t *testing.T) {
 	}
 	if activeTunnel {
 		t.Fatal("native selection left AMT active")
+	}
+}
+
+func TestMulticastConnDelayedTunnelOpenerHonorsNativeSelection(t *testing.T) {
+	// The probe can release tunnelStart before the opener goroutine is scheduled.
+	// Keep a native socket present so a delayed opener must not construct AMT after
+	// native arbitration has already won.
+	udp, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("listen native socket: %v", err)
+	}
+	t.Cleanup(func() { _ = udp.Close() })
+	mc := &MulticastConn{conn4: ipv4.NewPacketConn(udp), wantTunnel: true, activeTunnel: true}
+	mc.prepareTunnel()
+	mc.setActiveTunnel(false)
+	mc.releaseTunnelStart()
+
+	if err := mc.openTunnel(); err != nil {
+		t.Fatalf("delayed opener returned an error: %v", err)
+	}
+	if mc.amtGw != nil {
+		t.Fatal("delayed opener constructed an AMT gateway after native selection")
 	}
 }
 
@@ -172,6 +242,7 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 	// up. Kept as a separate, earlier assertion than the handshake result: if
 	// this one fails the group never reached AMT at all, which is a different
 	// diagnosis from a handshake that started and then broke.
+	waitForRelayDiscovery(t, fr)
 	if n := fr.advertised.Load(); n < 1 {
 		t.Fatalf("relay received no Relay Discovery (advertisements sent = %d): the "+
 			"probe timed out but the group was never handed to an AMT gateway", n)
@@ -241,6 +312,7 @@ func TestMulticastConnPicksNativeAgainAfterItRecovers(t *testing.T) {
 	// Leg 1: native silent, so the group is handed away.
 	givenUp := newMulticastConnUnderTest(t, fr)
 	_ = givenUp.Open() // outcome asserted by the handover test above
+	waitForRelayDiscovery(t, fr)
 	if n := fr.advertised.Load(); n < 1 {
 		t.Fatalf("relay received no discovery on the first open (advertisements = %d); "+
 			"the group was never given up, so there is nothing to recover from", n)
