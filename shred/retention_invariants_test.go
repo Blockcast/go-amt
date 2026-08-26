@@ -431,10 +431,16 @@ func TestCeilingValueUniquelyIdentifiesAnOverflowedPercentile(t *testing.T) {
 // the union, since receiptFor runs per-feed over the union's key universe.
 func TestCompletionsTotalIdentityHoldsAcrossRandomArrivals(t *testing.T) {
 	random := rand.New(rand.NewSource(20260819))
+	var completions, erased uint64
 	for trial := 0; trial < 300; trial++ {
 		window := time.Duration(100+random.Intn(2000)) * time.Millisecond
 		scorer := NewFeedScorerWithRetention(FormatAgave, []string{"a", "b", "c"}, window)
 		at := time.Unix(int64(1000+trial), 0)
+		type arrival struct {
+			set   uint64
+			index uint32
+		}
+		var arrivals []arrival
 		for set := uint64(0); set < uint64(1+random.Intn(4)); set++ {
 			// A shred index must stay inside its FEC set, so the population is
 			// 0..completionThreshold. Half the sets are forced to the full count so
@@ -446,17 +452,34 @@ func TestCompletionsTotalIdentityHoldsAcrossRandomArrivals(t *testing.T) {
 				shreds = completionThreshold
 			}
 			for index := uint32(0); index < shreds; index++ {
-				// Gaps up to 3s so sets land on both sides of the eviction boundary.
-				at = at.Add(time.Duration(random.Intn(3000)) * time.Millisecond)
-				feed := []string{"a", "b", "c"}[random.Intn(3)]
-				if _, err := scorer.Observe(feed, dataPacket(set, 0, index), at); err != nil {
-					t.Fatalf("trial %d: %v", trial, err)
-				}
+				arrivals = append(arrivals, arrival{set: set, index: index})
+			}
+		}
+		// Present shreds in a mixed order rather than walking one complete set
+		// before the next. Production feeds interleave concurrent FEC sets, and
+		// that is the arrangement in which one set can remain live while another
+		// crosses the eviction boundary.
+		random.Shuffle(len(arrivals), func(i, j int) {
+			arrivals[i], arrivals[j] = arrivals[j], arrivals[i]
+		})
+		for _, arrival := range arrivals {
+			// Gaps up to 3s so sets land on both sides of the eviction boundary.
+			at = at.Add(time.Duration(random.Intn(3000)) * time.Millisecond)
+			feed := []string{"a", "b", "c"}[random.Intn(3)]
+			if _, err := scorer.Observe(feed, dataPacket(arrival.set, 0, arrival.index), at); err != nil {
+				t.Fatalf("trial %d: %v", trial, err)
 			}
 		}
 
 		receipt := scorer.Receipt()
+		completions += receipt.Union.CompletionsTotal
+		if receipt.Union.SetsErased > receipt.Union.SetsTotal {
+			t.Fatalf("trial %d: SetsErased = %d exceeds SetsTotal = %d", trial,
+				receipt.Union.SetsErased, receipt.Union.SetsTotal)
+		}
+		erased += uint64(receipt.Union.SetsErased)
 		check := func(label string, r Receipt) {
+			t.Helper()
 			if want := r.SetsTotal - r.SetsErased; r.CompletionsTotal != uint64(want) {
 				t.Fatalf("trial %d window=%s %s: CompletionsTotal = %d but "+
 					"SetsTotal-SetsErased = %d", trial, window, label,
@@ -473,5 +496,8 @@ func TestCompletionsTotalIdentityHoldsAcrossRandomArrivals(t *testing.T) {
 		for _, feed := range receipt.Feeds {
 			check("feed "+feed.Name, feed.Receipt)
 		}
+	}
+	if completions == 0 || erased == 0 {
+		t.Fatalf("randomized fixture was vacuous: observed %d completions and %d erasures across 300 trials; want both paths exercised", completions, erased)
 	}
 }
