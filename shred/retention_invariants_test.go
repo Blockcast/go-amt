@@ -1,6 +1,7 @@
 package shred
 
 import (
+	"math/rand"
 	"strings"
 	"testing"
 	"time"
@@ -374,8 +375,129 @@ func TestPartialOverflowDoesNotClaimEveryPercentileUnderstates(t *testing.T) {
 		t.Errorf("caveat does not state the affected fraction, so a reader cannot tell "+
 			"a one-in-a-hundred run from a wholly-overflowed one: %s", caveat)
 	}
+	if !strings.Contains(caveat, CompletionCeiling.String()) {
+		t.Errorf("caveat does not name the value that identifies an affected "+
+			"percentile, so the reader must derive it: %s", caveat)
+	}
 	if strings.Contains(caveat, "the percentiles above UNDERSTATE") {
 		t.Errorf("caveat asserts every percentile understates, which is false here — "+
 			"p50/p95/p99 are all accurate and only one completion overflowed: %s", caveat)
+	}
+}
+
+// TestCeilingValueUniquelyIdentifiesAnOverflowedPercentile is the precondition
+// for the caveat naming a value instead of describing a rule.
+//
+// The caveat tells the reader "a percentile printed as exactly 4.194304s is one
+// of them". That is only sound if no bucket other than the overflow one can
+// report that duration — otherwise an unaffected percentile could wear the
+// marker. Checking all 2048 non-overflow buckets rather than the top one alone,
+// because the edge arithmetic is per-octave and a future widening changes every
+// edge, not just the last.
+func TestCeilingValueUniquelyIdentifiesAnOverflowedPercentile(t *testing.T) {
+	var highest time.Duration
+	for index := 0; index < completionOverflow; index++ {
+		edge := completionBucketUpperEdge(index)
+		if edge >= CompletionCeiling {
+			t.Errorf("non-overflow bucket %d reports %s, at or above the ceiling %s: the "+
+				"caveat's claim that this value identifies an overflowed percentile is "+
+				"no longer true, so an accurate percentile can wear the marker",
+				index, edge, CompletionCeiling)
+		}
+		if edge > highest {
+			highest = edge
+		}
+	}
+	if highest >= CompletionCeiling {
+		t.Fatalf("highest non-overflow edge %s does not clear the ceiling %s", highest, CompletionCeiling)
+	}
+	// The overflow bucket must actually report the value the caveat names.
+	if got := completionBucketUpperEdge(completionOverflow); got != CompletionCeiling {
+		t.Errorf("overflow bucket reports %s, but the caveat tells operators to look "+
+			"for %s", got, CompletionCeiling)
+	}
+}
+
+// TestCompletionsTotalIdentityHoldsAcrossRandomArrivals is the randomized form
+// of TestCompletionsTotalIsTheCompletedSetCount.
+//
+// That test pins the identity in one arrangement while Receipt documents it "by
+// construction". The construction is that finalize and receiptFor each count a
+// set once and then take exactly one of two exclusive branches — erased, or into
+// the histogram. A third disposition in either loop (a set that is neither) would
+// leave both counters individually plausible while the caveat's denominator
+// quietly stopped being the completed-set count. Randomizing the window, set
+// sizes and gaps holds that shut, and asserts on every feed receipt as well as
+// the union, since receiptFor runs per-feed over the union's key universe.
+func TestCompletionsTotalIdentityHoldsAcrossRandomArrivals(t *testing.T) {
+	random := rand.New(rand.NewSource(20260819))
+	var completions, erased uint64
+	for trial := 0; trial < 300; trial++ {
+		window := time.Duration(100+random.Intn(2000)) * time.Millisecond
+		scorer := NewFeedScorerWithRetention(FormatAgave, []string{"a", "b", "c"}, window)
+		at := time.Unix(int64(1000+trial), 0)
+		type arrival struct {
+			set   uint64
+			index uint32
+		}
+		var arrivals []arrival
+		for set := uint64(0); set < uint64(1+random.Intn(4)); set++ {
+			// A shred index must stay inside its FEC set, so the population is
+			// 0..completionThreshold. Half the sets are forced to the full count so
+			// completions actually occur — a purely uniform draw would complete a
+			// set only ~3% of the time and the identity would go mostly untested on
+			// the histogram side.
+			shreds := uint32(random.Intn(completionThreshold + 1))
+			if random.Intn(2) == 0 {
+				shreds = completionThreshold
+			}
+			for index := uint32(0); index < shreds; index++ {
+				arrivals = append(arrivals, arrival{set: set, index: index})
+			}
+		}
+		// Present shreds in a mixed order rather than walking one complete set
+		// before the next. Production feeds interleave concurrent FEC sets, and
+		// that is the arrangement in which one set can remain live while another
+		// crosses the eviction boundary.
+		random.Shuffle(len(arrivals), func(i, j int) {
+			arrivals[i], arrivals[j] = arrivals[j], arrivals[i]
+		})
+		for _, arrival := range arrivals {
+			// Gaps up to 3s so sets land on both sides of the eviction boundary.
+			at = at.Add(time.Duration(random.Intn(3000)) * time.Millisecond)
+			feed := []string{"a", "b", "c"}[random.Intn(3)]
+			if _, err := scorer.Observe(feed, dataPacket(arrival.set, 0, arrival.index), at); err != nil {
+				t.Fatalf("trial %d: %v", trial, err)
+			}
+		}
+
+		receipt := scorer.Receipt()
+		completions += receipt.Union.CompletionsTotal
+		if receipt.Union.SetsErased > receipt.Union.SetsTotal {
+			t.Fatalf("trial %d: SetsErased = %d exceeds SetsTotal = %d", trial,
+				receipt.Union.SetsErased, receipt.Union.SetsTotal)
+		}
+		erased += uint64(receipt.Union.SetsErased)
+		check := func(label string, r Receipt) {
+			t.Helper()
+			if want := r.SetsTotal - r.SetsErased; r.CompletionsTotal != uint64(want) {
+				t.Fatalf("trial %d window=%s %s: CompletionsTotal = %d but "+
+					"SetsTotal-SetsErased = %d", trial, window, label,
+					r.CompletionsTotal, want)
+			}
+			if r.CompletionsAboveCeiling > r.CompletionsTotal {
+				t.Fatalf("trial %d window=%s %s: CompletionsAboveCeiling = %d exceeds "+
+					"CompletionsTotal = %d, so the caveat would read \"N of M\" with "+
+					"N > M", trial, window, label, r.CompletionsAboveCeiling,
+					r.CompletionsTotal)
+			}
+		}
+		check("union", receipt.Union)
+		for _, feed := range receipt.Feeds {
+			check("feed "+feed.Name, feed.Receipt)
+		}
+	}
+	if completions == 0 || erased == 0 {
+		t.Fatalf("randomized fixture was vacuous: observed %d completions and %d erasures across 300 trials; want both paths exercised", completions, erased)
 	}
 }

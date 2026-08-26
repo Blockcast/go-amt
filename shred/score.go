@@ -716,6 +716,12 @@ func (s *Scorer) receiptFor(keys []SetKey) Receipt {
 // completionCaveat renders the line that has to appear beside completion
 // percentiles when any completion overflowed the ladder, or "" otherwise.
 //
+// It names the exact printed value that identifies an affected percentile, so a
+// reader inspects rather than derives. That is only sound because no other
+// bucket can produce it: the overflow bucket reports its floor, and the highest
+// non-overflow upper edge is 4.194303s, one microsecond clear of the ceiling —
+// TestCeilingValueUniquelyIdentifiesAnOverflowedPercentile checks all 2048.
+//
 // It says "a percentile that fell among them" rather than "the percentiles",
 // because overflow is per-completion, not per-run: 99 completions at 10ms plus
 // one at 30s leaves p50, p95 and p99 all accurate at 10.047ms while one
@@ -741,8 +747,9 @@ func bucketedPercentileCaveat(metric, sample string, aboveCeiling, total uint64)
 	return fmt.Sprintf("%s WARNING: %d of %d %s(s) were at or "+
 		"above %s and recorded as that value, so a percentile that fell among them "+
 		"UNDERSTATES by an unbounded amount and the documented %.2f%% error does not "+
-		"apply to it. Percentiles below that point are unaffected.",
-		metric, aboveCeiling, total, sample, CompletionCeiling, CompletionRelativeError*100)
+		"apply to it. A percentile printed as exactly %s is one of them; the others "+
+		"are unaffected.",
+		metric, aboveCeiling, total, sample, CompletionCeiling, CompletionRelativeError*100, CompletionCeiling)
 }
 
 func (r UnionReceipt) String() string {
