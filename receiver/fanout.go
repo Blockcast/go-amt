@@ -367,7 +367,7 @@ func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObs
 // the only close the sender could attest to was CloseShutdown. The caller is
 // expected to close those sessions; this method does not reach into the
 // billing plane itself.
-func (f *Fanout) ReconcileDestinations(targets []Target) ([]Target, error) {
+func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, error) {
 	if f.udpConn == nil {
 		return nil, errors.New("fan-out: reconcile is only supported on a UDP fan-out")
 	}
@@ -399,14 +399,22 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]Target, error) {
 	for _, entry := range entries {
 		retained[entry.id] = struct{}{}
 	}
-	var removed []Target
+	var departing []destination
 	for _, entry := range previous {
 		if _, kept := retained[entry.id]; !kept {
-			removed = append(removed, Target{ID: entry.id, Address: entry.name})
+			departing = append(departing, entry)
 		}
 	}
 
 	f.table.Store(&destTable{entries: entries})
+	removed := make([]DestinationStat, 0, len(departing))
+	for _, entry := range departing {
+		removed = append(removed, DestinationStat{
+			TargetID: entry.id, Destination: entry.name,
+			Packets: entry.counters.packets.Load(), Bytes: entry.counters.bytes.Load(),
+			Drops: entry.counters.drops.Load(), WriteErrors: entry.counters.errors.Load(),
+		})
+	}
 	return removed, nil
 }
 

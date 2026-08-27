@@ -812,7 +812,7 @@ func TestReconcilePreservesSurvivingTargetCountersWhenATargetIsRevoked(t *testin
 		t.Fatal(err)
 	}
 
-	if len(removed) != 1 || removed[0].ID != "grant-b" {
+	if len(removed) != 1 || removed[0].TargetID != "grant-b" {
 		t.Fatalf("reconcile reported removed %+v, want exactly grant-b", removed)
 	}
 

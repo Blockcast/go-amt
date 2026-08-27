@@ -194,6 +194,19 @@ func (r *Reporter) CloseAll(samples []LedgerSample, reason CloseReason) error {
 	return errors.Join(errs...)
 }
 
+// CloseRemoved closes sessions whose broker grants left the served target set.
+// The samples contain the departing counters captured during reconciliation,
+// so the final record includes traffic delivered since the last tick.
+func (r *Reporter) CloseRemoved(samples []LedgerSample) error {
+	var errs []error
+	for _, sample := range samples {
+		if err := r.CloseDestination(sample, CloseTicketExpired); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // CloseDestination folds a final ledger sample for one target and emits its
 // final record carrying reason.
 //
