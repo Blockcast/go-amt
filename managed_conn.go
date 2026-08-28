@@ -29,8 +29,12 @@ type ManagedConn struct {
 	GroupPort uint16
 	TTL       int
 	IFace     *net.Interface
-	Timeout   time.Duration
-	Timestamp bool
+	// Timeout is deprecated. It seeds ProbeWindow and RelayHandshakeTimeout when
+	// either explicit field is unset.
+	Timeout               time.Duration
+	ProbeWindow           time.Duration
+	RelayHandshakeTimeout time.Duration
+	Timestamp             bool
 
 	// RcvBufBytes and SndBufBytes are forwarded to the native multicast
 	// socket; see MulticastConn for semantics.
@@ -145,7 +149,8 @@ func (mc *ManagedConn) Open() error {
 	}
 
 	hasRelay := len(mc.RelayAddr.IP) > 0
-	plan := planManagedOpen(mc.Mode, hasRelay, mc.EnableDRIAD, mc.Timeout)
+	probeWindow, relayHandshakeTimeout := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)
+	plan := planManagedOpen(mc.Mode, hasRelay, mc.EnableDRIAD, probeWindow)
 	useDRIAD := plan.UseDRIAD
 
 	// Try native multicast first unless the operator asked outright for the
@@ -195,12 +200,8 @@ func (mc *ManagedConn) Open() error {
 
 	// Build transport config
 	transportCfg := TransportConfig{
-		RelayAddr: mc.RelayAddr,
-		// gatewayOpenTimeout, not mc.Timeout: the operator's relay timeout is
-		// also the probe window, and a value too short to complete a round trip
-		// to the relay must not become the handshake bound. Production's 50ms did
-		// exactly that, so the tunnel replacing native could not come up either.
-		Timeout:         gatewayOpenTimeout(mc.Timeout),
+		RelayAddr:       mc.RelayAddr,
+		Timeout:         gatewayOpenTimeout(relayHandshakeTimeout),
 		EnableTimestamp: mc.Timestamp,
 		MTU:             1500,
 		RcvBufBytes:     mc.RcvBufBytes,
