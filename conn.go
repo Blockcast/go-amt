@@ -92,7 +92,7 @@ func (mc *MulticastConn) Open() error {
 	var prog []bpf.RawInstruction
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
-	probeWindow, relayHandshakeTimeout := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)
+	probeWindow, _ := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)
 
 	if mc.GroupAddr.Is6() {
 		// The plan is consulted BEFORE the socket is bound. Binding first made
@@ -265,6 +265,7 @@ func (mc *MulticastConn) watchNativeV4() {
 }
 
 func (mc *MulticastConn) openTunnel() (err error) {
+	_, relayHandshakeTimeout := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)
 	mc.pathMu.RLock()
 	decision := mc.tunnelDecision
 	mc.pathMu.RUnlock()
