@@ -700,12 +700,40 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 			trackers[name] = tracker
 		}
 	}
+	var brokerClient *http.Client
+	var targetReader *gwclient.DeliveryTargetReader
+	var brokerTargets []receiver.Target
+	if beat.enabled() {
+		brokerClient, err = heartbeatHTTPClient(beat)
+		if err != nil {
+			return err
+		}
+		if len(names) == 0 {
+			return errors.New("broker delivery targets require at least one feed")
+		}
+		targetReader, err = gwclient.NewDeliveryTargetReader(beat.brokerURL, names[0], brokerClient)
+		if err != nil {
+			return err
+		}
+		initial, readErr := targetReader.Read(context.Background())
+		if readErr != nil {
+			return fmt.Errorf("read initial broker delivery targets: %w", readErr)
+		}
+		brokerTargets = gwclient.ReceiverTargets(initial)
+		if len(brokerTargets) == 0 {
+			return errors.New("broker returned no initial delivery targets")
+		}
+	}
 
 	// The fan-out is constructed after the metrics so the worker can attribute
 	// each delivered datagram back to the feed that received it.
 	var fanout *receiver.Fanout
-	if len(destinations) != 0 {
-		fanout, err = receiver.NewUDPFanout(destinations, 4096, metrics)
+	if len(destinations) != 0 || len(brokerTargets) != 0 {
+		if len(brokerTargets) != 0 {
+			fanout, err = receiver.NewUDPFanoutTargets(brokerTargets, 4096, metrics)
+		} else {
+			fanout, err = receiver.NewUDPFanout(destinations, 4096, metrics)
+		}
 		if err != nil {
 			return err
 		}
@@ -749,7 +777,6 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 			return err
 		}
 	}
-
 	health, err := receiver.NewHealth(healthMaxAge)
 	if err != nil {
 		return err
@@ -783,6 +810,12 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 				// which is what lets the /metrics ledger cross-check the
 				// records at all.
 				billDestinations(biller, fanout)
+				if targetReader != nil {
+					if err := reconcileBrokerDeliveryTargets(context.Background(), targetReader, fanout, biller); err != nil {
+						// Keep the last-known-good target table on a failed poll.
+						fmt.Fprintln(os.Stderr, "delivery-target reconcile:", err)
+					}
+				}
 			case <-reporterStop:
 				return
 			}
@@ -821,11 +854,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		// consequence if this is ever removed.
 		publishWindows(trackers, metrics, time.Now())
 
-		client, err := heartbeatHTTPClient(beat)
-		if err != nil {
-			return err
-		}
-		producer, err := gwclient.NewProducer(beat.gwUUID, beat.brokerURL, metrics, gwclient.WithHTTPClient(client))
+		producer, err := gwclient.NewProducer(beat.gwUUID, beat.brokerURL, metrics, gwclient.WithHTTPClient(brokerClient))
 		if err != nil {
 			return err
 		}
