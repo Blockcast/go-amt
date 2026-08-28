@@ -124,16 +124,14 @@ type DeliveryTarget struct {
 // # An empty set is an answer, not a failure
 //
 // This is the distinction the type exists to carry across the wire, and losing
-// it is the expensive failure mode. Fanout.ReconcileDestinations deliberately
-// *refuses* an empty target set, on the grounds that a broker returning nothing
-// is more often a broker fault than a genuinely idle feed. So a caller that
-// cannot tell "authoritatively zero subscribers" from "the read failed" makes a
-// legitimately idle feed look like a permanent error forever.
+// it is the expensive failure mode. A broker returning nothing is more often a
+// broker fault than a genuinely idle feed, but a successful validated response
+// is authoritative and must be applied as a zero-subscriber state.
 //
 // On a 200, Targets is therefore non-nil, and len(Targets) == 0 means
 // authoritatively zero entitled subscribers — a fact. The correct response is
-// to hold the previous table and stop sending, which is a different action from
-// erroring. It must not be forwarded to ReconcileDestinations.
+// to replace the served table with an empty one and close the removed sessions,
+// which is a different action from erroring.
 //
 // See ValidateDeliveryTargetsRead for why "non-nil" needs enforcing rather than
 // documenting.

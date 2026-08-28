@@ -860,6 +860,33 @@ func TestReconcileCarriesCountersAcrossAnAddressChange(t *testing.T) {
 	}
 }
 
+func TestReconcileAllowsAuthoritativeEmptyTargetSet(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+	}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	for _, entry := range fanout.table.Load().entries {
+		entry.counters.packets.Add(3)
+		entry.counters.bytes.Add(30)
+	}
+
+	removed, err := fanout.ReconcileDestinations(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 2 {
+		t.Fatalf("removed %d targets, want 2: %+v", len(removed), removed)
+	}
+	if len(fanout.DestinationStats()) != 0 {
+		t.Fatalf("empty reconcile left served targets: %+v", fanout.DestinationStats())
+	}
+}
+
 // A newly granted target starts at zero rather than inheriting whatever sat at
 // its position before.
 func TestReconcileStartsANewTargetAtZero(t *testing.T) {
@@ -894,7 +921,6 @@ func TestReconcileRejectsUnusableTargetSets(t *testing.T) {
 		targets []Target
 		wantErr string
 	}{
-		{name: "empty set", targets: nil, wantErr: "at least one destination"},
 		{
 			name:    "duplicate target ID",
 			targets: []Target{{ID: "dup", Address: "127.0.0.1:20001"}, {ID: "dup", Address: "127.0.0.1:20002"}},

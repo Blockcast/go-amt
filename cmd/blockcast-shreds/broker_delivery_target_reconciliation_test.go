@@ -131,22 +131,20 @@ func TestBrokerDeliveryTargetReconciliation(t *testing.T) {
 	failed = false
 	read.Targets = []broker.DeliveryTarget{}
 	mu.Unlock()
-	// Empty snapshots are authoritative broker data but are held safely by the
-	// sender until the explicit zero-subscriber lifecycle is available.
 	if err := reconcileBrokerDeliveryTargets(context.Background(), reader, fanout, biller); err != nil {
 		t.Fatal(err)
 	}
-	if len(fanout.DestinationStats()) != 1 {
-		t.Fatal("empty snapshot stopped the last-known-good target")
+	if len(fanout.DestinationStats()) != 0 {
+		t.Fatal("empty snapshot left revoked targets in the fan-out")
 	}
 
 	mu.Lock()
 	read.Targets = []broker.DeliveryTarget{{TargetID: grantB, Addr: destination.LocalAddr().String()}}
 	mu.Unlock()
-	sendPacket(t, fanout, destination, []byte("tail"))
 	if err := reconcileBrokerDeliveryTargets(context.Background(), reader, fanout, biller); err != nil {
 		t.Fatal(err)
 	}
+	sendPacket(t, fanout, destination, []byte("tail"))
 	records := readRecords(t, recordPath)
 	var finals []delivery.Record
 	for _, record := range records {
@@ -161,8 +159,8 @@ func TestBrokerDeliveryTargetReconciliation(t *testing.T) {
 	if final.SubscriberID != grantA || final.CloseReason != delivery.CloseTicketExpired {
 		t.Fatalf("final record = %#v, want grant A TICKET_EXPIRED", final)
 	}
-	if final.PacketsOut != 1 || final.BytesOut != uint64(len("tail")) {
-		t.Fatalf("final tail = packets %d bytes %d, want 1 and %d", final.PacketsOut, final.BytesOut, len("tail"))
+	if final.PacketsOut != 0 || final.BytesOut != 0 {
+		t.Fatalf("final revoked grant = packets %d bytes %d, want 0 and 0 after the prior tick", final.PacketsOut, final.BytesOut)
 	}
 
 }

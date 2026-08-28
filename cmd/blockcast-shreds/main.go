@@ -1023,9 +1023,10 @@ func billDestinations(biller *delivery.Reporter, fanout *receiver.Fanout) {
 
 // reconcileBrokerDeliveryTargets applies one broker target snapshot to the
 // running fan-out. A failed read is deliberately a no-op: the last-known-good
-// table must continue serving until a valid snapshot replaces it. Removed
-// targets are closed before returning so their final ledger delta is billed as
-// TICKET_EXPIRED rather than being deferred to sender shutdown.
+// table must continue serving until a valid snapshot replaces it. An
+// authoritative empty snapshot removes every target and closes their sessions
+// before returning, so their final ledger delta is billed as TICKET_EXPIRED
+// rather than being deferred to sender shutdown.
 func reconcileBrokerDeliveryTargets(ctx context.Context, reader *gwclient.DeliveryTargetReader, fanout *receiver.Fanout, biller *delivery.Reporter) error {
 	if reader == nil {
 		return errors.New("broker delivery target reader is nil")
@@ -1036,12 +1037,6 @@ func reconcileBrokerDeliveryTargets(ctx context.Context, reader *gwclient.Delive
 	read, err := reader.Read(ctx)
 	if err != nil {
 		return err
-	}
-	// An empty target response is valid broker data, but Fanout refuses an
-	// empty table to fail closed. Preserve the prior table until the sender has
-	// an explicit zero-subscriber lifecycle path.
-	if len(read.Targets) == 0 {
-		return nil
 	}
 	removed, err := fanout.ReconcileDestinations(gwclient.ReceiverTargets(read))
 	if err != nil {

@@ -371,14 +371,6 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 	if f.udpConn == nil {
 		return nil, errors.New("fan-out: reconcile is only supported on a UDP fan-out")
 	}
-	if len(targets) == 0 {
-		// An empty grant table is refused rather than served. Accepting it
-		// would silently stop delivery to everyone while the process kept
-		// reporting healthy, and a broker returning nothing is far more often
-		// a broker fault than a genuine "no subscribers" state.
-		return nil, errors.New("fan-out requires at least one destination")
-	}
-
 	f.reconcileMu.Lock()
 	defer f.reconcileMu.Unlock()
 
@@ -553,6 +545,9 @@ func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
 	}
 
 	count := len(entries)
+	if count == 0 {
+		return 0, 0
+	}
 	messages, offset := f.rotatedMessages(entries, packet)
 
 	written, err := f.sendBatch(f.udpConn, messages, runtime.GOOS == "linux")
