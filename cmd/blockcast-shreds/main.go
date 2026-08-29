@@ -720,17 +720,14 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 			return fmt.Errorf("read initial broker delivery targets: %w", readErr)
 		}
 		brokerTargets = gwclient.ReceiverTargets(initial)
-		if len(brokerTargets) == 0 {
-			return errors.New("broker returned no initial delivery targets")
-		}
 	}
 
 	// The fan-out is constructed after the metrics so the worker can attribute
 	// each delivered datagram back to the feed that received it.
 	var fanout *receiver.Fanout
-	if len(destinations) != 0 || len(brokerTargets) != 0 {
-		if len(brokerTargets) != 0 {
-			fanout, err = receiver.NewUDPFanoutTargets(brokerTargets, 4096, metrics)
+	if beat.enabled() || len(destinations) != 0 {
+		if beat.enabled() {
+			fanout, err = receiver.NewUDPFanoutTargetsAllowEmpty(brokerTargets, 4096, metrics)
 		} else {
 			fanout, err = receiver.NewUDPFanout(destinations, 4096, metrics)
 		}

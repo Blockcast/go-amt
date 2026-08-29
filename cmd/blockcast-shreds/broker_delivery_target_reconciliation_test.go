@@ -165,6 +165,30 @@ func TestBrokerDeliveryTargetReconciliation(t *testing.T) {
 
 }
 
+func TestBrokerDeliveryTargetsStartEmptyAndReconcile(t *testing.T) {
+	fanout, err := receiver.NewUDPFanoutTargetsAllowEmpty(nil, 32, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	if stats := fanout.DestinationStats(); len(stats) != 0 {
+		t.Fatalf("initial target table = %#v, want empty", stats)
+	}
+
+	removed, err := fanout.ReconcileDestinations([]receiver.Target{{ID: grantA, Address: "127.0.0.1:20001"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("added target removed = %#v, want none", removed)
+	}
+	stats := fanout.DestinationStats()
+	if len(stats) != 1 || stats[0].TargetID != grantA {
+		t.Fatalf("reconciled target table = %#v, want grant A", stats)
+	}
+}
+
 func listenUDP(t *testing.T) *net.UDPConn {
 	t.Helper()
 	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})

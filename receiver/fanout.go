@@ -311,7 +311,19 @@ func NewUDPFanout(destinations []string, queueCapacity int, observer EgressObser
 
 // NewUDPFanoutTargets starts a bounded UDP fan-out over identified targets.
 func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObserver) (*Fanout, error) {
-	if len(targets) == 0 {
+	return newUDPFanoutTargets(targets, queueCapacity, observer, false)
+}
+
+// NewUDPFanoutTargetsAllowEmpty starts a UDP fan-out whose target table may
+// initially be empty. This is used for broker-driven delivery, where an
+// authoritative zero-subscriber snapshot is valid and later reconciliations
+// may add targets without restarting the receiver.
+func NewUDPFanoutTargetsAllowEmpty(targets []Target, queueCapacity int, observer EgressObserver) (*Fanout, error) {
+	return newUDPFanoutTargets(targets, queueCapacity, observer, true)
+}
+
+func newUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObserver, allowEmpty bool) (*Fanout, error) {
+	if len(targets) == 0 && !allowEmpty {
 		return nil, errors.New("fan-out requires at least one destination")
 	}
 	if queueCapacity <= 0 {
