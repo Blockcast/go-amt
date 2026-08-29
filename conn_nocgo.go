@@ -16,16 +16,20 @@ import (
 // This stub allows packages that reference the type to compile without CGO,
 // but all methods return errors indicating CGO is required.
 type MulticastConn struct {
-	RelayAddr   net.UDPAddr
-	SrcAddr     netip.Addr
-	GroupAddr   netip.Addr
-	GroupPort   uint16
-	TTL         int
-	IFace       *net.Interface
-	Timeout     time.Duration
-	Timestamp   bool
-	RcvBufBytes int
-	SndBufBytes int
+	RelayAddr net.UDPAddr
+	SrcAddr   netip.Addr
+	GroupAddr netip.Addr
+	GroupPort uint16
+	TTL       int
+	IFace     *net.Interface
+	// Timeout is deprecated. It seeds ProbeWindow and RelayHandshakeTimeout when
+	// either explicit field is unset.
+	Timeout               time.Duration
+	ProbeWindow           time.Duration
+	RelayHandshakeTimeout time.Duration
+	Timestamp             bool
+	RcvBufBytes           int
+	SndBufBytes           int
 	// Mode mirrors the cgo build's field so callers can set it under any build
 	// configuration without tag-specific code.
 	Mode AMTMode

@@ -17,16 +17,20 @@ var _ net.PacketConn = (*MulticastConn)(nil)
 // delegates to ManagedConn so native multicast and AMT relay fallback share the
 // same code path on Android and iOS.
 type MulticastConn struct {
-	RelayAddr   net.UDPAddr
-	SrcAddr     netip.Addr
-	GroupAddr   netip.Addr
-	GroupPort   uint16
-	TTL         int
-	IFace       *net.Interface
-	Timeout     time.Duration
-	Timestamp   bool
-	RcvBufBytes int
-	SndBufBytes int
+	RelayAddr net.UDPAddr
+	SrcAddr   netip.Addr
+	GroupAddr netip.Addr
+	GroupPort uint16
+	TTL       int
+	IFace     *net.Interface
+	// Timeout is deprecated. It seeds ProbeWindow and RelayHandshakeTimeout when
+	// either explicit field is unset.
+	Timeout               time.Duration
+	ProbeWindow           time.Duration
+	RelayHandshakeTimeout time.Duration
+	Timestamp             bool
+	RcvBufBytes           int
+	SndBufBytes           int
 	// Mode mirrors the cgo build's field so callers can set it under any build
 	// configuration without tag-specific code. It is forwarded to ManagedConn
 	// below, which is where this build makes the native-vs-tunnel decision.
@@ -37,17 +41,19 @@ type MulticastConn struct {
 
 func (mc *MulticastConn) Open() error {
 	managed := &ManagedConn{
-		RelayAddr:   mc.RelayAddr,
-		SrcAddr:     mc.SrcAddr,
-		GroupAddr:   mc.GroupAddr,
-		GroupPort:   mc.GroupPort,
-		TTL:         mc.TTL,
-		IFace:       mc.IFace,
-		Timeout:     mc.Timeout,
-		Timestamp:   mc.Timestamp,
-		RcvBufBytes: mc.RcvBufBytes,
-		SndBufBytes: mc.SndBufBytes,
-		Mode:        mc.Mode,
+		RelayAddr:             mc.RelayAddr,
+		SrcAddr:               mc.SrcAddr,
+		GroupAddr:             mc.GroupAddr,
+		GroupPort:             mc.GroupPort,
+		TTL:                   mc.TTL,
+		IFace:                 mc.IFace,
+		Timeout:               mc.Timeout,
+		ProbeWindow:           mc.ProbeWindow,
+		RelayHandshakeTimeout: mc.RelayHandshakeTimeout,
+		Timestamp:             mc.Timestamp,
+		RcvBufBytes:           mc.RcvBufBytes,
+		SndBufBytes:           mc.SndBufBytes,
+		Mode:                  mc.Mode,
 	}
 	if err := managed.Open(); err != nil {
 		return err

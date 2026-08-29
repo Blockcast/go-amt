@@ -33,18 +33,14 @@ type MulticastConn struct {
 	GroupPort uint16
 	TTL       int
 	IFace     *net.Interface
-	// Timeout is the operator's relay timeout, and it sizes two unrelated things:
-	// the native probe window (floored at MinUsefulProbeWindow, because a shorter
-	// window is not evidence) and the AMT handshake bound (dropped below
-	// MinRelayHandshakeTimeout, so Gateway.Open applies DefaultOpenTimeout
-	// instead of failing every handshake).
-	//
-	// That overloading is what let one bad value break both paths at once in
-	// BLO-28640. This is the seam a split into two explicit config keys lands on;
-	// multicast-api has since done so (probeWindow + relayHandshakeTimeout, with
-	// timeout kept as a deprecated alias seeding both).
-	Timeout   time.Duration
-	Timestamp bool
+	// Timeout is deprecated. It seeds ProbeWindow and RelayHandshakeTimeout when
+	// either explicit field is unset.
+	Timeout time.Duration
+	// ProbeWindow controls how long native multicast is probed before fallback.
+	ProbeWindow time.Duration
+	// RelayHandshakeTimeout bounds the AMT relay handshake.
+	RelayHandshakeTimeout time.Duration
+	Timestamp             bool
 
 	// RcvBufBytes, if > 0, requests this size on the underlying UDP socket via
 	// SetForcedReceiveBuffer (SO_RCVBUFFORCE on Linux, SO_RCVBUF on Darwin).
@@ -96,13 +92,14 @@ func (mc *MulticastConn) Open() error {
 	var prog []bpf.RawInstruction
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
+	probeWindow, _ := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)
 
 	if mc.GroupAddr.Is6() {
 		// The plan is consulted BEFORE the socket is bound. Binding first made
 		// AMTModeTunnel fail closed in its own use case: a bind error returned
 		// here, so mc.amtGw was never constructed on precisely the hosts where
 		// an operator selects the mode. See probePlan.attemptNative.
-		plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
+		plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, probeWindow)
 
 		if plan.attemptNative() {
 			flags6 := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit
@@ -136,7 +133,7 @@ func (mc *MulticastConn) Open() error {
 	// selected AMTModeTunnel never pays for a socket on this path, so the bind
 	// can neither fail the tunnel out from under them nor emit an IGMP
 	// join/leave pair for a group nothing here will read.
-	plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
+	plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, probeWindow)
 
 	if plan.attemptNative() {
 		flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
@@ -268,6 +265,7 @@ func (mc *MulticastConn) watchNativeV4() {
 }
 
 func (mc *MulticastConn) openTunnel() (err error) {
+	_, relayHandshakeTimeout := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)
 	mc.pathMu.RLock()
 	decision := mc.tunnelDecision
 	mc.pathMu.RUnlock()
@@ -302,7 +300,7 @@ func (mc *MulticastConn) openTunnel() (err error) {
 		MTU:         mc.IFace.MTU,
 		RcvBufBytes: mc.RcvBufBytes,
 		SndBufBytes: mc.SndBufBytes,
-		Timeout:     gatewayOpenTimeout(mc.Timeout),
+		Timeout:     gatewayOpenTimeout(relayHandshakeTimeout),
 	}
 	if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
 		gw.SourceAddr = mc.SrcAddr.AsSlice()
