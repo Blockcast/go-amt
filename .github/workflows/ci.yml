@@ -326,7 +326,7 @@ jobs:
               rc=1
             }
           done
-          for t in gateway_timeout_test.go gateway_logging_test.go; do
+          for t in gateway_timeout_test.go gateway_logging_test.go gateway_advertisement_length_test.go; do
             printf '%s\n' "$tst" | grep -qxF "$t" || {
               echo "::error::$t is not in the test selection; the Gateway.Open guards are not running"
               rc=1
@@ -590,12 +590,20 @@ jobs:
       # The MulticastConn switchover guards. This lane is the only one that can
       # run them, so a silent deselection here leaves the live-path arbiter
       # asserted by nothing at all — which is the gap BLO-29196 exists to close.
+      #
+      # The log assertions below are NOT redundant with the PASS lines. Until
+      # BLO-29437 the handover test had a timeout branch that returned early and
+      # passed, so `--- PASS` was exactly what an unfixed, never-completing
+      # handshake produced. The completion of the handshake is therefore asserted
+      # on its own log line, and the old incomplete-handshake line must be absent.
       - name: Prove the MulticastConn switchover guards ran
         run: |
           set -euo pipefail
           names='TestMulticastConnKeepsNativeWhenBothPathsAreLive
           TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent
-          TestMulticastConnPicksNativeAgainAfterItRecovers'
+          TestMulticastConnPicksNativeAgainAfterItRecovers
+          TestRelayAdvertisementMustBeDecodedAtItsReceivedLength
+          TestZeroLengthDatagramIsNotDispatchedFromAStaleTypeByte'
           rc=0
           go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/switchover.log || rc=$?
           for t in $names; do
@@ -604,6 +612,19 @@ jobs:
               rc=1
             }
           done
+          # Positive: the AMT handshake actually completed against fakeRelay, so
+          # the tunnel-data assertions that follow it in the test were reached.
+          grep -qF -- 'Gateway.Open COMPLETED against fakeRelay' /tmp/switchover.log || {
+            echo "::error::the handover test never logged a completed Gateway.Open; the tunnel-DATA leg did not run (BLO-29437 regression)"
+            rc=1
+          }
+          # Negative: the phrase the test uses when the handshake breaks after the
+          # relay answered. Its presence means the handshake regressed even if
+          # something downstream still managed to pass.
+          if grep -qF -- 'Gateway.Open did not complete against fakeRelay' /tmp/switchover.log; then
+            echo "::error::the handover test reported an incomplete handshake (BLO-29437 regression)"
+            rc=1
+          fi
           exit $rc
 
       # The shared half, in this lane too.
@@ -672,3 +693,22 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: GOOS=android GOARCH=arm64 go vet ./...
+
+  # Android and iOS select the mobile/native files because their GOOS values
+  # satisfy linux or darwin. Windows is the intentional non-native selection:
+  # it compiles managed_conn_non_native.go and catches signature drift at the
+  # untagged managed_conn.go call site.
+  cross-build:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build Windows non-native selection
+        run: GOOS=windows GOARCH=amd64 go build ./...
+      - name: Build js/wasm non-native selection
+        run: GOOS=js GOARCH=wasm go build ./...

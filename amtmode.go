@@ -2,6 +2,19 @@ package amt
 
 import "time"
 
+// resolveTimeouts keeps the legacy Timeout field working while allowing the
+// two delivery-path bounds to be configured independently. An explicit zero
+// means unset, so each bound falls back to the compatibility alias separately.
+func resolveTimeouts(timeout, probeWindow, relayHandshakeTimeout time.Duration) (time.Duration, time.Duration) {
+	if probeWindow == 0 {
+		probeWindow = timeout
+	}
+	if relayHandshakeTimeout == 0 {
+		relayHandshakeTimeout = timeout
+	}
+	return probeWindow, relayHandshakeTimeout
+}
+
 // AMTMode selects how MulticastConn.Open chooses between a native multicast
 // join and an AMT tunnel.
 //
@@ -99,7 +112,7 @@ type probePlan struct {
 // Both now yield a window that a healthy native path can actually answer, while
 // still tunnelling when it does not — so deployments that genuinely need AMT
 // keep their fallback.
-func planProbe(mode AMTMode, relayConfigured bool, timeout time.Duration) probePlan {
+func planProbe(mode AMTMode, relayConfigured bool, probeWindow time.Duration) probePlan {
 	// No relay means there is nothing to fall back to, so there is nothing a
 	// probe could decide. Keep the native join.
 	if !relayConfigured {
@@ -114,7 +127,7 @@ func planProbe(mode AMTMode, relayConfigured bool, timeout time.Duration) probeP
 		return probePlan{TunnelOnFailure: true}
 
 	default: // AMTModeAuto
-		window := timeout
+		window := probeWindow
 		if window < MinUsefulProbeWindow {
 			window = MinUsefulProbeWindow
 		}
@@ -167,7 +180,7 @@ type managedPlan struct {
 // native path needs a multicast-capable host to exercise, so the decision has to
 // be separable from the act to be testable at all. It was untested when it
 // carried the BLO-28640 defect (Ally review on go-amt#49).
-func planManagedOpen(mode AMTMode, hasRelay, enableDRIAD bool, timeout time.Duration) managedPlan {
+func planManagedOpen(mode AMTMode, hasRelay, enableDRIAD bool, probeWindow time.Duration) managedPlan {
 	// DRIAD means the relay address is not known yet. Discovery is the whole
 	// point of the mode, so there is no local native-vs-tunnel decision to make
 	// and the native socket is not attempted. Preserved as-is; the BLO-28640
@@ -176,7 +189,7 @@ func planManagedOpen(mode AMTMode, hasRelay, enableDRIAD bool, timeout time.Dura
 		return managedPlan{UseDRIAD: true}
 	}
 
-	plan := planProbe(mode, hasRelay, timeout)
+	plan := planProbe(mode, hasRelay, probeWindow)
 
 	return managedPlan{
 		AttemptNative: plan.attemptNative(),

@@ -12,6 +12,7 @@ import (
 	"golang.org/x/net/ipv6"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 )
 
@@ -32,18 +33,14 @@ type MulticastConn struct {
 	GroupPort uint16
 	TTL       int
 	IFace     *net.Interface
-	// Timeout is the operator's relay timeout, and it sizes two unrelated things:
-	// the native probe window (floored at MinUsefulProbeWindow, because a shorter
-	// window is not evidence) and the AMT handshake bound (dropped below
-	// MinRelayHandshakeTimeout, so Gateway.Open applies DefaultOpenTimeout
-	// instead of failing every handshake).
-	//
-	// That overloading is what let one bad value break both paths at once in
-	// BLO-28640. This is the seam a split into two explicit config keys lands on;
-	// multicast-api has since done so (probeWindow + relayHandshakeTimeout, with
-	// timeout kept as a deprecated alias seeding both).
-	Timeout   time.Duration
-	Timestamp bool
+	// Timeout is deprecated. It seeds ProbeWindow and RelayHandshakeTimeout when
+	// either explicit field is unset.
+	Timeout time.Duration
+	// ProbeWindow controls how long native multicast is probed before fallback.
+	ProbeWindow time.Duration
+	// RelayHandshakeTimeout bounds the AMT relay handshake.
+	RelayHandshakeTimeout time.Duration
+	Timestamp             bool
 
 	// RcvBufBytes, if > 0, requests this size on the underlying UDP socket via
 	// SetForcedReceiveBuffer (SO_RCVBUFFORCE on Linux, SO_RCVBUF on Darwin).
@@ -62,6 +59,15 @@ type MulticastConn struct {
 	conn4 *ipv4.PacketConn
 	conn6 *ipv6.PacketConn
 	amtGw *Gateway
+
+	pathMu         sync.RWMutex
+	activeTunnel   bool
+	wantTunnel     bool
+	closed         bool
+	tunnelReady    chan struct{}
+	tunnelStart    chan struct{}
+	tunnelDecision chan struct{}
+	tunnelDecided  bool
 
 	// pending holds the datagram a successful probe consumed, so the first read
 	// after Open returns it instead of the caller waiting a whole signalling
@@ -86,13 +92,14 @@ func (mc *MulticastConn) Open() error {
 	var prog []bpf.RawInstruction
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
+	probeWindow, _ := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)
 
 	if mc.GroupAddr.Is6() {
 		// The plan is consulted BEFORE the socket is bound. Binding first made
 		// AMTModeTunnel fail closed in its own use case: a bind error returned
 		// here, so mc.amtGw was never constructed on precisely the hosts where
 		// an operator selects the mode. See probePlan.attemptNative.
-		plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
+		plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, probeWindow)
 
 		if plan.attemptNative() {
 			flags6 := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit
@@ -102,31 +109,17 @@ func (mc *MulticastConn) Open() error {
 			}
 			mc.conn6 = conn
 
-			if plan.Probe {
-				var src net.Addr
-				pkt, native, err := probeNativeTraffic(mc.conn6, plan.Window, mc.IFace.MTU, func(b []byte) (int, error) {
-					n, _, s, err := mc.conn6.ReadFrom(b)
-					src = s
-					return n, err
-				})
-				if err != nil {
-					return err
-				}
-				if native {
-					// cm stays nil: the v6 read path drops the control message
-					// anyway, since ipv6.ControlMessage is a different type.
-					mc.pending.put(&pendingPacket{buf: pkt, src: src})
-					return nil
-				}
+			if plan.TunnelOnFailure {
+				mc.prepareTunnel()
+				go mc.openTunnel()
+			}
+			if plan.Probe && plan.TunnelOnFailure {
+				go mc.probeNativeV6(plan.Window)
 			}
 			if !plan.TunnelOnFailure {
 				return nil
 			}
-
-			if err := mc.conn6.Close(); err != nil {
-				return err
-			}
-			mc.conn6 = nil
+			return nil
 		}
 
 		// Native v6 produced no traffic — or was never attempted, because the
@@ -140,7 +133,7 @@ func (mc *MulticastConn) Open() error {
 	// selected AMTModeTunnel never pays for a socket on this path, so the bind
 	// can neither fail the tunnel out from under them nor emit an IGMP
 	// join/leave pair for a group nothing here will read.
-	plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, mc.Timeout)
+	plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, probeWindow)
 
 	if plan.attemptNative() {
 		flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
@@ -150,54 +143,222 @@ func (mc *MulticastConn) Open() error {
 		}
 		mc.conn4 = conn
 
-		if plan.Probe {
-			var cm *ipv4.ControlMessage
-			var src net.Addr
-			pkt, native, err := probeNativeTraffic(mc.conn4, plan.Window, mc.IFace.MTU, func(b []byte) (int, error) {
-				n, c, s, err := mc.conn4.ReadFrom(b)
-				cm, src = c, s
-				return n, err
-			})
-			if err != nil {
-				return err
-			}
-			if native {
-				mc.pending.put(&pendingPacket{buf: pkt, cm: cm, src: src})
-				return nil
-			}
+		if plan.TunnelOnFailure {
+			mc.prepareTunnel()
+			go mc.openTunnel()
+		}
+		if plan.Probe && plan.TunnelOnFailure {
+			go mc.probeNativeV4(plan.Window)
 		}
 		if !plan.TunnelOnFailure {
 			return nil
 		}
-
-		// Hand the group over to an AMT tunnel. The native join is dropped only here,
-		// once the plan has actually concluded native is not deliverable — never on
-		// the strength of a window too short to be evidence (BLO-28640).
-		if err := mc.conn4.Close(); err != nil {
-			return err
-		}
-		mc.conn4 = nil
+		return nil
 	}
+	return mc.startTunnel()
+}
 
-	mc.amtGw = &Gateway{
+func (mc *MulticastConn) prepareTunnel() {
+	mc.pathMu.Lock()
+	mc.wantTunnel = true
+	// Native delivery remains the preferred path until the probe proves it
+	// silent. The AMT opener may run in parallel, but it is only active after
+	// arbitration selects it.
+	mc.activeTunnel = false
+	mc.tunnelReady = make(chan struct{})
+	mc.tunnelStart = make(chan struct{})
+	mc.tunnelDecision = make(chan struct{})
+	mc.tunnelDecided = false
+	mc.pathMu.Unlock()
+}
+
+func (mc *MulticastConn) startTunnel() error {
+	mc.prepareTunnel()
+	mc.releaseTunnelStart()
+	return mc.openTunnel()
+}
+
+func (mc *MulticastConn) probeNativeV4(window time.Duration) {
+	var cm *ipv4.ControlMessage
+	var src net.Addr
+	pkt, native, err := probeNativeTraffic(mc.conn4, window, mc.IFace.MTU, func(b []byte) (int, error) {
+		n, c, s, err := mc.conn4.ReadFrom(b)
+		cm, src = c, s
+		return n, err
+	})
+	if err != nil {
+		mc.setActiveTunnel(true)
+		mc.releaseTunnelStart()
+		return
+	}
+	if mc.isClosed() {
+		return
+	}
+	if native {
+		mc.pending.put(&pendingPacket{buf: pkt, cm: cm, src: src})
+		mc.setActiveTunnel(false)
+		mc.releaseTunnelStart()
+		return
+	}
+	mc.pathMu.Lock()
+	mc.wantTunnel = true
+	mc.activeTunnel = true
+	mc.pathMu.Unlock()
+	mc.releaseTunnelStart()
+	mc.watchNativeV4()
+}
+
+func (mc *MulticastConn) probeNativeV6(window time.Duration) {
+	var src net.Addr
+	pkt, native, err := probeNativeTraffic(mc.conn6, window, mc.IFace.MTU, func(b []byte) (int, error) {
+		n, _, s, err := mc.conn6.ReadFrom(b)
+		src = s
+		return n, err
+	})
+	if err != nil {
+		mc.setActiveTunnel(true)
+		mc.releaseTunnelStart()
+		return
+	}
+	if mc.isClosed() {
+		return
+	}
+	if native {
+		mc.pending.put(&pendingPacket{buf: pkt, src: src})
+		mc.setActiveTunnel(false)
+		mc.releaseTunnelStart()
+		return
+	}
+	mc.pathMu.Lock()
+	mc.wantTunnel = true
+	mc.activeTunnel = true
+	mc.pathMu.Unlock()
+	mc.releaseTunnelStart()
+}
+
+func (mc *MulticastConn) releaseTunnelStart() {
+	mc.pathMu.Lock()
+	if !mc.tunnelDecided {
+		mc.tunnelDecided = true
+		if mc.tunnelDecision != nil {
+			close(mc.tunnelDecision)
+		}
+	}
+	if mc.tunnelStart != nil {
+		close(mc.tunnelStart)
+		mc.tunnelStart = nil
+	}
+	mc.pathMu.Unlock()
+}
+
+func (mc *MulticastConn) watchNativeV4() {
+	buf := make([]byte, mc.IFace.MTU)
+	for !mc.isClosed() && mc.IsUsingTunnel() {
+		n, cm, src, err := mc.conn4.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		mc.pending.put(&pendingPacket{buf: append([]byte(nil), buf[:n]...), cm: cm, src: src})
+		mc.setActiveTunnel(false)
+		return
+	}
+}
+
+func (mc *MulticastConn) openTunnel() (err error) {
+	_, relayHandshakeTimeout := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)
+	mc.pathMu.RLock()
+	decision := mc.tunnelDecision
+	mc.pathMu.RUnlock()
+	if decision != nil {
+		<-decision
+		mc.pathMu.RLock()
+		open := !mc.closed && (mc.activeTunnel || (mc.wantTunnel && mc.conn4 == nil && mc.conn6 == nil))
+		mc.pathMu.RUnlock()
+		if !open {
+			mc.pathMu.Lock()
+			if mc.tunnelReady != nil {
+				close(mc.tunnelReady)
+				mc.tunnelReady = nil
+			}
+			mc.pathMu.Unlock()
+			return nil
+		}
+	}
+	defer func() {
+		mc.pathMu.Lock()
+		if mc.tunnelReady != nil {
+			close(mc.tunnelReady)
+			mc.tunnelReady = nil
+		}
+		mc.pathMu.Unlock()
+	}()
+	dstAddr := net.UDPAddrFromAddrPort(netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort))
+
+	gw := &Gateway{
 		RelayAddr:   &mc.RelayAddr,
 		GroupAddr:   dstAddr.IP,
 		MTU:         mc.IFace.MTU,
 		RcvBufBytes: mc.RcvBufBytes,
 		SndBufBytes: mc.SndBufBytes,
-		Timeout:     gatewayOpenTimeout(mc.Timeout),
+		Timeout:     gatewayOpenTimeout(relayHandshakeTimeout),
 	}
 	if mc.SrcAddr.IsValid() && !mc.SrcAddr.IsUnspecified() {
-		mc.amtGw.SourceAddr = mc.SrcAddr.AsSlice()
+		gw.SourceAddr = mc.SrcAddr.AsSlice()
 	}
-	if err := mc.amtGw.Open(); err != nil {
-		return fmt.Errorf("Error setting up socket: %w", err)
+	if err := gw.Open(); err != nil {
+		gw.abortOpen()
+		return err
 	}
+	mc.pathMu.Lock()
+	if mc.closed {
+		mc.pathMu.Unlock()
+		gw.abortOpen()
+		return net.ErrClosed
+	}
+	mc.amtGw = gw
+	// Keep a native-preferred arbitration decision intact when AMT finishes
+	// opening first. AMT-only construction has no native socket, so it still
+	// becomes active immediately.
+	mc.activeTunnel = mc.activeTunnel || (mc.wantTunnel && mc.conn4 == nil && mc.conn6 == nil)
+	mc.pathMu.Unlock()
 	return nil
 }
 
+func (mc *MulticastConn) waitTunnel() *Gateway {
+	for {
+		mc.pathMu.RLock()
+		gw, ready := mc.amtGw, mc.tunnelReady
+		mc.pathMu.RUnlock()
+		if gw != nil || ready == nil {
+			return gw
+		}
+		<-ready
+	}
+}
+
+func (mc *MulticastConn) isClosed() bool {
+	mc.pathMu.RLock()
+	defer mc.pathMu.RUnlock()
+	return mc.closed
+}
+
+func (mc *MulticastConn) setActiveTunnel(active bool) {
+	mc.pathMu.Lock()
+	mc.activeTunnel = active
+	// A native packet is authoritative for path selection. Clear the tunnel
+	// intent as well so an opener racing this decision cannot reactivate AMT
+	// when it publishes its gateway.
+	mc.wantTunnel = active
+	mc.pathMu.Unlock()
+}
+
 func (mc *MulticastConn) IsUsingTunnel() bool {
-	return mc.amtGw != nil
+	mc.pathMu.RLock()
+	defer mc.pathMu.RUnlock()
+	// A gateway-backed connection with no native socket is tunnel-active even
+	// when it was constructed by an older call site that did not set the path
+	// flag explicitly.
+	return mc.activeTunnel || (mc.amtGw != nil && mc.conn4 == nil && mc.conn6 == nil)
 }
 func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 	// A packet the probe consumed is owed to the caller before anything read
@@ -233,21 +394,83 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 		}
 		return mc.conn4.ReadBatch(ms, flags)
 	}
-	if err := mc.amtGw.loopErr.Swap(nil); err != nil {
+	gw := mc.waitTunnel()
+	if gw == nil {
+		return 0, net.ErrClosed
+	}
+	if err := gw.loopErr.Swap(nil); err != nil {
 		return 0, err
 	}
-	N, err := mc.amtGw.conn.ReadBatch(ms, flags)
+	N, err := gw.conn.ReadBatch(ms, flags)
 	if err != nil {
 		return 0, fmt.Errorf("error reading from connection: %w", err)
 	}
+	return mc.processAMTBatch(gw, ms, N)
+}
+
+// processAMTBatch dispatches and compacts the messages returned by an AMT
+// socket read. The active portion of ms is [i, N-bad): control and unwanted
+// messages are moved to the tail, while the replacement at i is examined on
+// the next iteration. Keeping this separate from the socket read makes the
+// compaction invariant directly testable without depending on platform-specific
+// ReadBatch batching behavior.
+func (mc *MulticastConn) processAMTBatch(gw *Gateway, ms []ipv4.Message, N int) (int, error) {
 	var i, bad int
-	for i = 0; i < N && N > bad; i++ {
+	var err error
+	// The live portion is [i, N-bad). A dropped message is replaced from the
+	// tail and the same index is examined again; shrinking the loop bound with
+	// bad is what prevents re-dispatching a message that was already at that
+	// tail.
+	for i = 0; i < N-bad; i++ {
 		cur := ms[i]
 		n := cur.N
-		amtMessageType := determineAMTmessageType(cur.Buffers[0])
+		// Drop a zero-length datagram before dispatch, and read the type from
+		// the bytes actually received rather than from the buffer's stale tail.
+		// This is the same guard Gateway.Open carries, for the same reason; it
+		// was not mirrored here when the [:n] slicing below was introduced.
+		//
+		// A zero-length UDP datagram is legal and carries no type byte. Two
+		// things then go wrong, and neither is visible in the tests:
+		//
+		//  1. determineAMTmessageType was handed cur.Buffers[0] UNSLICED, so it
+		//     read whatever byte was left at offset 0 of this reused buffer by
+		//     an earlier ReadBatch. After any batch that carried an
+		//     advertisement (0x02) or a query (0x04), that stale byte routes the
+		//     empty datagram into one of the control arms below.
+		//  2. Those arms pass cur.Buffers[0][:n] — a len-0 slice — to
+		//     handleRelayAdvertisement / handleMembershipQuery, which both take
+		//     &data[0] unconditionally to reach the FFI. That panics with
+		//     "index out of range [0] with length 0".
+		//
+		// Before the [:n] change the handlers got the whole caller-allocated
+		// buffer, so &data[0] was always valid. A freshly zeroed buffer reads
+		// type 0 and falls to default:, which is why a test never sees this.
+		//
+		// The MulticastDataType arm is covered too: [m.DataMsgHdrLen:n] at n == 0
+		// is an invalid slice (low > high) and panics as well. That one predates
+		// this change; the same guard closes it.
+		if n == 0 {
+			bad++
+			ms[i] = ms[N-bad]
+			i--
+			continue
+		}
+		amtMessageType := determineAMTmessageType(cur.Buffers[0][:n])
 		switch amtMessageType {
 		case m.MulticastDataType:
-			mc.amtGw.lastData.Store(time.Now())
+			// A data message must carry its 2-byte header. The n == 0 guard
+			// above does not cover n == 1: [m.DataMsgHdrLen:n] is then [2:1],
+			// low > high, which panics exactly like the zero-length case it
+			// was written for. One 1-byte 0x06 datagram on the tunnel socket
+			// is enough. RelayManager.routeDataToSubscription already drops
+			// these (relay_manager.go:848); this path never did.
+			if n < m.DataMsgHdrLen {
+				bad++
+				ms[i] = ms[N-bad]
+				i--
+				break
+			}
+			gw.lastData.Store(time.Now())
 			p := gopacket.NewPacket(cur.Buffers[0][m.DataMsgHdrLen:n], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)
 			udpHdr, ok := p.TransportLayer().(*layers.UDP)
@@ -257,8 +480,7 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			}
 			if !ok || !ipHdr.DstIP.Equal(mc.GroupAddr.AsSlice()) {
 				bad++
-				cur = ms[N-bad]
-				ms[N-bad] = cur
+				ms[i] = ms[N-bad]
 				i--
 				break
 			}
@@ -275,21 +497,26 @@ func (mc *MulticastConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 			ms[i].N = len(stream.Payload())
 			ms[i].Buffers[0] = stream.Payload()
 		case m.MembershipQueryType:
-			err = mc.amtGw.handleMembershipQuery(cur.Buffers[0])
+			// [:n], not the whole buffer — see the slicing note in Gateway.Open.
+			// The Rust Relay Advertisement decoder matches on EXACT length (12
+			// or 24), so handing it a full-MTU buffer makes re-discovery in
+			// steady state fail the same way the initial handshake did under
+			// BLO-29437. The Query decoder is length-tolerant, but is sliced
+			// here too so the "decode what you received" invariant holds
+			// uniformly and nobody has to re-derive which decoders forgive
+			// padding.
+			err = mc.amtGw.handleMembershipQuery(cur.Buffers[0][:n])
 			bad++
-			cur = ms[N-bad]
-			ms[N-bad] = cur
+			ms[i] = ms[N-bad]
 			i--
 		case m.RelayAdvertisementType:
-			err = mc.amtGw.handleRelayAdvertisement(cur.Buffers[0])
+			err = mc.amtGw.handleRelayAdvertisement(cur.Buffers[0][:n])
 			bad++
-			cur = ms[N-bad]
-			ms[N-bad] = cur
+			ms[i] = ms[N-bad]
 			i--
 		default:
 			bad++
-			cur = ms[N-bad]
-			ms[N-bad] = cur
+			ms[i] = ms[N-bad]
 			i--
 			err = fmt.Errorf("unknown data type: %d", amtMessageType) // TODO: see how to handle
 			break
@@ -316,24 +543,43 @@ func (mc *MulticastConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4
 		}
 		return mc.conn4.ReadFrom(buf)
 	}
-	if err := mc.amtGw.loopErr.Swap(nil); err != nil {
+	gw := mc.waitTunnel()
+	if gw == nil {
+		return 0, nil, nil, net.ErrClosed
+	}
+	if err := gw.loopErr.Swap(nil); err != nil {
 		return 0, nil, nil, err
 	}
 	for {
-		n, cm, src, err = mc.amtGw.conn.ReadFrom(buf)
+		n, cm, src, err = gw.conn.ReadFrom(buf)
 		if n == 0 || err != nil {
 			return
 		}
-		amtMessageType := determineAMTmessageType(buf[:])
+		// n >= 1 is guaranteed by the return above, and determineAMTmessageType
+		// reads only index 0, so this slice does NOT change today's
+		// classification — buf[:] and buf[:n] are identical here for every
+		// n >= 1. It is passed anyway so the call site stops depending on that
+		// property of the callee: if the type read ever widens past byte 0,
+		// this path would otherwise start reading the reused buffer's stale
+		// tail while the batch path above stayed correct.
+		amtMessageType := determineAMTmessageType(buf[:n])
 		data := buf[:n]
 		switch amtMessageType {
 		case m.RelayAdvertisementType:
-			err = mc.amtGw.handleRelayAdvertisement(data)
+			err = gw.handleRelayAdvertisement(data)
 			n = 0
 		case m.MembershipQueryType:
-			err = mc.amtGw.handleMembershipQuery(data)
+			err = gw.handleMembershipQuery(data)
 			n = 0
 		case m.MulticastDataType:
+			// Same received-length invariant as the batch path above. The
+			// n == 0 return at the top of this loop does not cover n == 1:
+			// data[m.DataMsgHdrLen:] is then a low > high slice and panics.
+			// Drop the runt and read the next datagram, as the mismatched-group
+			// case below does.
+			if n < m.DataMsgHdrLen {
+				break
+			}
 			mc.amtGw.lastData.Store(time.Now())
 			p := gopacket.NewPacket(data[m.DataMsgHdrLen:], layers.LayerTypeIPv4, gopacket.NoCopy)
 			ipHdr := p.NetworkLayer().(*layers.IPv4)
@@ -376,43 +622,92 @@ func (mc *MulticastConn) WriteToWithControlMessage(b []byte, cm *ipv4.ControlMes
 }
 
 func (mc *MulticastConn) Close() error {
-	if !mc.IsUsingTunnel() {
-		if c := mc.activeConn(); c != nil {
-			return c.Close()
+	mc.pathMu.Lock()
+	mc.closed = true
+	gw := mc.amtGw
+	if mc.tunnelStart != nil {
+		if !mc.tunnelDecided {
+			mc.tunnelDecided = true
+			if mc.tunnelDecision != nil {
+				close(mc.tunnelDecision)
+			}
+		}
+		close(mc.tunnelStart)
+		mc.tunnelStart = nil
+	}
+	if mc.tunnelReady != nil {
+		close(mc.tunnelReady)
+		mc.tunnelReady = nil
+	}
+	conn4, conn6 := mc.conn4, mc.conn6
+	mc.pathMu.Unlock()
+	var closeErr error
+	if conn4 != nil {
+		closeErr = conn4.Close()
+	}
+	if conn6 != nil {
+		if err := conn6.Close(); closeErr == nil {
+			closeErr = err
 		}
 	}
-	if mc.amtGw != nil {
-		return mc.amtGw.Close()
+	if gw != nil {
+		if err := gw.Close(); closeErr == nil {
+			closeErr = err
+		}
 	}
-	return nil
+	return closeErr
 }
 
 func (mc *MulticastConn) LocalAddr() net.Addr {
 	if !mc.IsUsingTunnel() {
-		return mc.activeConn().LocalAddr()
+		if c := mc.activeConn(); c != nil {
+			return c.LocalAddr()
+		}
+		return nil
 	}
-	return mc.amtGw.conn.LocalAddr()
+	if gw := mc.waitTunnel(); gw != nil {
+		return gw.conn.LocalAddr()
+	}
+	return nil
 }
 
 func (mc *MulticastConn) SetDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
-		return mc.activeConn().SetDeadline(t)
+		if c := mc.activeConn(); c != nil {
+			return c.SetDeadline(t)
+		}
+		return net.ErrClosed
 	}
-	return mc.amtGw.conn.SetDeadline(t)
+	if gw := mc.waitTunnel(); gw != nil {
+		return gw.conn.SetDeadline(t)
+	}
+	return net.ErrClosed
 }
 
 func (mc *MulticastConn) SetReadDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
-		return mc.activeConn().SetReadDeadline(t)
+		if c := mc.activeConn(); c != nil {
+			return c.SetReadDeadline(t)
+		}
+		return net.ErrClosed
 	}
-	return mc.amtGw.conn.SetReadDeadline(t)
+	if gw := mc.waitTunnel(); gw != nil {
+		return gw.conn.SetReadDeadline(t)
+	}
+	return net.ErrClosed
 }
 
 func (mc *MulticastConn) SetWriteDeadline(t time.Time) error {
 	if !mc.IsUsingTunnel() {
-		return mc.activeConn().SetWriteDeadline(t)
+		if c := mc.activeConn(); c != nil {
+			return c.SetWriteDeadline(t)
+		}
+		return net.ErrClosed
 	}
-	return mc.amtGw.conn.SetWriteDeadline(t)
+	if gw := mc.waitTunnel(); gw != nil {
+		return gw.conn.SetWriteDeadline(t)
+	}
+	return net.ErrClosed
 }
 
 func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {

@@ -24,12 +24,16 @@ func modeIsSettableUnderEveryBuildConfiguration() {
 	mc.Mode = AMTModeNative
 	mc.Mode = AMTModeTunnel
 	mc.Mode = AMTModeAuto
+	mc.ProbeWindow = time.Minute
+	mc.RelayHandshakeTimeout = 2 * time.Second
 
 	// ManagedConn is the path conn_mobile.go delegates to, so mobile inherits its
 	// policy. It needs the same field for the delegation to carry the operator's
 	// choice rather than silently dropping it.
 	var managed ManagedConn
 	managed.Mode = AMTModeNative
+	managed.ProbeWindow = time.Minute
+	managed.RelayHandshakeTimeout = 2 * time.Second
 }
 
 var _ = modeIsSettableUnderEveryBuildConfiguration

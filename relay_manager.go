@@ -671,7 +671,7 @@ func (rm *RelayManager) performHandshake() error {
 			// the Query leaves the gateway in Querying, and that state can send
 			// nothing further. On the cgo/Rust path -- the one production uses --
 			// request_membership admits only Idle or Active
-			// (amt-protocol@44ff7e1d `src/gateway.rs:257`), so a gateway parked in
+			// (amt-protocol@ef1bf21a `src/gateway.rs:264`), so a gateway parked in
 			// Querying fails every keepalive with InvalidState. keepaliveLoop
 			// discards that error and continues (see the comment there), so no
 			// Request reaches the wire, no Query comes back, and the tunnel

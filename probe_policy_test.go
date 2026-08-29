@@ -41,6 +41,30 @@ func TestAttemptNativeIsTheSamePredicateOnBothTypes(t *testing.T) {
 	}
 }
 
+func TestTimeoutBoundsRemainIndependent(t *testing.T) {
+	probeWindow, handshakeTimeout := resolveTimeouts(0, 60*time.Second, 2*time.Second)
+
+	probe := planProbe(AMTModeAuto, true, probeWindow)
+	if probe.Window != 60*time.Second {
+		t.Fatalf("probe window = %v, want 1m", probe.Window)
+	}
+	if got := gatewayOpenTimeout(handshakeTimeout); got != 2*time.Second {
+		t.Fatalf("handshake timeout = %v, want 2s", got)
+	}
+}
+
+func TestLegacyTimeoutSeedsUnsetBoundsIndependently(t *testing.T) {
+	probeWindow, handshakeTimeout := resolveTimeouts(7*time.Second, 0, 0)
+	if probeWindow != 7*time.Second || handshakeTimeout != 7*time.Second {
+		t.Fatalf("legacy timeout resolved to probe=%v handshake=%v, want both 7s", probeWindow, handshakeTimeout)
+	}
+
+	probeWindow, handshakeTimeout = resolveTimeouts(7*time.Second, 60*time.Second, 0)
+	if probeWindow != 60*time.Second || handshakeTimeout != 7*time.Second {
+		t.Fatalf("partial explicit config resolved to probe=%v handshake=%v, want 60s/7s", probeWindow, handshakeTimeout)
+	}
+}
+
 // TestOnlyDeliberateTunnelModeDeclinesTheNativeBind pins the truth table itself,
 // so a change that keeps both call sites consistent while making the predicate
 // wrong is still caught.

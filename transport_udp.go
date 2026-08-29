@@ -3,8 +3,6 @@ package amt
 import (
 	"context"
 	"net"
-	"os"
-	"syscall"
 	"time"
 
 	"golang.org/x/net/ipv4"
@@ -35,44 +33,14 @@ func NewUDPTransport(cfg TransportConfig) (*UDPTransport, error) {
 }
 
 func (t *UDPTransport) Open(ctx context.Context) error {
-	// Create UDP socket
-	sock, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+	conn, err := openUDPConn(t.cfg)
 	if err != nil {
-		return &TransportError{
-			Type:    TransportTypeUDP,
-			Message: "failed to create socket",
-			Cause:   err,
-		}
-	}
-
-	// Enable timestamps if supported
-	if t.cfg.EnableTimestamp {
-		_ = syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, syscall.SO_TIMESTAMP, 1)
-	}
-
-	// Apply forced socket buffers (mirrors Gateway.setupSocket); clamps are
-	// logged + counted as non-fatal, real syscall errors abort setup.
-	if err := applyForcedBuffers(sock, t.cfg.RcvBufBytes, t.cfg.SndBufBytes); err != nil {
-		_ = syscall.Close(sock)
-		return &TransportError{
-			Type:    TransportTypeUDP,
-			Message: "failed to apply socket buffers",
-			Cause:   err,
-		}
-	}
-
-	// Convert socket to PacketConn
-	file := os.NewFile(uintptr(sock), "")
-	conn, err := net.FilePacketConn(file)
-	if err != nil {
-		_ = file.Close()
 		return &TransportError{
 			Type:    TransportTypeUDP,
 			Message: "failed to create packet conn",
 			Cause:   err,
 		}
 	}
-	_ = file.Close()
 
 	t.conn = ipv4.NewPacketConn(conn)
 
