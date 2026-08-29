@@ -18,6 +18,7 @@ const maxDeliveryTargetsBodyBytes = 1 << 20
 // DeliveryTargetReader reads the broker's authoritative target snapshot.
 type DeliveryTargetReader struct {
 	endpoint string
+	feedID   string
 	client   *http.Client
 }
 
@@ -35,6 +36,7 @@ func NewDeliveryTargetReader(baseURL, feedID string, client *http.Client) (*Deli
 	}
 	return &DeliveryTargetReader{
 		endpoint: strings.TrimRight(parsed.Scheme+"://"+parsed.Host, "/") + broker.DeliveryTargetsPath(feedID),
+		feedID:   feedID,
 		client:   client,
 	}, nil
 }
@@ -60,6 +62,9 @@ func (r *DeliveryTargetReader) Read(ctx context.Context) (broker.DeliveryTargets
 	}
 	if err := broker.ValidateDeliveryTargetsRead(read); err != nil {
 		return broker.DeliveryTargetsRead{}, fmt.Errorf("validate delivery targets: %w", err)
+	}
+	if read.FeedID != r.feedID {
+		return broker.DeliveryTargetsRead{}, fmt.Errorf("validate delivery targets: response feed_id %q does not match requested feed_id %q", read.FeedID, r.feedID)
 	}
 	return read, nil
 }

@@ -61,6 +61,23 @@ func TestDeliveryTargetReaderPreservesAuthoritativeEmptySet(t *testing.T) {
 	}
 }
 
+func TestDeliveryTargetReaderRejectsMismatchedFeedID(t *testing.T) {
+	read := validTargetRead()
+	read.FeedID = "feed-b"
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(read)
+	}))
+	defer server.Close()
+
+	reader, err := NewDeliveryTargetReader(server.URL, "feed-a", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(context.Background()); err == nil || !strings.Contains(err.Error(), "does not match requested feed_id") {
+		t.Fatalf("mismatched feed ID error = %v", err)
+	}
+}
+
 func TestDeliveryTargetReaderRejectsBadResponseAndHTTPFailure(t *testing.T) {
 	for name, handler := range map[string]http.HandlerFunc{
 		"http failure": http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "no", http.StatusServiceUnavailable) }),

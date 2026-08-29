@@ -711,6 +711,9 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		if len(names) == 0 {
 			return errors.New("broker delivery targets require at least one feed")
 		}
+		if len(names) > 1 {
+			return errors.New("broker delivery targets support exactly one feed")
+		}
 		targetReader, err = gwclient.NewDeliveryTargetReader(beat.brokerURL, names[0], brokerClient)
 		if err != nil {
 			return err
