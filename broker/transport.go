@@ -53,7 +53,16 @@ const (
 	// constant exists so both sides can assert at build time that they were
 	// compiled against the same revision of the contract, and so a changelog
 	// has something to name.
-	TransportSchema = "gateway.transport.v1"
+	//
+	// v2 added MintRequest.DstPort (BLO-30636). The routes are deliberately
+	// still /v1/: a route bump is how a *deployed* client is kept working
+	// against a changed shape, and there is no deployed client — the first
+	// gateway↔broker bind (BLO-29552) had not landed when this changed,
+	// because the missing field is precisely what blocked it. Renumbering the
+	// path would have published a /v2/ whose only /v1/ caller never existed.
+	// A shape change made after a gateway ships is a different decision and
+	// does need the route.
+	TransportSchema = "gateway.transport.v2"
 
 	// TicketTTL is the maximum lifetime the broker will grant a ticket.
 	//
@@ -109,6 +118,19 @@ const (
 
 	// MaxRelayIDBytes bounds relay_id, matching MaxFeedIDBytes for feed_id.
 	MaxRelayIDBytes = 128
+
+	// MinDstPort and MaxDstPort bound MintRequest.DstPort at the only values a
+	// UDP destination port can take. Zero is excluded: it is not a deliverable
+	// destination, and it is also the Go zero value, so admitting it would make
+	// "the client set no port" and "the client set port 0" the same request.
+	//
+	// They are published here, rather than each side carrying its own literals,
+	// for the reason stated at the top of this file: both sides read the same
+	// constants so the two cannot drift. The broker's range check is the one
+	// that enforces — see ValidateMintRequest for why the client-side call is
+	// not redundant with it.
+	MinDstPort = 1
+	MaxDstPort = 65535
 )
 
 // Route patterns, in the exact spelling the broker registers on a
@@ -159,9 +181,16 @@ func RenewPath(ticketID string) string {
 //
 // The gateway's identity is the client certificate that terminated the TLS
 // connection. The broker derives every identity-shaped value from it — the
-// gateway UUID, the entitlement it checks, and the plane binding it records
-// from the peer address — so MintRequest carries only the two facts the
+// gateway UUID, the entitlement it checks, and the delivery *host* it binds
+// from the peer address — so MintRequest carries only the facts the
 // certificate cannot supply, and RenewRequest carries nothing at all.
+//
+// MintRequest.DstPort is the one input that is not identity-shaped, and it is
+// worth being precise about why, because "part of the plane binding is now an
+// input" sounds like the rule bending. It is not: the binding's *host* is
+// still ambient and still confirmed against the peer address, so the port
+// cannot name a third party — it can only choose a port on the machine that
+// already authenticated. See MintRequest.DstPort.
 //
 // The rule is that an assertion which must agree is never an input. Heartbeat's
 // gw_uuid is the single field that looks like an exception and is in fact the
@@ -224,9 +253,10 @@ type Identity struct{}
 // MintRequest asks the broker for a ticket admitting this gateway to one feed.
 //
 // The envelope is this small because identity is ambient: the gateway UUID, its
-// entitlement, the plane binding, and the certificate expiry the grant is
+// entitlement, the delivery host, and the certificate expiry the grant is
 // clamped against are all derived by the broker from the connection. See
-// Identity.
+// Identity. DstPort is the exception the connection cannot answer, and
+// MintRequest.DstPort explains why it is safe for it to be an input.
 //
 // Mint is idempotent — see MintIdempotency, which is the rule that makes
 // RetryTransportFailure safe to apply to this route.
@@ -243,6 +273,50 @@ type MintRequest struct {
 	// returns the existing ticket; it does not mint a second one. See
 	// MintIdempotency.
 	RelayID string `json:"relay_id"`
+
+	// DstPort is the UDP port the serving relay will send this feed's shred
+	// traffic to, on the gateway's own authenticated address.
+	//
+	// It is client-supplied because it is the one part of the delivery
+	// destination the broker cannot observe. The mint arrives over mTLS, whose
+	// peer address is a *TCP* endpoint; that connection's port is the control
+	// port and has no relationship to the UDP port the gateway will receive
+	// delivery on. There is nothing on the connection to compare it against and
+	// nothing to derive it from, which is why it is stated rather than inferred.
+	//
+	// # Why this is not the identity field Identity forbids
+	//
+	// Identity's rule is that an assertion which must agree is never an input.
+	// DstPort does not have to agree with anything, and that is exactly what
+	// makes it safe: it is not a selector, because it cannot select. The
+	// destination *host* remains ambient — the broker takes dst_ip from the
+	// peer address and rejects a mint whose asserted address disagrees — so a
+	// client that lies about its port redirects delivery only to another port
+	// on the machine that authenticated for it. The blast radius of the lie is
+	// the liar's own host, which is the anti-amplification property intact,
+	// not weakened. A dst_ip field, by contrast, would be the tenant selector
+	// Identity forbids, and is still absent for that reason.
+	//
+	// # Required, never defaulted
+	//
+	// Zero is rejected rather than defaulted to anything. The two candidate
+	// defaults were both refused on BLO-30634: the mTLS peer's TCP port is a
+	// wrong answer that looks right and would silently blackhole every session
+	// that took it, and a well-known literal invents a number no gateway
+	// agreed to. A ticket that cannot address a datagram is not a deliverable
+	// seat, so this fails at mint, loudly, rather than at delivery, silently.
+	//
+	// # Why int and not uint16
+	//
+	// uint16 makes the range look self-enforcing and is the reason to want it,
+	// but the enforcement is an illusion: 65536 and -1 do not fail to decode,
+	// they wrap, so a client bug that computes an out-of-range port arrives as
+	// a *valid* one and is delivered to the wrong place. int keeps a malformed
+	// value malformed all the way to ValidateMintRequest, which can then reject
+	// it — and which is testable precisely because the bad value is
+	// representable. It also matches the broker's own PlaneBinding.DstPort, so
+	// the value crosses the bind with no conversion to get wrong.
+	DstPort int `json:"dst_port"`
 }
 
 // MintIdempotency states what a repeat Mint does, which is the rule that makes
@@ -657,6 +731,9 @@ func ValidateMintRequest(req MintRequest) error {
 	}
 	if req.RelayID == "" || !utf8.ValidString(req.RelayID) || len(req.RelayID) > MaxRelayIDBytes {
 		return invalid("relay_id must be non-empty, valid UTF-8, and at most %d bytes", MaxRelayIDBytes)
+	}
+	if req.DstPort < MinDstPort || req.DstPort > MaxDstPort {
+		return invalid("dst_port must be in %d..%d; it is required and has no default (see MintRequest.DstPort)", MinDstPort, MaxDstPort)
 	}
 	return nil
 }
