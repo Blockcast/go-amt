@@ -55,20 +55,25 @@ func freeLocalAddr(t *testing.T, network string) string {
 	}
 }
 
-// scrape fetches the Prometheus text exposition and returns the value of the
-// first sample of name whose label set contains every fragment in match.
-func scrape(t *testing.T, address, name string, match ...string) (float64, bool) {
+// scrapeSnapshot fetches one coherent Prometheus exposition response.
+func scrapeSnapshot(t *testing.T, address string) (string, bool) {
 	t.Helper()
 	response, err := http.Get("http://" + address + "/metrics")
 	if err != nil {
-		return 0, false
+		return "", false
 	}
 	defer func() { _ = response.Body.Close() }()
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		return 0, false
+		return "", false
 	}
-	for _, line := range strings.Split(string(body), "\n") {
+	return string(body), true
+}
+
+// scrapeText returns the first sample of name whose label set contains every
+// fragment in match from a single Prometheus exposition response.
+func scrapeText(text, name string, match ...string) (float64, bool) {
+	for _, line := range strings.Split(text, "\n") {
 		if strings.HasPrefix(line, "#") || !strings.HasPrefix(line, name) {
 			continue
 		}
@@ -97,6 +102,17 @@ func scrape(t *testing.T, address, name string, match ...string) (float64, bool)
 		return parsed, true
 	}
 	return 0, false
+}
+
+// scrape fetches the Prometheus text exposition and returns the value of the
+// first sample of name whose label set contains every fragment in match.
+func scrape(t *testing.T, address, name string, match ...string) (float64, bool) {
+	t.Helper()
+	text, ok := scrapeSnapshot(t, address)
+	if !ok {
+		return 0, false
+	}
+	return scrapeText(text, name, match...)
 }
 
 // silenceStdout points os.Stdout at the null device for the duration of a test.
@@ -238,12 +254,17 @@ func TestListenAndScorePublishesRealErasureToMetrics(t *testing.T) {
 	var total, erased, fraction, graceMS, schema float64
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		total, _ = scrape(t, httpAddress, "bcast_shred_gw_erasure_sets", `feed="default"`, `result="total"`)
-		erased, _ = scrape(t, httpAddress, "bcast_shred_gw_erasure_sets", `feed="default"`, `result="erased"`)
+		snapshot, ok := scrapeSnapshot(t, httpAddress)
+		if !ok {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		total, _ = scrapeText(snapshot, "bcast_shred_gw_erasure_sets", `feed="default"`, `result="total"`)
+		erased, _ = scrapeText(snapshot, "bcast_shred_gw_erasure_sets", `feed="default"`, `result="erased"`)
 		if total > 0 && erased > 0 && erased < total {
-			fraction, _ = scrape(t, httpAddress, "bcast_shred_gw_erasure_fraction", `feed="default"`)
-			graceMS, _ = scrape(t, httpAddress, "bcast_shred_gw_erasure_grace_milliseconds", `feed="default"`)
-			schema, _ = scrape(t, httpAddress, "bcast_shred_gw_report_schema", `feed="default"`)
+			fraction, _ = scrapeText(snapshot, "bcast_shred_gw_erasure_fraction", `feed="default"`)
+			graceMS, _ = scrapeText(snapshot, "bcast_shred_gw_erasure_grace_milliseconds", `feed="default"`)
+			schema, _ = scrapeText(snapshot, "bcast_shred_gw_report_schema", `feed="default"`)
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
