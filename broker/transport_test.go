@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -326,22 +327,41 @@ func TestTransportFailurePostureIsBackoff(t *testing.T) {
 }
 
 func TestValidateMintRequest(t *testing.T) {
-	valid := MintRequest{FeedID: "feed-a", RelayID: "relay-a"}
+	// Every case starts from a fully valid envelope and perturbs one field, so
+	// a case named for feed_id is not quietly also failing on dst_port. The
+	// port cases perturb the port and leave the ids alone for the same reason.
+	req := func(mutate func(*MintRequest)) MintRequest {
+		r := MintRequest{FeedID: "feed-a", RelayID: "relay-a", DstPort: 41234}
+		mutate(&r)
+		return r
+	}
+	unchanged := func(*MintRequest) {}
 
 	for _, tc := range []struct {
 		name    string
 		req     MintRequest
 		wantErr bool
 	}{
-		{"valid", valid, false},
-		{"empty feed_id", MintRequest{FeedID: "", RelayID: "relay-a"}, true},
-		{"empty relay_id", MintRequest{FeedID: "feed-a", RelayID: ""}, true},
-		{"feed_id at bound", MintRequest{FeedID: strings.Repeat("f", MaxFeedIDBytes), RelayID: "relay-a"}, false},
-		{"feed_id over bound", MintRequest{FeedID: strings.Repeat("f", MaxFeedIDBytes+1), RelayID: "relay-a"}, true},
-		{"relay_id at bound", MintRequest{FeedID: "feed-a", RelayID: strings.Repeat("r", MaxRelayIDBytes)}, false},
-		{"relay_id over bound", MintRequest{FeedID: "feed-a", RelayID: strings.Repeat("r", MaxRelayIDBytes+1)}, true},
-		{"invalid utf8 feed_id", MintRequest{FeedID: "\xff\xfe", RelayID: "relay-a"}, true},
-		{"invalid utf8 relay_id", MintRequest{FeedID: "feed-a", RelayID: "\xff\xfe"}, true},
+		{"valid", req(unchanged), false},
+		{"empty feed_id", req(func(r *MintRequest) { r.FeedID = "" }), true},
+		{"empty relay_id", req(func(r *MintRequest) { r.RelayID = "" }), true},
+		{"feed_id at bound", req(func(r *MintRequest) { r.FeedID = strings.Repeat("f", MaxFeedIDBytes) }), false},
+		{"feed_id over bound", req(func(r *MintRequest) { r.FeedID = strings.Repeat("f", MaxFeedIDBytes+1) }), true},
+		{"relay_id at bound", req(func(r *MintRequest) { r.RelayID = strings.Repeat("r", MaxRelayIDBytes) }), false},
+		{"relay_id over bound", req(func(r *MintRequest) { r.RelayID = strings.Repeat("r", MaxRelayIDBytes+1) }), true},
+		{"invalid utf8 feed_id", req(func(r *MintRequest) { r.FeedID = "\xff\xfe" }), true},
+		{"invalid utf8 relay_id", req(func(r *MintRequest) { r.RelayID = "\xff\xfe" }), true},
+
+		// dst_port. Zero is called out separately from the rest of the
+		// out-of-range set because it is the one an omitted field decodes to:
+		// it is the value a client that never heard of this field sends, and
+		// admitting it is the defaulting BLO-30634 refused.
+		{"dst_port zero (omitted by an unmigrated client)", req(func(r *MintRequest) { r.DstPort = 0 }), true},
+		{"dst_port at lower bound", req(func(r *MintRequest) { r.DstPort = MinDstPort }), false},
+		{"dst_port at upper bound", req(func(r *MintRequest) { r.DstPort = MaxDstPort }), false},
+		{"dst_port just over upper bound", req(func(r *MintRequest) { r.DstPort = MaxDstPort + 1 }), true},
+		{"dst_port negative", req(func(r *MintRequest) { r.DstPort = -1 }), true},
+		{"dst_port wildly out of range", req(func(r *MintRequest) { r.DstPort = 1 << 20 }), true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := ValidateMintRequest(tc.req)
@@ -358,6 +378,54 @@ func TestValidateMintRequest(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+// TestMintRequestDstPortBoundsAreThePortSpace pins the bounds to the actual UDP
+// port range rather than to whatever the constants happen to say. Widening
+// MaxDstPort past 65535 would let the broker mint a ticket carrying a port no
+// datagram can be addressed to; narrowing the range would refuse ports gateways
+// legitimately bind, including the whole ephemeral range.
+func TestMintRequestDstPortBoundsAreThePortSpace(t *testing.T) {
+	if MinDstPort != 1 {
+		t.Errorf("MinDstPort = %d, want 1: port 0 is not a deliverable destination", MinDstPort)
+	}
+	if MaxDstPort != 65535 {
+		t.Errorf("MaxDstPort = %d, want 65535: the UDP port space is 16 bits", MaxDstPort)
+	}
+}
+
+// TestMintRequestFieldsAreExactlyTheContract is the companion to
+// TestRequestEnvelopesCarryNoIdentityFields: that test rejects a known list of
+// identity-shaped names, this one rejects *anything* unlisted. BLO-30636 added
+// the first input to this envelope, and the risk it opens is that the next
+// field rides in behind it under a name nobody thought to forbid. A new field
+// here is a contract change and must fail until it is deliberately admitted.
+func TestMintRequestFieldsAreExactlyTheContract(t *testing.T) {
+	want := []string{"feed_id", "relay_id", "dst_port"}
+
+	typ := reflect.TypeOf(MintRequest{})
+	var got []string
+	for i := 0; i < typ.NumField(); i++ {
+		tag := typ.Field(i).Tag.Get("json")
+		name, _, _ := strings.Cut(tag, ",")
+		got = append(got, name)
+	}
+
+	if !slices.Equal(got, want) {
+		t.Errorf("MintRequest fields = %v, want exactly %v; a new field is a contract change (see Identity)", got, want)
+	}
+}
+
+// TestTransportSchemaTracksEnvelopeChanges pins the schema string against the
+// revision that introduced dst_port. TransportSchema's own doc requires a new
+// string for any shape change, and the constant is the only thing a broker can
+// assert at build time to prove it compiled against the contract it thinks it
+// did — so leaving it at v1 after changing MintRequest is the exact silent edit
+// it exists to prevent.
+func TestTransportSchemaTracksEnvelopeChanges(t *testing.T) {
+	if got, want := TransportSchema, "gateway.transport.v2"; got != want {
+		t.Errorf("TransportSchema = %q, want %q: adding MintRequest.DstPort is a shape change", got, want)
 	}
 }
 
@@ -420,12 +488,23 @@ func TestTicketNotAfterSharesHeartbeatTimestampRule(t *testing.T) {
 // test in this file and break every non-Go implementer.
 func TestEnvelopesRoundTrip(t *testing.T) {
 	t.Run("MintRequest", func(t *testing.T) {
-		encoded, err := json.Marshal(MintRequest{FeedID: "feed-a", RelayID: "relay-a"})
+		encoded, err := json.Marshal(MintRequest{FeedID: "feed-a", RelayID: "relay-a", DstPort: 41234})
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
-		if got, want := string(encoded), `{"feed_id":"feed-a","relay_id":"relay-a"}`; got != want {
+		if got, want := string(encoded), `{"feed_id":"feed-a","relay_id":"relay-a","dst_port":41234}`; got != want {
 			t.Errorf("MintRequest = %s, want %s", got, want)
+		}
+
+		// The round trip has to come back with the port intact, not merely
+		// marshal to the right name: a decode that dropped dst_port would
+		// leave the broker validating a zero it never received.
+		var decoded MintRequest
+		if err := json.Unmarshal(encoded, &decoded); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if want := (MintRequest{FeedID: "feed-a", RelayID: "relay-a", DstPort: 41234}); decoded != want {
+			t.Errorf("round trip = %#v, want %#v", decoded, want)
 		}
 	})
 
