@@ -178,6 +178,12 @@ type Fanout struct {
 	// write a swap that loses the other's carried-over counters.
 	reconcileMu sync.Mutex
 
+	// deliveryMu quiesces the worker while a reconcile swaps the table and
+	// snapshots departing counters. Without this barrier, deliver can hold an
+	// old table after the swap and its final counters can be omitted from the
+	// departing session close.
+	deliveryMu sync.RWMutex
+
 	queuedPackets  atomic.Uint64
 	droppedPackets atomic.Uint64
 	egressPackets  atomic.Uint64
@@ -385,6 +391,8 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, err
 	}
 	f.reconcileMu.Lock()
 	defer f.reconcileMu.Unlock()
+	f.deliveryMu.Lock()
+	defer f.deliveryMu.Unlock()
 
 	// Read the old table under reconcileMu so two concurrent reconciles cannot
 	// both carry counters forward from the same pre-swap snapshot.
@@ -533,6 +541,9 @@ func (f *Fanout) run() {
 
 // deliver writes one packet to every destination and reports how many landed.
 func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
+	f.deliveryMu.RLock()
+	defer f.deliveryMu.RUnlock()
+
 	size := uint64(len(packet))
 	// One Load for the whole packet. Charging and batch construction must
 	// agree on the same destination set; re-loading would let a reconcile land
