@@ -178,6 +178,12 @@ type Fanout struct {
 	// write a swap that loses the other's carried-over counters.
 	reconcileMu sync.Mutex
 
+	// deliveryMu quiesces the worker while a reconcile swaps the table and
+	// snapshots departing counters. Without this barrier, deliver can hold an
+	// old table after the swap and its final counters can be omitted from the
+	// departing session close.
+	deliveryMu sync.RWMutex
+
 	queuedPackets  atomic.Uint64
 	droppedPackets atomic.Uint64
 	egressPackets  atomic.Uint64
@@ -311,7 +317,19 @@ func NewUDPFanout(destinations []string, queueCapacity int, observer EgressObser
 
 // NewUDPFanoutTargets starts a bounded UDP fan-out over identified targets.
 func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObserver) (*Fanout, error) {
-	if len(targets) == 0 {
+	return newUDPFanoutTargets(targets, queueCapacity, observer, false)
+}
+
+// NewUDPFanoutTargetsAllowEmpty starts a UDP fan-out whose target table may
+// initially be empty. This is used for broker-driven delivery, where an
+// authoritative zero-subscriber snapshot is valid and later reconciliations
+// may add targets without restarting the receiver.
+func NewUDPFanoutTargetsAllowEmpty(targets []Target, queueCapacity int, observer EgressObserver) (*Fanout, error) {
+	return newUDPFanoutTargets(targets, queueCapacity, observer, true)
+}
+
+func newUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObserver, allowEmpty bool) (*Fanout, error) {
+	if len(targets) == 0 && !allowEmpty {
 		return nil, errors.New("fan-out requires at least one destination")
 	}
 	if queueCapacity <= 0 {
@@ -367,20 +385,14 @@ func NewUDPFanoutTargets(targets []Target, queueCapacity int, observer EgressObs
 // the only close the sender could attest to was CloseShutdown. The caller is
 // expected to close those sessions; this method does not reach into the
 // billing plane itself.
-func (f *Fanout) ReconcileDestinations(targets []Target) ([]Target, error) {
+func (f *Fanout) ReconcileDestinations(targets []Target) ([]DestinationStat, error) {
 	if f.udpConn == nil {
 		return nil, errors.New("fan-out: reconcile is only supported on a UDP fan-out")
 	}
-	if len(targets) == 0 {
-		// An empty grant table is refused rather than served. Accepting it
-		// would silently stop delivery to everyone while the process kept
-		// reporting healthy, and a broker returning nothing is far more often
-		// a broker fault than a genuine "no subscribers" state.
-		return nil, errors.New("fan-out requires at least one destination")
-	}
-
 	f.reconcileMu.Lock()
 	defer f.reconcileMu.Unlock()
+	f.deliveryMu.Lock()
+	defer f.deliveryMu.Unlock()
 
 	// Read the old table under reconcileMu so two concurrent reconciles cannot
 	// both carry counters forward from the same pre-swap snapshot.
@@ -399,14 +411,22 @@ func (f *Fanout) ReconcileDestinations(targets []Target) ([]Target, error) {
 	for _, entry := range entries {
 		retained[entry.id] = struct{}{}
 	}
-	var removed []Target
+	var departing []destination
 	for _, entry := range previous {
 		if _, kept := retained[entry.id]; !kept {
-			removed = append(removed, Target{ID: entry.id, Address: entry.name})
+			departing = append(departing, entry)
 		}
 	}
 
 	f.table.Store(&destTable{entries: entries})
+	removed := make([]DestinationStat, 0, len(departing))
+	for _, entry := range departing {
+		removed = append(removed, DestinationStat{
+			TargetID: entry.id, Destination: entry.name,
+			Packets: entry.counters.packets.Load(), Bytes: entry.counters.bytes.Load(),
+			Drops: entry.counters.drops.Load(), WriteErrors: entry.counters.errors.Load(),
+		})
+	}
 	return removed, nil
 }
 
@@ -521,6 +541,9 @@ func (f *Fanout) run() {
 
 // deliver writes one packet to every destination and reports how many landed.
 func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
+	f.deliveryMu.RLock()
+	defer f.deliveryMu.RUnlock()
+
 	size := uint64(len(packet))
 	// One Load for the whole packet. Charging and batch construction must
 	// agree on the same destination set; re-loading would let a reconcile land
@@ -545,6 +568,9 @@ func (f *Fanout) deliver(packet []byte) (delivered, failed uint64) {
 	}
 
 	count := len(entries)
+	if count == 0 {
+		return 0, 0
+	}
 	messages, offset := f.rotatedMessages(entries, packet)
 
 	written, err := f.sendBatch(f.udpConn, messages, runtime.GOOS == "linux")

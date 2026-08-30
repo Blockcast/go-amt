@@ -812,7 +812,7 @@ func TestReconcilePreservesSurvivingTargetCountersWhenATargetIsRevoked(t *testin
 		t.Fatal(err)
 	}
 
-	if len(removed) != 1 || removed[0].ID != "grant-b" {
+	if len(removed) != 1 || removed[0].TargetID != "grant-b" {
 		t.Fatalf("reconcile reported removed %+v, want exactly grant-b", removed)
 	}
 
@@ -860,6 +860,87 @@ func TestReconcileCarriesCountersAcrossAnAddressChange(t *testing.T) {
 	}
 }
 
+func TestReconcileAllowsAuthoritativeEmptyTargetSet(t *testing.T) {
+	fanout, err := NewUDPFanoutTargets([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+		{ID: "grant-b", Address: "127.0.0.1:20002"},
+	}, 16, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+
+	for _, entry := range fanout.table.Load().entries {
+		entry.counters.packets.Add(3)
+		entry.counters.bytes.Add(30)
+	}
+
+	removed, err := fanout.ReconcileDestinations(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 2 {
+		t.Fatalf("removed %d targets, want 2: %+v", len(removed), removed)
+	}
+	if len(fanout.DestinationStats()) != 0 {
+		t.Fatalf("empty reconcile left served targets: %+v", fanout.DestinationStats())
+	}
+}
+
+// Reconciliation must wait for an in-flight batch before it snapshots a
+// departing target. Otherwise a packet accepted before revocation can still
+// be sent to the old target while its billing close records stale counters.
+func TestReconcileWaitsForInFlightDeliveryBeforeReturningDepartingCounters(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	fanout, err := NewUDPFanoutTargets([]Target{
+		{ID: "grant-a", Address: "127.0.0.1:20001"},
+	}, 4, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fanout.Close()
+	fanout.sendBatch = func(_ *ipv4.PacketConn, _ []ipv4.Message, _ bool) (int, error) {
+		close(entered)
+		<-release
+		return 1, nil
+	}
+
+	if fanout.Enqueue("feed", []byte("packet")) != EnqueueAccepted {
+		t.Fatal("packet was not accepted")
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not start the in-flight batch")
+	}
+
+	reconciled := make(chan []DestinationStat, 1)
+	go func() {
+		removed, reconcileErr := fanout.ReconcileDestinations(nil)
+		if reconcileErr != nil {
+			t.Errorf("reconcile failed: %v", reconcileErr)
+			return
+		}
+		reconciled <- removed
+	}()
+	select {
+	case <-reconciled:
+		t.Fatal("reconcile returned before the in-flight batch completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case removed := <-reconciled:
+		if len(removed) != 1 || removed[0].TargetID != "grant-a" || removed[0].Packets != 1 {
+			t.Fatalf("departing counters = %+v, want grant-a with one packet", removed)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reconcile did not complete after delivery was released")
+	}
+}
+
 // A newly granted target starts at zero rather than inheriting whatever sat at
 // its position before.
 func TestReconcileStartsANewTargetAtZero(t *testing.T) {
@@ -894,7 +975,6 @@ func TestReconcileRejectsUnusableTargetSets(t *testing.T) {
 		targets []Target
 		wantErr string
 	}{
-		{name: "empty set", targets: nil, wantErr: "at least one destination"},
 		{
 			name:    "duplicate target ID",
 			targets: []Target{{ID: "dup", Address: "127.0.0.1:20001"}, {ID: "dup", Address: "127.0.0.1:20002"}},

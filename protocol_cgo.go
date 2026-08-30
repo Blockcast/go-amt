@@ -191,6 +191,13 @@ func (p *CGOProtocol) CreateIGMPJoinReport(source, group netip.Addr) ([]byte, er
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if !source.Is4() && !source.Is4In6() {
+		return nil, &ProtocolError{State: p.state, Message: fmt.Sprintf("source address must be IPv4: %s", source)}
+	}
+	if !group.Is4() && !group.Is4In6() {
+		return nil, &ProtocolError{State: p.state, Message: fmt.Sprintf("group address must be IPv4: %s", group)}
+	}
+
 	source4 := source.As4()
 	group4 := group.As4()
 
@@ -223,6 +230,9 @@ func (p *CGOProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []neti
 			Message: "no groups specified",
 		}
 	}
+	if !source.Is4() && !source.Is4In6() {
+		return nil, &ProtocolError{State: p.state, Message: fmt.Sprintf("source address must be IPv4: %s", source)}
+	}
 
 	source4 := source.As4()
 	cSource := C.CString(netip.AddrFrom4(source4).String())
@@ -231,6 +241,9 @@ func (p *CGOProtocol) CreateIGMPJoinReportMulti(source netip.Addr, groups []neti
 	// Build array of group address C strings
 	cGroups := make([]*C.char, len(groups))
 	for i, g := range groups {
+		if !g.Is4() && !g.Is4In6() {
+			return nil, &ProtocolError{State: p.state, Message: fmt.Sprintf("group address must be IPv4: %s", g)}
+		}
 		g4 := g.As4()
 		cGroups[i] = C.CString(netip.AddrFrom4(g4).String())
 		defer C.free(unsafe.Pointer(cGroups[i]))

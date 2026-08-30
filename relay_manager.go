@@ -548,11 +548,9 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 			if otherGroupSource {
 				sourceLeaver, ok := rm.protocol.(SourceSpecificLeaveReporter)
 				if !ok {
-					// Converge on leaveErr rather than returning here. Teardown
-					// above is already irreversible, so an early return would
-					// drop the subscription and still skip scheduleBatchedJoin,
-					// leaving the relay's membership un-refreshed.
-					err = fmt.Errorf("protocol does not support source-specific leave reports")
+					// A group-wide leave is safer than reporting an error after
+					// teardown: the removed source must not remain subscribed.
+					report, err = rm.protocol.CreateIGMPLeaveReport(key.Source, key.Group)
 				} else {
 					report, err = sourceLeaver.CreateIGMPSourceLeaveReport(key.Source, key.Group)
 				}
