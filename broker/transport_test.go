@@ -326,12 +326,18 @@ func TestTransportFailurePostureIsBackoff(t *testing.T) {
 	}
 }
 
+// testRelayID is a canonical, non-nil, lowercase UUID — the only shape
+// MintRequest.RelayID accepts. It is the same literal the broker's own suite
+// uses, so a value that travels between the two suites is not silently a
+// different shape.
+const testRelayID = "0198a654-9f3e-7c1a-b2ee-224d8e1c9a02"
+
 func TestValidateMintRequest(t *testing.T) {
 	// Every case starts from a fully valid envelope and perturbs one field, so
 	// a case named for feed_id is not quietly also failing on dst_port. The
 	// port cases perturb the port and leave the ids alone for the same reason.
 	req := func(mutate func(*MintRequest)) MintRequest {
-		r := MintRequest{FeedID: "feed-a", RelayID: "relay-a", DstPort: 41234}
+		r := MintRequest{FeedID: "feed-a", RelayID: testRelayID, DstPort: 41234}
 		mutate(&r)
 		return r
 	}
@@ -347,8 +353,18 @@ func TestValidateMintRequest(t *testing.T) {
 		{"empty relay_id", req(func(r *MintRequest) { r.RelayID = "" }), true},
 		{"feed_id at bound", req(func(r *MintRequest) { r.FeedID = strings.Repeat("f", MaxFeedIDBytes) }), false},
 		{"feed_id over bound", req(func(r *MintRequest) { r.FeedID = strings.Repeat("f", MaxFeedIDBytes+1) }), true},
-		{"relay_id at bound", req(func(r *MintRequest) { r.RelayID = strings.Repeat("r", MaxRelayIDBytes) }), false},
-		{"relay_id over bound", req(func(r *MintRequest) { r.RelayID = strings.Repeat("r", MaxRelayIDBytes+1) }), true},
+
+		// relay_id is a canonical, non-nil, lowercase UUID and nothing else.
+		// The first case is the literal this suite used to send: it is the
+		// value a gateway conforming to the OLD client contract would have
+		// produced, and the broker refused it with invalid_request (BLO-31098).
+		{"relay_id free-form label (the pre-BLO-31098 fixture)", req(func(r *MintRequest) { r.RelayID = "relay-a" }), true},
+		{"relay_id uppercase UUID", req(func(r *MintRequest) { r.RelayID = strings.ToUpper(testRelayID) }), true},
+		{"relay_id nil UUID", req(func(r *MintRequest) { r.RelayID = "00000000-0000-0000-0000-000000000000" }), true},
+		{"relay_id braced", req(func(r *MintRequest) { r.RelayID = "{" + testRelayID + "}" }), true},
+		{"relay_id urn prefixed", req(func(r *MintRequest) { r.RelayID = "urn:uuid:" + testRelayID }), true},
+		{"relay_id hex without separators", req(func(r *MintRequest) { r.RelayID = strings.ReplaceAll(testRelayID, "-", "") }), true},
+		{"relay_id misplaced separator", req(func(r *MintRequest) { r.RelayID = "0198a6549-f3e-7c1a-b2ee-224d8e1c9a02" }), true},
 		{"invalid utf8 feed_id", req(func(r *MintRequest) { r.FeedID = "\xff\xfe" }), true},
 		{"invalid utf8 relay_id", req(func(r *MintRequest) { r.RelayID = "\xff\xfe" }), true},
 
@@ -488,11 +504,11 @@ func TestTicketNotAfterSharesHeartbeatTimestampRule(t *testing.T) {
 // test in this file and break every non-Go implementer.
 func TestEnvelopesRoundTrip(t *testing.T) {
 	t.Run("MintRequest", func(t *testing.T) {
-		encoded, err := json.Marshal(MintRequest{FeedID: "feed-a", RelayID: "relay-a", DstPort: 41234})
+		encoded, err := json.Marshal(MintRequest{FeedID: "feed-a", RelayID: testRelayID, DstPort: 41234})
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
-		if got, want := string(encoded), `{"feed_id":"feed-a","relay_id":"relay-a","dst_port":41234}`; got != want {
+		if got, want := string(encoded), `{"feed_id":"feed-a","relay_id":"`+testRelayID+`","dst_port":41234}`; got != want {
 			t.Errorf("MintRequest = %s, want %s", got, want)
 		}
 
@@ -503,7 +519,7 @@ func TestEnvelopesRoundTrip(t *testing.T) {
 		if err := json.Unmarshal(encoded, &decoded); err != nil {
 			t.Fatalf("unmarshal: %v", err)
 		}
-		if want := (MintRequest{FeedID: "feed-a", RelayID: "relay-a", DstPort: 41234}); decoded != want {
+		if want := (MintRequest{FeedID: "feed-a", RelayID: testRelayID, DstPort: 41234}); decoded != want {
 			t.Errorf("round trip = %#v, want %#v", decoded, want)
 		}
 	})

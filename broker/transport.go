@@ -116,9 +116,6 @@ const (
 	// ReplayRule and CodeBodyTooLarge.
 	HeartbeatMaxBodyBytes = 4 << 20 // 4 MiB
 
-	// MaxRelayIDBytes bounds relay_id, matching MaxFeedIDBytes for feed_id.
-	MaxRelayIDBytes = 128
-
 	// MinDstPort and MaxDstPort bound MintRequest.DstPort at the only values a
 	// UDP destination port can take. Zero is excluded: it is not a deliverable
 	// destination, and it is also the Go zero value, so admitting it would make
@@ -266,7 +263,16 @@ type MintRequest struct {
 	// the other.
 	FeedID string `json:"feed_id"`
 
-	// RelayID names the relay the gateway intends to draw the feed from.
+	// RelayID names the relay the gateway intends to draw the feed from, as a
+	// canonical, non-nil, lowercase UUID — the same form ticket_id takes, and
+	// the same form the broker stores (session_ticket.relay_id is UUID NOT
+	// NULL).
+	//
+	// It is a UUID rather than a free-form label because the broker's storage
+	// and its frozen payload contract both say so, and a client contract that
+	// admitted more than they do could produce a value accepted here and
+	// refused a ticket — which is the defect this rule closes. A relay is named
+	// by its UUID or it is not nameable in this envelope.
 	//
 	// It is not part of the idempotency key. A Mint naming a different relay
 	// for a feed this gateway already holds a ticket for re-binds the relay and
@@ -729,8 +735,8 @@ func ValidateMintRequest(req MintRequest) error {
 	if req.FeedID == "" || !utf8.ValidString(req.FeedID) || len(req.FeedID) > MaxFeedIDBytes {
 		return invalid("feed_id must be non-empty, valid UTF-8, and at most %d bytes", MaxFeedIDBytes)
 	}
-	if req.RelayID == "" || !utf8.ValidString(req.RelayID) || len(req.RelayID) > MaxRelayIDBytes {
-		return invalid("relay_id must be non-empty, valid UTF-8, and at most %d bytes", MaxRelayIDBytes)
+	if err := validateCanonicalUUID(req.RelayID); err != nil {
+		return invalid("relay_id must be a canonical, non-nil, lowercase UUID: %s", err)
 	}
 	if req.DstPort < MinDstPort || req.DstPort > MaxDstPort {
 		return invalid("dst_port must be in %d..%d; it is required and has no default (see MintRequest.DstPort)", MinDstPort, MaxDstPort)
