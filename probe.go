@@ -137,7 +137,16 @@ func probeNativeTraffic(conn nativeConn, window time.Duration, mtu int, read fun
 		}
 		return buf[:n], true, nil
 	}
-	if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+	// errors.As rather than a bare err.(net.Error) assertion: every read closure
+	// returns the ReadFrom error unwrapped today (conn.go:125, :174,
+	// managed_conn_native.go:54), so the assertion happens to succeed — but the
+	// promise this branch keeps ("a timeout is the answer, not a failure") must
+	// not depend on that. Wrapping one closure for context is a one-line edit
+	// that would otherwise send a timeout to the hard-error return below, and
+	// Open would fail instead of handing the group to the tunnel: the BLO-28640
+	// shape reached through error classification rather than the deadline.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
 		// Clear the expired deadline even though every caller today hands the
 		// group to a tunnel on this path. A plan that probed without a fallback
 		// would otherwise return a live socket carrying a deadline already in

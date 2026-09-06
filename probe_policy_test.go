@@ -2,6 +2,7 @@ package amt
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -213,5 +214,44 @@ func TestProbeYieldsNoPacketWhenClearingTheDeadlineFails(t *testing.T) {
 	}
 	if native {
 		t.Errorf("probe reported native=true alongside an error; the bool must carry no information on the error path")
+	}
+}
+
+// TestProbeClassifiesWrappedTimeoutAsTimeout pins the timeout predicate against
+// error wrapping.
+//
+// The doc comment on probeNativeTraffic promises that a timeout "is not an error
+// here: it is the answer the caller asked for" — the window elapsed, nothing
+// arrived natively, hand the group to the tunnel. A bare err.(net.Error) type
+// assertion only keeps that promise while every read closure returns the
+// ReadFrom error unwrapped, which all three do today (conn.go:125, :174,
+// managed_conn_native.go:54). Adding context is the natural thing for someone
+// touching one of them — fmt.Errorf("read %s: %w", group, err) — and under the
+// bare assertion that one edit silently reclassifies the timeout as a hard
+// failure, so Open returns an error instead of falling back to the tunnel.
+//
+// That is the BLO-28640 outage shape (native unreachable, no fallback taken)
+// arriving through error classification rather than through the deadline the
+// comment at the timeout branch already defends. The assertion here is on the
+// wrapped form specifically: the unwrapped case is already covered above and
+// would keep passing against the very assertion this guards.
+func TestProbeClassifiesWrappedTimeoutAsTimeout(t *testing.T) {
+	conn := &probeConnStub{}
+
+	pkt, native, err := probeNativeTraffic(conn, time.Second, 1500, func([]byte) (int, error) {
+		return 0, fmt.Errorf("read %s: %w", "239.0.0.1", timeoutError{})
+	})
+
+	if err != nil {
+		t.Fatalf("a wrapped timeout returned error %v; the probe must report it as 'native is silent' so the caller tunnels, not as a hard Open failure", err)
+	}
+	if native {
+		t.Errorf("probe reported native=true on a timeout; nothing arrived")
+	}
+	if pkt != nil {
+		t.Errorf("probe returned a %d-byte packet on a timeout", len(pkt))
+	}
+	if len(conn.deadlines) != 2 || !conn.deadlines[1].IsZero() {
+		t.Errorf("probe left the expired deadline on the socket (%v); every subsequent read would fail instantly", conn.deadlines)
 	}
 }
