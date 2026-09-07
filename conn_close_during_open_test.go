@@ -33,7 +33,8 @@ import (
 // what it finds, so a Close that completes entirely between the bind and the
 // publish closes nothing — and an unguarded publish then attaches a live bound
 // socket to a conn nobody will ever close again, while Open returns nil and the
-// caller believes it succeeded. TestMulticastConnOpenOntoAClosedConnDoesNotLeak
+// caller believes it succeeded.
+// TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket
 // asserts that semantic deterministically; the race test below covers the
 // interleaving the detector is needed for. Both are required: the deterministic
 // one would pass on a fix that used no lock at all, and the race one would pass
