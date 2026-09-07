@@ -126,11 +126,28 @@ permissions:
 # failure, and only the missing PASS line reveals it. Anchoring the selection
 # narrows what runs; anchoring the match detects what did not.
 #
-# `^(...)$` constrains only the top-level test name -- go splits -run on `/` and
-# applies each element separately -- so subtests of a guarded test still run and
-# still report. go also emits exactly one space between the test name and the
-# `(0.00s)` duration field, for subtests too, so the trailing-space anchor is
-# safe for every passing test.
+# Naming a top-level test in `^(...)$` still runs and reports all of its
+# SUBTESTS: go applies the top-level element of -run to the top-level test name,
+# and an unconstrained subtest path underneath it matches everything. go also
+# emits exactly one space between the test name and the `(0.00s)` duration
+# field, for subtests too, so the trailing-space anchor is safe for every
+# passing test.
+#
+# GUARDED NAMES MUST BE TOP-LEVEL TESTS ONLY. Do not write `^(Parent/Sub)$`.
+# go's splitRegexp splits -run on `/` but tracks paren depth, so a `/` ENCLOSED
+# in parens is not a separator: the whole `Parent/Sub` is matched against the
+# top-level name alone, nothing matches, and go reports `[no tests to run]`.
+# Using each of these as the -run expression (spelled without the flag here, so
+# this illustration is not counted by a grep auditing the six real sites):
+#
+#     'Parent/subA'        -> parent + subA run
+#     '^(Parent/subA)$'    -> testing: warning: no tests to run
+#
+# That is a selection miss, not a silent pass -- the grep half turns it into a
+# loud `::error::<name> did not report a PASS line`, which is exactly the
+# complementarity described above. Still, guard the parent and let its subtests
+# come along; if you need one subtest specifically, assert it from inside the
+# test rather than by narrowing -run.
 #
 # This is a property of all six loops across `test`, `race` and `cgo-test`, not
 # of any one step. When BLO-32655 normalised the grep half, four of the six
