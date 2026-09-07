@@ -107,13 +107,39 @@ func (mc *MulticastConn) Open() error {
 			if err != nil {
 				return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 			}
-			// Publish under pathMu: Close reads conn4/conn6/amtGw under it, and
-			// IsUsingTunnel reads them under RLock. amtGw was already written
-			// under it in openTunnel; these two native assignments were the only
-			// one-sided writes left, so a consumer calling Close while Open is
-			// binding raced on the field itself. Scoped, not deferred --
-			// prepareTunnel below takes the same non-reentrant lock.
+			// Publish under pathMu, and only onto a conn that is still open.
+			//
+			// Close reads conn4/conn6/amtGw under this lock and closes whatever
+			// it snapshots; IsUsingTunnel reads them under RLock. amtGw was
+			// already written under it in openTunnel; these two native
+			// assignments were the only one-sided writes left, so a consumer
+			// calling Close while Open was binding raced on the field itself.
+			//
+			// The mc.closed check closes the wider hole the lock alone leaves. A
+			// Close that completes entirely between the bind above and this
+			// publish snapshots conn6 as nil and so closes nothing; without the
+			// check, this assignment would then hand a live bound socket to a
+			// conn nobody will ever close again, leaking the fd and its group
+			// membership for the process lifetime while Open still returned nil.
+			// openTunnel guards the gateway publication exactly this way, so the
+			// native path is no longer the odd one out.
+			//
+			// These fields are written ONCE, here, under the lock, and are then
+			// read WITHOUT it by activeConn, ReadBatch, ReadFrom, WriteTo and
+			// WriteBatch. That is safe only because of write-once plus the
+			// happens-before edges from Open's return and from the probe
+			// goroutine's start. A second write — a re-bind, a reconnect, a
+			// nil-out on close — would be racy against every one of those
+			// readers while looking correct next to this comment.
+			//
+			// Scoped, not deferred: prepareTunnel below takes the same
+			// non-reentrant lock.
 			mc.pathMu.Lock()
+			if mc.closed {
+				mc.pathMu.Unlock()
+				_ = conn.Close()
+				return net.ErrClosed
+			}
 			mc.conn6 = conn
 			mc.pathMu.Unlock()
 
@@ -149,10 +175,19 @@ func (mc *MulticastConn) Open() error {
 		if err != nil {
 			return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 		}
-		// See the v6 branch: publish under pathMu so Close and IsUsingTunnel
-		// cannot read this field while Open is writing it. Scoped rather than
-		// deferred because prepareTunnel takes the same non-reentrant lock.
+		// See the v6 branch above for the full rationale. In short: publish under
+		// pathMu so Close and IsUsingTunnel cannot read this field while Open
+		// writes it; refuse to publish onto an already-closed conn so a Close
+		// that landed during the bind cannot leak this socket; written once here
+		// and read unlocked afterwards, so do not add a second write. Scoped
+		// rather than deferred because prepareTunnel takes the same
+		// non-reentrant lock.
 		mc.pathMu.Lock()
+		if mc.closed {
+			mc.pathMu.Unlock()
+			_ = conn.Close()
+			return net.ErrClosed
+		}
 		mc.conn4 = conn
 		mc.pathMu.Unlock()
 
