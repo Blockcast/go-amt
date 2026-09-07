@@ -112,10 +112,11 @@ func TestBrokerDeliveryTargetReconciliation(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	firstPacket := []byte("first")
 	if err := biller.Tick(ledgerSamples(fanout)); err != nil {
 		t.Fatal(err)
 	}
-	sendPacket(t, fanout, destination, []byte("first"))
+	sendPacket(t, fanout, destination, firstPacket)
 	if err := biller.Tick(ledgerSamples(fanout)); err != nil {
 		t.Fatal(err)
 	}
@@ -162,8 +163,39 @@ func TestBrokerDeliveryTargetReconciliation(t *testing.T) {
 	if final.SubscriberID != grantA || final.CloseReason != delivery.CloseTicketExpired {
 		t.Fatalf("final record = %#v, want grant A TICKET_EXPIRED", final)
 	}
-	if final.PacketsOut != 0 || final.BytesOut != 0 {
-		t.Fatalf("final revoked grant = packets %d bytes %d, want 0 and 0 after the prior tick", final.PacketsOut, final.BytesOut)
+	// Grant A's single packet must be billed EXACTLY ONCE across its records —
+	// but not necessarily on any particular one of them.
+	//
+	// Do NOT "tighten" this back to `final.PacketsOut != 0 || final.BytesOut != 0`.
+	// That form asserts the pre-revocation Tick won a race it is not ordered
+	// against, and it went red in roughly half of CI runs (BLO-32580: the same
+	// commit failed the push-event run and passed the pull_request-event run).
+	// The mechanism, confirmed by widening the window and reproducing 5/5:
+	// the fan-out worker charges entry.counters AFTER the sendmmsg syscall
+	// returns (deliver, in receiver/fanout.go), while sendPacket waits only for
+	// the datagram to land on the destination socket — which happens inside
+	// that syscall. The counter increment can therefore still be invisible when
+	// Tick reads DestinationStats, and the delta then legitimately rides out on
+	// the close record instead of the tick.
+	//
+	// Both orderings are correct. What is actually guaranteed is the delta
+	// watermark: BytesOut/PacketsOut cover only traffic since the previous
+	// record and are never restated by a later one (emitLocked, in
+	// receiver/delivery/session.go), so the SUM over grant A's records is its
+	// true total. Asserting that sum is strictly stronger than the old check —
+	// it still fails if the tail delta is dropped after the table swap (the
+	// BLO-29760 defect this test exists to catch) or if it is double-billed.
+	var billedPackets, billedBytes uint64
+	for _, record := range records {
+		if record.SubscriberID != grantA {
+			continue
+		}
+		billedPackets += record.PacketsOut
+		billedBytes += record.BytesOut
+	}
+	if billedPackets != 1 || billedBytes != uint64(len(firstPacket)) {
+		t.Fatalf("grant A billed packets %d bytes %d across its records, want exactly 1 and %d billed once: %#v",
+			billedPackets, billedBytes, len(firstPacket), records)
 	}
 }
 
