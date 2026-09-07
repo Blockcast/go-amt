@@ -107,7 +107,65 @@ func (mc *MulticastConn) Open() error {
 			if err != nil {
 				return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 			}
+			// Publish under pathMu, and only onto a conn that is still open.
+			//
+			// Close reads conn4/conn6/amtGw under this lock and closes whatever
+			// it snapshots; IsUsingTunnel reads them under RLock; openTunnel
+			// reads them under RLock in its `wantTunnel && conn4 == nil &&
+			// conn6 == nil` predicate and again under Lock when it publishes
+			// the gateway. Those four are the complete set of locked readers,
+			// stated exhaustively because the unlocked list below is — a reader
+			// who sees one enumeration will assume the other. openTunnel's
+			// predicate is the reason publication ORDER matters and not just
+			// mutual exclusion: it decides native-vs-tunnel by observing
+			// whether these fields are still nil. amtGw was already written
+			// under this lock in openTunnel; these two native assignments were
+			// the only one-sided writes left, so a consumer calling Close while
+			// Open was binding raced on the field itself.
+			//
+			// The mc.closed check closes the wider hole the lock alone leaves. A
+			// Close that completes entirely between the bind above and this
+			// publish snapshots conn6 as nil and so closes nothing; without the
+			// check, this assignment would then hand a live bound socket to a
+			// conn nobody will ever close again, leaking the fd and its group
+			// membership for the process lifetime while Open still returned nil.
+			// openTunnel guards the gateway publication exactly this way, so the
+			// native path is no longer the odd one out.
+			//
+			// These fields are written ONCE, here, under the lock, and are then
+			// read WITHOUT it by activeConn, ReadBatch,
+			// ReadFromWithControlMessage, WriteToWithControlMessage, WriteBatch,
+			// probeNativeV4, probeNativeV6 and watchNativeV4. That is safe only
+			// because of write-once plus the happens-before edges from Open's
+			// return and from the probe goroutine's start. All three probe/watch
+			// readers sit behind that second edge: the publish above happens
+			// before the `go mc.probeNative*` below, and watchNativeV4 is reached
+			// only through probeNativeV4's synchronous call, so it inherits that
+			// edge rather than needing one of its own. A second write — a re-bind,
+			// a reconnect, a nil-out on close — would be racy against every one of
+			// those readers while looking correct next to this comment.
+			//
+			// Bind-then-guard is deliberate, and the tests depend on the order. An
+			// Open that races a Close therefore performs a real join and
+			// immediately leaves: exactly the IGMP join/leave pair for a group
+			// nothing here will read that the decide-then-bind ordering otherwise
+			// exists to avoid. Testing mc.closed *before* binding would not close
+			// the window — Close can still land during the bind — so that pair is
+			// the price of closing it completely rather than narrowing it. Do not
+			// "optimise" it into an early return: the deterministic guard test
+			// asserts the bind seam ran exactly once and fails with "the guard was
+			// reached without binding, so this test is vacuous".
+			//
+			// Scoped, not deferred: prepareTunnel below takes the same
+			// non-reentrant lock.
+			mc.pathMu.Lock()
+			if mc.closed {
+				mc.pathMu.Unlock()
+				_ = conn.Close()
+				return net.ErrClosed
+			}
 			mc.conn6 = conn
+			mc.pathMu.Unlock()
 
 			if plan.TunnelOnFailure {
 				mc.prepareTunnel()
@@ -141,7 +199,23 @@ func (mc *MulticastConn) Open() error {
 		if err != nil {
 			return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 		}
+		// See the v6 branch above for the full rationale. In short: publish under
+		// pathMu so the locked readers there — Close, IsUsingTunnel and
+		// openTunnel's two — cannot read this field while Open writes it;
+		// refuse to publish onto an already-closed conn so a Close
+		// that landed during the bind cannot leak this socket; written once here
+		// and read unlocked afterwards, so do not add a second write; bind before
+		// testing mc.closed, deliberately, which conn_close_during_open_test.go
+		// asserts. Scoped rather than deferred because prepareTunnel takes the
+		// same non-reentrant lock.
+		mc.pathMu.Lock()
+		if mc.closed {
+			mc.pathMu.Unlock()
+			_ = conn.Close()
+			return net.ErrClosed
+		}
 		mc.conn4 = conn
+		mc.pathMu.Unlock()
 
 		if plan.TunnelOnFailure {
 			mc.prepareTunnel()

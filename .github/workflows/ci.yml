@@ -191,11 +191,14 @@ jobs:
       #
       # This is a NARROWED race-coverage gap. It used to be a total build-coverage
       # gap — nothing on CI compiled those three files — which is how BLO-28640
-      # shipped. The cgo-test job below builds and tests them, and now runs the
-      # named Gateway.Open tests under -race (BLO-29064), so those specific tests
+      # shipped. The cgo-test job below builds and tests them, and runs named
+      # tests under -race: the Gateway.Open set (BLO-29064) and, since
+      # BLO-32575, conn.go's close-during-Open guards, so those specific tests
       # ARE race-covered. The rest of the package there still is not: anything
       # those tests do not reach — handleMembershipQuery, for one — has no race
-      # coverage on any job.
+      # coverage on any job. conn.go's v6 publication site is in that remainder,
+      # because the v6 bind has no substitutable seam and the real join cannot
+      # succeed on a stock runner.
       - run: go test -race -tags purego ./...
 
       # The same two guards the `test` lane carries, because this lane needs them
@@ -341,6 +344,18 @@ jobs:
           for t in fakenative_test.go fakenative_flows_test.go fakerelay_switchover_test.go; do
             printf '%s\n' "$tst" | grep -qxF "$t" || {
               echo "::error::$t is not in the cgo test selection; the MulticastConn switchover tests are not running anywhere"
+              rc=1
+            }
+          done
+          # The close-during-Open guards (BLO-32575). Same argument as the
+          # switchover files above, one step stronger: this is the ONLY file
+          # asserting conn.go's native publication site, and the -race step
+          # below is the only place its verdict means anything. Deselected here
+          # it is deselected everywhere, and the data race it guards would ship
+          # green exactly as BLO-28640 did.
+          for t in conn_close_during_open_test.go; do
+            printf '%s\n' "$tst" | grep -qxF "$t" || {
+              echo "::error::$t is not in the cgo test selection; the MulticastConn close-during-Open guards are not running anywhere"
               rc=1
             }
           done
@@ -509,6 +524,29 @@ jobs:
       # aggregate FAIL. Keep it first. The bare breadth run below still covers
       # everything not named here.
       #
+      # THE SAME RULE GOVERNS THE -race PROOF STEP that now follows this one,
+      # and it is here rather than only there because the rule is a property of
+      # the job's shape, not of either step: any step whose job is to *prove a
+      # named test ran* is worthless downstream of `Test`, because the breadth
+      # run aborts the job on the first failure anywhere in the module and takes
+      # the proof with it. That is not hypothetical either — at 263f67d4 an
+      # unrelated flake in cmd/blockcast-shreds aborted `Test` on the first
+      # attempt of the pull_request run, the -race step never executed, and
+      # BLO-32575's entire evidentiary basis was absent from that run (Ally
+      # review of go-amt#98; a re-run later passed, which is luck, not a
+      # mechanism). Worse than the missing proof is the inference it invites: a
+      # red cgo-test gets triaged as "the known flake, re-run it", and that
+      # dismissal discards the conn.go race verdict along with it. Any future
+      # prove-it-ran step goes above `Test` too.
+      #
+      # NOT YET DONE FOR ALL OF THEM, and the remainder is disclosed rather than
+      # left to be discovered: "Prove the MulticastConn switchover guards ran"
+      # and "Prove the native-delivery harness guards ran under cgo" both still
+      # sit below `Test` and carry exactly this defect. They were left in place
+      # because BLO-32575 moved only the step it made load-bearing, and moving
+      # those two as well reorders enough of the job to deserve its own change.
+      # They should move; treat this as the standing reason.
+      #
       # TestIGMPEnvelopeParityAcrossImplementations rides along because it is
       # the assertion that pins the Router Alert convergence the 44ff7e1d bump
       # carried, and it is only meaningful on this job — under CGO_ENABLED=0 it
@@ -545,10 +583,6 @@ jobs:
           done
           exit $rc
 
-      - name: Test
-        run: |
-          go test ./...
-
       # Run the Gateway.Open guards by name so the log carries positive proof
       # they executed, rather than a bare "ok" that is also what a fully
       # deselected package prints.
@@ -562,7 +596,24 @@ jobs:
       # (BLO-29064). Running the whole package under -race here would roughly
       # double the job; these named tests are the ones that actually exercise
       # gateway.go's concurrency, so the detector is pointed at them.
-      - name: Prove the Gateway.Open guards ran (under -race)
+      #
+      # conn.go joined this list in BLO-32575, and it had the same total gap for
+      # the same reason: MulticastConn.Open published conn4/conn6 outside pathMu
+      # while Close and IsUsingTunnel read them under it, and NO job ran that
+      # file under the detector — race deselects it via purego, and cgo-test's
+      # own `go test ./...` below has no detector. The switchover step further
+      # below exercises conn.go but not under -race, so it cannot adjudicate a
+      # field race either. These two names are the close-during-Open guards;
+      # without them here the test file compiles, passes without the detector,
+      # and proves nothing about the property it is named for.
+      #
+      # ORDERED BEFORE `Test`, for the reason spelled out in full on the
+      # BLO-28805 step above: a prove-it-ran step downstream of the breadth run
+      # is deleted by any flake anywhere in the module. This step is the ONLY
+      # place conn.go's race verdict means anything, so leaving it downstream
+      # made this PR's own proof hostage to packages it does not touch. Do not
+      # move it back below `Test`.
+      - name: Prove the Gateway.Open and MulticastConn publication guards ran (under -race)
         run: |
           set -euo pipefail
           # Capture the status rather than letting `set -e` abort here. With a
@@ -572,11 +623,13 @@ jobs:
           # the loop to run either way, then fail on the captured status.
           rc=0
           go test -v -count=1 -race \
-            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine' \
+            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine|TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket|TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns' \
             . 2>&1 | tee /tmp/cgo-test.log || rc=$?
           for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault \
                    TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress \
-                   TestStopKeepaliveIsObservedByTheKeepaliveGoroutine; do
+                   TestStopKeepaliveIsObservedByTheKeepaliveGoroutine \
+                   TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket \
+                   TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns; do
             # Anchored on the trailing space, as in the BLO-28805 step above:
             # TestGatewayOpenLogsTheRelayItIsAttempting is exactly the shape of
             # name a later sibling would extend.
@@ -586,6 +639,10 @@ jobs:
             }
           done
           exit $rc
+
+      - name: Test
+        run: |
+          go test ./...
 
       # The MulticastConn switchover guards. This lane is the only one that can
       # run them, so a silent deselection here leaves the live-path arbiter
