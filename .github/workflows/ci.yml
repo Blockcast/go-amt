@@ -94,32 +94,69 @@ permissions:
 # asserted everywhere. Each lane below asserts its own selection with `go list`,
 # because `go test` exits 0 whether a file was selected or not.
 #
-# Every "Prove ... ran" step below asserts its tests actually executed by
-# grepping the verbose log for a `--- PASS:` line per named test, and every one
-# of those greps anchors on the TRAILING SPACE -- the grep target is the test
-# name followed by a space, not the bare name:
+# Every "Prove ... ran" step below asserts its tests actually executed. Each one
+# does this in TWO places, and the two are complementary -- neither alone is
+# sufficient, so keep both when adding a guard:
 #
-#     "--- PASS: <name> "        <- the trailing space is not a typo
+#   1. ANCHORED SELECTION.  The -run expression is wrapped `^(A|B|C)$`, so go
+#      selects exactly the guarded names and nothing else.
+#   2. ANCHORED MATCHING.   The per-name grep targets the test name followed by
+#      a TRAILING SPACE, not the bare name:
 #
-# That space is load-bearing. `go test -run` matches its expression as an
-# UNANCHORED regexp, so a future test whose name merely EXTENDS a guarded one is
-# selected by the same -run expression, and go then prints
-# `--- PASS: <longer name> (0.00s)` -- a line that contains the shorter name as
-# a prefix. Without the trailing space the shorter name's guard is satisfied by
-# its sibling's PASS line, so the guard keeps passing after the test it exists
-# to protect has stopped running. That is exactly the vacuity these steps exist
-# to prevent, and it fails green and silent.
+#          "--- PASS: <name> "        <- the trailing space is not a typo
 #
-# go emits exactly one space between the test name and the `(0.00s)` duration
-# field, for subtests too, so the anchor is safe for every passing test.
+# Both exist because `go test -run` matches its expression as an UNANCHORED
+# regexp by default. Without (1), a future test whose name merely EXTENDS a
+# guarded one is selected by the same -run expression. Two distinct failures
+# follow, and each half stops one of them:
+#
+#   * The sibling PASSES.  go prints `--- PASS: <longer name> (0.00s)`, a line
+#     that contains the shorter name as a prefix, so an unanchored grep is
+#     satisfied by the sibling and keeps passing after the test it exists to
+#     protect has stopped running. (2) is what catches this.
+#   * The sibling FAILS.   go exits non-zero, the step's `rc` picks it up, and
+#     the step goes red with every per-name grep satisfied and NO `::error::`
+#     annotation -- a red step whose diagnostics say nothing and whose log
+#     blames a test these guards were never guarding. (1) is what catches this,
+#     by never selecting the sibling in the first place.
+#
+# (2) does not subsume (1): a failing sibling satisfies every grep, so matching
+# alone still yields the silent red. (1) does not subsume (2) either: a guarded
+# test that is renamed, deleted or t.Skip-ed is simply not selected, produces no
+# failure, and only the missing PASS line reveals it. Anchoring the selection
+# narrows what runs; anchoring the match detects what did not.
+#
+# Naming a top-level test in `^(...)$` still runs and reports all of its
+# SUBTESTS: go applies the top-level element of -run to the top-level test name,
+# and an unconstrained subtest path underneath it matches everything. go also
+# emits exactly one space between the test name and the `(0.00s)` duration
+# field, for subtests too, so the trailing-space anchor is safe for every
+# passing test.
+#
+# GUARDED NAMES MUST BE TOP-LEVEL TESTS ONLY. Do not write `^(Parent/Sub)$`.
+# go's splitRegexp splits -run on `/` but tracks paren depth, so a `/` ENCLOSED
+# in parens is not a separator: the whole `Parent/Sub` is matched against the
+# top-level name alone, nothing matches, and go reports `[no tests to run]`.
+# Using each of these as the -run expression (spelled without the flag here, so
+# this illustration is not counted by a grep auditing the six real sites):
+#
+#     'Parent/subA'        -> parent + subA run
+#     '^(Parent/subA)$'    -> testing: warning: no tests to run
+#
+# That is a selection miss, not a silent pass -- the grep half turns it into a
+# loud `::error::<name> did not report a PASS line`, which is exactly the
+# complementarity described above. Still, guard the parent and let its subtests
+# come along; if you need one subtest specifically, assert it from inside the
+# test rather than by narrowing -run.
 #
 # This is a property of all six loops across `test`, `race` and `cgo-test`, not
-# of any one step. When BLO-32655 normalised it, four of the six matched
-# unanchored; measured over the tree at that point there were 27 guarded names
-# and no strict-prefix collision among the 478 test functions, so the defect was
-# latent rather than live. Keep new guards in the anchored form -- a collision
-# introduces itself silently, and the first symptom is a guard that no longer
-# guards anything.
+# of any one step. When BLO-32655 normalised the grep half, four of the six
+# matched unanchored; BLO-32663 then anchored all six -run expressions. Measured
+# over the tree at that point there were 27 guarded names and no strict-prefix
+# collision among the 478 test functions, so both defects were latent rather
+# than live. Keep new guards in both anchored forms -- a collision introduces
+# itself silently, and the first symptom is either a guard that no longer guards
+# anything or a red step with no annotation.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -185,7 +222,8 @@ jobs:
           TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers
           TestNativeSourceFedGuardFiresWhenTheSourceIsDisabled'
           rc=0
-          go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness.log || rc=$?
+          # Anchored selection; see the prove-it-ran note above `jobs:`.
+          go test -v -count=1 -run "^($(echo $names | tr ' ' '|'))$" . 2>&1 | tee /tmp/native-harness.log || rc=$?
           for t in $names; do
             # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
             grep -qF -- "--- PASS: $t " /tmp/native-harness.log || {
@@ -275,7 +313,8 @@ jobs:
           TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers
           TestNativeSourceFedGuardFiresWhenTheSourceIsDisabled'
           rc=0
-          go test -race -tags purego -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness-race.log || rc=$?
+          # Anchored selection; see the prove-it-ran note above `jobs:`.
+          go test -race -tags purego -v -count=1 -run "^($(echo $names | tr ' ' '|'))$" . 2>&1 | tee /tmp/native-harness-race.log || rc=$?
           for t in $names; do
             # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
             grep -qF -- "--- PASS: $t " /tmp/native-harness-race.log || {
@@ -596,8 +635,9 @@ jobs:
         run: |
           set -euo pipefail
           rc=0
+          # Anchored selection; see the prove-it-ran note above `jobs:`.
           go test -v -count=1 \
-            -run 'TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestQueuedPacketsOwnPayloadAndSourceAddress|TestIGMPEnvelopeParityAcrossImplementations|TestDataStarvationReconnectsDespiteControlTraffic|TestHandshakeAnswersQueryWithCurrentStateUpdate' \
+            -run '^(TestUnsubscribeDuringPendingJoinPreservesOtherSource|TestV4MappedSubscriptionCompletesFullLifecycle|TestQueuedPacketsOwnPayloadAndSourceAddress|TestIGMPEnvelopeParityAcrossImplementations|TestDataStarvationReconnectsDespiteControlTraffic|TestHandshakeAnswersQueryWithCurrentStateUpdate)$' \
             . 2>&1 | tee /tmp/blo28805.log || rc=$?
           for t in TestUnsubscribeDuringPendingJoinPreservesOtherSource \
                    TestV4MappedSubscriptionCompletesFullLifecycle \
@@ -650,8 +690,9 @@ jobs:
           # reachable only for a skip (exit 0) and never for a failure. We want
           # the loop to run either way, then fail on the captured status.
           rc=0
+          # Anchored selection; see the prove-it-ran note above `jobs:`.
           go test -v -count=1 -race \
-            -run 'TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine|TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket|TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns' \
+            -run '^(TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine|TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket|TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns)$' \
             . 2>&1 | tee /tmp/cgo-test.log || rc=$?
           for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault \
                    TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress \
@@ -684,7 +725,8 @@ jobs:
           TestRelayAdvertisementMustBeDecodedAtItsReceivedLength
           TestZeroLengthDatagramIsNotDispatchedFromAStaleTypeByte'
           rc=0
-          go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/switchover.log || rc=$?
+          # Anchored selection; see the prove-it-ran note above `jobs:`.
+          go test -v -count=1 -run "^($(echo $names | tr ' ' '|'))$" . 2>&1 | tee /tmp/switchover.log || rc=$?
           for t in $names; do
             # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
             grep -qF -- "--- PASS: $t " /tmp/switchover.log || {
@@ -737,7 +779,8 @@ jobs:
           TestNativeDeliveryAssertionFailsWhenNativeNeverDelivers
           TestNativeSourceFedGuardFiresWhenTheSourceIsDisabled'
           rc=0
-          go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness-cgo.log || rc=$?
+          # Anchored selection; see the prove-it-ran note above `jobs:`.
+          go test -v -count=1 -run "^($(echo $names | tr ' ' '|'))$" . 2>&1 | tee /tmp/native-harness-cgo.log || rc=$?
           for t in $names; do
             # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
             grep -qF -- "--- PASS: $t " /tmp/native-harness-cgo.log || {
