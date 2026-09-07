@@ -93,6 +93,33 @@ permissions:
 # ManagedConn reaches it through the untagged relay_manager.go, so its arbiter is
 # asserted everywhere. Each lane below asserts its own selection with `go list`,
 # because `go test` exits 0 whether a file was selected or not.
+#
+# Every "Prove ... ran" step below asserts its tests actually executed by
+# grepping the verbose log for a `--- PASS:` line per named test, and every one
+# of those greps anchors on the TRAILING SPACE -- the grep target is the test
+# name followed by a space, not the bare name:
+#
+#     "--- PASS: <name> "        <- the trailing space is not a typo
+#
+# That space is load-bearing. `go test -run` matches its expression as an
+# UNANCHORED regexp, so a future test whose name merely EXTENDS a guarded one is
+# selected by the same -run expression, and go then prints
+# `--- PASS: <longer name> (0.00s)` -- a line that contains the shorter name as
+# a prefix. Without the trailing space the shorter name's guard is satisfied by
+# its sibling's PASS line, so the guard keeps passing after the test it exists
+# to protect has stopped running. That is exactly the vacuity these steps exist
+# to prevent, and it fails green and silent.
+#
+# go emits exactly one space between the test name and the `(0.00s)` duration
+# field, for subtests too, so the anchor is safe for every passing test.
+#
+# This is a property of all six loops across `test`, `race` and `cgo-test`, not
+# of any one step. When BLO-32655 normalised it, four of the six matched
+# unanchored; measured over the tree at that point there were 27 guarded names
+# and no strict-prefix collision among the 478 test functions, so the defect was
+# latent rather than live. Keep new guards in the anchored form -- a collision
+# introduces itself silently, and the first symptom is a guard that no longer
+# guards anything.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -160,7 +187,8 @@ jobs:
           rc=0
           go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness.log || rc=$?
           for t in $names; do
-            grep -qF -- "--- PASS: $t" /tmp/native-harness.log || {
+            # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
+            grep -qF -- "--- PASS: $t " /tmp/native-harness.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
             }
@@ -249,7 +277,8 @@ jobs:
           rc=0
           go test -race -tags purego -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness-race.log || rc=$?
           for t in $names; do
-            grep -qF -- "--- PASS: $t" /tmp/native-harness-race.log || {
+            # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
+            grep -qF -- "--- PASS: $t " /tmp/native-harness-race.log || {
               echo "::error::$t did not report a PASS line under -race; it was skipped, deselected or failed"
               rc=1
             }
@@ -576,10 +605,7 @@ jobs:
                    TestIGMPEnvelopeParityAcrossImplementations \
                    TestDataStarvationReconnectsDespiteControlTraffic \
                    TestHandshakeAnswersQueryWithCurrentStateUpdate; do
-            # Anchor on the trailing space before go's duration field. A bare
-            # prefix match would let a future test whose name extends one of
-            # these (…SourceAddressV6) satisfy the assertion for its shorter
-            # sibling.
+            # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
             grep -qF -- "--- PASS: $t " /tmp/blo28805.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
@@ -632,9 +658,7 @@ jobs:
                    TestStopKeepaliveIsObservedByTheKeepaliveGoroutine \
                    TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket \
                    TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns; do
-            # Anchored on the trailing space, as in the BLO-28805 step above:
-            # TestGatewayOpenLogsTheRelayItIsAttempting is exactly the shape of
-            # name a later sibling would extend.
+            # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
             grep -qF -- "--- PASS: $t " /tmp/cgo-test.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
@@ -662,7 +686,8 @@ jobs:
           rc=0
           go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/switchover.log || rc=$?
           for t in $names; do
-            grep -qF -- "--- PASS: $t" /tmp/switchover.log || {
+            # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
+            grep -qF -- "--- PASS: $t " /tmp/switchover.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
             }
@@ -714,7 +739,8 @@ jobs:
           rc=0
           go test -v -count=1 -run "$(echo $names | tr ' ' '|')" . 2>&1 | tee /tmp/native-harness-cgo.log || rc=$?
           for t in $names; do
-            grep -qF -- "--- PASS: $t" /tmp/native-harness-cgo.log || {
+            # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
+            grep -qF -- "--- PASS: $t " /tmp/native-harness-cgo.log || {
               echo "::error::$t did not report a PASS line under cgo; it was skipped, deselected or failed"
               rc=1
             }
