@@ -383,8 +383,8 @@ jobs:
       #
       # Ordering: after the selection assertion above, so a vacuous pass trips
       # that gate before vet can report clean over nothing; and before the
-      # BLO-28805 block below, so that block stays adjacent to the `Test` step it
-      # documents rather than reading as this step's preamble.
+      # BLO-28805 block below, so that block stays at the head of the proof
+      # cluster it documents rather than reading as this step's preamble.
       - name: Vet the cgo selection
         run: go vet ./...
 
@@ -539,13 +539,17 @@ jobs:
       # dismissal discards the conn.go race verdict along with it. Any future
       # prove-it-ran step goes above `Test` too.
       #
-      # NOT YET DONE FOR ALL OF THEM, and the remainder is disclosed rather than
-      # left to be discovered: "Prove the MulticastConn switchover guards ran"
-      # and "Prove the native-delivery harness guards ran under cgo" both still
-      # sit below `Test` and carry exactly this defect. They were left in place
-      # because BLO-32575 moved only the step it made load-bearing, and moving
-      # those two as well reorders enough of the job to deserve its own change.
-      # They should move; treat this as the standing reason.
+      # NOW TRUE OF ALL FOUR PROOF STEPS (BLO-32642). "Prove the MulticastConn
+      # switchover guards ran" and "Prove the native-delivery harness guards ran
+      # under cgo" used to sit below `Test` and carried exactly this defect. That
+      # was observed, not projected: on push run 34150720812 (head 4d890a25) both
+      # reported "skipped" behind a red `Test`, aborted by the
+      # TestBrokerDeliveryTargetReconciliation flake in cmd/blockcast-shreds — a
+      # package neither step covers. They pass on main today only because ab9d76e1
+      # (BLO-32580) removed that particular flake, which repairs one flake and not
+      # the shape that let it delete two unrelated proofs. Both now sit above
+      # `Test`, so the rule above is a property of this job's shape rather than a
+      # claim that holds for some of its proof steps and not others.
       #
       # TestIGMPEnvelopeParityAcrossImplementations rides along because it is
       # the assertion that pins the Router Alert convergence the 44ff7e1d bump
@@ -601,18 +605,16 @@ jobs:
       # the same reason: MulticastConn.Open published conn4/conn6 outside pathMu
       # while Close and IsUsingTunnel read them under it, and NO job ran that
       # file under the detector — race deselects it via purego, and cgo-test's
-      # own `go test ./...` below has no detector. The switchover step further
-      # below exercises conn.go but not under -race, so it cannot adjudicate a
+      # own `go test ./...` below has no detector. The switchover step that
+      # follows exercises conn.go but not under -race, so it cannot adjudicate a
       # field race either. These two names are the close-during-Open guards;
       # without them here the test file compiles, passes without the detector,
-      # and proves nothing about the property it is named for.
-      #
-      # ORDERED BEFORE `Test`, for the reason spelled out in full on the
-      # BLO-28805 step above: a prove-it-ran step downstream of the breadth run
-      # is deleted by any flake anywhere in the module. This step is the ONLY
-      # place conn.go's race verdict means anything, so leaving it downstream
-      # made this PR's own proof hostage to packages it does not touch. Do not
-      # move it back below `Test`.
+      # and proves nothing about the property it is named for. This step is
+      # therefore the ONLY place conn.go's race verdict means anything — which is
+      # why leaving it downstream of the breadth run made BLO-32575's own proof
+      # hostage to packages it does not touch. The ordering rule that puts it,
+      # and every other proof step, ahead of `Test` is stated once on the
+      # BLO-28805 step above.
       - name: Prove the Gateway.Open and MulticastConn publication guards ran (under -race)
         run: |
           set -euo pipefail
@@ -639,10 +641,6 @@ jobs:
             }
           done
           exit $rc
-
-      - name: Test
-        run: |
-          go test ./...
 
       # The MulticastConn switchover guards. This lane is the only one that can
       # run them, so a silent deselection here leaves the live-path arbiter
@@ -722,6 +720,10 @@ jobs:
             }
           done
           exit $rc
+
+      - name: Test
+        run: |
+          go test ./...
 
   # MulticastConn is defined three times under mutually exclusive build tags
   # (conn.go for cgo, conn_nocgo.go, conn_mobile.go for android/ios). Nothing in
