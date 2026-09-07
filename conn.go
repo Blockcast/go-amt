@@ -107,7 +107,15 @@ func (mc *MulticastConn) Open() error {
 			if err != nil {
 				return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 			}
+			// Publish under pathMu: Close reads conn4/conn6/amtGw under it, and
+			// IsUsingTunnel reads them under RLock. amtGw was already written
+			// under it in openTunnel; these two native assignments were the only
+			// one-sided writes left, so a consumer calling Close while Open is
+			// binding raced on the field itself. Scoped, not deferred --
+			// prepareTunnel below takes the same non-reentrant lock.
+			mc.pathMu.Lock()
 			mc.conn6 = conn
+			mc.pathMu.Unlock()
 
 			if plan.TunnelOnFailure {
 				mc.prepareTunnel()
@@ -141,7 +149,12 @@ func (mc *MulticastConn) Open() error {
 		if err != nil {
 			return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 		}
+		// See the v6 branch: publish under pathMu so Close and IsUsingTunnel
+		// cannot read this field while Open is writing it. Scoped rather than
+		// deferred because prepareTunnel takes the same non-reentrant lock.
+		mc.pathMu.Lock()
 		mc.conn4 = conn
+		mc.pathMu.Unlock()
 
 		if plan.TunnelOnFailure {
 			mc.prepareTunnel()
