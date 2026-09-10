@@ -228,13 +228,17 @@ func TestProbeYieldsNoPacketWhenClearingTheDeadlineFails(t *testing.T) {
 // managed_conn_native.go:54). Adding context is the natural thing for someone
 // touching one of them — fmt.Errorf("read %s: %w", group, err) — and under the
 // bare assertion that one edit silently reclassifies the timeout as a hard
-// failure, so Open returns an error instead of falling back to the tunnel.
+// failure.
 //
-// That is the BLO-28640 outage shape (native unreachable, no fallback taken)
-// arriving through error classification rather than through the deadline the
-// comment at the timeout branch already defends. The assertion here is on the
-// wrapped form specifically: the unwrapped case is already covered above and
-// would keep passing against the very assertion this guards.
+// On the MulticastConn v4 path that is the difference between the timeout
+// branch, which sets wantTunnel and starts watchNativeV4 (conn.go:204-208), and
+// the hard-error branch, which parks the connection on the tunnel with no
+// watcher to bring it back to native (conn.go:190). ManagedConn is unaffected
+// either way: its fallback is error-agnostic (managed_conn.go:188-193). The
+// assertion here is on the wrapped form specifically: the unwrapped case is
+// covered by TestProbeReturnsNoPacketOnTimeout (pending_packet_test.go:414),
+// which feeds a bare &net.OpError and would keep passing against the very
+// assertion this guards.
 func TestProbeClassifiesWrappedTimeoutAsTimeout(t *testing.T) {
 	conn := &probeConnStub{}
 

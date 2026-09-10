@@ -142,9 +142,18 @@ func probeNativeTraffic(conn nativeConn, window time.Duration, mtu int, read fun
 	// managed_conn_native.go:54), so the assertion happens to succeed — but the
 	// promise this branch keeps ("a timeout is the answer, not a failure") must
 	// not depend on that. Wrapping one closure for context is a one-line edit
-	// that would otherwise send a timeout to the hard-error return below, and
-	// Open would fail instead of handing the group to the tunnel: the BLO-28640
-	// shape reached through error classification rather than the deadline.
+	// that would otherwise send a timeout to the hard-error return below.
+	//
+	// The consequence is not a lost fallback: ManagedConn.Open falls through to
+	// the relay on any error once TunnelOnFailure is set (managed_conn.go:188-193)
+	// and never consults errNativeProbeTimedOut, so with a fallback configured a
+	// misclassified timeout still tunnels, and without one there was no fallback
+	// to lose. The divergence is on the MulticastConn v4 path: the hard-error
+	// branch in probeNativeV4 calls setActiveTunnel(true) and returns
+	// (conn.go:190), while the timeout branch also sets wantTunnel and starts
+	// watchNativeV4 (conn.go:204-208). A timeout routed through the wrong branch
+	// parks the connection on the tunnel with no watcher to ever bring it back to
+	// native — silent, and only visible as a group that never recovers.
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		// Clear the expired deadline even though every caller today hands the
