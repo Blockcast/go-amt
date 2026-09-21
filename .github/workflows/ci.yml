@@ -415,15 +415,22 @@ jobs:
               rc=1
             }
           done
-          # The close-during-Open guards (BLO-32575). Same argument as the
-          # switchover files above, one step stronger: this is the ONLY file
-          # asserting conn.go's native publication site, and the -race step
-          # below is the only place its verdict means anything. Deselected here
-          # it is deselected everywhere, and the data race it guards would ship
-          # green exactly as BLO-28640 did.
-          for t in conn_close_during_open_test.go; do
+          # The close-during-Open guards (BLO-32575) and the exported
+          # control-flag guard (BLO-34983). Same argument as the switchover
+          # files above, one step stronger: each is the ONLY file asserting its
+          # property of conn.go's native join sites, so deselected here they are
+          # deselected everywhere. For the close-during-Open guards that
+          # property is conn.go's native publication site, and the -race step
+          # below is the only place their verdict means anything — the data race
+          # they guard would otherwise ship green exactly as BLO-28640 did. For
+          # the control-flag guard it is that Open passes the exported
+          # ControlFlags4/ControlFlags6 rather than a local copy — the v6 half
+          # has no counterpart in any other lane, and a drift there silently
+          # truncates Dst off every v6 datagram in the consumer that sizes its
+          # OOB buffer from those constants.
+          for t in conn_close_during_open_test.go control_flags_conn_test.go; do
             printf '%s\n' "$tst" | grep -qxF "$t" || {
-              echo "::error::$t is not in the cgo test selection; the MulticastConn close-during-Open guards are not running anywhere"
+              echo "::error::$t is not in the cgo test selection; the MulticastConn guards in it are not running anywhere"
               rc=1
             }
           done
