@@ -353,3 +353,78 @@ func TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConnsV6(t *testing.T)
 		}
 	}
 }
+
+// TestMulticastConnOpenPublishesTheNativeV4Socket is the positive control for
+// the v4 publication site, and the only test that kills a mutation deleting
+// `mc.conn4 = conn` outright.
+//
+// Every other test in this file exercises the negative case, and none of them
+// sees that line execute. The deterministic guard tests Close first, so Open
+// returns at the mc.closed check and never reaches the publish; their
+// `conn4 != nil || conn6 != nil` assertion therefore only ever observes the
+// refusal. The race tests reach it only on the interleaving where Close lands
+// after Open's guard read, so their kill is probabilistic — a run in which all
+// 50 iterations put Close first is green on the mutant. A guard with no
+// deterministic failing mutation is a comment (BLO-35104).
+//
+// It also pins the branch: Open dispatches on GroupAddr.Is6(), so a v4 group
+// must leave conn6 untouched. That half is what makes the two tests
+// independent rather than one test run twice.
+func TestMulticastConnOpenPublishesTheNativeV4Socket(t *testing.T) {
+	handed, mu := handOutLoopbackNativeConns(t)
+
+	mc := newNativeOnlyConn()
+	if err := mc.Open(); err != nil {
+		t.Fatalf("Open() = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = mc.Close() })
+
+	mu.Lock()
+	n := len(*handed)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("bind seam called %d times, want 1; Open did not bind, so this test is vacuous", n)
+	}
+
+	mc.pathMu.RLock()
+	conn4, conn6 := mc.conn4, mc.conn6
+	mc.pathMu.RUnlock()
+	if conn4 == nil {
+		t.Fatal("Open() bound a native v4 socket and returned nil but did not publish it: conn4 is nil")
+	}
+	if conn6 != nil {
+		t.Fatalf("Open() on a v4 group published conn6=%v, want nil", conn6)
+	}
+}
+
+// TestMulticastConnOpenPublishesTheNativeV6Socket is the v6 half of
+// TestMulticastConnOpenPublishesTheNativeV4Socket; see that test for why the
+// negative cases cannot kill the publication-line mutation. The gap is
+// symmetric, so both halves exist — fixing only one leaves the other's
+// publication line asserted by nothing deterministic.
+func TestMulticastConnOpenPublishesTheNativeV6Socket(t *testing.T) {
+	handed, mu := handOutLoopbackNativeConnsV6(t)
+
+	mc := newNativeOnlyConnV6()
+	if err := mc.Open(); err != nil {
+		t.Fatalf("Open() = %v, want nil", err)
+	}
+	t.Cleanup(func() { _ = mc.Close() })
+
+	mu.Lock()
+	n := len(*handed)
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("v6 bind seam called %d times, want 1; Open did not bind, so this test is vacuous", n)
+	}
+
+	mc.pathMu.RLock()
+	conn4, conn6 := mc.conn4, mc.conn6
+	mc.pathMu.RUnlock()
+	if conn6 == nil {
+		t.Fatal("Open() bound a native v6 socket and returned nil but did not publish it: conn6 is nil")
+	}
+	if conn4 != nil {
+		t.Fatalf("Open() on a v6 group published conn4=%v, want nil", conn4)
+	}
+}
