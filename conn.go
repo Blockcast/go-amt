@@ -102,8 +102,7 @@ func (mc *MulticastConn) Open() error {
 		plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, probeWindow)
 
 		if plan.attemptNative() {
-			flags6 := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit
-			conn, err := ListenMulticastUDP6("udp6", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags6, mc.RcvBufBytes, mc.SndBufBytes)
+			conn, err := listenMulticastUDP6("udp6", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, ControlFlags6, mc.RcvBufBytes, mc.SndBufBytes)
 			if err != nil {
 				return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 			}
@@ -194,8 +193,7 @@ func (mc *MulticastConn) Open() error {
 	plan := planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, probeWindow)
 
 	if plan.attemptNative() {
-		flags4 := ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
-		conn, err := listenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, flags4, mc.RcvBufBytes, mc.SndBufBytes)
+		conn, err := listenMulticastUDP4("udp4", mc.IFace, mc.SrcAddr, dstAddr, prog, mc.Timestamp, mc.TTL, ControlFlags4, mc.RcvBufBytes, mc.SndBufBytes)
 		if err != nil {
 			return fmt.Errorf("failed to create conn %s on %s: %w", addr.String(), mc.IFace.Name, err)
 		}

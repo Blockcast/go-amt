@@ -40,13 +40,18 @@ import (
 // one would pass on a fix that used no lock at all, and the race one would pass
 // on a fix that locked the write and still leaked the socket.
 //
-// v4 ONLY, DELIBERATELY, AND THIS IS A RESIDUAL GAP. The v4 bind goes through
-// the listenMulticastUDP4 seam, so it can be substituted for a loopback socket;
-// the v6 bind at conn.go calls ListenMulticastUDP6 directly with no seam, and
-// the real v6 group join cannot succeed on a stock runner (no multicast route,
-// no CAP_NET_ADMIN). So the v6 publication site carries the identical guard and
-// is asserted by nothing here. Adding a v6 seam would close it; until then, a
-// regression reintroduced only on the v6 branch would ship green.
+// v4 ONLY TODAY, AND THE V6 GAP IS NOW CLOSABLE. The v4 bind goes through the
+// listenMulticastUDP4 seam, so it can be substituted for a loopback socket. The
+// v6 bind had no seam when this file was written, and a real v6 group join
+// cannot succeed on a stock runner (no multicast route, no CAP_NET_ADMIN), so
+// the identical guard at conn.go's v6 publication site is asserted by nothing
+// here. That blocker is gone: BLO-34983 added listen_seam6.go, conn.go:105 now
+// binds through listenMulticastUDP6, and its tag union is a superset of this
+// file's — so a v6 counterpart to handOutLoopbackNativeConns can hand out a
+// loopback *ipv6.PacketConn exactly the way the v4 one hands out an
+// *ipv4.PacketConn. Writing it is tracked as BLO-35057. Until that lands a
+// regression reintroduced only on the v6 branch still ships green, but the
+// reason is now that nobody has written the test, not that they cannot.
 
 // handOutLoopbackNativeConns substitutes the v4 bind seam with one that returns
 // a real loopback UDP socket, and records every socket it hands out so a test
