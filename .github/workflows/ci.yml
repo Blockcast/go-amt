@@ -154,9 +154,28 @@ permissions:
 # matched unanchored; BLO-32663 then anchored all six -run expressions. Measured
 # over the tree at that point there were 27 guarded names and no strict-prefix
 # collision among the 478 test functions, so both defects were latent rather
-# than live. Keep new guards in both anchored forms -- a collision introduces
+# than live AT THAT POINT -- one of them is live now, see the paragraph below,
+# so do not quote that measurement as current. Keep new guards in both anchored forms -- a collision introduces
 # itself silently, and the first symptom is either a guard that no longer guards
 # anything or a red step with no annotation.
+#
+# THAT IS NO LONGER THE TREE. BLO-35057 (472a4b7d) introduced the first LIVE
+# strict-prefix collisions, both in the cgo -race guard list below, and both by
+# adding a V6 sibling next to an existing name:
+#
+#     TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket
+#       <- strict prefix of ...TheNativeSocketV6
+#     TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns
+#       <- strict prefix of ...TheNativeConnsV6
+#
+# So (2) -- the trailing space in `grep -qF -- "--- PASS: $t "` -- is
+# LOAD-BEARING here, not belt-and-braces: drop it and a log containing only the
+# V6 sibling's PASS line satisfies the shorter v4 name vacuously, and the guard
+# reports a pass for a test that did not run. (1) still stops the other half:
+# the anchored `^(...)$` means the V6 sibling is selected because it is named,
+# not because it extends a neighbour, so a failing sibling cannot redden the
+# step under a v4 name. BLO-35104 verified the grep half by mutation -- space
+# removed, V6-only log, false PASS for the v4 name.
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -693,12 +712,16 @@ jobs:
       # file under the detector — race deselects it via purego, and cgo-test's
       # own `go test ./...` below has no detector. The switchover step that
       # follows exercises conn.go but not under -race, so it cannot adjudicate a
-      # field race either. These four names are the close-during-Open guards —
-      # a deterministic/race pair per address family, because the mutation they
-      # catch is per-branch and the v4 pair alone left the identical v6 guard
-      # asserted by nothing (BLO-35057). Without them here the test file
-      # compiles, passes without the detector, and proves nothing about the
-      # property it is named for. This step is
+      # field race either. Six of these names cover conn.go: a
+      # deterministic/race close-during-Open pair per address family, because
+      # the mutation they catch is per-branch and the v4 pair alone left the
+      # identical v6 guard asserted by nothing (BLO-35057), plus one
+      # publication positive control per family. The controls are what kill a
+      # mutation deleting `mc.conn4 = conn` / `mc.conn6 = conn` outright: the
+      # deterministic guards never reach that line, and the race guards reach
+      # it only on a favourable interleaving (BLO-35104). Without them here the
+      # test file compiles, passes without the detector, and proves nothing
+      # about the property it is named for. This step is
       # therefore the ONLY place conn.go's race verdict means anything — which is
       # why leaving it downstream of the breadth run made BLO-32575's own proof
       # hostage to packages it does not touch. The ordering rule that puts it,
@@ -715,7 +738,7 @@ jobs:
           rc=0
           # Anchored selection; see the prove-it-ran note above `jobs:`.
           go test -v -count=1 -race \
-            -run '^(TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine|TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket|TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns|TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocketV6|TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConnsV6)$' \
+            -run '^(TestGatewayOpenTimesOutAgainstSilentRelay|TestGatewayOpenZeroTimeoutUsesDefault|TestGatewayOpenLogsTheRelayItIsAttempting|TestGatewayOpenLogsWithoutARelayAddress|TestStopKeepaliveIsObservedByTheKeepaliveGoroutine|TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket|TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns|TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocketV6|TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConnsV6|TestMulticastConnOpenPublishesTheNativeV4Socket|TestMulticastConnOpenPublishesTheNativeV6Socket)$' \
             . 2>&1 | tee /tmp/cgo-test.log || rc=$?
           for t in TestGatewayOpenTimesOutAgainstSilentRelay TestGatewayOpenZeroTimeoutUsesDefault \
                    TestGatewayOpenLogsTheRelayItIsAttempting TestGatewayOpenLogsWithoutARelayAddress \
@@ -723,7 +746,9 @@ jobs:
                    TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket \
                    TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns \
                    TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocketV6 \
-                   TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConnsV6; do
+                   TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConnsV6 \
+                   TestMulticastConnOpenPublishesTheNativeV4Socket \
+                   TestMulticastConnOpenPublishesTheNativeV6Socket; do
             # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
             grep -qF -- "--- PASS: $t " /tmp/cgo-test.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
