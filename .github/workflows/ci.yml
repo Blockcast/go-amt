@@ -185,15 +185,22 @@ jobs:
       # here. Assert the split rather than trusting it: `go test` exits 0 whether
       # a file was selected or not, so a tag mistake would silently relocate
       # coverage between lanes — the same class of gap as BLO-28640.
+      #
+      # control_flags_managed_test.go (BLO-34983) rides the same `linux || darwin`
+      # tag for the same reason, and needs the guard more: conn.go's half of the
+      # exported-flag property lives in control_flags_conn_test.go, which is
+      # `cgo && !purego` and deselected here, so in THIS lane
+      # managed_conn_native.go is the only native join site built and this file is
+      # the only thing watching what flag set it passes.
       - name: Assert the native-delivery harness is selected in this lane
         run: |
           set -euo pipefail
           tst=$(go list -f '{{join .TestGoFiles "\n"}}{{"\n"}}{{join .XTestGoFiles "\n"}}' .)
           echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
           rc=0
-          for t in fakenative_test.go fakenative_flows_test.go; do
+          for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go; do
             printf '%s\n' "$tst" | grep -qxF "$t" || {
-              echo "::error::$t is not in the CGO_ENABLED=0 test selection; the ManagedConn switchover tests are not running in this lane"
+              echo "::error::$t is not in the CGO_ENABLED=0 test selection; the ManagedConn guards in it are not running in this lane"
               rc=1
             }
           done
@@ -276,15 +283,21 @@ jobs:
       # tag edit that dropped the harness out of this lane would take both with
       # it and print nothing: `go test` exits 0 whether a file was selected or
       # not. That is the BLO-28640 shape, in the lane this harness needs most.
+      #
+      # control_flags_managed_test.go (BLO-34983) is in the list for the reason
+      # given in the `test` lane: purego deselects conn.go, so
+      # managed_conn_native.go is the only native join site built here and this
+      # file is the only thing asserting it passes the exported ControlFlags4
+      # rather than a local copy.
       - name: Assert the native-delivery harness is selected in this lane
         run: |
           set -euo pipefail
           tst=$(go list -tags purego -f '{{join .TestGoFiles "\n"}}{{"\n"}}{{join .XTestGoFiles "\n"}}' .)
           echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
           rc=0
-          for t in fakenative_test.go fakenative_flows_test.go; do
+          for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go; do
             printf '%s\n' "$tst" | grep -qxF "$t" || {
-              echo "::error::$t is not in the -tags purego test selection; the ManagedConn switchover tests are not race-covered"
+              echo "::error::$t is not in the -tags purego test selection; the ManagedConn guards in it are not running in the race lane"
               rc=1
             }
           done
