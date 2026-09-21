@@ -434,10 +434,3 @@ func calculateChecksum(data []byte) uint16 {
 	sum += (sum >> 16)
 	return ^uint16(sum)
 }
-
-func determineAMTmessageType(data []byte) m.MessageType {
-	if len(data) == 0 {
-		return 0
-	}
-	return m.MessageType(data[0])
-}
