@@ -12,6 +12,7 @@ import (
 
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // Close-during-Open guards for MulticastConn's native publication site.
@@ -40,18 +41,22 @@ import (
 // one would pass on a fix that used no lock at all, and the race one would pass
 // on a fix that locked the write and still leaked the socket.
 //
-// v4 ONLY TODAY, AND THE V6 GAP IS NOW CLOSABLE. The v4 bind goes through the
-// listenMulticastUDP4 seam, so it can be substituted for a loopback socket. The
-// v6 bind had no seam when this file was written, and a real v6 group join
-// cannot succeed on a stock runner (no multicast route, no CAP_NET_ADMIN), so
-// the identical guard at conn.go's v6 publication site is asserted by nothing
-// here. That blocker is gone: BLO-34983 added listen_seam6.go, conn.go:105 now
-// binds through listenMulticastUDP6, and its tag union is a superset of this
-// file's — so a v6 counterpart to handOutLoopbackNativeConns can hand out a
-// loopback *ipv6.PacketConn exactly the way the v4 one hands out an
-// *ipv4.PacketConn. Writing it is tracked as BLO-35057. Until that lands a
-// regression reintroduced only on the v6 branch still ships green, but the
-// reason is now that nobody has written the test, not that they cannot.
+// BOTH FAMILIES ARE COVERED, AND BOTH HALVES EXIST FOR EACH (BLO-35057). conn.go
+// carries the identical pathMu + mc.closed guard at its v4 and v6 publication
+// sites, and each is asserted here by its own deterministic/race pair — four
+// tests, all four named in ci.yml's cgo -race -run list. v6 was the residual gap
+// until BLO-34983 added listen_seam6.go: before it, the v6 bind called
+// ListenMulticastUDP6 directly with nothing to substitute, and a real v6 group
+// join cannot succeed on a stock runner (no multicast route, no CAP_NET_ADMIN),
+// so a regression reintroduced only on the v6 branch shipped green. The seam's
+// tag union — `(linux && !android) || (darwin && !ios)` — is a superset of this
+// file's, so it is available wherever this file builds.
+//
+// The two families are guarded separately rather than through one table-driven
+// test because the mutation they exist to catch is per-branch: deleting the
+// mc.closed check from the v6 site alone leaves the v4 site intact, and a shared
+// test parameterised over both would have to fail for the right family to prove
+// anything. Two named pairs make the -race -run list say which site ran.
 
 // handOutLoopbackNativeConns substitutes the v4 bind seam with one that returns
 // a real loopback UDP socket, and records every socket it hands out so a test
@@ -208,6 +213,143 @@ func TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns(t *testing.T) {
 	for i, s := range sockets {
 		if cerr := s.Close(); cerr == nil {
 			t.Fatalf("socket %d of %d survived Open+Close: neither path closed it", i, len(sockets))
+		}
+	}
+}
+
+// handOutLoopbackNativeConnsV6 is the v6 counterpart of
+// handOutLoopbackNativeConns: it substitutes the listenMulticastUDP6 seam with
+// one returning a real loopback UDP socket and records every socket handed out.
+// The rationale is the v4 one verbatim — real sockets because the assertion is
+// about ownership of an fd, and a second Close on an already-closed
+// *net.UDPConn is the observation that answers it; mutex-guarded because the
+// race test calls the seam from a goroutine racing the test body.
+//
+// It binds [::1]:0, not a v6 multicast group. The group join is precisely what a
+// stock runner cannot do, and it is not what is under test: the guard runs after
+// the bind regardless of what the bind joined.
+//
+// The seam is package state, so a test using this must not call t.Parallel.
+func handOutLoopbackNativeConnsV6(t *testing.T) (handed *[]*net.UDPConn, mu *sync.Mutex) {
+	t.Helper()
+
+	var (
+		lock    sync.Mutex
+		sockets []*net.UDPConn
+	)
+
+	orig := listenMulticastUDP6
+	listenMulticastUDP6 = func(network string, ifi *net.Interface, saddr netip.Addr,
+		gaddr *net.UDPAddr, f []bpf.RawInstruction, timestamp bool, hoplimit int,
+		flags6 ipv6.ControlFlags, rcvBufBytes, sndBufBytes int) (*ipv6.PacketConn, error) {
+		udp, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback, Port: 0})
+		if err != nil {
+			return nil, err
+		}
+		lock.Lock()
+		sockets = append(sockets, udp)
+		lock.Unlock()
+		return ipv6.NewPacketConn(udp), nil
+	}
+	t.Cleanup(func() {
+		listenMulticastUDP6 = orig
+		lock.Lock()
+		for _, s := range sockets {
+			_ = s.Close()
+		}
+		lock.Unlock()
+	})
+
+	return &sockets, &lock
+}
+
+// newNativeOnlyConnV6 is newNativeOnlyConn with a v6 group, which is the only
+// thing that selects conn.go's v6 branch: Open dispatches on GroupAddr.Is6().
+// Everything else is identical and for the same reason — no relay plus an
+// explicit native mode yields the zero probePlan, so Open binds, publishes and
+// returns without starting the probe or tunnel goroutines.
+func newNativeOnlyConnV6() *MulticastConn {
+	return &MulticastConn{
+		SrcAddr:   netip.MustParseAddr("2001:db8::1"),
+		GroupAddr: netip.MustParseAddr("ff3e::8000:1"),
+		GroupPort: 5005,
+		IFace:     &net.Interface{Index: 0, Name: "gonotexist0", MTU: 1500},
+		Mode:      AMTModeNative,
+		Timeout:   time.Second,
+	}
+}
+
+// TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocketV6 is the v6
+// half of TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket, and
+// asserts the same semantic at conn.go's v6 publication site. See that test for
+// why close-then-Open is the deterministic form of the interleaving.
+func TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocketV6(t *testing.T) {
+	handed, mu := handOutLoopbackNativeConnsV6(t)
+
+	mc := newNativeOnlyConnV6()
+	if err := mc.Close(); err != nil {
+		t.Fatalf("Close() on a fresh conn = %v, want nil", err)
+	}
+
+	err := mc.Open()
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Open() after Close() = %v, want net.ErrClosed", err)
+	}
+
+	mu.Lock()
+	sockets := append([]*net.UDPConn(nil), *handed...)
+	mu.Unlock()
+	if len(sockets) != 1 {
+		t.Fatalf("v6 bind seam called %d times, want 1; the guard was reached without binding, so this test is vacuous", len(sockets))
+	}
+
+	if cerr := sockets[0].Close(); cerr == nil {
+		t.Fatal("Open() refused to publish but leaked the native v6 socket: it was still open after Open returned")
+	}
+
+	mc.pathMu.RLock()
+	conn4, conn6 := mc.conn4, mc.conn6
+	mc.pathMu.RUnlock()
+	if conn4 != nil || conn6 != nil {
+		t.Fatalf("Open() published onto a closed conn: conn4=%v conn6=%v, want both nil", conn4, conn6)
+	}
+}
+
+// TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConnsV6 is the v6 half
+// of TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConns. Its verdict
+// comes from -race, so like its v4 twin it must be named in ci.yml's cgo -race
+// -run list or it proves nothing; see that test for the full rationale.
+func TestMulticastConnCloseDuringOpenDoesNotRaceOnTheNativeConnsV6(t *testing.T) {
+	handed, mu := handOutLoopbackNativeConnsV6(t)
+
+	const attempts = 50
+	for i := 0; i < attempts; i++ {
+		mc := newNativeOnlyConnV6()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = mc.Open()
+		}()
+		go func() {
+			defer wg.Done()
+			_ = mc.Close()
+		}()
+		wg.Wait()
+
+		_ = mc.Close()
+	}
+
+	mu.Lock()
+	sockets := append([]*net.UDPConn(nil), *handed...)
+	mu.Unlock()
+	if len(sockets) == 0 {
+		t.Fatal("v6 bind seam was never called; this test is vacuous")
+	}
+	for i, s := range sockets {
+		if cerr := s.Close(); cerr == nil {
+			t.Fatalf("v6 socket %d of %d survived Open+Close: neither path closed it", i, len(sockets))
 		}
 	}
 }
