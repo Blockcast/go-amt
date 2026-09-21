@@ -238,8 +238,8 @@ func (g *GatewayWASM) decapsulateMulticastData(data []byte) (payload []byte, sou
 	// Parse encapsulated IP packet
 	p := gopacket.NewPacket(ipPacket, layers.LayerTypeIPv4, gopacket.NoCopy)
 
-	ipHdr := p.NetworkLayer().(*layers.IPv4)
-	if ipHdr == nil {
+	ipHdr, ok := p.NetworkLayer().(*layers.IPv4)
+	if !ok || ipHdr == nil {
 		return nil, nil, fmt.Errorf("no IPv4 header in multicast data")
 	}
 

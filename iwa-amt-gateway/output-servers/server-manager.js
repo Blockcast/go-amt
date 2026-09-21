@@ -111,7 +111,7 @@ export class ServerManager {
 
     await Promise.allSettled(promises);
 
-    this.enabled = true;
+    this.enabled = Object.values(results).some((result) => result.success);
     this.startTime = Date.now();
     this.stats.startedAt = this.startTime;
 
@@ -389,4 +389,3 @@ export class ServerManager {
 
 // Export singleton instance
 export const serverManager = new ServerManager();
-

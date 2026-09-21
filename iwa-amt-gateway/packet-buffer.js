@@ -326,7 +326,9 @@ export class PacketBuffer {
 
       this.packetsAppended += packets.length;
       this.consecutiveErrors = 0;  // Reset error counter on successful append
-      this.sourceBuffer.appendBuffer(dataToAppend.buffer);
+      // Keep the sanitized view's offset and length. Passing .buffer would
+      // append the discarded pre-keyframe bytes as well.
+      this.sourceBuffer.appendBuffer(dataToAppend);
     } catch (error) {
       console.error('[PacketBuffer] Error appending buffer:', error);
       // Clear buffer on error
@@ -598,4 +600,3 @@ export class PacketBuffer {
     this.mediaSource = null;
   }
 }
-

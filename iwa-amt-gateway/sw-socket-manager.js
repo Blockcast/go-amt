@@ -147,7 +147,7 @@ class SocketManager {
         
         // Invoke callback
         if (onPacket) {
-          onPacket(packet, remoteAddress, remotePort, relayId);
+          await onPacket(packet, remoteAddress, remotePort, relayId);
         }
       }
     } catch (error) {
@@ -266,5 +266,4 @@ class SocketManager {
 }
 
 export const socketManager = new SocketManager();
-
 

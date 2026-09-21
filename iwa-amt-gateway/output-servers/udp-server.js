@@ -183,7 +183,7 @@ export class LocalUDPServer {
    * Broadcast packet to subscribed clients
    */
   async broadcastPacket(rawPayload, sourceIP, groupIP, groupPort) {
-    if (!this.enabled || !this.dataSocket) {
+    if (!this.enabled || !this.dataWriter) {
       return 0;
     }
     
@@ -275,6 +275,5 @@ export class LocalUDPServer {
 
 // Export singleton instance
 export const udpServer = new LocalUDPServer();
-
 
 

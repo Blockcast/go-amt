@@ -27,6 +27,12 @@ All output servers receive raw UDP multicast packets from the AMT gateway and fo
 
 - **Port:** 5002 (WebSocket)
 - **Protocol:** JSON messages over WebSocket
+
+The legacy Chrome Apps socket implementation is not registered by the IWA
+service worker. Direct Sockets exposes `TCPServerSocket`, not
+`chrome.sockets.tcp`; the worker currently exposes the Direct Sockets UDP
+output only rather than reporting a non-functional WebSocket listener as
+healthy.
 - **Best For:** Web applications, bidirectional communication
 - **Status:** 🚧 To be implemented
 
@@ -67,7 +73,6 @@ See `/tests/*.test.js` for test specifications.
 ## API Documentation
 
 See [/iwa-reorganization-tdd.plan.md](/iwa-reorganization-tdd.plan.md) for complete API specifications for each server.
-
 
 
 

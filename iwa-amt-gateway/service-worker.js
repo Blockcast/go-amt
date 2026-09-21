@@ -9,7 +9,6 @@ import { socketManager } from './sw-socket-manager.js';
 // Import output servers
 import { serverManager } from './output-servers/server-manager.js';
 import { LocalUDPServer } from './output-servers/udp-server.js';
-import { LocalWebSocketServer } from './output-servers/websocket-server.js';
 
 // Import packet parser for (S,G) extraction
 import { parsePacketMetadata, formatSG } from './packet-parser.js';
@@ -44,10 +43,7 @@ self.addEventListener('activate', (event) => {
         try {
           // Register servers
           const udpServer = new LocalUDPServer();
-          const wsServer = new LocalWebSocketServer();
-          
           serverManager.registerServer('udp', udpServer);
-          serverManager.registerServer('websocket', wsServer);
           
           // Start servers
           const results = await serverManager.startAll();
@@ -133,14 +129,17 @@ self.addEventListener('message', async (event) => {
           // Forward packet to all clients for MediaSource playback (direct streaming)
           const clients = await self.clients.matchAll();
           clients.forEach(client => {
+            // Transfer a per-client copy so the receive buffer remains
+            // available for output-server forwarding and other clients.
+            const clientPacket = packet.slice();
             client.postMessage({
               type: 'UDP_PACKET',
-              data: Array.from(packet),
+              data: clientPacket.buffer,
               remoteAddress: remoteAddress || '0.0.0.0',
               remotePort: remotePort || 0,
               size: packet.length,
               relayId
-            });
+            }, [clientPacket.buffer]);
           });
           
         // ALSO forward to output servers for external clients
@@ -238,14 +237,15 @@ self.addEventListener('message', async (event) => {
         // Forward to all clients
         const clients = await self.clients.matchAll();
         clients.forEach(client => {
+          const clientPacket = packet.slice();
           client.postMessage({
             type: 'UDP_PACKET',
-            data: Array.from(packet),
+            data: clientPacket.buffer,
             remoteAddress: '127.0.0.1',
             remotePort: 0,
             size: packet.length,
             relayId: relayId || 'test'
-          });
+          }, [clientPacket.buffer]);
         });
         
         event.ports[0].postMessage({ 
