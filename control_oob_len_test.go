@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/ipv4"
@@ -46,19 +47,28 @@ var timestampSockoptsCoveredBy32 = map[string]bool{
 // whichever one job compiles, and the AST walk does not need the file it reads
 // to be selected by the current build tags.
 func TestTimestampSockoptsAreAllAccountedFor(t *testing.T) {
-	files, err := filepath.Glob("listen_multicast*.go")
+	// Every non-test file in the package, not just the listen files: gateway.go
+	// and transport_udp_posix.go set the option on sockets whose cmsgs land in
+	// the same caller-supplied OOB buffer this constant sizes, and a glob that
+	// covered only the listen files kept seen > 0 while those two drifted.
+	// Test files are skipped because they name SO_TIMESTAMPING in prose and
+	// fixtures, which would satisfy the seen == 0 check without a real caller.
+	files, err := filepath.Glob("*.go")
 	if err != nil {
-		t.Fatalf("glob listen files: %v", err)
+		t.Fatalf("glob package files: %v", err)
 	}
 	if len(files) == 0 {
-		t.Fatal("no listen_multicast*.go files matched — the join sites were " +
-			"renamed and this guard is now inspecting nothing. Re-point the glob " +
-			"rather than deleting it: a guard that silently matches an empty set " +
-			"reports success for every possible upstream change")
+		t.Fatal("no .go files matched in the package directory, so this guard " +
+			"is inspecting nothing. Re-point the glob rather than deleting it: a " +
+			"guard that silently matches an empty set reports success for every " +
+			"possible upstream change")
 	}
 
 	seen := 0
 	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
 		f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
@@ -82,7 +92,7 @@ func TestTimestampSockoptsAreAllAccountedFor(t *testing.T) {
 		})
 	}
 	if seen == 0 {
-		t.Fatal("no SO_TIMESTAMP* option found in any listen file. Either this " +
+		t.Fatal("no SO_TIMESTAMP* option found in any non-test file of this package. Either this " +
 			"package stopped requesting timestamps — in which case " +
 			"TimestampControlMessageLen is now dead weight in every caller's " +
 			"buffer — or the option moved somewhere this guard does not look, " +
