@@ -220,19 +220,18 @@ export class LocalUDPServer {
    * Send control message
    */
   async sendControl(data, address, port) {
-    if (!this.controlSocket) return;
+    if (!this.dataWriter) return;
     
     try {
-      const { writable } = await this.controlSocket.opened;
-      const writer = writable.getWriter();
-      
-      await writer.write({
+      // start() holds the control socket's only writer (this.dataWriter) for
+      // the life of the server, so a second getWriter() on the same stream
+      // throws and the ACK is lost. Reuse the held writer; the destination is
+      // per-write anyway.
+      await this.dataWriter.write({
         data: data,
         remoteAddress: address,
         remotePort: port
       });
-      
-      writer.releaseLock();
     } catch (error) {
       console.error('[UDP Server] Failed to send control message:', error);
     }
