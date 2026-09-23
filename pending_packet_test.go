@@ -412,7 +412,7 @@ func TestProbeReturnsThePacketItRead(t *testing.T) {
 func TestProbeReturnsNoPacketOnTimeout(t *testing.T) {
 	conn := &probeConnStub{}
 	pkt, native, err := probeNativeTraffic(conn, time.Second, 1500, func([]byte) (int, error) {
-		return 0, &net.OpError{Op: "read", Err: timeoutError{}}
+		return 0, &net.OpError{Op: "read", Err: pendingTimeoutError{}}
 	})
 	if err != nil {
 		t.Fatalf("a probe timeout is a decision, not an error, but got: %v", err)
@@ -447,8 +447,8 @@ func TestProbeDistinguishesZeroLengthDatagramFromSilence(t *testing.T) {
 
 // timeoutError is a net.Error reporting a timeout, which is how the probe
 // distinguishes "the window elapsed" from a real read failure.
-type timeoutError struct{}
+type pendingTimeoutError struct{}
 
-func (timeoutError) Error() string   { return "i/o timeout" }
-func (timeoutError) Timeout() bool   { return true }
-func (timeoutError) Temporary() bool { return true }
+func (pendingTimeoutError) Error() string   { return "i/o timeout" }
+func (pendingTimeoutError) Timeout() bool   { return true }
+func (pendingTimeoutError) Temporary() bool { return true }

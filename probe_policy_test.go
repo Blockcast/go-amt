@@ -243,7 +243,7 @@ func TestProbeClassifiesWrappedTimeoutAsTimeout(t *testing.T) {
 	conn := &probeConnStub{}
 
 	pkt, native, err := probeNativeTraffic(conn, time.Second, 1500, func([]byte) (int, error) {
-		return 0, fmt.Errorf("read %s: %w", "239.0.0.1", timeoutError{})
+		return 0, fmt.Errorf("read %s: %w", "239.0.0.1", pendingTimeoutError{})
 	})
 
 	if err != nil {

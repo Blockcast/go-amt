@@ -890,3 +890,22 @@ jobs:
         run: GOOS=windows GOARCH=amd64 go build ./...
       - name: Build js/wasm non-native selection
         run: GOOS=js GOARCH=wasm go build ./...
+
+  # The iwa-amt-gateway output-server unit suites are the only tests for that
+  # JavaScript; without this job no CI run executes them.
+  iwa-unit:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: iwa-amt-gateway
+    env:
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: iwa-amt-gateway/package-lock.json
+      - run: npm ci
+      - run: npm run test:unit

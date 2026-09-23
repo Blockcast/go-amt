@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Blockcast AMT Stream Consumer</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>🎥 Blockcast AMT Stream Consumer</h1>
+      <p>Connect to multicast streams via IWA Gateway</p>
+    </header>
+
+    <main>
+      <!-- Connection Panel -->
+      <section class="panel connection-panel">
+        <h2>📡 Connection Settings</h2>
+        
+        <div class="form-group">
+          <label for="protocol">Output Server Protocol</label>
+          <select id="protocol">
+            <option value="tcp">TCP/HTTP (Port 5001) - Recommended</option>
+            <option value="websocket">WebSocket (Port 5002)</option>
+            <option value="udp" disabled>UDP (Port 5000) - Not supported in browser</option>
+          </select>
+          <small>TCP/HTTP works best for MPEG-TS playback</small>
+        </div>
+
+        <div class="form-group">
+          <label for="gateway-host">IWA Gateway Host</label>
+          <input type="text" id="gateway-host" value="localhost" placeholder="localhost">
+          <small>Usually localhost when IWA is running locally</small>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="source-ip">Source IP</label>
+            <input type="text" id="source-ip" value="*" placeholder="*">
+            <small>Use * for wildcard</small>
+          </div>
+
+          <div class="form-group">
+            <label for="group-ip">Multicast Group IP</label>
+            <input type="text" id="group-ip" value="239.255.1.1" placeholder="239.255.1.1">
+            <small>224.0.0.0 - 239.255.255.255</small>
+          </div>
+
+          <div class="form-group">
+            <label for="group-port">Group Port</label>
+            <input type="number" id="group-port" value="5000" placeholder="5000">
+            <small>Multicast port number</small>
+          </div>
+        </div>
+
+        <div class="button-group">
+          <button id="connect-btn" class="btn btn-primary">🔌 Connect</button>
+          <button id="disconnect-btn" class="btn btn-secondary" disabled>⏹️ Disconnect</button>
+        </div>
+
+        <div id="connection-status" class="status-indicator disconnected">
+          <span class="status-dot"></span>
+          <span class="status-text">Disconnected</span>
+        </div>
+      </section>
+
+      <!-- Channel Presets -->
+      <section class="panel presets-panel">
+        <h2>📺 Channel Presets</h2>
+        <p>Quick access to menu.treedn.net streams</p>
+        
+        <div class="channel-grid">
+          <button class="channel-btn" data-source="*" data-group="239.100.1.1" data-port="5000">
+            📺 Channel 1
+          </button>
+          <button class="channel-btn" data-source="*" data-group="239.100.1.2" data-port="5000">
+            📺 Channel 2
+          </button>
+          <button class="channel-btn" data-source="*" data-group="239.100.1.3" data-port="5000">
+            📺 Channel 3
+          </button>
+          <button class="channel-btn" data-source="*" data-group="239.255.1.1" data-port="5000">
+            📺 Test Stream
+          </button>
+        </div>
+      </section>
+
+      <!-- Video Player -->
+      <section class="panel player-panel">
+        <h2>🎬 Video Player</h2>
+        
+        <div class="video-container">
+          <video id="video-player" controls></video>
+          <div id="player-overlay" class="player-overlay">
+            <div class="overlay-content">
+              <p>📡 Connect to a stream to start playback</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="player-info">
+          <div class="info-item">
+            <label>Stream:</label>
+            <span id="current-stream">None</span>
+          </div>
+          <div class="info-item">
+            <label>Protocol:</label>
+            <span id="current-protocol">-</span>
+          </div>
+          <div class="info-item">
+            <label>Bitrate:</label>
+            <span id="current-bitrate">-</span>
+          </div>
+          <div class="info-item">
+            <label>Dropped Frames:</label>
+            <span id="dropped-frames">0</span>
+          </div>
+        </div>
+      </section>
+
+      <!-- Statistics -->
+      <section class="panel stats-panel">
+        <h2>📊 Statistics</h2>
+        
+        <div class="stats-grid">
+          <div class="stat-card">
+            <div class="stat-value" id="bytes-received">0</div>
+            <div class="stat-label">Bytes Received</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="packets-received">0</div>
+            <div class="stat-label">Packets</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="connection-time">0s</div>
+            <div class="stat-label">Connected</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-value" id="buffer-level">0%</div>
+            <div class="stat-label">Buffer</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Logs -->
+      <section class="panel logs-panel">
+        <h2>📝 Connection Logs</h2>
+        <div id="log-container" class="log-container">
+          <div class="log-entry info">
+            <span class="log-time">[00:00:00]</span>
+            <span class="log-level">INFO</span>
+            <span class="log-message">Consumer app loaded. Ready to connect.</span>
+          </div>
+        </div>
+        <button id="clear-logs-btn" class="btn btn-small">Clear Logs</button>
+      </section>
+    </main>
+
+    <footer>
+      <p>Blockcast IWA AMT Gateway Consumer Application</p>
+      <p>
+        <a href="https://github.com/blockcast/go-amt" target="_blank">GitHub</a> |
+        <a href="../MANUAL_TESTING_GUIDE.md" target="_blank">Testing Guide</a>
+      </p>
+    </footer>
+  </div>
+
+  <!-- mpegts.js for MPEG-TS playback -->
+  <script src="https://cdn.jsdelivr.net/npm/mpegts.js@1.7.3/dist/mpegts.min.js"></script>
+  <script src="player.js" type="module"></script>
+</body>
+</html>
+
+
+
+
