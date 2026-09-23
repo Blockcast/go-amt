@@ -1,353 +1,153 @@
 /**
- * Unit tests for UDP Output Server
- * 
- * These tests run in Node.js without requiring IWA or browser environment.
- * We mock the chrome.sockets.udp API to test the server logic.
+ * Unit tests for the UDP Output Server (output-servers/udp-server.js).
+ *
+ * The suite loads the real module and replaces only the Direct Sockets API
+ * with a double. The double hands back Node's own web streams, so the
+ * WritableStream locking rules are the real ones: a second getWriter() on the
+ * control socket's writable throws, exactly as it does in Chrome.
  */
 
 const { describe, test, expect, beforeEach, afterEach } = require('@jest/globals');
-const { setupChromeMocks, resetChromeMocks } = require('../mocks/chrome-sockets');
+const { LocalUDPServer } = require('../../output-servers/udp-server.js');
 
-describe('UDP Server Unit Tests', () => {
-  let udpServer;
-  let LocalUDPServer;
+// Every datagram written to any fake socket, in order.
+let sent;
+
+class FakeUDPSocket {
+  constructor(options) {
+    this.options = options;
+    this.opened = Promise.resolve({
+      localAddress: options.localAddress,
+      localPort: options.localPort,
+      readable: new ReadableStream({ pull() {} }),
+      writable: new WritableStream({ write(message) { sent.push(message); } })
+    });
+  }
+
+  async close() {}
+}
+
+describe('LocalUDPServer', () => {
+  let server;
 
   beforeEach(() => {
-    // Setup chrome mocks before importing the server
-    setupChromeMocks();
-    
-    // Clear module cache and require fresh
-    jest.resetModules();
-    
-    // Mock console methods to avoid noise
+    sent = [];
+    global.UDPSocket = FakeUDPSocket;
     jest.spyOn(console, 'log').mockImplementation(() => {});
     jest.spyOn(console, 'error').mockImplementation(() => {});
+    server = new LocalUDPServer();
   });
 
-  afterEach(() => {
-    resetChromeMocks();
+  afterEach(async () => {
+    await server.stop();
+    delete global.UDPSocket;
     jest.restoreAllMocks();
   });
 
-  describe('Initialization', () => {
-    test('should create UDP server instance', () => {
-      // Create a simple version for testing
-      class LocalUDPServer {
-        constructor() {
-          this.controlSocketId = null;
-          this.dataSocketId = null;
-          this.subscriptions = new Map();
-          this.enabled = false;
-        }
-      }
-      
-      const server = new LocalUDPServer();
-      expect(server).toBeDefined();
-      expect(server.controlSocketId).toBeNull();
-      expect(server.dataSocketId).toBeNull();
-      expect(server.subscriptions).toBeInstanceOf(Map);
-      expect(server.enabled).toBe(false);
-    });
+  test('start() binds the control socket and enables the server', async () => {
+    await server.start(5000);
+
+    expect(server.controlSocket.options).toEqual({ localAddress: '127.0.0.1', localPort: 5000 });
+    expect(server.enabled).toBe(true);
+    expect(server.dataPort).toBe(5000);
   });
 
-  describe('Subscription Management', () => {
-    test('should add subscription', () => {
-      const subscriptions = new Map();
-      const clientAddress = '192.168.1.100';
-      const clientPort = 50000;
-      const filter = {
-        source: '10.0.0.1',
-        group: '232.1.1.1',
-        port: 1234
-      };
+  test('addSubscription delivers the ACK to the subscriber', async () => {
+    await server.start(5000);
 
-      const key = `${clientAddress}:${clientPort}`;
-      subscriptions.set(key, { clientAddress, clientPort, filter });
+    await server.addSubscription(
+      '192.168.1.100:50000',
+      { source: '10.0.0.1', group: '232.1.1.1', port: 1234 },
+      '192.168.1.100',
+      50000
+    );
 
-      expect(subscriptions.has(key)).toBe(true);
-      expect(subscriptions.get(key).filter.source).toBe('10.0.0.1');
-      expect(subscriptions.get(key).filter.group).toBe('232.1.1.1');
-      expect(subscriptions.get(key).filter.port).toBe(1234);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].remoteAddress).toBe('192.168.1.100');
+    expect(sent[0].remotePort).toBe(50000);
+    expect(JSON.parse(new TextDecoder().decode(sent[0].data))).toEqual({
+      type: 'ACK',
+      subscribed: { source: '10.0.0.1', group: '232.1.1.1', port: 1234 },
+      dataPort: 5000
     });
-
-    test('should remove subscription', () => {
-      const subscriptions = new Map();
-      const clientAddress = '192.168.1.100';
-      const clientPort = 50000;
-      const key = `${clientAddress}:${clientPort}`;
-      
-      subscriptions.set(key, { clientAddress, clientPort });
-      expect(subscriptions.has(key)).toBe(true);
-      
-      subscriptions.delete(key);
-      expect(subscriptions.has(key)).toBe(false);
-    });
-
-    test('should handle multiple subscriptions', () => {
-      const subscriptions = new Map();
-      
-      subscriptions.set('192.168.1.100:50000', {
-        clientAddress: '192.168.1.100',
-        clientPort: 50000,
-        filter: { source: '*', group: '232.1.1.1', port: 1234 }
-      });
-      
-      subscriptions.set('192.168.1.101:50001', {
-        clientAddress: '192.168.1.101',
-        clientPort: 50001,
-        filter: { source: '10.0.0.1', group: '*', port: '*' }
-      });
-
-      expect(subscriptions.size).toBe(2);
-      expect(subscriptions.has('192.168.1.100:50000')).toBe(true);
-      expect(subscriptions.has('192.168.1.101:50001')).toBe(true);
-    });
+    expect(server.getStatus().subscriptions).toBe(1);
   });
 
-  describe('Packet Filtering', () => {
-    // Test the matchesFilter logic
-    function matchesFilter(filter, sourceIP, groupIP, port) {
-      const sourceMatch = filter.source === '*' || filter.source === sourceIP;
-      const groupMatch = filter.group === '*' || filter.group === groupIP;
-      const portMatch = filter.port === '*' || filter.port === port;
-      return sourceMatch && groupMatch && portMatch;
+  test('broadcastPacket writes the payload to every matching subscriber', async () => {
+    await server.start(5000);
+    await server.addSubscription('a', { source: '10.0.0.1', group: '232.1.1.1', port: 1234 }, '192.168.1.100', 50000);
+    await server.addSubscription('b', { group: '232.1.1.1', port: '*' }, '192.168.1.101', 50001);
+    await server.addSubscription('c', { source: '10.0.0.2', group: '232.1.1.1', port: 1234 }, '192.168.1.102', 50002);
+    sent.length = 0; // drop the three ACKs
+
+    // A view with a non-zero offset: only the viewed bytes may go out.
+    const payload = new Uint8Array([9, 1, 2, 3]).subarray(1);
+    const count = await server.broadcastPacket(payload, '10.0.0.1', '232.1.1.1', 1234);
+
+    expect(count).toBe(2);
+    expect(sent.map(m => [m.remoteAddress, m.remotePort])).toEqual([
+      ['192.168.1.100', 50000],
+      ['192.168.1.101', 50001]
+    ]);
+    for (const message of sent) {
+      expect(Array.from(new Uint8Array(message.data))).toEqual([1, 2, 3]);
     }
+  });
 
-    test('should match exact filter', () => {
+  test('removeSubscription drops only the matching filter', async () => {
+    await server.start(5000);
+    await server.addSubscription('k', { source: '10.0.0.1', group: '232.1.1.1', port: 1 }, '1.1.1.1', 1);
+    await server.addSubscription('k', { source: '10.0.0.1', group: '232.1.1.2', port: 1 }, '1.1.1.1', 1);
+
+    server.removeSubscription('k', { source: '10.0.0.1', group: '232.1.1.1' });
+    expect(server.subscriptions.get('k').map(f => f.group)).toEqual(['232.1.1.2']);
+
+    server.removeSubscription('k', { source: '10.0.0.1', group: '232.1.1.2' });
+    expect(server.subscriptions.has('k')).toBe(false);
+  });
+
+  describe('matchesFilter', () => {
+    const match = (filter, port = 1234) =>
+      server.matchesFilter(filter, '10.0.0.1', '232.1.1.1', port);
+
+    test('exact filter matches only its own source, group and port', () => {
       const filter = { source: '10.0.0.1', group: '232.1.1.1', port: 1234 };
-      expect(matchesFilter(filter, '10.0.0.1', '232.1.1.1', 1234)).toBe(true);
-      expect(matchesFilter(filter, '10.0.0.2', '232.1.1.1', 1234)).toBe(false);
+      expect(match(filter)).toBe(true);
+      expect(server.matchesFilter(filter, '10.0.0.2', '232.1.1.1', 1234)).toBe(false);
+      expect(server.matchesFilter(filter, '10.0.0.1', '232.1.1.2', 1234)).toBe(false);
+      expect(match(filter, 5678)).toBe(false);
     });
 
-    test('should match wildcard source', () => {
-      const filter = { source: '*', group: '232.1.1.1', port: 1234 };
-      expect(matchesFilter(filter, '10.0.0.1', '232.1.1.1', 1234)).toBe(true);
-      expect(matchesFilter(filter, '10.0.0.2', '232.1.1.1', 1234)).toBe(true);
-      expect(matchesFilter(filter, '192.168.1.1', '232.1.1.1', 1234)).toBe(true);
+    test('wildcards match anything', () => {
+      expect(match({ source: '*', group: '*', port: '*' }, 9999)).toBe(true);
     });
 
-    test('should match wildcard group', () => {
-      const filter = { source: '10.0.0.1', group: '*', port: 1234 };
-      expect(matchesFilter(filter, '10.0.0.1', '232.1.1.1', 1234)).toBe(true);
-      expect(matchesFilter(filter, '10.0.0.1', '232.2.2.2', 1234)).toBe(true);
-      expect(matchesFilter(filter, '10.0.0.2', '232.1.1.1', 1234)).toBe(false);
+    test('a missing port matches every port', () => {
+      expect(match({ source: '10.0.0.1', group: '232.1.1.1' }, 5678)).toBe(true);
     });
 
-    test('should match wildcard port', () => {
-      const filter = { source: '10.0.0.1', group: '232.1.1.1', port: '*' };
-      expect(matchesFilter(filter, '10.0.0.1', '232.1.1.1', 1234)).toBe(true);
-      expect(matchesFilter(filter, '10.0.0.1', '232.1.1.1', 5678)).toBe(true);
-      expect(matchesFilter(filter, '10.0.0.1', '232.1.1.1', 9999)).toBe(true);
-    });
-
-    test('should match all wildcards', () => {
-      const filter = { source: '*', group: '*', port: '*' };
-      expect(matchesFilter(filter, '10.0.0.1', '232.1.1.1', 1234)).toBe(true);
-      expect(matchesFilter(filter, '192.168.1.1', '239.255.255.255', 65535)).toBe(true);
-    });
-
-    test('should not match mismatched filter', () => {
-      const filter = { source: '10.0.0.1', group: '232.1.1.1', port: 1234 };
-      expect(matchesFilter(filter, '10.0.0.2', '232.1.1.1', 1234)).toBe(false);
-      expect(matchesFilter(filter, '10.0.0.1', '232.1.1.2', 1234)).toBe(false);
-      expect(matchesFilter(filter, '10.0.0.1', '232.1.1.1', 5678)).toBe(false);
+    test('a port that arrived as a string still matches the numeric port', () => {
+      expect(match({ source: '10.0.0.1', group: '232.1.1.1', port: '1234' })).toBe(true);
     });
   });
 
-  describe('Control Message Parsing', () => {
-    test('should parse subscribe message', () => {
-      const message = JSON.stringify({
-        type: 'SUBSCRIBE',
-        source: '10.0.0.1',
-        group: '232.1.1.1',
-        port: 1234
-      });
-      
-      const buffer = new TextEncoder().encode(message);
-      const decoded = JSON.parse(new TextDecoder().decode(buffer));
-      
-      expect(decoded.type).toBe('SUBSCRIBE');
-      expect(decoded.source).toBe('10.0.0.1');
-      expect(decoded.group).toBe('232.1.1.1');
-      expect(decoded.port).toBe(1234);
-    });
+  test('broadcastPacket sends nothing when the server is not started', async () => {
+    server.subscriptions.set('a', [{ source: '*', group: '*', port: '*', clientAddress: 'x', clientPort: 1 }]);
 
-    test('should parse unsubscribe message', () => {
-      const message = JSON.stringify({
-        type: 'UNSUBSCRIBE',
-        source: '10.0.0.1',
-        group: '232.1.1.1',
-        port: 1234
-      });
-      
-      const buffer = new TextEncoder().encode(message);
-      const decoded = JSON.parse(new TextDecoder().decode(buffer));
-      
-      expect(decoded.type).toBe('UNSUBSCRIBE');
-    });
+    expect(await server.broadcastPacket(new Uint8Array([1]), '10.0.0.1', '232.1.1.1', 1)).toBe(0);
 
-    test('should handle wildcard in subscribe message', () => {
-      const message = JSON.stringify({
-        type: 'SUBSCRIBE',
-        source: '*',
-        group: '232.1.1.1',
-        port: '*'
-      });
-      
-      const buffer = new TextEncoder().encode(message);
-      const decoded = JSON.parse(new TextDecoder().decode(buffer));
-      
-      expect(decoded.source).toBe('*');
-      expect(decoded.port).toBe('*');
-    });
-
-    test('should handle invalid JSON gracefully', () => {
-      const message = 'not valid json{';
-      const buffer = new TextEncoder().encode(message);
-      
-      expect(() => {
-        JSON.parse(new TextDecoder().decode(buffer));
-      }).toThrow();
-    });
+    server.enabled = true; // enabled but no writer
+    expect(await server.broadcastPacket(new Uint8Array([1]), '10.0.0.1', '232.1.1.1', 1)).toBe(0);
+    server.enabled = false;
+    expect(sent).toHaveLength(0);
   });
 
-  describe('Chrome Sockets Integration', () => {
-    test('should create UDP socket', async () => {
-      const udp = global.chrome.sockets.udp;
-      
-      const socketId = await new Promise((resolve) => {
-        udp.create({}, (createInfo) => {
-          resolve(createInfo.socketId);
-        });
-      });
-      
-      expect(socketId).toBeDefined();
-      expect(typeof socketId).toBe('number');
-    });
-
-    test('should bind socket to address', async () => {
-      const udp = global.chrome.sockets.udp;
-      
-      const socketId = await new Promise((resolve) => {
-        udp.create({}, (createInfo) => {
-          resolve(createInfo.socketId);
-        });
-      });
-      
-      const result = await new Promise((resolve) => {
-        udp.bind(socketId, '0.0.0.0', 5000, (result) => {
-          resolve(result);
-        });
-      });
-      
-      expect(result).toBe(0); // Success
-      
-      const info = await new Promise((resolve) => {
-        udp.getInfo(socketId, (info) => {
-          resolve(info);
-        });
-      });
-      
-      expect(info.localAddress).toBe('0.0.0.0');
-      expect(info.localPort).toBe(5000);
-    });
-
-    test('should send UDP packet', async () => {
-      const udp = global.chrome.sockets.udp;
-      
-      const socketId = await new Promise((resolve) => {
-        udp.create({}, (createInfo) => {
-          resolve(createInfo.socketId);
-        });
-      });
-      
-      await new Promise((resolve) => {
-        udp.bind(socketId, '0.0.0.0', 0, () => resolve());
-      });
-      
-      const data = new Uint8Array([1, 2, 3, 4, 5]);
-      const result = await new Promise((resolve) => {
-        udp.send(socketId, data.buffer, '127.0.0.1', 5000, (sendInfo) => {
-          resolve(sendInfo);
-        });
-      });
-      
-      expect(result.resultCode).toBe(0);
-      expect(result.bytesSent).toBe(5);
-    });
-
-    test('should close socket', async () => {
-      const udp = global.chrome.sockets.udp;
-      
-      const socketId = await new Promise((resolve) => {
-        udp.create({}, (createInfo) => {
-          resolve(createInfo.socketId);
-        });
-      });
-      
-      await new Promise((resolve) => {
-        udp.close(socketId, () => resolve());
-      });
-      
-      // Socket should be removed
-      const info = await new Promise((resolve) => {
-        udp.getInfo(socketId, (info) => {
-          resolve(info);
-        });
-      });
-      
-      expect(info).toBeNull();
-    });
-  });
-
-  describe('Broadcast Logic', () => {
-    test('should broadcast to matching subscribers', () => {
-      const subscriptions = new Map();
-      
-      // Add subscribers
-      subscriptions.set('192.168.1.100:50000', {
-        clientAddress: '192.168.1.100',
-        clientPort: 50000,
-        filter: { source: '10.0.0.1', group: '232.1.1.1', port: 1234 }
-      });
-      
-      subscriptions.set('192.168.1.101:50001', {
-        clientAddress: '192.168.1.101',
-        clientPort: 50001,
-        filter: { source: '*', group: '232.1.1.1', port: '*' }
-      });
-      
-      subscriptions.set('192.168.1.102:50002', {
-        clientAddress: '192.168.1.102',
-        clientPort: 50002,
-        filter: { source: '10.0.0.2', group: '232.1.1.1', port: 1234 }
-      });
-      
-      // Packet metadata
-      const sourceIP = '10.0.0.1';
-      const groupIP = '232.1.1.1';
-      const port = 1234;
-      
-      // Find matching subscribers
-      const matches = [];
-      for (const [key, sub] of subscriptions.entries()) {
-        const sourceMatch = sub.filter.source === '*' || sub.filter.source === sourceIP;
-        const groupMatch = sub.filter.group === '*' || sub.filter.group === groupIP;
-        const portMatch = sub.filter.port === '*' || sub.filter.port === port;
-        
-        if (sourceMatch && groupMatch && portMatch) {
-          matches.push(sub);
-        }
-      }
-      
-      // Should match first two subscribers, not the third
-      expect(matches.length).toBe(2);
-      expect(matches[0].clientAddress).toBe('192.168.1.100');
-      expect(matches[1].clientAddress).toBe('192.168.1.101');
+  test('getStatus reports the server shape', () => {
+    expect(server.getStatus()).toEqual({
+      enabled: false,
+      controlPort: 5000,
+      dataPort: 0,
+      subscriptions: 0
     });
   });
 });
-
-
-
-

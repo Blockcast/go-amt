@@ -22,8 +22,13 @@ module.exports = {
   // Module paths
   roots: ['<rootDir>'],
   
-  // Transform files (if needed)
-  transform: {},
+  // The output-servers modules and constants.js are ESM; babel-jest turns them
+  // into CommonJS so the suites can require() the real implementation. The
+  // preset is inline, not in a babel.config.js, because a project-wide babel
+  // config would also be picked up by the webpack babel-loader.
+  transform: {
+    '\\.js$': ['babel-jest', { presets: [['@babel/preset-env', { targets: { node: 'current' } }]] }]
+  },
   
   // Setup files
   setupFilesAfterEnv: [],

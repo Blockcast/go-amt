@@ -1,32 +1,30 @@
 /**
- * Unit tests for Server Manager
- * 
- * The Server Manager coordinates all output servers (UDP, TCP, WebSocket, WebRTC)
- * and provides unified control, monitoring, and packet distribution.
- * 
- * TEST FIRST - Writing tests before implementation
+ * Unit tests for the Server Manager (output-servers/server-manager.js).
+ *
+ * The manager is pure coordination logic, so the suite loads the real class
+ * and registers fake servers whose methods are jest mocks.
  */
 
 const { describe, test, expect, beforeEach, afterEach } = require('@jest/globals');
+const { ServerManager } = require('../../output-servers/server-manager.js');
 
-describe('Server Manager Unit Tests', () => {
-  let ServerManager;
+function fakeServer(overrides = {}) {
+  return {
+    enabled: true,
+    start: jest.fn().mockResolvedValue(true),
+    stop: jest.fn().mockResolvedValue(true),
+    broadcastPacket: jest.fn().mockResolvedValue(0),
+    ...overrides
+  };
+}
+
+describe('ServerManager', () => {
   let manager;
 
   beforeEach(() => {
-    // Mock console
     jest.spyOn(console, 'log').mockImplementation(() => {});
+    jest.spyOn(console, 'warn').mockImplementation(() => {});
     jest.spyOn(console, 'error').mockImplementation(() => {});
-    
-    // Simple implementation for testing
-    class TestServerManager {
-      constructor() {
-        this.servers = new Map();
-        this.enabled = false;
-      }
-    }
-    
-    ServerManager = TestServerManager;
     manager = new ServerManager();
   });
 
@@ -34,429 +32,141 @@ describe('Server Manager Unit Tests', () => {
     jest.restoreAllMocks();
   });
 
-  describe('Initialization', () => {
-    test('should create server manager instance', () => {
-      expect(manager).toBeDefined();
-      expect(manager.servers).toBeInstanceOf(Map);
+  describe('registration', () => {
+    test('registers, replaces and rejects invalid servers', () => {
+      const first = fakeServer();
+      const second = fakeServer();
+
+      expect(manager.registerServer('udp', first)).toBe(true);
+      expect(manager.registerServer('udp', second)).toBe(true);
+      expect(manager.getServer('udp')).toBe(second);
+      expect(manager.registerServer('', fakeServer())).toBe(false);
+      expect(manager.registerServer('tcp', null)).toBe(false);
+      expect(manager.getServerNames()).toEqual(['udp']);
+    });
+
+    test('unregisterServer stops a running server before removing it', async () => {
+      const udp = fakeServer();
+      manager.registerServer('udp', udp);
+
+      expect(await manager.unregisterServer('udp')).toBe(true);
+      expect(udp.stop).toHaveBeenCalled();
+      expect(manager.getServerCount()).toBe(0);
+      expect(await manager.unregisterServer('udp')).toBe(false);
+    });
+  });
+
+  describe('lifecycle', () => {
+    test('startAll reports each result and stays enabled if any server started', async () => {
+      manager.registerServer('udp', fakeServer());
+      manager.registerServer('tcp', fakeServer({ start: jest.fn().mockRejectedValue(new Error('Port in use')) }));
+
+      const results = await manager.startAll();
+
+      expect(results).toEqual({
+        udp: { success: true },
+        tcp: { success: false, error: 'Port in use' }
+      });
+      expect(manager.enabled).toBe(true);
+      expect(manager.stats.errors).toEqual([expect.objectContaining({ server: 'tcp', error: 'Port in use' })]);
+    });
+
+    test('startAll leaves the manager disabled when every server fails', async () => {
+      manager.registerServer('udp', fakeServer({ start: jest.fn().mockRejectedValue(new Error('no')) }));
+
+      await manager.startAll();
+
       expect(manager.enabled).toBe(false);
     });
 
-    test('should initialize with no servers', () => {
-      expect(manager.servers.size).toBe(0);
-    });
-  });
-
-  describe('Server Registration', () => {
-    test('should register server', () => {
-      const udpServer = {
-        name: 'udp',
-        type: 'udp',
-        enabled: false,
-        start: jest.fn(),
-        stop: jest.fn(),
-        broadcastPacket: jest.fn()
-      };
-
-      manager.servers.set('udp', udpServer);
-
-      expect(manager.servers.has('udp')).toBe(true);
-      expect(manager.servers.get('udp').name).toBe('udp');
-    });
-
-    test('should register multiple servers', () => {
-      const servers = [
-        { name: 'udp', type: 'udp' },
-        { name: 'tcp', type: 'tcp' },
-        { name: 'websocket', type: 'websocket' }
-      ];
-
-      servers.forEach(s => manager.servers.set(s.name, s));
-
-      expect(manager.servers.size).toBe(3);
-      expect(manager.servers.has('udp')).toBe(true);
-      expect(manager.servers.has('tcp')).toBe(true);
-      expect(manager.servers.has('websocket')).toBe(true);
-    });
-
-    test('should unregister server', () => {
-      manager.servers.set('udp', { name: 'udp' });
-      expect(manager.servers.has('udp')).toBe(true);
-
-      manager.servers.delete('udp');
-      expect(manager.servers.has('udp')).toBe(false);
-    });
-  });
-
-  describe('Server Lifecycle', () => {
-    test('should start all servers', async () => {
-      const udpServer = {
-        name: 'udp',
-        enabled: false,
-        start: jest.fn().mockResolvedValue(true)
-      };
-      const tcpServer = {
-        name: 'tcp',
-        enabled: false,
-        start: jest.fn().mockResolvedValue(true)
-      };
-
-      manager.servers.set('udp', udpServer);
-      manager.servers.set('tcp', tcpServer);
-
-      // Simulate starting all
-      await Promise.all(
-        Array.from(manager.servers.values()).map(s => s.start())
-      );
-
-      expect(udpServer.start).toHaveBeenCalled();
-      expect(tcpServer.start).toHaveBeenCalled();
-    });
-
-    test('should stop all servers', async () => {
-      const udpServer = {
-        name: 'udp',
-        enabled: true,
-        stop: jest.fn().mockResolvedValue(true)
-      };
-      const tcpServer = {
-        name: 'tcp',
-        enabled: true,
-        stop: jest.fn().mockResolvedValue(true)
-      };
-
-      manager.servers.set('udp', udpServer);
-      manager.servers.set('tcp', tcpServer);
-
-      // Simulate stopping all
-      await Promise.all(
-        Array.from(manager.servers.values()).map(s => s.stop())
-      );
-
-      expect(udpServer.stop).toHaveBeenCalled();
-      expect(tcpServer.stop).toHaveBeenCalled();
-    });
-
-    test('should handle server start failure gracefully', async () => {
-      const udpServer = {
-        name: 'udp',
-        start: jest.fn().mockRejectedValue(new Error('Port in use'))
-      };
-
-      manager.servers.set('udp', udpServer);
-
-      await expect(udpServer.start()).rejects.toThrow('Port in use');
-    });
-  });
-
-  describe('Packet Distribution', () => {
-    test('should broadcast packet to all enabled servers', async () => {
-      const udpServer = {
-        name: 'udp',
-        enabled: true,
-        broadcastPacket: jest.fn().mockResolvedValue(2) // 2 clients
-      };
-      const tcpServer = {
-        name: 'tcp',
-        enabled: true,
-        broadcastPacket: jest.fn().mockResolvedValue(3) // 3 clients
-      };
-
-      manager.servers.set('udp', udpServer);
-      manager.servers.set('tcp', tcpServer);
-
-      const packet = new Uint8Array([1, 2, 3, 4, 5]);
-      const sourceIP = '10.0.0.1';
-      const groupIP = '232.1.1.1';
-      const port = 1234;
-
-      // Simulate broadcast to all servers
-      const promises = Array.from(manager.servers.values())
-        .filter(s => s.enabled)
-        .map(s => s.broadcastPacket(packet, sourceIP, groupIP, port));
-
-      const results = await Promise.all(promises);
-      const totalClients = results.reduce((sum, count) => sum + count, 0);
-
-      expect(udpServer.broadcastPacket).toHaveBeenCalledWith(packet, sourceIP, groupIP, port);
-      expect(tcpServer.broadcastPacket).toHaveBeenCalledWith(packet, sourceIP, groupIP, port);
-      expect(totalClients).toBe(5);
-    });
-
-    test('should skip disabled servers', async () => {
-      const udpServer = {
-        name: 'udp',
-        enabled: true,
-        broadcastPacket: jest.fn().mockResolvedValue(2)
-      };
-      const tcpServer = {
-        name: 'tcp',
-        enabled: false,
-        broadcastPacket: jest.fn()
-      };
-
-      manager.servers.set('udp', udpServer);
-      manager.servers.set('tcp', tcpServer);
-
-      const packet = new Uint8Array([1, 2, 3, 4, 5]);
-
-      // Only broadcast to enabled servers
-      const promises = Array.from(manager.servers.values())
-        .filter(s => s.enabled)
-        .map(s => s.broadcastPacket(packet, '10.0.0.1', '232.1.1.1', 1234));
-
-      await Promise.all(promises);
-
-      expect(udpServer.broadcastPacket).toHaveBeenCalled();
-      expect(tcpServer.broadcastPacket).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('Server Status', () => {
-    test('should get status of all servers', () => {
-      const udpServer = {
-        name: 'udp',
-        enabled: true,
-        getStatus: jest.fn().mockReturnValue({ subscriptions: 5, packets: 100 })
-      };
-      const tcpServer = {
-        name: 'tcp',
-        enabled: true,
-        getStatus: jest.fn().mockReturnValue({ clients: 3, packets: 50 })
-      };
-
-      manager.servers.set('udp', udpServer);
-      manager.servers.set('tcp', tcpServer);
-
-      const status = {};
-      for (const [name, server] of manager.servers.entries()) {
-        status[name] = server.getStatus();
-      }
-
-      expect(status.udp).toBeDefined();
-      expect(status.tcp).toBeDefined();
-      expect(status.udp.subscriptions).toBe(5);
-      expect(status.tcp.clients).toBe(3);
-    });
-
-    test('should count enabled servers', () => {
-      manager.servers.set('udp', { enabled: true });
-      manager.servers.set('tcp', { enabled: true });
-      manager.servers.set('websocket', { enabled: false });
-
-      const enabledCount = Array.from(manager.servers.values())
-        .filter(s => s.enabled).length;
-
-      expect(enabledCount).toBe(2);
-    });
-
-    test('should list server names', () => {
-      manager.servers.set('udp', { name: 'udp' });
-      manager.servers.set('tcp', { name: 'tcp' });
-      manager.servers.set('websocket', { name: 'websocket' });
-
-      const names = Array.from(manager.servers.keys());
-
-      expect(names).toHaveLength(3);
-      expect(names).toContain('udp');
-      expect(names).toContain('tcp');
-      expect(names).toContain('websocket');
-    });
-  });
-
-  describe('Health Monitoring', () => {
-    test('should check if server is healthy', () => {
-      const udpServer = {
-        name: 'udp',
-        enabled: true,
-        isHealthy: jest.fn().mockReturnValue(true)
-      };
-
-      manager.servers.set('udp', udpServer);
-
-      const healthy = udpServer.isHealthy();
-
-      expect(healthy).toBe(true);
-      expect(udpServer.isHealthy).toHaveBeenCalled();
-    });
-
-    test('should detect unhealthy server', () => {
-      const udpServer = {
-        name: 'udp',
-        enabled: true,
-        isHealthy: jest.fn().mockReturnValue(false),
-        lastError: 'Socket closed unexpectedly'
-      };
-
-      manager.servers.set('udp', udpServer);
-
-      const healthy = udpServer.isHealthy();
-
-      expect(healthy).toBe(false);
-      expect(udpServer.lastError).toBeDefined();
-    });
-
-    test('should get health status of all servers', () => {
-      manager.servers.set('udp', {
-        name: 'udp',
-        enabled: true,
-        isHealthy: jest.fn().mockReturnValue(true)
-      });
-      manager.servers.set('tcp', {
-        name: 'tcp',
-        enabled: true,
-        isHealthy: jest.fn().mockReturnValue(false)
-      });
-
-      const healthStatus = {};
-      for (const [name, server] of manager.servers.entries()) {
-        healthStatus[name] = server.isHealthy();
-      }
-
-      expect(healthStatus.udp).toBe(true);
-      expect(healthStatus.tcp).toBe(false);
-    });
-  });
-
-  describe('Statistics Aggregation', () => {
-    test('should aggregate packet counts', () => {
-      manager.servers.set('udp', {
-        getStats: jest.fn().mockReturnValue({ packetsSent: 100 })
-      });
-      manager.servers.set('tcp', {
-        getStats: jest.fn().mockReturnValue({ packetsSent: 50 })
-      });
-
-      let totalPackets = 0;
-      for (const server of manager.servers.values()) {
-        const stats = server.getStats();
-        totalPackets += stats.packetsSent;
-      }
-
-      expect(totalPackets).toBe(150);
-    });
-
-    test('should aggregate subscription counts', () => {
-      manager.servers.set('udp', {
-        getStats: jest.fn().mockReturnValue({ subscriptions: 5 })
-      });
-      manager.servers.set('tcp', {
-        getStats: jest.fn().mockReturnValue({ clients: 3 })
-      });
-
-      const stats = {};
-      for (const [name, server] of manager.servers.entries()) {
-        stats[name] = server.getStats();
-      }
-
-      const totalSubscribers = (stats.udp.subscriptions || 0) + (stats.tcp.clients || 0);
-
-      expect(totalSubscribers).toBe(8);
-    });
-  });
-
-  describe('Error Handling', () => {
-    test('should handle broadcast errors gracefully', async () => {
-      const udpServer = {
-        name: 'udp',
-        enabled: true,
-        broadcastPacket: jest.fn().mockRejectedValue(new Error('Send failed'))
-      };
-
-      manager.servers.set('udp', udpServer);
-
-      const packet = new Uint8Array([1, 2, 3]);
-
-      await expect(udpServer.broadcastPacket(packet)).rejects.toThrow('Send failed');
-    });
-
-    test('should continue with other servers if one fails', async () => {
-      const udpServer = {
-        name: 'udp',
-        enabled: true,
-        broadcastPacket: jest.fn().mockRejectedValue(new Error('Failed'))
-      };
-      const tcpServer = {
-        name: 'tcp',
-        enabled: true,
-        broadcastPacket: jest.fn().mockResolvedValue(3)
-      };
-
-      manager.servers.set('udp', udpServer);
-      manager.servers.set('tcp', tcpServer);
-
-      const packet = new Uint8Array([1, 2, 3]);
-
-      // Use Promise.allSettled to continue even if one fails
-      const results = await Promise.allSettled(
-        Array.from(manager.servers.values())
-          .filter(s => s.enabled)
-          .map(s => s.broadcastPacket(packet, '10.0.0.1', '232.1.1.1', 1234))
-      );
-
-      expect(results[0].status).toBe('rejected');
-      expect(results[1].status).toBe('fulfilled');
-      expect(results[1].value).toBe(3);
-    });
-  });
-
-  describe('Graceful Shutdown', () => {
-    test('should stop servers in reverse order', async () => {
+    test('stopAll stops servers in reverse registration order', async () => {
       const order = [];
-      
-      const udpServer = {
-        name: 'udp',
-        stop: jest.fn().mockImplementation(async () => { order.push('udp'); })
-      };
-      const tcpServer = {
-        name: 'tcp',
-        stop: jest.fn().mockImplementation(async () => { order.push('tcp'); })
-      };
-      const wsServer = {
-        name: 'websocket',
-        stop: jest.fn().mockImplementation(async () => { order.push('websocket'); })
-      };
-
-      manager.servers.set('udp', udpServer);
-      manager.servers.set('tcp', tcpServer);
-      manager.servers.set('websocket', wsServer);
-
-      // Stop in reverse order
-      const serverArray = Array.from(manager.servers.values()).reverse();
-      for (const server of serverArray) {
-        await server.stop();
+      for (const name of ['udp', 'tcp', 'websocket']) {
+        manager.registerServer(name, fakeServer({ stop: jest.fn(async () => { order.push(name); }) }));
       }
+
+      await manager.stopAll();
 
       expect(order).toEqual(['websocket', 'tcp', 'udp']);
+      expect(manager.enabled).toBe(false);
     });
 
-    test('should wait for all servers to stop', async () => {
-      const udpServer = {
-        stop: jest.fn().mockImplementation(() => 
-          new Promise(resolve => setTimeout(resolve, 10))
-        )
-      };
-      const tcpServer = {
-        stop: jest.fn().mockImplementation(() =>
-          new Promise(resolve => setTimeout(resolve, 20))
-        )
-      };
+    test('shutdown stops everything and clears the registry', async () => {
+      const udp = fakeServer();
+      manager.registerServer('udp', udp);
 
-      manager.servers.set('udp', udpServer);
-      manager.servers.set('tcp', tcpServer);
+      expect(await manager.shutdown()).toBe(true);
+      expect(udp.stop).toHaveBeenCalled();
+      expect(manager.getServerCount()).toBe(0);
+    });
+  });
 
-      const startTime = Date.now();
-      await Promise.all(
-        Array.from(manager.servers.values()).map(s => s.stop())
-      );
-      const elapsed = Date.now() - startTime;
+  describe('packet distribution', () => {
+    test('handleIncomingPacket sums enabled servers and survives one that throws', async () => {
+      const udp = fakeServer({ broadcastPacket: jest.fn().mockResolvedValue(2) });
+      const tcp = fakeServer({ broadcastPacket: jest.fn().mockRejectedValue(new Error('Send failed')) });
+      const ws = fakeServer({ broadcastPacket: jest.fn().mockResolvedValue(3) });
+      const off = fakeServer({ enabled: false });
+      manager.registerServer('udp', udp);
+      manager.registerServer('tcp', tcp);
+      manager.registerServer('websocket', ws);
+      manager.registerServer('off', off);
+      const packet = new Uint8Array([1, 2, 3, 4, 5]);
 
-      expect(elapsed).toBeGreaterThanOrEqual(20);
-      expect(udpServer.stop).toHaveBeenCalled();
-      expect(tcpServer.stop).toHaveBeenCalled();
+      const total = await manager.handleIncomingPacket(packet, '10.0.0.1', '232.1.1.1', 1234);
+
+      expect(total).toBe(5);
+      expect(udp.broadcastPacket).toHaveBeenCalledWith(packet, '10.0.0.1', '232.1.1.1', 1234);
+      expect(off.broadcastPacket).not.toHaveBeenCalled();
+      expect(manager.stats.totalPackets).toBe(1);
+      expect(manager.stats.totalBytes).toBe(5);
+    });
+
+    test('broadcastToAll reports per-server outcomes', async () => {
+      manager.registerServer('udp', fakeServer({ broadcastPacket: jest.fn().mockResolvedValue(2) }));
+      manager.registerServer('tcp', fakeServer({ broadcastPacket: jest.fn().mockRejectedValue(new Error('Failed')) }));
+      manager.registerServer('off', fakeServer({ enabled: false }));
+
+      const results = await manager.broadcastToAll(new Uint8Array([1]), '10.0.0.1', '232.1.1.1', 1234);
+
+      expect(results).toEqual({
+        udp: { success: true, clientCount: 2 },
+        tcp: { success: false, error: 'Failed' },
+        off: { skipped: true, reason: 'disabled' }
+      });
+    });
+  });
+
+  describe('status', () => {
+    test('checkHealth uses isHealthy when a server provides it', () => {
+      manager.registerServer('udp', fakeServer({ isHealthy: () => false, lastError: 'Socket closed' }));
+      manager.registerServer('tcp', fakeServer({ enabled: false }));
+
+      expect(manager.checkHealth()).toEqual({
+        udp: { enabled: true, healthy: false, lastError: 'Socket closed' },
+        tcp: { enabled: false, healthy: true, lastError: null }
+      });
+      expect(manager.getEnabledServerCount()).toBe(1);
+    });
+
+    test('getStats aggregates subscribers and packets across servers', () => {
+      manager.registerServer('udp', fakeServer({ getStats: () => ({ subscriptions: 5, packetsSent: 100 }) }));
+      manager.registerServer('tcp', fakeServer({ getStats: () => ({ clients: 3, packetsSent: 50 }) }));
+
+      const stats = manager.getStats();
+
+      expect(stats.totalSubscribers).toBe(8);
+      expect(stats.totalServerPackets).toBe(150);
+    });
+
+    test('getStatus falls back to enabled when a server has no getStatus', () => {
+      manager.registerServer('udp', fakeServer({ getStatus: () => ({ subscriptions: 5 }) }));
+      manager.registerServer('tcp', fakeServer());
+
+      const status = manager.getStatus();
+
+      expect(status.manager).toEqual(expect.objectContaining({ serverCount: 2, enabledCount: 2 }));
+      expect(status.servers).toEqual({ udp: { subscriptions: 5 }, tcp: { enabled: true } });
     });
   });
 });
-
-
-
-
