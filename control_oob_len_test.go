@@ -105,11 +105,19 @@ func TestTimestampSockoptsAreAllAccountedFor(t *testing.T) {
 //
 // Value-equality against a restatement of the same expression would be circular
 // — that is the defect BLO-34983 was filed about. So each term is asserted to
-// FIT, from the narrower side: the buffer must hold v4's cmsgs, must hold v6's,
-// and must hold either plus the timestamp. Dropping any one term from the
-// expression fails here, while an upstream flag addition correctly stays green
-// because the length grew with the requirement.
+// FIT, from the narrower side: each family's cmsgs must fit, whichever of the
+// two is larger, plus the timestamp. An upstream flag addition correctly stays
+// green, because the length grew with the requirement.
+//
+// That is weaker than "dropping any one term fails here", which this comment
+// used to claim, and the difference is worth stating. Dropping the v4 term
+// stays green today — v6 (64) exceeds v4 (56), so the value is unchanged and
+// still sufficient. What these assertions pin is the terms that are load-bearing
+// at current sizes: the timestamp term always, and whichever family is wider.
+// If x/net ever made v4's cmsgs the wider ones, a v6-only expression would start
+// failing at the first loop arm on its own.
 func TestControlMessageOOBLenCoversBothFamiliesAndTheTimestamp(t *testing.T) {
+	oobLen := ControlMessageOOBLen()
 	v4 := len(ipv4.NewControlMessage(ControlFlags4))
 	v6 := len(ipv6.NewControlMessage(ControlFlags6))
 	if v4 == 0 || v6 == 0 {
@@ -124,16 +132,16 @@ func TestControlMessageOOBLenCoversBothFamiliesAndTheTimestamp(t *testing.T) {
 		{"v4 cmsgs + timestamp", v4 + TimestampControlMessageLen},
 		{"v6 cmsgs + timestamp", v6 + TimestampControlMessageLen},
 	} {
-		if ControlMessageOOBLen < tc.need {
-			t.Errorf("ControlMessageOOBLen = %d, too small for %s (%d). A short "+
+		if oobLen < tc.need {
+			t.Errorf("ControlMessageOOBLen() = %d, too small for %s (%d). A short "+
 				"buffer makes the kernel set MSG_CTRUNC and drop whichever cmsgs "+
-				"did not fit, Dst first", ControlMessageOOBLen, tc.name, tc.need)
+				"did not fit, Dst first", oobLen, tc.name, tc.need)
 		}
 	}
-	if ControlMessageOOBLen <= max(v4, v6) {
-		t.Errorf("ControlMessageOOBLen = %d does not exceed the IP-level cmsgs "+
+	if oobLen <= max(v4, v6) {
+		t.Errorf("ControlMessageOOBLen() = %d does not exceed the IP-level cmsgs "+
 			"alone (%d), so the SOL_SOCKET timestamp term is not in it. That term "+
 			"is unreachable from ControlFlags4/6 and is the one a caller cannot "+
-			"derive for itself", ControlMessageOOBLen, max(v4, v6))
+			"derive for itself", oobLen, max(v4, v6))
 	}
 }

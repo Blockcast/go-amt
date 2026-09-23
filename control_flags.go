@@ -56,8 +56,9 @@ const (
 // timespecs at CmsgSpace(48) = 64.
 const TimestampControlMessageLen = 32
 
-// ControlMessageOOBLen is the per-slot OOB buffer length a ReadBatch caller
-// must allocate to receive everything a socket opened by this package can emit.
+// ControlMessageOOBLen returns the per-slot OOB buffer length a ReadBatch
+// caller must allocate to receive everything a socket opened by this package
+// can emit.
 //
 // This, not the flag sets, is what a caller should size from. Every term is
 // owned here — the IP-level cmsgs by ControlFlags4/6 and the SOL_SOCKET one by
@@ -76,7 +77,18 @@ const TimestampControlMessageLen = 32
 // per-config: over-allocating 32 bytes per slot costs nothing, and a length
 // that varied by config would put the caller back in the business of tracking
 // which options this package set.
-var ControlMessageOOBLen = max(
+//
+// A function and not an exported var. It cannot be a const — len of a call is
+// not constant — and an exported var is assignable by any importer, which is
+// the one way a consumer silently un-sizes every OOB buffer in the process and
+// lands back on the exact MSG_CTRUNC path this symbol exists to close. Nothing
+// would catch that: not the compiler, not vet, not the guards in
+// control_oob_len_test.go, which read the same var the assignment clobbered. A
+// package that exports a length to stop a silent truncation does not get to
+// leave a one-assignment hole into it.
+func ControlMessageOOBLen() int { return controlMessageOOBLen }
+
+var controlMessageOOBLen = max(
 	len(ipv4.NewControlMessage(ControlFlags4)),
 	len(ipv6.NewControlMessage(ControlFlags6)),
 ) + TimestampControlMessageLen

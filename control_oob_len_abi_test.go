@@ -27,6 +27,11 @@ import (
 // Tagged, unlike the guards in control_oob_len_test.go, because unix.CmsgSpace
 // exists only where there is a real ABI to ask. The untagged guards there cover
 // what is asserted about source rather than about this machine.
+//
+// linux already covers android, so CI's android/arm64 go vet typechecks this
+// file. Harmless while every target in the test matrix is 64-bit — the check is
+// runtime, not compile-time — and correct to fail by design if a 32-bit one is
+// ever added, per the paragraph above.
 func TestTimestampControlMessageLenMatchesTheABI(t *testing.T) {
 	// SCM_TIMESTAMPNS carries a timespec, SCM_TIMESTAMP a timeval. Both are two
 	// words, so both land on the same space — assert each, so a platform where
