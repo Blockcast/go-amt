@@ -245,3 +245,102 @@ func TestControlMessageOOBLenCoversBothFamiliesAndTheTimestamp(t *testing.T) {
 			"derive for itself", oobLen, max(v4, v6))
 	}
 }
+
+// sockoptsWithoutCmsg are the raw setsockopt options this package sets that
+// never put a control message on a received datagram. Everything else a raw
+// setsockopt can ask for either is in timestampSockoptsCoveredBy32 or has to be
+// added to ControlMessageOOBLen before it is set.
+var sockoptsWithoutCmsg = map[string]bool{
+	"SO_REUSEADDR":     true,
+	"SO_REUSEPORT":     true,
+	"SO_ATTACH_FILTER": true,
+	"IP_BOUND_IF":      true,
+	"IPV6_BOUND_IF":    true,
+}
+
+// sockbufOptParams are the parameter names sockbuf_*.go uses to plumb
+// SO_RCVBUF/SO_RCVBUFFORCE through to setsockopt. They are accepted by name,
+// and only in those files, because the option value is not visible at the call
+// site. That is a known soft spot: a cmsg-emitting option passed through one of
+// these parameters would not be caught here.
+var sockbufOptParams = map[string]bool{
+	"opt":      true,
+	"getOpt":   true,
+	"forceOpt": true,
+}
+
+// TestRawSockoptsAreAllClassified pins the other route by which a cmsg reaches
+// the caller's OOB buffer. A cmsg exists on these sockets only because a socket
+// option asked for it, and an option is set either through x/net's
+// SetControlMessage (TestSetControlMessageUsesPassedFlags plus the seam test)
+// or through a raw Setsockopt* call. This covers the second: every option
+// argument of a raw Setsockopt* call in a non-test file must be classified as
+// emitting no cmsg or as a timestamp TimestampControlMessageLen covers.
+// IP_RECVTTL beside IP_BOUND_IF, or SO_RXQ_OVFL on a Linux listener, would
+// otherwise truncate Dst with every other guard green.
+//
+// It overlaps TestTimestampSockoptsAreAllAccountedFor without replacing it:
+// that one also catches a SO_TIMESTAMPING ident outside any call.
+func TestRawSockoptsAreAllClassified(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob package files: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no .go files matched in the package directory, so this guard is " +
+			"inspecting nothing")
+	}
+
+	seen := 0
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || !strings.HasPrefix(selector.Sel.Name, "Setsockopt") {
+				return true
+			}
+			seen++
+			// Every syscall/unix Setsockopt* variant is (fd, level, opt, value).
+			if len(call.Args) < 3 {
+				t.Errorf("%s calls %s with %d arguments; expected (fd, level, opt, ...)",
+					path, selector.Sel.Name, len(call.Args))
+				return true
+			}
+			var name string
+			switch opt := call.Args[2].(type) {
+			case *ast.SelectorExpr: // syscall.SO_TIMESTAMP, unix.IP_BOUND_IF
+				name = opt.Sel.Name
+			case *ast.Ident: // SO_REUSEPORT, or a sockbuf parameter
+				name = opt.Name
+			default:
+				t.Errorf("%s passes a computed option expression to %s; name the "+
+					"option so this guard can classify it", path, selector.Sel.Name)
+				return true
+			}
+			switch {
+			case sockoptsWithoutCmsg[name], timestampSockoptsCoveredBy32[name]:
+			case sockbufOptParams[name] && strings.HasPrefix(path, "sockbuf_"):
+			default:
+				t.Errorf("%s sets socket option %q, which is not classified against "+
+					"ControlMessageOOBLen. If it puts a cmsg on received datagrams, "+
+					"raise ControlMessageOOBLen in the same change; either way add it "+
+					"to sockoptsWithoutCmsg or timestampSockoptsCoveredBy32", path, name)
+			}
+			return true
+		})
+	}
+	if seen == 0 {
+		t.Fatal("no Setsockopt* call found in any non-test file of this package; " +
+			"either the raw socket options moved or this guard is inspecting nothing")
+	}
+}
