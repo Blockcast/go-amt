@@ -36,12 +36,11 @@ var errCaptureBind = errors.New("control-flag capture: bind refused")
 // this test must fail on. Asserting anything observable after the bind would
 // not: every flag set produces a working socket.
 //
-// The one drift it cannot see is a post-join override: an Open that called
-// conn.SetControlMessage(...) after the seam returned would diverge from the
-// argument and leave this green. conn.go makes no such call today —
-// SetControlMessage appears only inside the listen_multicast* implementations,
-// where it applies exactly the set it is passed — so nothing is lost now; add
-// the effective-set assertion if one is ever introduced.
+// An AST guard in control_oob_len_test.go checks the other half: every
+// SetControlMessage call in a non-test package file passes a bare flags
+// argument, so a call-site OR or other computed expression cannot silently
+// diverge from the seam's value. A post-join override would still be a
+// separate policy change; none exists in conn.go today.
 //
 // The seams are package state, so no t.Parallel.
 func TestOpenPassesTheExportedControlFlags(t *testing.T) {
