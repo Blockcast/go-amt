@@ -328,11 +328,30 @@ func Version() string { return version }
 // evidence has to be a census of PRODUCERS, and the per-producer signal
 // already exists: each gateway publishes the schema of its last drained window
 // as the report_schema gauge on its own /metrics (receiver.ReceiverMetrics).
-// What does not exist is an aggregate view of it — either central scraping of
+// What was missing was an aggregate view of it — either central scraping of
 // that gauge across the fleet, or a broker-side record of the per-feed schema
-// each ingest accepted. Either satisfies the gate; neither is in place, so the
-// floor stays at 1. Building one is a precondition for the floor moving, not a
-// follow-up to it, because a census that cannot see a straggler is
+// each ingest accepted. Either satisfies the gate. The second now exists: the
+// append-only gateway_heartbeat ledger in Network-Operator-Portal, censused by
+// docs/observability/gateway-heartbeat-erasure-schema-census.sql and pinned by
+// db/gateway_heartbeat_census_integ_test.go, which executes that file against a
+// real Postgres. That census is the named evidence source for this gate.
+//
+// It does not clear the gate yet, and the reason is not operational. As
+// published the census buckets gateways by the heartbeat's version, and version
+// cannot identify a schema here: no release tag contains the erasure producer
+// at all. The newest tag is v0.2.1 (2026-01-22), the producer landed in 3bbea71
+// (2026-08-11) and moved 1 -> 2 in 7a47bdd (2026-08-22), and `git tag
+// --contains` is empty for both. Every binary that can emit an erasure report
+// therefore reports "dev-unstamped" or an ad-hoc deploy string, so the
+// version-to-schema map has no rows to fill and the census can only ever return
+// one unmapped bucket.
+//
+// The schema it needs is already in the ledger and does not depend on version:
+// canonical_body is CanonicalBytes output, so each accepted report's schema is
+// at feeds[].erasure.schema. Reading it is a read-time cast — the column stays
+// BYTEA and byte-diffable. The floor moves when that census counts distinct
+// gw_uuid by that value over a fresh window, with no-data and stale coverage
+// visibly distinct from a count of zero: a census that cannot see a straggler is
 // indistinguishable from one that found none.
 //
 // Until then the range costs one comparison and buys the fleet an upgrade
