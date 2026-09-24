@@ -106,6 +106,21 @@ func TestTimestampSockoptsAreAllAccountedFor(t *testing.T) {
 // this AST guard checks that the listen function does not add a computed flag
 // expression or OR another bit when it applies that argument to the socket.
 //
+// Two mutations, not one. Rejecting a non-identifier argument stops the inline
+// form, conn.SetControlMessage(flags6|ipv6.FlagTrafficClass, true). It does
+// nothing about the rebind form,
+//
+//	flags6 |= ipv6.FlagTrafficClass
+//	conn.SetControlMessage(flags6, true)
+//
+// which is still a bare identifier and so still passes an argument-shape check.
+// Both put one more cmsg on the wire than ControlFlags6 accounts for — 24 bytes
+// for traffic class — against a v6 buffer that already sums to exactly its own
+// size, so the kernel truncates Dst and multicast's group filter then drops
+// every v6 datagram, silently. Hence the second half: the identifier handed to
+// SetControlMessage must never be assigned anywhere in its file, so it can only
+// be the value the seam was called with.
+//
 // Parsed rather than grepped so comments and string literals cannot satisfy
 // the guard. Keep the vacuity check: if SetControlMessage moves out of the
 // package files this test must fail rather than silently stop protecting the
@@ -129,27 +144,54 @@ func TestSetControlMessageUsesPassedFlags(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parse %s: %v", path, err)
 		}
+
+		// Whole-file, not per-function: a name assigned anywhere in the file is
+		// not a name this guard can vouch for, and over-rejecting here costs
+		// only a rename.
+		assigned := map[string]bool{}
+		var flagArgs []*ast.Ident
 		ast.Inspect(f, func(n ast.Node) bool {
-			call, ok := n.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			selector, ok := call.Fun.(*ast.SelectorExpr)
-			if !ok || selector.Sel.Name != "SetControlMessage" {
-				return true
-			}
-			seen++
-			if len(call.Args) == 0 {
-				t.Errorf("%s calls SetControlMessage without a control-flag argument", path)
-				return true
-			}
-			if _, ok := call.Args[0].(*ast.Ident); !ok {
-				t.Errorf("%s applies a computed control-flag expression at the "+
-					"socket call site; pass the flags argument unchanged so the "+
-					"exported OOB accounting cannot drift", path)
+			switch node := n.(type) {
+			case *ast.AssignStmt: // =, :=, |=
+				for _, lhs := range node.Lhs {
+					if id, ok := lhs.(*ast.Ident); ok {
+						assigned[id.Name] = true
+					}
+				}
+			case *ast.ValueSpec: // var flags6 ipv6.ControlFlags = ...
+				for _, id := range node.Names {
+					assigned[id.Name] = true
+				}
+			case *ast.CallExpr:
+				selector, ok := node.Fun.(*ast.SelectorExpr)
+				if !ok || selector.Sel.Name != "SetControlMessage" {
+					return true
+				}
+				seen++
+				if len(node.Args) == 0 {
+					t.Errorf("%s calls SetControlMessage without a control-flag argument", path)
+					return true
+				}
+				id, ok := node.Args[0].(*ast.Ident)
+				if !ok {
+					t.Errorf("%s applies a computed control-flag expression at the "+
+						"socket call site; pass the flags argument unchanged so the "+
+						"exported OOB accounting cannot drift", path)
+					return true
+				}
+				flagArgs = append(flagArgs, id)
 			}
 			return true
 		})
+
+		for _, id := range flagArgs {
+			if assigned[id.Name] {
+				t.Errorf("%s assigns %q before handing it to SetControlMessage; the "+
+					"socket then requests flags the exported sets do not account for, "+
+					"and the kernel truncates the OOB buffer rather than erroring. "+
+					"Pass the listen argument through unchanged.", path, id.Name)
+			}
+		}
 	}
 	if seen == 0 {
 		t.Fatal("no SetControlMessage call found in any non-test file of this " +
