@@ -7,6 +7,9 @@
     "type": "git",
     "url": "https://github.com/blockcast/go-amt"
   },
+  "engines": {
+    "node": ">=20.9.0"
+  },
   "dependencies": {
     "mpegts.js": "^1.8.0"
   },
