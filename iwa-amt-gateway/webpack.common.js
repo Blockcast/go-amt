@@ -40,17 +40,10 @@ module.exports = {
           }
         }
       },
-      {
-        test: /\.html$/,
-        loader: 'html-loader',
-        options: {
-          sources: false  // Don't process any URLs in HTML
-        }
-      },
-      {
-        test: /\.css$/,
-        use: ['style-loader', 'css-loader']
-      },
+      // No .html or .css rule: nothing in the entry graph imports either, and
+      // HtmlWebpackPlugin compiles index.html itself. The .html rule used to
+      // name html-loader, which was never in devDependencies, so it only ever
+      // failed the child compilation (BLO-36052).
     ],
   },
   plugins: [
@@ -61,11 +54,13 @@ module.exports = {
     new CopyPlugin({
       patterns: [
         { from: "icons", to: "icons", noErrorOnMissing: true },
-        { 
-          from: ".well-known", 
+        {
+          from: ".well-known",
           to: ".well-known",
           transform(content, absoluteFrom) {
-            // Inject version into manifest.webmanifest
+            // Inject version into manifest.webmanifest. This is the only
+            // writer of that field: the source manifest's placeholder
+            // "0.0.0" never ships.
             if (absoluteFrom.endsWith('manifest.webmanifest')) {
               const manifest = JSON.parse(content.toString());
               manifest.version = packageJson.version;
@@ -74,7 +69,6 @@ module.exports = {
             return content;
           }
         },
-        { from: "manifest.webmanifest", to: "manifest.webmanifest", noErrorOnMissing: true },
         { 
           from: "update_manifest.json", 
           to: "update_manifest.json", 
@@ -88,7 +82,12 @@ module.exports = {
             return JSON.stringify(updateManifest, null, 2);
           }
         },
-        { from: "amt-client.wasm", to: "amt-client.wasm" },
+        // Optional: cmd/wasm-client does not exist in this repo, so nothing
+        // produces amt-client.wasm. app.js's fetch('amt-client.wasm') 404s at
+        // runtime today; that is BLO-36052's sibling BLO-36170, not a build
+        // problem. Drop noErrorOnMissing there — either once an entrypoint is
+        // written, or by deleting this pattern if the WASM client is retired.
+        { from: "amt-client.wasm", to: "amt-client.wasm", noErrorOnMissing: true },
         { from: "wasm_exec.js", to: "wasm_exec.js" },
         { from: "amt-url-parser.js", to: "amt-url-parser.js" },
         { from: "constants.js", to: "constants.js" },
