@@ -151,17 +151,28 @@ permissions:
 #
 # This is a property of all six loops across `test`, `race` and `cgo-test`, not
 # of any one step. When BLO-32655 normalised the grep half, four of the six
-# matched unanchored; BLO-32663 then anchored all six -run expressions. Measured
-# over the tree at that point there were 27 guarded names and no strict-prefix
-# collision among the 478 test functions, so both defects were latent rather
-# than live AT THAT POINT -- one of them is live now, see the paragraph below,
-# so do not quote that measurement as current. Keep new guards in both anchored forms -- a collision introduces
-# itself silently, and the first symptom is either a guard that no longer guards
+# matched unanchored; BLO-32663 then anchored all six -run expressions. What
+# that measurement asserted was narrow, and is the invariant to preserve: no
+# strict-prefix collision among the GUARDED names. It was never a claim about
+# the tree's test functions, which have always collided freely. Re-measured at
+# 1a61db3 (BLO-35733): 501 Test/Fuzz/Benchmark functions, 31 strict-prefix
+# pairs among them, 31 guarded names, and exactly the two live collisions
+# below. The other 29 pairs are inert only because neither side is guarded --
+# adding either side to a -run list makes one live on the spot, silently. The
+# latent traps, so that warning is concrete rather than abstract:
+#
+#     TestParse                strict prefix of 16 other test functions
+#     TestPlanProbe            strict prefix of 3
+#     TestGatewayOpenTimeout   strict prefix of 2
+#     TestParseHeader          strict prefix of 2
+#
+# Keep new guards in both anchored forms -- a collision introduces itself
+# silently, and the first symptom is either a guard that no longer guards
 # anything or a red step with no annotation.
 #
-# THAT IS NO LONGER THE TREE. BLO-35057 (472a4b7d) introduced the first LIVE
-# strict-prefix collisions, both in the cgo -race guard list below, and both by
-# adding a V6 sibling next to an existing name:
+# THE TWO LIVE ONES. BLO-35057 (472a4b7d) introduced them, both in the cgo
+# -race guard list below, and both by adding a V6 sibling next to an existing
+# name:
 #
 #     TestMulticastConnOpenOntoAClosedConnDoesNotLeakTheNativeSocket
 #       <- strict prefix of ...TheNativeSocketV6
