@@ -100,6 +100,64 @@ func TestTimestampSockoptsAreAllAccountedFor(t *testing.T) {
 	}
 }
 
+// TestSetControlMessageUsesPassedFlags pins the effective IP-level control
+// flags at every platform listen site. The seam test in
+// control_flags_conn_test.go checks what Open passes into the listen function;
+// this AST guard checks that the listen function does not add a computed flag
+// expression or OR another bit when it applies that argument to the socket.
+//
+// Parsed rather than grepped so comments and string literals cannot satisfy
+// the guard. Keep the vacuity check: if SetControlMessage moves out of the
+// package files this test must fail rather than silently stop protecting the
+// five platform sites.
+func TestSetControlMessageUsesPassedFlags(t *testing.T) {
+	files, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatalf("glob package files: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no .go files matched in the package directory, so this guard is " +
+			"inspecting nothing")
+	}
+
+	seen := 0
+	for _, path := range files {
+		if strings.HasSuffix(path, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			t.Fatalf("parse %s: %v", path, err)
+		}
+		ast.Inspect(f, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			selector, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || selector.Sel.Name != "SetControlMessage" {
+				return true
+			}
+			seen++
+			if len(call.Args) == 0 {
+				t.Errorf("%s calls SetControlMessage without a control-flag argument", path)
+				return true
+			}
+			if _, ok := call.Args[0].(*ast.Ident); !ok {
+				t.Errorf("%s applies a computed control-flag expression at the "+
+					"socket call site; pass the flags argument unchanged so the "+
+					"exported OOB accounting cannot drift", path)
+			}
+			return true
+		})
+	}
+	if seen == 0 {
+		t.Fatal("no SetControlMessage call found in any non-test file of this " +
+			"package; either the platform sites moved or this guard is inspecting " +
+			"nothing")
+	}
+}
+
 // TestControlMessageOOBLenCoversBothFamiliesAndTheTimestamp pins that the
 // exported length is the sum a caller actually needs, per term.
 //
