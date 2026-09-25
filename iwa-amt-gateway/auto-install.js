@@ -91,7 +91,7 @@ document.getElementById('installButton').addEventListener('click', async (event)
         // MUST be called synchronously in click handler due to user activation requirement
         if (navigator.install) {
             log('📦 Trying navigator.install()...', 'info');
-            const manifestUrl = window.location.origin + '/manifest.webmanifest';
+            const manifestUrl = window.location.origin + '/.well-known/manifest.webmanifest';
             log(`   Manifest URL: ${manifestUrl}`, 'info');
             
             try {

@@ -919,4 +919,31 @@ jobs:
           cache: npm
           cache-dependency-path: iwa-amt-gateway/package-lock.json
       - run: npm ci
+      # Build before the unit tests so the CopyPlugin path is exercised on every
+      # PR touching this package. It was not, and the build sat broken on main
+      # with 4 errors and no dist/ at all (BLO-36052).
+      - run: npm run build
+      - name: Assert build output
+        run: |
+          node -e '
+            const fs = require("fs");
+            const want = require("./package.json").version;
+            for (const f of ["index.html", "service-worker.js", "wasm_exec.js",
+                             ".well-known/manifest.webmanifest"]) {
+              if (!fs.existsSync("dist/" + f)) throw new Error("missing dist/" + f);
+            }
+            const got = JSON.parse(
+              fs.readFileSync("dist/.well-known/manifest.webmanifest")).version;
+            if (got !== want) throw new Error(`manifest version ${got} != ${want}`);
+            // dist/ is the intermediate; the web bundle is the deliverable, and
+            // a bundle without the manifest will not install as an IWA. Keyless
+            // CI emits .wbn, a keyed build .swbn — accept either.
+            const bundle = ["dist/amt-gateway.wbn", "dist/amt-gateway.swbn"]
+              .find(fs.existsSync);
+            if (!bundle) throw new Error("no amt-gateway.wbn/.swbn emitted");
+            if (!fs.readFileSync(bundle).includes("/.well-known/manifest.webmanifest")) {
+              throw new Error(bundle + " is missing /.well-known/manifest.webmanifest");
+            }
+            console.log("dist/ ok, manifest version " + got + ", " + bundle + " ok");
+          '
       - run: npm run test:unit
