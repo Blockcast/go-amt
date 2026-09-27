@@ -336,10 +336,9 @@ func Version() string { return version }
 // db/gateway_heartbeat_census_integ_test.go, which executes that file against a
 // real Postgres. That census is the named evidence source for this gate.
 //
-// That census no longer derives the schema from version, and the version dead
-// end is why — version survives as a reported dimension, it just no longer
-// attributes anything. A
-// version-keyed census could never have cleared this gate: no release tag
+// That census no longer derives the schema from version; version survives as a
+// reported dimension but no longer attributes anything. A version-keyed census
+// could never have cleared this gate: no release tag
 // contains the erasure producer at all. The newest tag is v0.2.1 (2026-01-22),
 // the producer landed in 3bbea71 (2026-08-11) and moved 1 -> 2 in 7a47bdd
 // (2026-08-22), and `git tag --contains` is empty for both, so every binary
@@ -361,15 +360,36 @@ func Version() string { return version }
 // Network-Operator-Portal deployment question, not a protocol one. The floor
 // moves when the census runs against that ledger and returns fresh coverage,
 // no schema-1 bucket, and no unattributed (NULL) bucket. The third conjunct is
-// not redundant with the second. The census deliberately degrades four
-// malformed shapes to a NULL schema — absent feeds, non-array feeds, a
-// non-numeric erasure.schema, and a fractional or out-of-range one — and files
-// them as unattributed rather than rounding them into a real bucket. A fleet
-// whose surviving schema-1 producers all emit a payload that degrades would
-// therefore report fresh coverage and no schema-1 bucket while the stragglers
-// are live. A NULL bucket may be discounted only once every gw_uuid
-// contributing to it has been read back from the ledger and shown to be
-// something other than a schema-1 producer. Until then no_data must never be
+// not redundant with the second. The census files several shapes as
+// unattributed rather than rounding them into a real bucket, and they split on
+// whether a conforming producer can emit them at all. Unreachable from one: an
+// absent feeds key, a non-array non-null feeds, a non-numeric erasure.schema,
+// and a fractional or out-of-range one — reportSchema is a uint8 constant
+// (erasure/tracker.go) and CanonicalBytes always emits the feeds key, since
+// Feeds carries no omitempty. Reachable, and well-formed rather than
+// malformed: "feeds":null from a nil Feeds, and "feeds":[] from a non-nil
+// empty one — CanonicalBytes rebuilds Feeds only when len > 0 and
+// ValidateHeartbeat bounds it only from above, so both survive ingest
+// verbatim. The first takes the census's ELSE '[]' arm; the second passes its
+// array guard and then yields no rows from jsonb_array_elements; the
+// LEFT JOIN LATERAL emits the gateway with a NULL schema either way. Both are
+// just a gateway subscribed to nothing, so expect the NULL bucket to be mostly
+// idle gateways, not broken ones.
+//
+// A fleet whose surviving schema-1 producers all emit a degrading payload
+// would therefore report fresh coverage and no schema-1 bucket while the
+// stragglers are live. Reading every contributing gw_uuid back from the ledger
+// does not discharge that: for an idle gateway the payload carries no schema
+// by construction, so the readback returns the same absence and the condition
+// is unsatisfiable rather than merely unmet. Cross-bucket membership within
+// the same window does — buckets counts COUNT(DISTINCT gw_uuid) per
+// (version, erasure_schema), so a gateway with one degrading feed and one
+// readable schema-2 feed lands in both, and any gw_uuid in the NULL bucket
+// that also appears in a non-NULL, non-schema-1 bucket is discharged by set
+// difference. That needs a companion query, since the census reports counts
+// and not gw_uuids, and it clears only the mixed gateways. A gw_uuid appearing
+// only in NULL is not dischargeable from the ledger by any query; identifying
+// that gateway's build is out-of-band work. Until then no_data must never be
 // read as a clear: a census that cannot see a straggler is indistinguishable
 // from one that found none.
 //
