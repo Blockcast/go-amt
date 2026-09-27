@@ -336,23 +336,30 @@ func Version() string { return version }
 // db/gateway_heartbeat_census_integ_test.go, which executes that file against a
 // real Postgres. That census is the named evidence source for this gate.
 //
-// It does not clear the gate yet, and the reason is not operational. As
-// published the census buckets gateways by the heartbeat's version, and version
-// cannot identify a schema here: no release tag contains the erasure producer
-// at all. The newest tag is v0.2.1 (2026-01-22), the producer landed in 3bbea71
-// (2026-08-11) and moved 1 -> 2 in 7a47bdd (2026-08-22), and `git tag
-// --contains` is empty for both. Every binary that can emit an erasure report
-// therefore reports "dev-unstamped" or an ad-hoc deploy string, so the
-// version-to-schema map has no rows to fill and the census can only ever return
-// one unmapped bucket.
+// That census no longer keys on version, and the version dead end is why. A
+// version-keyed census could never have cleared this gate: no release tag
+// contains the erasure producer at all. The newest tag is v0.2.1 (2026-01-22),
+// the producer landed in 3bbea71 (2026-08-11) and moved 1 -> 2 in 7a47bdd
+// (2026-08-22), and `git tag --contains` is empty for both, so every binary
+// that can emit an erasure report reports "dev-unstamped" or an ad-hoc deploy
+// string. Network-Operator-Portal#1054 (merged 2026-09-26) re-keyed it off the
+// payload instead: canonical_body is CanonicalBytes output, so each accepted
+// report's schema is addressable at feeds[].erasure.schema, and reading it is a
+// read-time cast that leaves the column BYTEA and byte-diffable. It counts
+// distinct gw_uuid by that value over a 24h window, keeps no_data and
+// stale_coverage visibly distinct from a count of zero, and gives
+// dev-unstamped its own bucket. 13 cases pin that against a real Postgres in CI.
 //
-// The schema it needs is already in the ledger and does not depend on version:
-// canonical_body is CanonicalBytes output, so each accepted report's schema is
-// at feeds[].erasure.schema. Reading it is a read-time cast — the column stays
-// BYTEA and byte-diffable. The floor moves when that census counts distinct
-// gw_uuid by that value over a fresh window, with no-data and stale coverage
-// visibly distinct from a count of zero: a census that cannot see a straggler is
-// indistinguishable from one that found none.
+// What blocks the floor now is the evidence, not the query. The producer half
+// of it is known empty from the tag measurement above: no packaged build emits
+// an erasure report of any schema, so anything heartbeating one today was built
+// from an untagged commit and can be on either side of 7a47bdd. Whether the
+// ledger holds such rows is not measurable from this repo — that is a
+// Network-Operator-Portal deployment question, not a protocol one. The floor
+// moves when the census runs against that ledger and returns fresh coverage
+// with no schema-1 bucket. Until then no_data must never be read as a clear: a
+// census that cannot see a straggler is indistinguishable from one that found
+// none.
 //
 // Until then the range costs one comparison and buys the fleet an upgrade
 // window it cannot otherwise have.
