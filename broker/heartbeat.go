@@ -336,7 +336,9 @@ func Version() string { return version }
 // db/gateway_heartbeat_census_integ_test.go, which executes that file against a
 // real Postgres. That census is the named evidence source for this gate.
 //
-// That census no longer keys on version, and the version dead end is why. A
+// That census no longer derives the schema from version, and the version dead
+// end is why — version survives as a reported dimension, it just no longer
+// attributes anything. A
 // version-keyed census could never have cleared this gate: no release tag
 // contains the erasure producer at all. The newest tag is v0.2.1 (2026-01-22),
 // the producer landed in 3bbea71 (2026-08-11) and moved 1 -> 2 in 7a47bdd
@@ -348,7 +350,8 @@ func Version() string { return version }
 // read-time cast that leaves the column BYTEA and byte-diffable. It counts
 // distinct gw_uuid by that value over a 24h window, keeps no_data and
 // stale_coverage visibly distinct from a count of zero, and gives
-// dev-unstamped its own bucket. 13 cases pin that against a real Postgres in CI.
+// dev-unstamped its own bucket. 11 subtests across 2 integration tests pin that
+// against a real Postgres in CI.
 //
 // What blocks the floor now is the evidence, not the query. The producer half
 // of it is known empty from the tag measurement above: no packaged build emits
@@ -356,10 +359,19 @@ func Version() string { return version }
 // from an untagged commit and can be on either side of 7a47bdd. Whether the
 // ledger holds such rows is not measurable from this repo — that is a
 // Network-Operator-Portal deployment question, not a protocol one. The floor
-// moves when the census runs against that ledger and returns fresh coverage
-// with no schema-1 bucket. Until then no_data must never be read as a clear: a
-// census that cannot see a straggler is indistinguishable from one that found
-// none.
+// moves when the census runs against that ledger and returns fresh coverage,
+// no schema-1 bucket, and no unattributed (NULL) bucket. The third conjunct is
+// not redundant with the second. The census deliberately degrades four
+// malformed shapes to a NULL schema — absent feeds, non-array feeds, a
+// non-numeric erasure.schema, and a fractional or out-of-range one — and files
+// them as unattributed rather than rounding them into a real bucket. A fleet
+// whose surviving schema-1 producers all emit a payload that degrades would
+// therefore report fresh coverage and no schema-1 bucket while the stragglers
+// are live. A NULL bucket may be discounted only once every gw_uuid
+// contributing to it has been read back from the ledger and shown to be
+// something other than a schema-1 producer. Until then no_data must never be
+// read as a clear: a census that cannot see a straggler is indistinguishable
+// from one that found none.
 //
 // Until then the range costs one comparison and buys the fleet an upgrade
 // window it cannot otherwise have.
