@@ -1,4 +1,11 @@
-//go:build linux
+//go:build linux && !android && cgo && !purego
+
+// These tests reach conn.go's unexported conn4/conn6/activeTunnel fields, so
+// they must be selected under exactly the same conditions as conn.go itself --
+// restricted to linux, because they also drive the real UDP_SEGMENT syscall.
+// Tagged only `linux` they compile in the CGO_ENABLED=0 `test` lane, the
+// -tags purego `race` lane and the GOOS=android `mobile-typecheck` lane, where
+// MulticastConn is the stub and has no such fields.
 
 package amt
 
