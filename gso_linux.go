@@ -23,7 +23,15 @@ import (
 // function only adds the UDP-level cmsg alongside it.
 func appendUDPSegmentCmsg(oob []byte, segmentSize uint16) []byte {
 	off := len(oob)
-	oob = append(oob, make([]byte, unix.CmsgSpace(2))...)
+	// oob[:off:off] caps the slice at its length so append must allocate and
+	// copy instead of writing into whatever backing array the caller owns.
+	// Every caller today passes a fresh cm.Marshal(), but this function takes
+	// oob with no stated ownership contract, and the natural optimization on
+	// this path -- hoisting a scratch oob out of a per-block send loop, which
+	// is exactly the sort of per-packet allocation one-syscall sends exist to
+	// remove -- would otherwise have it scribble the UDP cmsg into a buffer
+	// the caller reuses.
+	oob = append(oob[:off:off], make([]byte, unix.CmsgSpace(2))...)
 	h := (*unix.Cmsghdr)(unsafe.Pointer(&oob[off]))
 	h.Level = unix.IPPROTO_UDP
 	h.Type = unix.UDP_SEGMENT

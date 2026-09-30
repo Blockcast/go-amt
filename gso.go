@@ -41,9 +41,24 @@ const (
 	UDPMaxSegments = 128
 
 	// maxSegmentedPayloadBytes is the total size a single segmented send may
-	// carry, bounded by the 16-bit IP payload length. Measured: 45 x 1366 =
-	// 61470B succeeded, 48 x 1366 = 65568B returned EMSGSIZE.
-	maxSegmentedPayloadBytes = 65535
+	// carry: the 16-bit IPv4 total-length field minus the headers the kernel
+	// accounts against the aggregate, i.e. 65535 - 20 (IP) - 8 (UDP) = 65507.
+	// It is written against udpIPv4HeaderOverhead because it is the same 28
+	// bytes for the same reason, so a correction to one must move the other.
+	//
+	// Bisected against the running kernel at segment sizes 512, 1024 and 1366:
+	// 65507 accepted, 65508 EMSGSIZE, identically at all three -- so the bound
+	// is on the aggregate buffer, not on how it is segmented.
+	//
+	// Overstating this costs exactly what overstating UDPMaxSegments costs:
+	// correctness is unaffected (the kernel's EMSGSIZE is classified as
+	// ErrSegmentsUnsupported and nothing reaches the wire either time), but
+	// every batch above the real ceiling pays a doomed syscall before falling
+	// back, which is the per-packet syscall cost this path exists to remove.
+	// The table tests express their bounds in terms of this constant and so
+	// move with it; TestMaxSegmentedPayloadBytesMatchesKernel is what pins it
+	// to the kernel in both directions, and it fails rather than skipping.
+	maxSegmentedPayloadBytes = 65535 - udpIPv4HeaderOverhead
 
 	// udpIPv4HeaderOverhead is the IPv4 (20) + UDP (8) header cost added to each
 	// emitted segment. A segment of exactly MTU-28 succeeded in probing; one

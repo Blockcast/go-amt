@@ -134,6 +134,53 @@ func TestAppendUDPSegmentCmsgPreservesExisting(t *testing.T) {
 	}
 }
 
+// TestAppendUDPSegmentCmsgDoesNotWriteIntoCallerCapacity pins the ownership
+// half of the oob contract. writeSegments takes oob []byte and states nothing
+// about who owns its backing array, so the guarantee has to live in the
+// function that relies on it.
+//
+// The shape that breaks is the one this path invites: hoisting a scratch oob
+// out of a per-block send loop to stop allocating per datagram. A plain append
+// into a slice with spare capacity writes the UDP cmsg in place, so the caller
+// gets its own buffer mutated under it -- silently, since the returned slice
+// is correct either way and the corrupted region is past len(oob).
+func TestAppendUDPSegmentCmsgDoesNotWriteIntoCallerCapacity(t *testing.T) {
+	cm := (&ipv4.ControlMessage{IfIndex: 1, TTL: 8}).Marshal()
+	// A caller-owned buffer with room to spare, i.e. what a hoisted scratch
+	// oob looks like. Fill the spare region so any in-place write shows up.
+	scratch := make([]byte, len(cm), len(cm)+unix.CmsgSpace(2)+16)
+	copy(scratch, cm)
+	spare := scratch[len(cm):cap(scratch)]
+	for i := range spare {
+		spare[i] = 0xAA
+	}
+
+	got := appendUDPSegmentCmsg(scratch, 1366)
+
+	for i, b := range scratch[len(cm):cap(scratch)] {
+		if b != 0xAA {
+			t.Fatalf("byte %d of the caller's spare capacity became %#x: the UDP "+
+				"cmsg was written into the caller's backing array, so a hoisted "+
+				"scratch oob would be corrupted on every send", i, b)
+		}
+	}
+
+	// The copy must still carry the cmsg -- forcing an allocation is only
+	// correct if the returned slice is unchanged by it.
+	msgs, err := unix.ParseSocketControlMessage(got)
+	if err != nil {
+		t.Fatalf("ParseSocketControlMessage: %v", err)
+	}
+	last := msgs[len(msgs)-1]
+	if last.Header.Level != unix.IPPROTO_UDP || last.Header.Type != unix.UDP_SEGMENT {
+		t.Fatalf("last cmsg is level %d type %d, want UDP_SEGMENT",
+			last.Header.Level, last.Header.Type)
+	}
+	if v := binary.NativeEndian.Uint16(last.Data); v != 1366 {
+		t.Fatalf("segment size = %d, want 1366", v)
+	}
+}
+
 // TestWriteSegmentsEmitsSeparateDatagramsInOrder is the load-bearing test: one
 // syscall must put N distinct, correctly sized datagrams on the wire, in order,
 // byte-identical to the slices a per-datagram sender would have written.
@@ -303,6 +350,51 @@ func TestUDPMaxSegmentsMatchesKernel(t *testing.T) {
 			t.Fatalf("kernel accepted %d segments, so UDPMaxSegments (%d) understates its "+
 				"real cap and batches are falling back needlessly",
 				UDPMaxSegments+1, UDPMaxSegments)
+		}
+		assertNoMoreDatagrams(t, rx)
+	})
+}
+
+// TestMaxSegmentedPayloadBytesMatchesKernel is TestUDPMaxSegmentsMatchesKernel
+// for the other cap, and exists for the same reason: every table row in
+// gso_test.go expresses its bound as maxSegmentedPayloadBytes or +1, so they
+// move with the constant and assert only that checkSegmentBatch agrees with
+// itself. The constant shipped at 65535, one recorded probe above the highest
+// total ever measured as accepted (45 x 1366 = 61470), and the real ceiling is
+// 28 bytes below it -- a gap no table test could see.
+//
+// As with the segment cap, being wrong here is a cost bug rather than a
+// correctness one: the kernel refuses with EMSGSIZE, that is classified as
+// ErrSegmentsUnsupported, and nothing reaches the wire. But an overstated
+// ceiling means every batch in the gap pays a doomed syscall before falling
+// back, which is the syscall this whole path exists to avoid. So assert
+// against the kernel in both directions and fail, do not skip.
+func TestMaxSegmentedPayloadBytesMatchesKernel(t *testing.T) {
+	// Picked so segmentCount stays well under UDPMaxSegments at both totals
+	// (48 and 49 segments); otherwise the segment cap refuses first and this
+	// test would pass without the byte cap ever being reached.
+	const segment = 1366
+
+	t.Run("cap is accepted", func(t *testing.T) {
+		rx, pc, dst := loopbackPair(t)
+		n, err := writeSegments(pc, make([]byte, maxSegmentedPayloadBytes), segment, nil, dst)
+		if err != nil {
+			t.Fatalf("kernel refused %d bytes, which maxSegmentedPayloadBytes claims "+
+				"is allowed, so the constant overstates the real ceiling and every "+
+				"batch in the gap pays a doomed syscall: %v", maxSegmentedPayloadBytes, err)
+		}
+		if n != maxSegmentedPayloadBytes {
+			t.Fatalf("wrote %d bytes, want %d", n, maxSegmentedPayloadBytes)
+		}
+		readDatagrams(t, rx, segmentCount(maxSegmentedPayloadBytes, segment))
+	})
+
+	t.Run("one over the cap is refused", func(t *testing.T) {
+		rx, pc, dst := loopbackPair(t)
+		if _, err := writeSegments(pc, make([]byte, maxSegmentedPayloadBytes+1), segment, nil, dst); err == nil {
+			t.Fatalf("kernel accepted %d bytes, so maxSegmentedPayloadBytes (%d) "+
+				"understates its real cap and batches are falling back needlessly",
+				maxSegmentedPayloadBytes+1, maxSegmentedPayloadBytes)
 		}
 		assertNoMoreDatagrams(t, rx)
 	})
