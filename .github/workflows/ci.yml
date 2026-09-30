@@ -477,6 +477,22 @@ jobs:
               rc=1
             }
           done
+          # WriteSegments (BLO-38384). Same argument again: it is tagged to
+          # conn.go's selection because it touches conn4/conn6/activeTunnel, so
+          # this is the only lane that compiles it, and it is the only file that
+          # exercises the UDP_SEGMENT send at all. Its assertions are not
+          # substitutable -- it is where the segmented send is proved to emit N
+          # separate datagrams rather than one jumbo one (a wrong cmsg level or
+          # type is silently ignored by the kernel and looks like success), and
+          # where a refused send is proved to emit zero frames, which is the
+          # only reason falling back to per-datagram writes cannot duplicate
+          # traffic on a live group.
+          for t in gso_linux_test.go; do
+            printf '%s\n' "$tst" | grep -qxF "$t" || {
+              echo "::error::$t is not in the cgo test selection; the UDP GSO send and its zero-frame refusal are not asserted anywhere"
+              rc=1
+            }
+          done
           exit $rc
 
       # Full `go vet` over the cgo selection, which no other job covers.

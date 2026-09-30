@@ -124,6 +124,13 @@ func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, flags int) (int, error) 
 	return managed.WriteBatch(msg, flags)
 }
 
+// WriteSegments is not offered on mobile: ManagedConn exposes no socket to set
+// UDP_SEGMENT on, and iOS is not Linux in any case. Callers fall back on
+// ErrSegmentsUnsupported.
+func (mc *MulticastConn) WriteSegments(b []byte, segmentSize int, cm *ipv4.ControlMessage, dst net.Addr) (int, error) {
+	return 0, fmt.Errorf("%w: managed mobile connection", ErrSegmentsUnsupported)
+}
+
 func (mc *MulticastConn) Close() error {
 	if mc.managed == nil {
 		return nil

@@ -792,3 +792,52 @@ func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {
 	}
 	return 0, fmt.Errorf("writebatch not implemented for amt gatway")
 }
+
+// WriteSegments writes b to dst as a single sendmsg(2) carrying UDP_SEGMENT
+// (UDP GSO), so the kernel emits ceil(len(b)/segmentSize) separate datagrams
+// instead of costing one syscall each. b must be the segments laid out
+// back-to-back, every one exactly segmentSize except the last, which may be
+// shorter.
+//
+// It exists because UDP_SEGMENT is an IPPROTO_UDP control message and
+// x/net's ipv4.ControlMessage marshals IP-level options only, so the option
+// cannot be expressed through WriteTo or WriteBatch. cm still supplies the
+// IP-level half (source address and egress interface) and is marshalled here.
+//
+// An error wrapping ErrSegmentsUnsupported means nothing was written and the
+// caller should fall back to WriteBatch or per-datagram WriteTo -- a refused
+// segmented send emits zero frames, so the fallback cannot duplicate traffic.
+// ErrSegmentsPartial is the one error that must NOT be retried.
+func (mc *MulticastConn) WriteSegments(b []byte, segmentSize int, cm *ipv4.ControlMessage, dst net.Addr) (int, error) {
+	if mc.IsUsingTunnel() {
+		// Consistent with WriteTo/WriteBatch above: the tunnel refuses every
+		// write, so a sender only ever writes natively.
+		return 0, fmt.Errorf("%w: amt tunnel has no write path", ErrSegmentsUnsupported)
+	}
+	if mc.conn6 != nil {
+		// The v4 control message does not apply to the v6 socket, matching the
+		// carve-out in WriteToWithControlMessage.
+		return 0, fmt.Errorf("%w: native v6 send", ErrSegmentsUnsupported)
+	}
+	if mc.conn4 == nil {
+		return 0, fmt.Errorf("%w: connection is not open", ErrSegmentsUnsupported)
+	}
+	udpDst, ok := dst.(*net.UDPAddr)
+	if !ok {
+		return 0, fmt.Errorf("%w: destination %T is not *net.UDPAddr", ErrSegmentsUnsupported, dst)
+	}
+	mtu := 0
+	if mc.IFace != nil {
+		mtu = mc.IFace.MTU
+	}
+	if err := checkSegmentBatch(len(b), segmentSize, mtu); err != nil {
+		return 0, err
+	}
+	var oob []byte
+	if cm != nil {
+		// Marshal allocates a fresh buffer per call, so appending the UDP cmsg
+		// to it cannot disturb a caller-held one.
+		oob = cm.Marshal()
+	}
+	return writeSegments(mc.conn4, b, segmentSize, oob, udpDst)
+}
