@@ -370,10 +370,30 @@ func TestUDPMaxSegmentsMatchesKernel(t *testing.T) {
 // back, which is the syscall this whole path exists to avoid. So assert
 // against the kernel in both directions and fail, do not skip.
 func TestMaxSegmentedPayloadBytesMatchesKernel(t *testing.T) {
-	// Picked so segmentCount stays well under UDPMaxSegments at both totals
-	// (48 and 49 segments); otherwise the segment cap refuses first and this
-	// test would pass without the byte cap ever being reached.
+	// Picked so segmentCount stays well under UDPMaxSegments at both totals;
+	// otherwise the segment cap refuses first and this test would pass without
+	// the byte cap ever being reached. 1366 x 47 = 64202 and 1366 x 48 = 65568,
+	// so 65507 and 65508 both fall in the same bucket and segmentCount returns
+	// 48 for each -- well under the 128-segment cap, so it cannot bind first.
 	const segment = 1366
+
+	// Assert the premise rather than only stating it. If segment is ever retuned
+	// so the segment cap binds first, the subtests below do not pass vacuously --
+	// they fail, but they MISATTRIBUTE: "cap is accepted" reports that
+	// maxSegmentedPayloadBytes overstates the real ceiling, when the kernel
+	// actually returned EINVAL for too many segments and never evaluated the byte
+	// ceiling at all. Measured at segment=400: the bare failure reads "kernel
+	// refused 65507 bytes ... the constant overstates the real ceiling",
+	// wrapping "invalid argument". That sends the next reader to change a correct
+	// constant. This loop names the real cause instead.
+	for _, total := range []int{maxSegmentedPayloadBytes, maxSegmentedPayloadBytes + 1} {
+		if got := segmentCount(total, segment); got > UDPMaxSegments {
+			t.Fatalf("segment=%d puts %d bytes at %d segments, over the %d cap: "+
+				"the kernel refuses on the segment cap before the byte ceiling is "+
+				"reached, so a failure below would blame maxSegmentedPayloadBytes "+
+				"for this test's own parameter", segment, total, got, UDPMaxSegments)
+		}
+	}
 
 	t.Run("cap is accepted", func(t *testing.T) {
 		rx, pc, dst := loopbackPair(t)
