@@ -68,3 +68,7 @@ func (mc *MulticastConn) WriteToWithControlMessage(b []byte, cm *ipv4.ControlMes
 func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {
 	return 0, errNoCGO
 }
+
+func (mc *MulticastConn) WriteSegments(b []byte, segmentSize int, cm *ipv4.ControlMessage, dst net.Addr) (int, error) {
+	return 0, errNoCGO
+}
