@@ -70,5 +70,11 @@ func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {
 }
 
 func (mc *MulticastConn) WriteSegments(b []byte, segmentSize int, cm *ipv4.ControlMessage, dst net.Addr) (int, error) {
-	return 0, errNoCGO
+	// Wrapped, unlike the other stubs in this file: WriteSegments publishes
+	// ErrSegmentsUnsupported as the way a caller detects "no segmented write
+	// here" and selects WriteBatch or per-datagram WriteTo. A bare errNoCGO
+	// would make errors.Is report false and the caller surface a hard error
+	// instead of falling back. conn_mobile.go and gso_other.go wrap it for the
+	// same reason.
+	return 0, fmt.Errorf("%w: %v", ErrSegmentsUnsupported, errNoCGO)
 }

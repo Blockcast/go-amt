@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
@@ -305,6 +306,38 @@ func TestUDPMaxSegmentsMatchesKernel(t *testing.T) {
 		}
 		assertNoMoreDatagrams(t, rx)
 	})
+}
+
+// TestRetrySegmentedSend covers the other branch no socket can reach. EAGAIN
+// needs a full send buffer and EINTR needs a signal landing mid-call, so the
+// predicate is untestable end-to-end -- and getting it wrong is silent in both
+// directions: too narrow and an interrupted send surfaces as a bare error that
+// wraps nothing, so the caller fails instead of falling back; too wide and a
+// real refusal is reissued forever.
+func TestRetrySegmentedSend(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		opErr error
+		want  bool
+	}{
+		// Neither put a byte on the wire -- sendmsg(2) on a datagram socket is
+		// all-or-nothing -- so reissuing cannot duplicate.
+		{"eagain parks for writability", unix.EAGAIN, true},
+		{"eintr is reissued", unix.EINTR, true},
+		{"wrapped eintr still matches", fmt.Errorf("sendmsg: %w", unix.EINTR), true},
+
+		// Refusals: these must surface so classifySendResult can map them onto
+		// ErrSegmentsUnsupported and the caller can fall back.
+		{"einval surfaces", unix.EINVAL, false},
+		{"emsgsize surfaces", unix.EMSGSIZE, false},
+		{"success surfaces", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := retrySegmentedSend(tc.opErr); got != tc.want {
+				t.Fatalf("retrySegmentedSend(%v) = %v, want %v", tc.opErr, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestWriteSegmentsRejectsNonIPv4Destination(t *testing.T) {

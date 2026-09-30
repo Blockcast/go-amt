@@ -61,11 +61,28 @@ func writeSegments(pc *ipv4.PacketConn, b []byte, segmentSize int, oob []byte, d
 	if err := rc.Write(func(fd uintptr) bool {
 		n, opErr = unix.SendmsgN(int(fd), b, oob, sa, 0)
 		// false parks until the socket is writable and calls back.
-		return !errors.Is(opErr, unix.EAGAIN)
+		return !retrySegmentedSend(opErr)
 	}); err != nil {
 		return 0, err
 	}
 	return classifySendResult(n, len(b), opErr)
+}
+
+// retrySegmentedSend reports whether a sendmsg outcome should be reissued
+// rather than surfaced. It is split out for the same reason classifySendResult
+// is: the decision is not observable through a real socket (EAGAIN needs a full
+// send buffer, EINTR needs a signal landing mid-call), so a table test is the
+// only way to assert it.
+//
+// Both cases are safe to reissue because sendmsg(2) on a datagram socket is
+// all-or-nothing: neither put a byte on the wire, so a retry cannot duplicate.
+// EINTR is included because unix.SendmsgN is a bare syscall wrapper, not one of
+// internal/poll's own send paths, so nothing else retries it -- and without this
+// a signal mid-send surfaces as a bare error that does not wrap
+// ErrSegmentsUnsupported, so the caller fails the send instead of falling back.
+// Rare (Go installs its handlers with SA_RESTART), but free to close.
+func retrySegmentedSend(opErr error) bool {
+	return errors.Is(opErr, unix.EAGAIN) || errors.Is(opErr, unix.EINTR)
 }
 
 // classifySendResult maps a segmented sendmsg outcome onto the caller contract.

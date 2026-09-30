@@ -28,8 +28,16 @@ const (
 	// the staging sender node (Talos, kernel 6.18) by bisecting the boundary:
 	// 128 x 400B succeeded in one call, 129 x 400B returned EINVAL. Linux has
 	// historically documented 64; do not substitute that value without
-	// re-measuring, and note that a kernel with a lower cap still fails closed
-	// via the EINVAL retry path rather than emitting a short batch.
+	// re-measuring.
+	//
+	// A kernel whose real cap is lower stays correct: its EINVAL is classified
+	// as ErrSegmentsUnsupported and the caller falls back, with nothing on the
+	// wire either time. But it is not free -- every batch above its real cap
+	// then pays a doomed syscall before falling back, which is the per-packet
+	// syscall cost this whole path exists to remove. That is why
+	// TestUDPMaxSegmentsMatchesKernel asserts this value against the running
+	// kernel in both directions and fails rather than skipping: a silently
+	// overstated cap is a permanent slow path that no other test can see.
 	UDPMaxSegments = 128
 
 	// maxSegmentedPayloadBytes is the total size a single segmented send may
@@ -76,6 +84,22 @@ func checkSegmentBatch(total, segmentSize, mtu int) error {
 	if total > maxSegmentedPayloadBytes {
 		return fmt.Errorf("%w: %d bytes exceeds the %d-byte limit",
 			ErrSegmentsUnsupported, total, maxSegmentedPayloadBytes)
+	}
+	// Ordering is load-bearing. total is now known to fit in 16 bits, so
+	// refusing a segment larger than the buffer is also what keeps the
+	// uint16(segmentSize) narrowing in writeSegments lossless -- and that
+	// narrowing is the one place an out-of-range value changes the wire
+	// silently instead of erroring: segmentSize 70000 wraps to 4464, so the
+	// kernel emits 15 datagrams where the caller asked for one, and the call
+	// returns success. The mtu check above cannot be relied on to catch it,
+	// because an unknown mtu skips that check by design.
+	//
+	// Refusing costs nothing real: a segment larger than the buffer is a
+	// degenerate GSO request either way -- the caller wanted a single
+	// datagram, which the fallback sends directly.
+	if segmentSize > total {
+		return fmt.Errorf("%w: segment size %d exceeds the %d-byte buffer",
+			ErrSegmentsUnsupported, segmentSize, total)
 	}
 	if mtu > 0 && segmentSize+udpIPv4HeaderOverhead > mtu {
 		return fmt.Errorf("%w: segment %d + %d header exceeds mtu %d",
