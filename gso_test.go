@@ -143,3 +143,45 @@ func TestSegmentsPartialIsDistinctFromUnsupported(t *testing.T) {
 		t.Fatal("ErrSegmentsUnsupported must not wrap ErrSegmentsPartial")
 	}
 }
+
+// TestMaxSegmentsPerSendIsTheLargestBatchWriteSegmentsAccepts pins the helper
+// to checkSegmentBatch rather than to its own arithmetic: at each size the
+// batch it reports must be accepted and one segment more must be refused.
+// Asserting it against min(UDPMaxSegments, maxSegmentedPayloadBytes/size)
+// would only restate the implementation, so a drift in either bound would move
+// both sides together and assert nothing.
+//
+// The sizes are chosen so each bound binds on its own: at 400B the count binds
+// (163 segments would fit in 65,507B, the kernel takes 128) and at 1366B the
+// aggregate binds (128 segments would be 174,848B, the kernel takes 47). So
+// dropping either arm of the min fails this test somewhere in the sweep.
+func TestMaxSegmentsPerSendIsTheLargestBatchWriteSegmentsAccepts(t *testing.T) {
+	for _, segmentSize := range []int{1, 2, 64, 400, 511, 512, 513, 1024, 1366, 1448, 8192, 32768, 65506, 65507} {
+		n := MaxSegmentsPerSend(segmentSize)
+		if n < 1 {
+			t.Fatalf("MaxSegmentsPerSend(%d) = %d, want at least 1 -- "+
+				"a size that fits the aggregate limit must allow one segment", segmentSize, n)
+		}
+		if err := checkSegmentBatch(n*segmentSize, segmentSize, 0); err != nil {
+			t.Errorf("checkSegmentBatch rejected a full batch of %d x %dB = %dB: %v",
+				n, segmentSize, n*segmentSize, err)
+		}
+		if err := checkSegmentBatch((n+1)*segmentSize, segmentSize, 0); err == nil {
+			t.Errorf("checkSegmentBatch accepted %d x %dB = %dB, one segment past "+
+				"MaxSegmentsPerSend(%d) = %d -- the helper understates the limit",
+				n+1, segmentSize, (n+1)*segmentSize, segmentSize, n)
+		}
+	}
+}
+
+// TestMaxSegmentsPerSendRefusesUnsegmentableSizes covers the 0 return, which a
+// caller must read as "do not segment" and not as a count: a non-positive size,
+// and a size that alone exceeds the aggregate limit so that not even one
+// segment fits.
+func TestMaxSegmentsPerSendRefusesUnsegmentableSizes(t *testing.T) {
+	for _, segmentSize := range []int{-1, 0, maxSegmentedPayloadBytes + 1, 1 << 20} {
+		if n := MaxSegmentsPerSend(segmentSize); n != 0 {
+			t.Errorf("MaxSegmentsPerSend(%d) = %d, want 0", segmentSize, n)
+		}
+	}
+}
