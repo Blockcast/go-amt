@@ -126,3 +126,36 @@ func checkSegmentBatch(total, segmentSize, mtu int) error {
 	}
 	return nil
 }
+
+// MaxSegmentsPerSend reports how many segments of segmentSize one WriteSegments
+// call may carry. A caller with more packets than that splits them across
+// several segmented sends; it does not drop to a per-datagram fallback, which
+// is for GSO being unavailable, not for a batch being large.
+//
+// This is exported rather than the two constants behind it because both bounds
+// bind at once -- UDPMaxSegments on the count and maxSegmentedPayloadBytes on
+// the aggregate -- and which one binds depends on segmentSize. At 400B the
+// count binds (128 segments, 51,200B); at 1366B the aggregate binds (47
+// segments, 64,202B, where 128 would be 174,848B). A caller handed only
+// UDPMaxSegments would build a batch the kernel refuses with EMSGSIZE at every
+// segment size above 511 bytes -- correct, because WriteSegments rejects it and
+// nothing reaches the wire, but it pays a doomed syscall per batch, which is
+// the per-packet syscall cost this path exists to remove.
+//
+// Returns 0 when no segmented send is possible on aggregate grounds, i.e.
+// segmentSize is non-positive or on its own exceeds the aggregate limit. MTU is
+// a third way a size is unsendable and this function cannot see it:
+// MaxSegmentsPerSend(8192) is 7, while WriteSegments on a 1500-byte path
+// refuses 8192 outright, so a nonzero return is not on its own permission to
+// send. Treat 0 as "do not segment" and never as a count -- as a loop stride it
+// does not misbehave, it hangs.
+func MaxSegmentsPerSend(segmentSize int) int {
+	if segmentSize <= 0 {
+		return 0
+	}
+	n := maxSegmentedPayloadBytes / segmentSize
+	if n > UDPMaxSegments {
+		n = UDPMaxSegments
+	}
+	return n
+}
