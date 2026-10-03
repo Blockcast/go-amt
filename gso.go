@@ -142,9 +142,13 @@ func checkSegmentBatch(total, segmentSize, mtu int) error {
 // nothing reaches the wire, but it pays a doomed syscall per batch, which is
 // the per-packet syscall cost this path exists to remove.
 //
-// Returns 0 when no segmented send is possible at this size, i.e. segmentSize
-// is non-positive or on its own exceeds the aggregate limit. A caller must
-// treat 0 as "do not segment" rather than as a count.
+// Returns 0 when no segmented send is possible on aggregate grounds, i.e.
+// segmentSize is non-positive or on its own exceeds the aggregate limit. MTU is
+// a third way a size is unsendable and this function cannot see it:
+// MaxSegmentsPerSend(8192) is 7, while WriteSegments on a 1500-byte path
+// refuses 8192 outright, so a nonzero return is not on its own permission to
+// send. Treat 0 as "do not segment" and never as a count -- as a loop stride it
+// does not misbehave, it hangs.
 func MaxSegmentsPerSend(segmentSize int) int {
 	if segmentSize <= 0 {
 		return 0

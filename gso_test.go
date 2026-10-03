@@ -151,23 +151,29 @@ func TestSegmentsPartialIsDistinctFromUnsupported(t *testing.T) {
 // would only restate the implementation, so a drift in either bound would move
 // both sides together and assert nothing.
 //
-// The sizes are chosen so each bound binds on its own: at 400B the count binds
-// (163 segments would fit in 65,507B, the kernel takes 128) and at 1366B the
-// aggregate binds (128 segments would be 174,848B, the kernel takes 47). So
-// dropping either arm of the min fails this test somewhere in the sweep.
+// The sweep is the whole domain, not a chosen set of sizes, because a chosen
+// set defends only against dropping an arm of the min -- not against
+// perturbing one. Mutating the aggregate numerator to maxSegmentedPayloadBytes+1
+// overstates at exactly 8 of the 65,507 sizes (618, 636, 1236, 5459, 10918,
+// 16377, 21836, 32754: the divisors of 65508 that are not divisors of 65507 and
+// are large enough to escape the 128 cap), so any hand-picked table is
+// overwhelmingly likely to miss it. At 618B the mutant reports 106 segments,
+// 65,508B, one byte over the limit and EMSGSIZE on the wire. Iterating the
+// domain closes that class rather than one instance of it, and two pure
+// comparisons x 65,507 runs in milliseconds.
 func TestMaxSegmentsPerSendIsTheLargestBatchWriteSegmentsAccepts(t *testing.T) {
-	for _, segmentSize := range []int{1, 2, 64, 400, 511, 512, 513, 1024, 1366, 1448, 8192, 32768, 65506, 65507} {
+	for segmentSize := 1; segmentSize <= maxSegmentedPayloadBytes; segmentSize++ {
 		n := MaxSegmentsPerSend(segmentSize)
 		if n < 1 {
 			t.Fatalf("MaxSegmentsPerSend(%d) = %d, want at least 1 -- "+
 				"a size that fits the aggregate limit must allow one segment", segmentSize, n)
 		}
 		if err := checkSegmentBatch(n*segmentSize, segmentSize, 0); err != nil {
-			t.Errorf("checkSegmentBatch rejected a full batch of %d x %dB = %dB: %v",
+			t.Fatalf("checkSegmentBatch rejected a full batch of %d x %dB = %dB: %v",
 				n, segmentSize, n*segmentSize, err)
 		}
 		if err := checkSegmentBatch((n+1)*segmentSize, segmentSize, 0); err == nil {
-			t.Errorf("checkSegmentBatch accepted %d x %dB = %dB, one segment past "+
+			t.Fatalf("checkSegmentBatch accepted %d x %dB = %dB, one segment past "+
 				"MaxSegmentsPerSend(%d) = %d -- the helper understates the limit",
 				n+1, segmentSize, (n+1)*segmentSize, segmentSize, n)
 		}
