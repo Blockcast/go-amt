@@ -52,8 +52,8 @@ type ReceiverMetrics struct {
 	// scoresErasure gates the erasure_* descriptors in Describe and Collect.
 	// The descs are built either way; only publication is conditional.
 	scoresErasure bool
-	feeds   map[string]feedMetrics
-	windows map[string]erasure.Window
+	feeds         map[string]feedMetrics
+	windows       map[string]erasure.Window
 	// liveness holds the per-feed ingress activity the broker heartbeat
 	// reports. It is kept here, beside the prometheus counters and written on
 	// the same call, because the heartbeat's packet count and
@@ -380,9 +380,19 @@ func (m *ReceiverMetrics) PublishGuard(feedID string, stats erasure.Stats) error
 	if _, err := m.feed(feedID); err != nil {
 		return err
 	}
-	// Refused rather than stored: with NoErasureScoring there is no surface to
-	// read these back from, so accepting them would drop a caller's guard
-	// counters silently. Failing names the mismatch instead.
+	// Refused rather than stored: with NoErasureScoring this method is a
+	// whole-method no-op -- guards reach no surface at all -- so accepting
+	// would drop a caller's counters silently. Failing names the mismatch.
+	//
+	// PublishWindow deliberately does NOT error under the same condition, and
+	// the distinction is whole-method vs partial no-op, not "is anything
+	// dropped": it stores a Window whose erasure fields Collect also skips,
+	// but it still drives _shreds_per_second, _gap_events and _report_schema,
+	// so there is no honest error for it to return.
+	//
+	// The only caller discards this (publishWindows, main.go), so today the
+	// error names the mismatch to nobody; it is here for the next caller that
+	// checks, and to make the no-op fail loudly under test.
 	if !m.scoresErasure {
 		return fmt.Errorf("receiver metrics feed %q: erasure scoring is disabled", feedID)
 	}

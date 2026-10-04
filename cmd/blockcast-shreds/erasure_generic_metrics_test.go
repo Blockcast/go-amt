@@ -122,9 +122,14 @@ func TestGenericModeExportsNoErasureSeries(t *testing.T) {
 				t.Errorf("shred mode did not export %s; a silent feed must report zeros, not disappear", name)
 			}
 		}
-		// grace is the one erasure series that is non-zero before any traffic,
-		// so it doubles as proof the window is really published rather than the
-		// family merely being registered.
+		// This asserts the zero VALUE, not that a window was published: no
+		// window is published pre-traffic at all. DrainWindow errors on an idle
+		// tracker, so publishWindows (main.go) hits `continue` and leaves the
+		// zero-value Window that Collect reads -- which is why grace reads 0
+		// here too rather than the configured 400. Nothing at this level can
+		// tell a published window from a merely-registered family, and nothing
+		// here needs to: receiver.TestReceiverMetricsExposePacketCountersAndExactWindow
+		// pins that directly, publishing GraceMS=400 and asserting it scrapes back.
 		if value, ok := scrapeText(text, "bcast_shred_gw_erasure_fraction", `feed="default"`); !ok || value != 0 {
 			t.Errorf("shred mode erasure_fraction = %v, ok = %v; want 0 pre-traffic", value, ok)
 		}
