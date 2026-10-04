@@ -214,6 +214,29 @@ func run(args []string) error {
 	if err := score.validate(); err != nil {
 		return err
 	}
+	// --erasure-grace-ms is inert in generic mode: the grace only ever reaches
+	// erasure.NewTracker, and listenAndScore builds no trackers there. Rejecting
+	// an explicitly-set value matches heartbeatOptions' stance on --broker-url --
+	// a flag that reads as configured and does nothing is the shape worth
+	// failing at startup for. Visit sees only flags the caller actually set, so
+	// the default still applies and plain generic invocations are unaffected.
+	//
+	// --report-interval is deliberately NOT rejected: it is not inert here. It
+	// also drives billDestinations and the broker delivery-target reconcile in
+	// the reporter goroutine, both of which run in generic mode.
+	if score.generic() {
+		var setGrace bool
+		flags.Visit(func(f *flag.Flag) {
+			if f.Name == "erasure-grace-ms" {
+				setGrace = true
+			}
+		})
+		if setGrace {
+			return errors.New(
+				"--erasure-grace-ms requires --mode shred: generic mode does no erasure " +
+					"scoring, so the grace would be accepted and silently ignored")
+		}
+	}
 	configured := []feed{{name: "default", address: listen}}
 	if len(configuredFeeds) != 0 {
 		configured = configured[:0]
@@ -675,7 +698,15 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		scorer = shred.NewFeedScorerWithRetention(shred.FormatForwarder, names, retention)
 	}
 	registry := prometheus.NewRegistry()
-	metrics, err := receiver.NewReceiverMetrics(registry, names)
+	// Generic mode does no erasure coding, so the erasure family is not
+	// registered at all rather than registered and left at zero -- see
+	// receiver.ErasureScoring, and the trackers comment immediately below for
+	// the same argument one layer down.
+	erasureScoring := receiver.ScoresErasure
+	if mode.generic() {
+		erasureScoring = receiver.NoErasureScoring
+	}
+	metrics, err := receiver.NewReceiverMetrics(registry, names, erasureScoring)
 	if err != nil {
 		return err
 	}

@@ -14,6 +14,30 @@ const receiverMetricsNamespace = "bcast_shred_gw"
 
 var ErrUnknownFeed = errors.New("receiver metrics feed is not configured")
 
+// ErasureScoring says whether this receiver measures FEC erasure at all.
+//
+// It is a required constructor argument rather than an option defaulting to on,
+// because the wrong answer is silent: a receiver that registers the erasure
+// family and never drives it publishes bcast_shred_gw_erasure_fraction=0 for
+// the life of the process, which is indistinguishable from a genuinely perfect
+// feed. That is the same false attestation heartbeatOptions in
+// cmd/blockcast-shreds already refuses to emit for generic mode, and
+// publishWindows refuses to emit on a failed drain. Forcing every call site to
+// state the answer keeps a future mode from inheriting the wrong one.
+//
+// It is a named type so a call site reads NoErasureScoring rather than false.
+type ErasureScoring bool
+
+const (
+	// ScoresErasure registers the bcast_shred_gw_erasure_* family. The caller
+	// must drive it via PublishWindow and PublishGuard.
+	ScoresErasure ErasureScoring = true
+	// NoErasureScoring omits that family entirely. Absent is the point: a
+	// consumer can then tell "this mode does not measure erasure" from
+	// "erasure measured, none observed".
+	NoErasureScoring ErasureScoring = false
+)
+
 var gapBuckets = []string{"<1", "1-2.4", "2.4-7", "7-32", ">=32"}
 
 // ReceiverMetrics is the fan-out worker's egress observer.
@@ -25,6 +49,9 @@ var _ EgressObserver = (*ReceiverMetrics)(nil)
 type ReceiverMetrics struct {
 	mu      sync.RWMutex
 	feedIDs []string
+	// scoresErasure gates the erasure_* descriptors in Describe and Collect.
+	// The descs are built either way; only publication is conditional.
+	scoresErasure bool
 	feeds   map[string]feedMetrics
 	windows map[string]erasure.Window
 	// liveness holds the per-feed ingress activity the broker heartbeat
@@ -65,7 +92,14 @@ type feedMetrics struct {
 
 // NewReceiverMetrics registers receiver metrics and materializes zero-valued
 // series for every configured feed.
-func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string) (*ReceiverMetrics, error) {
+//
+// With NoErasureScoring the bcast_shred_gw_erasure_* family is not exported at
+// all; see ErasureScoring for why that is absent rather than zero. The
+// remaining window series -- shreds_per_second, gap_events, report_schema --
+// are unaffected and still read zero on a receiver that never publishes a
+// window. That is deliberate scope: this argument answers the erasure
+// attestation only.
+func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, scoring ErasureScoring) (*ReceiverMetrics, error) {
 	if registerer == nil {
 		return nil, errors.New("receiver metrics registerer is nil")
 	}
@@ -84,6 +118,8 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string) (*Re
 	}
 
 	metrics := &ReceiverMetrics{
+		scoresErasure: bool(scoring),
+
 		feedIDs:  append([]string(nil), feedIDs...),
 		feeds:    make(map[string]feedMetrics, len(feedIDs)),
 		windows:  make(map[string]erasure.Window, len(feedIDs)),
@@ -177,12 +213,15 @@ func (m *ReceiverMetrics) Describe(ch chan<- *prometheus.Desc) {
 	m.dropped.Describe(ch)
 	m.writeErrors.Describe(ch)
 	m.unparsed.Describe(ch)
-	ch <- m.setsDesc
-	ch <- m.fractionDesc
 	ch <- m.rateDesc
 	ch <- m.gapsDesc
-	ch <- m.graceDesc
 	ch <- m.schemaDesc
+	if !m.scoresErasure {
+		return
+	}
+	ch <- m.setsDesc
+	ch <- m.fractionDesc
+	ch <- m.graceDesc
 	ch <- m.slotGuardDesc
 	ch <- m.resyncsDesc
 }
@@ -200,9 +239,6 @@ func (m *ReceiverMetrics) Collect(ch chan<- prometheus.Metric) {
 	defer m.mu.RUnlock()
 	for _, feedID := range m.feedIDs {
 		window := m.windows[feedID]
-		ch <- prometheus.MustNewConstMetric(m.setsDesc, prometheus.GaugeValue, float64(window.SetsTotal), feedID, "total")
-		ch <- prometheus.MustNewConstMetric(m.setsDesc, prometheus.GaugeValue, float64(window.SetsErased), feedID, "erased")
-		ch <- prometheus.MustNewConstMetric(m.fractionDesc, prometheus.GaugeValue, window.ErasureFraction, feedID)
 		ch <- prometheus.MustNewConstMetric(m.rateDesc, prometheus.GaugeValue, window.RMean, feedID, "mean")
 		ch <- prometheus.MustNewConstMetric(m.rateDesc, prometheus.GaugeValue, window.RPeak100MS, feedID, "peak_100ms")
 		gapValues := []uint64{
@@ -215,8 +251,14 @@ func (m *ReceiverMetrics) Collect(ch chan<- prometheus.Metric) {
 		for i, bucket := range gapBuckets {
 			ch <- prometheus.MustNewConstMetric(m.gapsDesc, prometheus.GaugeValue, float64(gapValues[i]), feedID, bucket)
 		}
-		ch <- prometheus.MustNewConstMetric(m.graceDesc, prometheus.GaugeValue, float64(window.GraceMS), feedID)
 		ch <- prometheus.MustNewConstMetric(m.schemaDesc, prometheus.GaugeValue, float64(window.Schema), feedID)
+		if !m.scoresErasure {
+			continue
+		}
+		ch <- prometheus.MustNewConstMetric(m.setsDesc, prometheus.GaugeValue, float64(window.SetsTotal), feedID, "total")
+		ch <- prometheus.MustNewConstMetric(m.setsDesc, prometheus.GaugeValue, float64(window.SetsErased), feedID, "erased")
+		ch <- prometheus.MustNewConstMetric(m.fractionDesc, prometheus.GaugeValue, window.ErasureFraction, feedID)
+		ch <- prometheus.MustNewConstMetric(m.graceDesc, prometheus.GaugeValue, float64(window.GraceMS), feedID)
 		guard := m.guards[feedID]
 		ch <- prometheus.MustNewConstMetric(m.slotGuardDesc, prometheus.CounterValue, float64(guard.RejectedSlotJumps), feedID, "ahead")
 		ch <- prometheus.MustNewConstMetric(m.slotGuardDesc, prometheus.CounterValue, float64(guard.StaleRejections), feedID, "behind")
@@ -337,6 +379,12 @@ func (m *ReceiverMetrics) PublishWindow(feedID string, window erasure.Window) er
 func (m *ReceiverMetrics) PublishGuard(feedID string, stats erasure.Stats) error {
 	if _, err := m.feed(feedID); err != nil {
 		return err
+	}
+	// Refused rather than stored: with NoErasureScoring there is no surface to
+	// read these back from, so accepting them would drop a caller's guard
+	// counters silently. Failing names the mismatch instead.
+	if !m.scoresErasure {
+		return fmt.Errorf("receiver metrics feed %q: erasure scoring is disabled", feedID)
 	}
 	m.mu.Lock()
 	m.guards[feedID] = stats

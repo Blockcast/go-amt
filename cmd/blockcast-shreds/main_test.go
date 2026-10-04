@@ -200,7 +200,7 @@ func TestRunRejectsDuplicateFeedNames(t *testing.T) {
 func TestPacketDeliveryDoesNotDependOnScoring(t *testing.T) {
 	writer := &captureWriter{packets: make(chan []byte, 2)}
 	registry := prometheus.NewRegistry()
-	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"}, receiver.ScoresErasure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestPacketDeliveryDoesNotDependOnScoring(t *testing.T) {
 func TestFanoutPublishesEgressToTheScrapedRegistry(t *testing.T) {
 	writer := &captureWriter{packets: make(chan []byte, 2)}
 	registry := prometheus.NewRegistry()
-	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"}, receiver.ScoresErasure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,7 +277,7 @@ func TestFanoutPublishesEgressToTheScrapedRegistry(t *testing.T) {
 // surface as a counter rather than only in FanoutStats.
 func TestFanoutPublishesWriteErrorsToTheScrapedRegistry(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"}, receiver.ScoresErasure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func fixtureShred(t *testing.T) []byte {
 func TestUnparsablePacketPublishesUnparsedToTheScrapedRegistry(t *testing.T) {
 	writer := &captureWriter{packets: make(chan []byte, 2)}
 	registry := prometheus.NewRegistry()
-	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"}, receiver.ScoresErasure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,7 +395,7 @@ func TestValidShredDuplicateIsForwardedByteIdentically(t *testing.T) {
 	want := append([]byte(nil), packet...)
 	writer := &captureWriter{packets: make(chan []byte, 2)}
 	registry := prometheus.NewRegistry()
-	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"}, receiver.ScoresErasure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,7 +484,7 @@ func (w *blockingWriter) Close() error { return nil }
 // the scraped metric disagree with Fanout.Stats().DroppedPackets.
 func TestShutdownDoesNotInflateTheFanoutDropCounter(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"}, receiver.ScoresErasure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -512,7 +512,7 @@ func TestShutdownDoesNotInflateTheFanoutDropCounter(t *testing.T) {
 // satisfied by never counting drops at all.
 func TestRingOverflowIncrementsTheFanoutDropCounter(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"})
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"}, receiver.ScoresErasure)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,7 +592,7 @@ func TestConcurrentProcessPacketIsRaceFreeAndOrderTolerant(t *testing.T) {
 		names[i] = fmt.Sprintf("feed-%d", i)
 	}
 	registry := prometheus.NewRegistry()
-	metrics, err := receiver.NewReceiverMetrics(registry, names)
+	metrics, err := receiver.NewReceiverMetrics(registry, names, receiver.ScoresErasure)
 	if err != nil {
 		t.Fatal(err)
 	}
