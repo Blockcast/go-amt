@@ -69,20 +69,39 @@ jobs:
       # Until this step existed the lane built and verified the image and then
       # threw it away (push: false, zero releases), so the binary BLO-22821
       # shipped was deployable nowhere. Push only after selftest has passed, and
-      # only from main: a pull_request run must never hold registry credentials.
+      # only on a `push` event: a fork cannot raise one, so a pull_request run
+      # never holds registry credentials.
+      #
+      # Off main this is a credential PROBE, not a publish, and it is
+      # deliberately never red. No agent identity can read Actions secrets (the
+      # App token 403s on /actions/secrets for every repo in the org), so
+      # "does go-amt see HARBOR_*?" is otherwise unmeasurable until a merge
+      # answers it — by turning main red for however long the grant takes. The
+      # probe moves that answer onto the branch, before the merge, and keeps
+      # answering it: a credential revoked later surfaces here instead of on
+      # release day.
       - name: Publish the verified image
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push'
         env:
           REPO: registry.blockcast.net/blockcast/go-amt/blockcast-shreds
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
           if [ -z "${HARBOR_USERNAME}" ] || [ -z "${HARBOR_PASSWORD}" ]; then
-            echo "::error::HARBOR_USERNAME/HARBOR_PASSWORD are not visible to this" \
-                 "repository, so the verified image cannot be published. They are" \
-                 "set org-wide for Blockcast/pim-multicast-gateway; this repo needs" \
-                 "the same grant. See BLO-40067."
-            exit 1
+            msg="HARBOR_USERNAME/HARBOR_PASSWORD are not visible to this repository, so the verified image cannot be published. They are set for other Blockcast repos (pim-multicast-gateway, magma, frr); this repo needs the same grant. See BLO-40067."
+            # Red on main, where it blocks a real publish. A warning elsewhere:
+            # a missing org grant is not a defect in whatever branch is building.
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "::error::${msg}"
+              exit 1
+            fi
+            echo "::warning::${msg}"
+            exit 0
+          fi
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::notice::Harbor credentials are visible to this repository." \
+                 "Not pushing from ${GITHUB_REF} — publish is main-only."
+            exit 0
           fi
           printf '%s' "${HARBOR_PASSWORD}" \
             | docker login registry.blockcast.net -u "${HARBOR_USERNAME}" --password-stdin
