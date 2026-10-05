@@ -1,4 +1,11 @@
-//go:build linux
+//go:build linux && !android && cgo && !purego
+
+// Tagged exactly like gso_linux_test.go, whose loopbackPair these tests reuse.
+// A bare `linux` tag also selects android -- the GOOS satisfies that
+// constraint -- which puts this file in the mobile typecheck job without the
+// file that defines the helper, so `GOOS=android go vet` fails to compile the
+// package. Keeping the two tag sets identical is what lets the helper be
+// shared instead of copied.
 
 package amt
 
