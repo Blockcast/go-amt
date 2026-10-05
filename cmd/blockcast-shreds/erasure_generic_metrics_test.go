@@ -22,6 +22,20 @@ var erasureSeriesNames = []string{
 	"bcast_shred_gw_erasure_frontier_resyncs_total",
 }
 
+// windowSeriesNames is every window-derived series OUTSIDE the erasure prefix:
+// the three BLO-40163 ruled omitted in generic mode. They are listed separately
+// from erasureSeriesNames because scrapeErasureLines cannot see them -- they
+// carry no erasure prefix -- so the generic-mode half below has to name them.
+//
+// All three are read off the same erasure.Window as the erasure family, and no
+// window is ever published in generic mode: publishWindows iterates trackers,
+// and listenAndScore builds none there. Their zeros are not measurements.
+var windowSeriesNames = []string{
+	"bcast_shred_gw_shreds_per_second",
+	"bcast_shred_gw_gap_events",
+	"bcast_shred_gw_report_schema",
+}
+
 // scrapeErasureLines returns every exposition line, comment or sample, whose
 // metric name starts with the erasure prefix.
 //
@@ -87,6 +101,94 @@ func runAndScrape(t *testing.T, mode scoring) string {
 		t.Fatalf("mode %q: /metrics never answered", mode.mode)
 	}
 	return text
+}
+
+// scrapeSeriesLines returns every exposition line, comment or sample, whose
+// metric name is exactly name or name with a label set appended.
+//
+// It exists alongside scrapeErasureLines because that one matches a prefix and
+// these three share none. The match is anchored on the name boundary rather
+// than a bare prefix so that bcast_shred_gw_shreds_per_second cannot be
+// satisfied by a longer unrelated name that happens to start the same way.
+//
+// HELP and TYPE lines are included for the same reason as scrapeErasureLines: a
+// registered-but-unpublished collector still emits them, so a sample-only
+// assertion would pass on a family that is half present.
+func scrapeSeriesLines(text, name string) []string {
+	var lines []string
+	for _, line := range strings.Split(text, "\n") {
+		candidate := line
+		if after, ok := strings.CutPrefix(line, "# HELP "); ok {
+			candidate = after
+		} else if after, ok := strings.CutPrefix(line, "# TYPE "); ok {
+			candidate = after
+		} else if strings.HasPrefix(line, "#") {
+			continue
+		}
+		rest, ok := strings.CutPrefix(candidate, name)
+		if !ok {
+			continue
+		}
+		// Anchor: what follows the name must start a label set, a value, or a
+		// TYPE/HELP word -- never another name character.
+		if rest == "" || strings.HasPrefix(rest, "{") || strings.HasPrefix(rest, " ") {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+// TestGenericModeExportsNoWindowSeries pins the BLO-40163 ruling: the three
+// window-derived series outside the erasure prefix are ABSENT under
+// --mode generic, and unchanged under --mode shred.
+//
+// All three read off the same never-published erasure.Window as the erasure
+// family BLO-28910 removed, so all three carry the same defect in a different
+// disguise:
+//
+//   - _report_schema=0 advertises a schema version that was never published; 0
+//     is outside the vocabulary, the shred-mode value being 1.
+//   - _gap_events all-zero reads as "no inter-arrival gaps observed" -- the
+//     same false-healthy shape as erasure_fraction=0.
+//   - _shreds_per_second=0 is the one argued honest in the ticket, and is not.
+//     Its zero comes from the unpublished window, not from measuring a generic
+//     feed and finding no shreds, so a generic feed carrying 30k packets/s
+//     reports a zero shred rate while ingress_packets_total climbs. That is
+//     false-UNhealthy: a rate alert fires on a feed that is working. Liveness
+//     cannot resolve it, because liveness is exactly what contradicts it.
+//
+// Each series gets its own subtest so a mutation reverting one guard names that
+// series. Both scrapes are taken once and shared: runAndScrape starts a real
+// binary, and the assertions are independent reads of one body.
+func TestGenericModeExportsNoWindowSeries(t *testing.T) {
+	genericText := runAndScrape(t, scoring{
+		mode:        "generic",
+		sourceLabel: "synthetic",
+		rightsBasis: "synthetic-generated-no-third-party-content",
+	})
+	// Control: the scrape is a real one, not an empty body that would make
+	// every absence assertion below vacuous.
+	if _, ok := scrapeText(genericText, "bcast_shred_gw_ingress_packets_total", `feed="default"`); !ok {
+		t.Fatal("generic mode exported no ingress_packets_total; the scrape proves nothing")
+	}
+	shredText := runAndScrape(t, scoring{mode: "shred"})
+
+	for _, name := range windowSeriesNames {
+		t.Run(name, func(t *testing.T) {
+			if lines := scrapeSeriesLines(genericText, name); len(lines) != 0 {
+				t.Errorf("generic mode exported %d %s lines, want 0:\n%s",
+					len(lines), name, strings.Join(lines, "\n"))
+			}
+			// The shred half is the control, and it is the load-bearing one: an
+			// assertion that a series is missing in generic mode passes just as
+			// well if it is missing everywhere. It asserts the PRE-TRAFFIC state
+			// -- no packet is ever sent here -- because a shred feed that has
+			// received nothing must still report zeros rather than disappear.
+			if lines := scrapeSeriesLines(shredText, name); len(lines) == 0 {
+				t.Errorf("shred mode did not export %s; a silent feed must report zeros, not disappear", name)
+			}
+		})
+	}
 }
 
 // TestGenericModeExportsNoErasureSeries pins both halves of the contract: the

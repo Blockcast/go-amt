@@ -303,18 +303,39 @@ Alert on liveness **first** and the erasure fraction second:
 The first two signals separate case 1 from case 2; only the slot-guard counters
 separate case 1 from case 3.
 
-There is deliberately no fourth case for `--mode generic`. Generic mode does no
-erasure coding, so the whole `bcast_shred_gw_erasure_*` family is **not exported
-at all** there — absent, not zero (BLO-28910). A zero that cannot be
-distinguished from a healthy feed is the confusion this section exists to name;
-publishing it for a mode that structurally cannot measure erasure would add a
-case no liveness signal could resolve. Absence states it instead. The remaining
-window series — `_shreds_per_second`, `_gap_events`, `_report_schema` — are
-still exported in generic mode and still read zero there, because generic mode
-publishes no window; they are outside the erasure attestation this change
-scoped.
+There is deliberately no fourth case for `--mode generic`. Generic mode drains
+no delivery window at all — `publishWindows` iterates trackers and
+`listenAndScore` builds none there — so **every window-derived series is not
+exported at all** in that mode: the whole `bcast_shred_gw_erasure_*` family
+(BLO-28910), plus `_shreds_per_second`, `_gap_events` and `_report_schema`
+(BLO-40163). Absent, not zero. A zero that cannot be distinguished from a
+healthy feed is the confusion this section exists to name; publishing it for a
+mode that structurally cannot measure would add a case no liveness signal could
+resolve. Absence states it instead.
+
+Why all three, including the shred rate:
+
+- `_report_schema` `0` advertises a schema version that was never published. `0`
+  is outside the vocabulary — the shred-mode value is `1`.
+- `_gap_events` all-zero reads as "no inter-arrival gaps observed", the same
+  false-healthy shape as `erasure_fraction 0`.
+- `_shreds_per_second` `0` looks honest in a mode that has no shreds, and is
+  not. Its zero comes from the unpublished window, not from measuring a generic
+  feed, so a generic feed carrying 30k packets/s reports a zero shred rate while
+  `ingress_packets_total` climbs. That is false-**un**healthy — the opposite
+  direction from `erasure_fraction`, and the one case liveness cannot resolve,
+  because liveness is exactly what contradicts it.
+
+The packet-path counters are unaffected and are exported in every mode:
+`ingress_packets_total`, `egress_packets_total`,
+`fanout_dropped_packets_total`, `fanout_write_errors_total` and
+`shreds_unparsed_total` are driven by the packet path, not by a drain. They
+remain the liveness signal to alert on under `--mode generic`.
 
 ### The gap histogram
+
+`bcast_shred_gw_gap_events` is exported only under `--mode shred`; see the
+section above for why generic mode omits it rather than publishing five zeros.
 
 Consecutive-arrival gaps land in five fixed buckets, in milliseconds:
 
@@ -361,9 +382,9 @@ that is merely idle:
 | `bcast_shred_gw_fanout_dropped_packets_total` | Packets dropped because the bounded fan-out ring was full. **The receiver-overload signal — alert on any increase.** |
 | `bcast_shred_gw_fanout_write_errors_total` | Failed or short destination writes; each is a packet a target did not receive. |
 | `bcast_shred_gw_shreds_unparsed_total` | Delivered packets whose shred header would not parse. |
-| `bcast_shred_gw_erasure_*`, `_shreds_per_second`, `_gap_events` | Per-feed delivery SLA for the last drained window, on the `--report-interval` cadence. The `erasure_*` family is exported only under `--mode shred`; see [Alerting](#alerting-erasure_fraction-0-has-three-meanings). `erasure_fraction` is a **windowed gauge**: `0` has [three meanings](#alerting-erasure_fraction-0-has-three-meanings), only one of which is a healthy feed. Never alert on it without a liveness signal — pair it with `ingress_packets_total` and the slot-guard counters below. |
-| `bcast_shred_gw_erasure_slot_rejections_total` | Observations refused by the slot-plausibility guard, by `direction`. `ahead` is beyond the forward jump bound; a sustained `behind` rate means the frontier itself is suspect. Part of the `erasure_*` family, so exported only under `--mode shred`. |
-| `bcast_shred_gw_erasure_frontier_resyncs_total` | Times the slot frontier was abandoned and re-adopted. Each is a discontinuity in the erasure series — sets in flight were dropped unscored, so a fraction spanning a resync is not comparable across it. Part of the `erasure_*` family, so exported only under `--mode shred`. |
+| `bcast_shred_gw_erasure_*`, `_shreds_per_second`, `_gap_events`, `_report_schema` | Per-feed delivery SLA for the last drained window, on the `--report-interval` cadence. **All of these are window-derived, so none is exported under `--mode generic`** — see [Alerting](#alerting-erasure_fraction-0-has-three-meanings). `erasure_fraction` is a **windowed gauge**: `0` has [three meanings](#alerting-erasure_fraction-0-has-three-meanings), only one of which is a healthy feed. Never alert on it without a liveness signal — pair it with `ingress_packets_total` and the slot-guard counters below. |
+| `bcast_shred_gw_erasure_slot_rejections_total` | Observations refused by the slot-plausibility guard, by `direction`. `ahead` is beyond the forward jump bound; a sustained `behind` rate means the frontier itself is suspect. Window-derived, so exported only under `--mode shred`. |
+| `bcast_shred_gw_erasure_frontier_resyncs_total` | Times the slot frontier was abandoned and re-adopted. Each is a discontinuity in the erasure series — sets in flight were dropped unscored, so a fraction spanning a resync is not comparable across it. Window-derived, so exported only under `--mode shred`. |
 
 Drops are counted at the drop site; there is no silent discard path.
 

@@ -698,15 +698,16 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 		scorer = shred.NewFeedScorerWithRetention(shred.FormatForwarder, names, retention)
 	}
 	registry := prometheus.NewRegistry()
-	// Generic mode does no erasure coding, so the erasure family is not
-	// registered at all rather than registered and left at zero -- see
-	// receiver.ErasureScoring, and the trackers comment immediately below for
-	// the same argument one layer down.
-	erasureScoring := receiver.ScoresErasure
+	// Generic mode drains no delivery window, so no window-derived series is
+	// registered at all rather than registered and left at zero -- not the
+	// erasure family, and not _shreds_per_second, _gap_events or _report_schema.
+	// See receiver.WindowReporting, and the trackers comment immediately below
+	// for the same argument one layer down.
+	windowReporting := receiver.ReportsWindows
 	if mode.generic() {
-		erasureScoring = receiver.NoErasureScoring
+		windowReporting = receiver.NoWindowReporting
 	}
-	metrics, err := receiver.NewReceiverMetrics(registry, names, erasureScoring)
+	metrics, err := receiver.NewReceiverMetrics(registry, names, windowReporting)
 	if err != nil {
 		return err
 	}

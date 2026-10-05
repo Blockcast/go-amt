@@ -14,7 +14,7 @@ import (
 
 func TestReceiverMetricsExposePacketCountersAndExactWindow(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"feed-a", "feed-b"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"feed-a", "feed-b"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestReceiverMetricsExposePacketCountersAndExactWindow(t *testing.T) {
 
 func TestReceiverMetricsRejectUnknownFeedWithoutCreatingSeries(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"configured"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"configured"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestReceiverMetricsRejectUnknownFeedWithoutCreatingSeries(t *testing.T) {
 
 func TestReceiverMetricsGatherNeverMixesPublishedWindows(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"feed"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"feed"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +168,7 @@ func TestNewReceiverMetricsRegistrationFailureLeavesNoPartialSeries(t *testing.T
 	})
 	registry.MustRegister(conflict)
 
-	if _, err := NewReceiverMetrics(registry, []string{"feed"}, ScoresErasure); err == nil {
+	if _, err := NewReceiverMetrics(registry, []string{"feed"}, ReportsWindows); err == nil {
 		t.Fatal("NewReceiverMetrics() succeeded with a conflicting descriptor")
 	}
 	families, err := registry.Gather()
@@ -194,7 +194,7 @@ func TestNewReceiverMetricsValidatesConfiguredFeeds(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := NewReceiverMetrics(prometheus.NewRegistry(), test.feeds, ScoresErasure)
+			_, err := NewReceiverMetrics(prometheus.NewRegistry(), test.feeds, ReportsWindows)
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("NewReceiverMetrics() error = %v, want substring %q", err, test.wantErr)
 			}
@@ -271,7 +271,7 @@ func equalLabels(got, want map[string]string) bool {
 // reject every datagram on the wire and publish nothing at all.
 func TestReceiverMetricsExposeSlotGuardCounters(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"feed-a", "feed-b"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"feed-a", "feed-b"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +320,7 @@ func TestReceiverMetricsExposeSlotGuardCounters(t *testing.T) {
 
 func TestReceiverMetricsRejectGuardPublishForUnknownFeed(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"feed"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"feed"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,20 +342,34 @@ func TestReceiverMetricsRejectGuardPublishForUnknownFeed(t *testing.T) {
 	}
 }
 
-// TestNoErasureScoringOmitsTheFamilyFromDescribe covers the half of the
-// NoErasureScoring contract that a /metrics scrape cannot see.
+// TestNoWindowReportingOmitsTheFamilyFromDescribe covers the half of the
+// NoWindowReporting contract that a /metrics scrape cannot see.
 //
 // The text exposition writes HELP and TYPE only for families that produced a
-// sample, so suppressing Collect alone makes the erasure family vanish from a
-// scrape whether or not Describe still advertises it. Describe is therefore
-// asserted directly: a collector that describes a descriptor it never emits
-// still reserves that fully-qualified name against the registry, so a second
-// collector legitimately exporting bcast_shred_gw_erasure_* would be refused as
-// a duplicate by a receiver that does no erasure scoring at all.
-func TestNoErasureScoringOmitsTheFamilyFromDescribe(t *testing.T) {
-	describedNames := func(scoring ErasureScoring) []string {
+// sample, so suppressing Collect alone makes a family vanish from a scrape
+// whether or not Describe still advertises it. Describe is therefore asserted
+// directly: a collector that describes a descriptor it never emits still
+// reserves that fully-qualified name against the registry, so a second
+// collector legitimately exporting one of these names would be refused as a
+// duplicate by a receiver that drains no window at all.
+//
+// All eight window-derived descriptors are asserted, not just the erasure five:
+// the name-reservation argument is identical for _shreds_per_second,
+// _gap_events and _report_schema, which BLO-40163 added to this gate.
+func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
+	windowDescNames := []string{
+		"bcast_shred_gw_erasure_sets",
+		"bcast_shred_gw_erasure_fraction",
+		"bcast_shred_gw_erasure_grace_milliseconds",
+		"bcast_shred_gw_erasure_slot_rejections_total",
+		"bcast_shred_gw_erasure_frontier_resyncs_total",
+		"bcast_shred_gw_shreds_per_second",
+		"bcast_shred_gw_gap_events",
+		"bcast_shred_gw_report_schema",
+	}
+	describedNames := func(reporting WindowReporting) []string {
 		t.Helper()
-		metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, scoring)
+		metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, reporting)
 		if err != nil {
 			t.Fatalf("NewReceiverMetrics() error = %v", err)
 		}
@@ -366,38 +380,51 @@ func TestNoErasureScoringOmitsTheFamilyFromDescribe(t *testing.T) {
 		}()
 		var names []string
 		for desc := range descs {
-			if strings.Contains(desc.String(), "bcast_shred_gw_erasure") {
-				names = append(names, desc.String())
+			for _, want := range windowDescNames {
+				if strings.Contains(desc.String(), want) {
+					names = append(names, desc.String())
+					break
+				}
 			}
 		}
 		return names
 	}
 
-	if names := describedNames(NoErasureScoring); len(names) != 0 {
-		t.Errorf("NoErasureScoring described %d erasure descriptors, want 0:\n%s",
+	if names := describedNames(NoWindowReporting); len(names) != 0 {
+		t.Errorf("NoWindowReporting described %d window descriptors, want 0:\n%s",
 			len(names), strings.Join(names, "\n"))
 	}
-	// Control: the matcher really does find them when scoring is on, so the
+	// Control: the matcher really does find them when reporting is on, so the
 	// assertion above is not vacuously passing on a broken substring.
-	if names := describedNames(ScoresErasure); len(names) != 5 {
-		t.Errorf("ScoresErasure described %d erasure descriptors, want 5:\n%s",
-			len(names), strings.Join(names, "\n"))
+	if names := describedNames(ReportsWindows); len(names) != len(windowDescNames) {
+		t.Errorf("ReportsWindows described %d window descriptors, want %d:\n%s",
+			len(names), len(windowDescNames), strings.Join(names, "\n"))
 	}
 }
 
-// TestPublishGuardRefusedWithoutErasureScoring pins the refusal rather than a
-// silent accept: with NoErasureScoring there is no surface to read guard stats
+// TestPublishGuardRefusedWithoutWindowReporting pins the refusal rather than a
+// silent accept: with NoWindowReporting there is no surface to read guard stats
 // back from, so storing them would discard a caller's counters unobserved.
-func TestPublishGuardRefusedWithoutErasureScoring(t *testing.T) {
-	metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, NoErasureScoring)
+func TestPublishGuardRefusedWithoutWindowReporting(t *testing.T) {
+	metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, NoWindowReporting)
 	if err != nil {
 		t.Fatalf("NewReceiverMetrics() error = %v", err)
 	}
 	if err := metrics.PublishGuard("feed", erasure.Stats{FrontierResyncs: 1}); err == nil {
-		t.Fatal("PublishGuard() succeeded with erasure scoring disabled; the stats would vanish")
+		t.Fatal("PublishGuard() succeeded with window reporting disabled; the stats would vanish")
 	}
 	// An unknown feed must still report the unknown feed, not the mode.
 	if err := metrics.PublishGuard("nope", erasure.Stats{}); !errors.Is(err, ErrUnknownFeed) {
 		t.Fatalf("PublishGuard(unknown) error = %v, want ErrUnknownFeed", err)
+	}
+	// PublishWindow is the deliberate asymmetry: Snapshot still reads the
+	// stored Window for the broker heartbeat, which is live in generic mode, so
+	// it must accept rather than refuse. Pinned here beside the refusal so a
+	// future "make these consistent" edit has to argue with the heartbeat.
+	if err := metrics.PublishWindow("feed", erasure.Window{Schema: 1}); err != nil {
+		t.Fatalf("PublishWindow() error = %v; the heartbeat still reads this window", err)
+	}
+	if got := metrics.Snapshot()[0].Window.Schema; got != 1 {
+		t.Fatalf("Snapshot() window schema = %d, want 1; the heartbeat path lost the window", got)
 	}
 }

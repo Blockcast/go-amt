@@ -25,7 +25,7 @@ import (
 // startup rejection in heartbeatOptions rather than to delete this test.
 func TestGenericModeHeartbeatIsUnsendable(t *testing.T) {
 	feeds := []string{"feed-a", "feed-b"}
-	metrics, err := receiver.NewReceiverMetrics(prometheus.NewRegistry(), feeds, receiver.ScoresErasure)
+	metrics, err := receiver.NewReceiverMetrics(prometheus.NewRegistry(), feeds, receiver.ReportsWindows)
 	if err != nil {
 		t.Fatalf("new receiver metrics: %v", err)
 	}
