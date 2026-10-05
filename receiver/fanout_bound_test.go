@@ -99,7 +99,7 @@ func TestFanoutDestinationsGaugeFollowsTheLiveTable(t *testing.T) {
 // collectors, and pins the gauge appearing exactly once in the output.
 func TestMetricsEndpointStillServesWithTheGaugeRegistered(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	if _, err := NewReceiverMetrics(registry, []string{"feed-a"}); err != nil {
+	if _, err := NewReceiverMetrics(registry, []string{"feed-a"}, ScoresErasure); err != nil {
 		t.Fatal(err)
 	}
 	// Two destinations sharing one address: the duplicate-address case that
