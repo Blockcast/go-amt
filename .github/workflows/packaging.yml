@@ -46,6 +46,16 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
+    # Serialise per ref so two quick merges cannot push `:main` out of order: a
+    # slower build of the OLDER commit finishing last would leave the floating
+    # tag on the older image, silently (`sha-*` tags are immutable and safe).
+    # Never cancel-in-progress: killing an in-flight publish is worse than
+    # waiting. GitHub still drops a superseded PENDING run, so with three quick
+    # merges the middle commit gets no `sha-*` tag -- `:main` stays correct.
+    # `on:` has no branch filter, hence the ref in the key.
+    concurrency:
+      group: packaging-docker-${{ github.ref }}
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -56,11 +66,86 @@ jobs:
           push: false
           load: true
           tags: blockcast-shreds:ci
+          # Without this the image reports dev-unstamped forever, which is the
+          # right default for a hand build and useless for one a cluster pulls:
+          # the sha is what lets an operator tie a running pod to a commit.
+          build-args: VERSION=sha-${{ github.sha }}
       # An image that builds but cannot execute its entrypoint is not a
       # verified image. selftest exits non-zero on a scoring mismatch, so this
       # also proves the embedded capture survived the build.
       - name: Entrypoint runs inside the image
         run: docker run --rm blockcast-shreds:ci selftest --fixture --json
+      # The image twin of the host binary's stamp guard above. selftest proves
+      # scoring, not provenance: drop `build-args` or let the -X symbol path
+      # drift in the Dockerfile and the image still builds, selftests green and
+      # publishes reporting dev-unstamped, so every heartbeat from it is
+      # unattributable. Assert the exact stamp the build was given, before the
+      # publish step, so a wrong or missing one never reaches the registry.
+      - name: Version stamp survived the image build
+        run: |
+          reported="$(docker run --rm blockcast-shreds:ci --version)"
+          echo "reported version: ${reported}"
+          if [ "${reported}" != "sha-${GITHUB_SHA}" ]; then
+            echo "::error::the image reports '${reported}', expected 'sha-${GITHUB_SHA}'." \
+                 "Check build-args in this workflow and ARG VERSION / the -X symbol path in the Dockerfile."
+            exit 1
+          fi
+
+      # Until this step existed the lane built and verified the image and then
+      # threw it away (push: false, zero releases), so the binary BLO-22821
+      # shipped was deployable nowhere. Push only after selftest has passed, and
+      # only on a `push` event: a fork cannot raise one, so a pull_request run
+      # never holds registry credentials.
+      #
+      # Off main this is a credential PROBE, not a publish, and it is
+      # deliberately never red. No agent identity can read Actions secrets (the
+      # App token 403s on /actions/secrets for every repo in the org), so
+      # "does go-amt see HARBOR_*?" is otherwise unmeasurable until a merge
+      # answers it — by turning main red for however long the grant takes. The
+      # probe moves that answer onto the branch, before the merge, and keeps
+      # answering it: a credential revoked later surfaces here instead of on
+      # release day.
+      - name: Publish the verified image
+        if: github.event_name == 'push'
+        env:
+          REPO: registry.blockcast.net/blockcast/go-amt/blockcast-shreds
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          # Red on main, where it blocks a real publish. A warning elsewhere:
+          # a missing or broken org grant is not a defect in whatever branch is
+          # building.
+          refuse() {
+            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+              echo "::error::$1"
+              exit 1
+            fi
+            echo "::warning::$1"
+            exit 0
+          }
+          if [ -z "${HARBOR_USERNAME}" ] || [ -z "${HARBOR_PASSWORD}" ]; then
+            refuse "HARBOR_USERNAME/HARBOR_PASSWORD are not visible to this repository, so the verified image cannot be published. They are set for other Blockcast repos (pim-multicast-gateway, magma, frr); this repo needs the same grant. See BLO-40067."
+          fi
+          # Log in BEFORE the ref check, so the off-main probe proves the
+          # credential authenticates, not merely that a value is visible. Login
+          # pushes nothing. It still does not prove PUSH rights on this new repo
+          # path: Harbor grants no per-repository scope at login, so a narrowly
+          # scoped robot account can authenticate here and still be refused at
+          # the first `docker push` on main.
+          if ! printf '%s' "${HARBOR_PASSWORD}" \
+              | docker login registry.blockcast.net -u "${HARBOR_USERNAME}" --password-stdin; then
+            refuse "HARBOR_USERNAME/HARBOR_PASSWORD are visible to this repository but do not authenticate to registry.blockcast.net. See BLO-40067."
+          fi
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::notice::Harbor credentials authenticate for this repository." \
+                 "Push rights on ${REPO} are not proven until the first main publish." \
+                 "Not pushing from ${GITHUB_REF} — publish is main-only."
+            exit 0
+          fi
+          docker tag blockcast-shreds:ci "${REPO}:main"
+          docker tag blockcast-shreds:ci "${REPO}:sha-${GITHUB_SHA}"
+          docker push "${REPO}:main"
+          docker push "${REPO}:sha-${GITHUB_SHA}"
 
   goreleaser:
     runs-on: ubuntu-latest
