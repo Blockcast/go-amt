@@ -56,11 +56,40 @@ jobs:
           push: false
           load: true
           tags: blockcast-shreds:ci
+          # Without this the image reports dev-unstamped forever, which is the
+          # right default for a hand build and useless for one a cluster pulls:
+          # the sha is what lets an operator tie a running pod to a commit.
+          build-args: VERSION=sha-${{ github.sha }}
       # An image that builds but cannot execute its entrypoint is not a
       # verified image. selftest exits non-zero on a scoring mismatch, so this
       # also proves the embedded capture survived the build.
       - name: Entrypoint runs inside the image
         run: docker run --rm blockcast-shreds:ci selftest --fixture --json
+
+      # Until this step existed the lane built and verified the image and then
+      # threw it away (push: false, zero releases), so the binary BLO-22821
+      # shipped was deployable nowhere. Push only after selftest has passed, and
+      # only from main: a pull_request run must never hold registry credentials.
+      - name: Publish the verified image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          REPO: registry.blockcast.net/blockcast/go-amt/blockcast-shreds
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          if [ -z "${HARBOR_USERNAME}" ] || [ -z "${HARBOR_PASSWORD}" ]; then
+            echo "::error::HARBOR_USERNAME/HARBOR_PASSWORD are not visible to this" \
+                 "repository, so the verified image cannot be published. They are" \
+                 "set org-wide for Blockcast/pim-multicast-gateway; this repo needs" \
+                 "the same grant. See BLO-40067."
+            exit 1
+          fi
+          printf '%s' "${HARBOR_PASSWORD}" \
+            | docker login registry.blockcast.net -u "${HARBOR_USERNAME}" --password-stdin
+          docker tag blockcast-shreds:ci "${REPO}:main"
+          docker tag blockcast-shreds:ci "${REPO}:sha-${GITHUB_SHA}"
+          docker push "${REPO}:main"
+          docker push "${REPO}:sha-${GITHUB_SHA}"
 
   goreleaser:
     runs-on: ubuntu-latest
