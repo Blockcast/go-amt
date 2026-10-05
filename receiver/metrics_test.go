@@ -366,6 +366,20 @@ func TestReceiverMetricsRejectGuardPublishForUnknownFeed(t *testing.T) {
 // reintroduces this PR's defect silently. Equality makes that case fail loudly,
 // and makes a new packet-path counter fail too -- which is the right prompt,
 // since it forces the author to classify the new descriptor as one or the other.
+// descFQName extracts the name Desc.String() publishes. Desc has no accessor for
+// it, and exact names rather than substrings are what let an assertion state a
+// complement -- a substring match cannot.
+var descFQName = regexp.MustCompile(`fqName:\s*"([^"]+)"`)
+
+func fqNameOf(t *testing.T, descString string) string {
+	t.Helper()
+	match := descFQName.FindStringSubmatch(descString)
+	if match == nil {
+		t.Fatalf("no fqName in Desc.String() = %q; the matcher has rotted", descString)
+	}
+	return match[1]
+}
+
 func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
 	// Described unconditionally: driven by the packet path, honest in every mode.
 	packetPathDescNames := []string{
@@ -386,9 +400,6 @@ func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
 		"bcast_shred_gw_gap_events",
 		"bcast_shred_gw_report_schema",
 	}
-	// Desc has no accessor for its name, so parse the one String() publishes.
-	// Exact names, not substrings: a substring match cannot assert a complement.
-	fqName := regexp.MustCompile(`fqName:\s*"([^"]+)"`)
 	describedNames := func(reporting WindowReporting) []string {
 		t.Helper()
 		metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, reporting)
@@ -402,12 +413,7 @@ func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
 		}()
 		var names []string
 		for desc := range descs {
-			match := fqName.FindStringSubmatch(desc.String())
-			if match == nil {
-				t.Errorf("no fqName in Desc.String() = %q; the matcher has rotted", desc.String())
-				continue
-			}
-			names = append(names, match[1])
+			names = append(names, fqNameOf(t, desc.String()))
 		}
 		slices.Sort(names)
 		return names
@@ -424,6 +430,76 @@ func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
 	if got := describedNames(ReportsWindows); !slices.Equal(got, wantAll) {
 		t.Errorf("ReportsWindows described:\n%s\nwant packet path + all %d window descriptors:\n%s",
 			strings.Join(got, "\n"), len(windowDescNames), strings.Join(wantAll, "\n"))
+	}
+}
+
+// TestDescribeAndCollectAgreePerMode pins the two gates to each other, which
+// nothing else does. The registry will not: Registry.Gather only rejects a
+// metric whose descriptor was never described when pedantic checks are on --
+// registry.go:442-445 populates registeredDescIDs only if
+// pedanticChecksEnabled, and the "collected metric ... with unregistered
+// descriptor" error at registry.go:711 is gated on that map being non-nil.
+// cmd/blockcast-shreds builds a plain prometheus.NewRegistry() (main.go:700),
+// which is not pedantic, so a series collected ABOVE the Collect gate while
+// correctly described BELOW the Describe gate is exported with no error at all:
+// a window-derived permanent zero in generic mode, which is the exact defect
+// BLO-40163 removed.
+//
+// The sibling test above cannot catch that, because in that shape the
+// descriptor is placed correctly and only Collect is wrong. Set equality
+// catches it from either side, and does so without re-listing the taxonomy in
+// a further place -- the two gates are asserted against each other, not against
+// a hand-maintained list.
+func TestDescribeAndCollectAgreePerMode(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reporting WindowReporting
+	}{
+		{"NoWindowReporting", NoWindowReporting},
+		{"ReportsWindows", ReportsWindows},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, tc.reporting)
+			if err != nil {
+				t.Fatalf("NewReceiverMetrics() error = %v", err)
+			}
+
+			descs := make(chan *prometheus.Desc, 64)
+			go func() {
+				metrics.Describe(descs)
+				close(descs)
+			}()
+			var described []string
+			for desc := range descs {
+				described = append(described, fqNameOf(t, desc.String()))
+			}
+
+			metricCh := make(chan prometheus.Metric, 64)
+			go func() {
+				metrics.Collect(metricCh)
+				close(metricCh)
+			}()
+			var collected []string
+			for metric := range metricCh {
+				collected = append(collected, fqNameOf(t, metric.Desc().String()))
+			}
+
+			// Collect emits several series per descriptor -- two rate measures,
+			// five gap buckets, two set kinds -- so compare distinct names.
+			slices.Sort(described)
+			slices.Sort(collected)
+			described, collected = slices.Compact(described), slices.Compact(collected)
+			if !slices.Equal(collected, described) {
+				t.Errorf("the two gates disagree.\ncollected:\n%s\ndescribed:\n%s",
+					strings.Join(collected, "\n"), strings.Join(described, "\n"))
+			}
+			// Vacuity control: equality also holds when both sets are empty, which
+			// a broken extraction would produce. The packet path is described and
+			// collected unconditionally, so neither set can legitimately be empty.
+			if len(collected) == 0 {
+				t.Error("no series at all; the extraction is broken, not the gates")
+			}
+		})
 	}
 }
 
