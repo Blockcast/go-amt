@@ -75,6 +75,21 @@ jobs:
       # also proves the embedded capture survived the build.
       - name: Entrypoint runs inside the image
         run: docker run --rm blockcast-shreds:ci selftest --fixture --json
+      # The image twin of the host binary's stamp guard above. selftest proves
+      # scoring, not provenance: drop `build-args` or let the -X symbol path
+      # drift in the Dockerfile and the image still builds, selftests green and
+      # publishes reporting dev-unstamped, so every heartbeat from it is
+      # unattributable. Assert the exact stamp the build was given, before the
+      # publish step, so a wrong or missing one never reaches the registry.
+      - name: Version stamp survived the image build
+        run: |
+          reported="$(docker run --rm blockcast-shreds:ci --version)"
+          echo "reported version: ${reported}"
+          if [ "${reported}" != "sha-${GITHUB_SHA}" ]; then
+            echo "::error::the image reports '${reported}', expected 'sha-${GITHUB_SHA}'." \
+                 "Check build-args in this workflow and ARG VERSION / the -X symbol path in the Dockerfile."
+            exit 1
+          fi
 
       # Until this step existed the lane built and verified the image and then
       # threw it away (push: false, zero releases), so the binary BLO-22821
