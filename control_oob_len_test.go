@@ -229,14 +229,21 @@ func TestControlMessageOOBLenCoversBothFamiliesAndTheTimestamp(t *testing.T) {
 		name string
 		need int
 	}{
-		{"v4 cmsgs + timestamp", v4 + TimestampControlMessageLen},
-		{"v6 cmsgs + timestamp", v6 + TimestampControlMessageLen},
+		{"v4 cmsgs + timestamp + gro", v4 + TimestampControlMessageLen + GROControlMessageLen},
+		{"v6 cmsgs + timestamp + gro", v6 + TimestampControlMessageLen + GROControlMessageLen},
 	} {
 		if oobLen < tc.need {
 			t.Errorf("ControlMessageOOBLen() = %d, too small for %s (%d). A short "+
 				"buffer makes the kernel set MSG_CTRUNC and drop whichever cmsgs "+
 				"did not fit, Dst first", oobLen, tc.name, tc.need)
 		}
+	}
+	if oobLen <= max(v4, v6)+TimestampControlMessageLen {
+		t.Errorf("ControlMessageOOBLen() = %d leaves no room beyond the IP-level "+
+			"cmsgs and the timestamp (%d), so the IPPROTO_UDP term is not in it. "+
+			"Like the timestamp term it is unreachable from ControlFlags4/6, and "+
+			"a caller that enabled GRO then loses a cmsg to MSG_CTRUNC",
+			oobLen, max(v4, v6)+TimestampControlMessageLen)
 	}
 	if oobLen <= max(v4, v6) {
 		t.Errorf("ControlMessageOOBLen() = %d does not exceed the IP-level cmsgs "+
@@ -248,14 +255,26 @@ func TestControlMessageOOBLenCoversBothFamiliesAndTheTimestamp(t *testing.T) {
 
 // sockoptsWithoutCmsg are the raw setsockopt options this package sets that
 // never put a control message on a received datagram. Everything else a raw
-// setsockopt can ask for either is in timestampSockoptsCoveredBy32 or has to be
-// added to ControlMessageOOBLen before it is set.
+// setsockopt can ask for either is in timestampSockoptsCoveredBy32, is in
+// sockoptsCoveredByGROLen, or has to be added to ControlMessageOOBLen before it
+// is set.
 var sockoptsWithoutCmsg = map[string]bool{
 	"SO_REUSEADDR":     true,
 	"SO_REUSEPORT":     true,
 	"SO_ATTACH_FILTER": true,
 	"IP_BOUND_IF":      true,
 	"IPV6_BOUND_IF":    true,
+}
+
+// sockoptsCoveredByGROLen are the IPPROTO_UDP options whose control message
+// fits in GROControlMessageLen.
+//
+// UDP_SEGMENT is deliberately absent: it is set per-send as a cmsg on
+// sendmsg(2), not with setsockopt, so it never appears here and never puts
+// anything in a RECEIVE buffer. If it is ever set as a socket option it needs
+// classifying on its own merits rather than inheriting this entry.
+var sockoptsCoveredByGROLen = map[string]bool{
+	"UDP_GRO": true,
 }
 
 // sockbufOptParams are the parameter names sockbuf_*.go uses to plumb
@@ -328,13 +347,14 @@ func TestRawSockoptsAreAllClassified(t *testing.T) {
 				return true
 			}
 			switch {
-			case sockoptsWithoutCmsg[name], timestampSockoptsCoveredBy32[name]:
+			case sockoptsWithoutCmsg[name], timestampSockoptsCoveredBy32[name], sockoptsCoveredByGROLen[name]:
 			case sockbufOptParams[name] && strings.HasPrefix(path, "sockbuf_"):
 			default:
 				t.Errorf("%s sets socket option %q, which is not classified against "+
 					"ControlMessageOOBLen. If it puts a cmsg on received datagrams, "+
 					"raise ControlMessageOOBLen in the same change; either way add it "+
-					"to sockoptsWithoutCmsg or timestampSockoptsCoveredBy32", path, name)
+					"to sockoptsWithoutCmsg, timestampSockoptsCoveredBy32 or "+
+					"sockoptsCoveredByGROLen", path, name)
 			}
 			return true
 		})

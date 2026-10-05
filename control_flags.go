@@ -21,8 +21,8 @@ import (
 // upstream and IPv6 goes dark (BLO-34983).
 //
 // These are the IP-level cmsgs only. To size a buffer, use
-// ControlMessageOOBLen, which adds the SOL_SOCKET term these flags cannot
-// reach.
+// ControlMessageOOBLen, which adds the SOL_SOCKET and IPPROTO_UDP terms these
+// flags cannot reach.
 //
 // Untagged on purpose. The listen calls that consume these are behind
 // platform and cgo constraints, but the callers that must size a buffer are
@@ -56,25 +56,48 @@ const (
 // timespecs at CmsgSpace(48) = 64.
 const TimestampControlMessageLen = 32
 
+// GROControlMessageLen is the OOB space the UDP_GRO control message occupies on
+// a socket MulticastConn.EnableGRO succeeded on.
+//
+// A third exported term for the same reason TimestampControlMessageLen is a
+// second one: the option is IPPROTO_UDP, so it is as unreachable from
+// ipv4.ControlFlags and ipv6.ControlFlags as the SOL_SOCKET one is. A caller
+// sizing from the flag sets alone is short by exactly this much and the kernel
+// truncates silently.
+//
+// Counted unconditionally, even though GRO is opt-in per connection, on the
+// same grounds as the timestamp term: 24 bytes per slot costs nothing, and a
+// length that varied by which options a caller had enabled would put the caller
+// back in the business of tracking what this package set. It also means
+// EnableGRO can be called on an already-running receiver without every OOB
+// buffer in the process having to be resized first -- which, since the cost of
+// getting that ordering wrong is MSG_CTRUNC and a silently dark group filter,
+// is the difference between an opt-in and a flag day.
+//
+// 24 is CmsgSpace(4) on a 64-bit ABI: udp_cmsg_recv reports the segment size as
+// an int. TestGROControlMessageLenMatchesTheABI checks that against
+// unix.CmsgSpace instead of trusting the literal.
+const GROControlMessageLen = 24
+
 // ControlMessageOOBLen returns the per-slot OOB buffer length a ReadBatch
 // caller must allocate to receive everything a socket opened by this package
 // can emit.
 //
 // This, not the flag sets, is what a caller should size from. Every term is
-// owned here — the IP-level cmsgs by ControlFlags4/6 and the SOL_SOCKET one by
-// TimestampControlMessageLen — so a cmsg added on either axis reaches the
-// caller's buffer on its next pin bump with no edit at the caller, which is the
-// whole point (BLO-34983). Exporting only the flag sets left the timestamp term
-// as a hand-mirror at the caller, i.e. one instance of the drift class the
-// export was meant to retire.
+// owned here — the IP-level cmsgs by ControlFlags4/6, the SOL_SOCKET one by
+// TimestampControlMessageLen and the IPPROTO_UDP one by GROControlMessageLen —
+// so a cmsg added on any axis reaches the caller's buffer on its next pin bump
+// with no edit at the caller, which is the whole point (BLO-34983). Exporting
+// only the flag sets left the timestamp term as a hand-mirror at the caller,
+// i.e. one instance of the drift class the export was meant to retire.
 //
 // The larger of the two families, because a caller allocating one buffer size
 // for slots it will hand to either family cannot know the family in advance.
 // v6's cmsgs are 8 bytes wider, so sizing from v4 alone truncates Dst on a v6
 // datagram and a group filter then discards all of it.
 //
-// Unconditionally includes the timestamp term, even though Timestamp is
-// per-config: over-allocating 32 bytes per slot costs nothing, and a length
+// Unconditionally includes the timestamp and GRO terms, even though both are
+// per-config: over-allocating 56 bytes per slot costs nothing, and a length
 // that varied by config would put the caller back in the business of tracking
 // which options this package set.
 //
@@ -91,4 +114,4 @@ func ControlMessageOOBLen() int { return controlMessageOOBLen }
 var controlMessageOOBLen = max(
 	len(ipv4.NewControlMessage(ControlFlags4)),
 	len(ipv6.NewControlMessage(ControlFlags6)),
-) + TimestampControlMessageLen
+) + TimestampControlMessageLen + GROControlMessageLen
