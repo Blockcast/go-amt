@@ -49,8 +49,15 @@ func TestGROControlMessageLenMatchesTheABI(t *testing.T) {
 // the right answer on little-endian for every segment size under 65536 and the
 // wrong one on big-endian, so no amd64 test run would ever show it.
 // TestGROReadsCoalescedSegmentsOverLoopback measures the width against the
-// running kernel; this one pins it against the ABI so a cross-compile target
-// fails too.
+// running kernel; this one only guards the constant against being edited to 2.
+//
+// It is deliberately not a measurement, and the distinction is worth keeping
+// straight: unsafe.Sizeof(int32(0)) is 4 on every Go platform by language
+// definition, so unlike control_oob_len_abi_test.go's unix.Timespec{} -- whose
+// width genuinely moves between ABIs -- this cannot vary by target. No
+// measurement is available to write instead. C int is 4 bytes on both ILP32 and
+// LP64, so there is no Go-reachable Linux ABI where groCmsgPayloadBytes should
+// differ, and nothing in Go tracks the C type to assert against.
 func TestGROCmsgPayloadIsFourBytes(t *testing.T) {
 	if got := int(unsafe.Sizeof(int32(0))); got != groCmsgPayloadBytes {
 		t.Errorf("the kernel reports gso_size as an int (%d bytes), but "+

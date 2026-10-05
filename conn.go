@@ -798,6 +798,15 @@ func (mc *MulticastConn) SetWriteDeadline(t time.Time) error {
 // An error wrapping ErrGROUnsupported means the socket is unchanged and still
 // delivers one datagram per slot, which is what the caller was already doing;
 // it is a capability report, not a failure. Any other error is real.
+//
+// Call it once Open has returned, not concurrently with it. The socket fields
+// read below are published under pathMu by Open's tunnel-fallback path and are
+// read here unlocked, as WriteBatch and WriteSegments read them. (The "already
+// running receiver" in GROControlMessageLen's note is about buffer sizing --
+// no flag day needed -- not a licence to race Open.) An RLock here would not
+// be the cheap fix it looks: IsUsingTunnel RLocks pathMu already, so wrapping
+// this body makes it a recursive read lock, which sync.RWMutex documents as
+// deadlock-prone whenever a writer is waiting between the two.
 func (mc *MulticastConn) EnableGRO() error {
 	if mc.IsUsingTunnel() {
 		// Consistent with WriteSegments: the tunnel decapsulates in userspace,

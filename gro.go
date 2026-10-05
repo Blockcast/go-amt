@@ -47,6 +47,17 @@ const SegmentSizeUnreadable = -1
 // A caller therefore needs no "is GRO on" flag at the read site: 0 and
 // "GRO disabled" are the same instruction.
 //
+// That reading of 0 holds only on a slot whose read did not set MSG_CTRUNC,
+// and the caller must check ms[i].Flags for it. Truncation is reported out of
+// band, never inside oob: the kernel drops whole control messages and shortens
+// msg_controllen, so what survives still parses and a dropped GRO cmsg is
+// indistinguishable here from one that was never attached. Acting on 0 after a
+// truncated read frames a coalesced run as one oversized datagram -- the same
+// silent corruption SegmentSizeUnreadable exists to prevent on the malformed
+// payload path, reached by a route this parse cannot see. Sizing the buffer
+// with ControlMessageOOBLen makes it unreachable; a caller that hand-mirrors
+// that length is short by exactly GROControlMessageLen.
+//
 // A positive n means the slot holds ceil(len/n) datagrams laid out
 // back-to-back, every one exactly n bytes except the last, which may be
 // shorter. That is the same layout WriteSegments sends, by construction.
