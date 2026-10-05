@@ -417,14 +417,27 @@ func TestPublishGuardRefusedWithoutWindowReporting(t *testing.T) {
 	if err := metrics.PublishGuard("nope", erasure.Stats{}); !errors.Is(err, ErrUnknownFeed) {
 		t.Fatalf("PublishGuard(unknown) error = %v, want ErrUnknownFeed", err)
 	}
-	// PublishWindow is the deliberate asymmetry: Snapshot still reads the
-	// stored Window for the broker heartbeat, which is live in generic mode, so
-	// it must accept rather than refuse. Pinned here beside the refusal so a
-	// future "make these consistent" edit has to argue with the heartbeat.
+}
+
+// TestPublishWindowAcceptedWithoutWindowReporting pins the deliberate asymmetry
+// with PublishGuard above: Snapshot returns m.windows without consulting
+// reportsWindows, so a Window stored under NoWindowReporting still reaches every
+// Snapshot consumer and PublishWindow must accept rather than refuse.
+//
+// Named for the acceptance rather than folded into the refusal test so that a
+// future "make these two consistent" edit finds this by name and has to argue
+// with it. The argument to beat is the package boundary -- receiver has no
+// concept of the caller's modes -- not any current consumer: do not retire this
+// on the grounds that broker/gwclient happens to be shred-only today.
+func TestPublishWindowAcceptedWithoutWindowReporting(t *testing.T) {
+	metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, NoWindowReporting)
+	if err != nil {
+		t.Fatalf("NewReceiverMetrics() error = %v", err)
+	}
 	if err := metrics.PublishWindow("feed", erasure.Window{Schema: 1}); err != nil {
-		t.Fatalf("PublishWindow() error = %v; the heartbeat still reads this window", err)
+		t.Fatalf("PublishWindow() error = %v; Snapshot still reads this window", err)
 	}
 	if got := metrics.Snapshot()[0].Window.Schema; got != 1 {
-		t.Fatalf("Snapshot() window schema = %d, want 1; the heartbeat path lost the window", got)
+		t.Fatalf("Snapshot() window schema = %d, want 1; the Snapshot path lost the window", got)
 	}
 }

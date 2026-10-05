@@ -56,6 +56,9 @@ type ReceiverMetrics struct {
 	feedIDs []string
 	// reportsWindows gates every window-derived descriptor in Describe and
 	// Collect. The descs are built either way; only publication is conditional.
+	// Immutable after construction: set once in NewReceiverMetrics and never
+	// mutated, which is why Describe, Collect and PublishGuard read it without
+	// holding mu. Adding a setter would make those reads a data race.
 	reportsWindows bool
 	feeds          map[string]feedMetrics
 	windows        map[string]erasure.Window
@@ -402,10 +405,18 @@ func (m *ReceiverMetrics) PublishGuard(feedID string, stats erasure.Stats) error
 	// PublishWindow deliberately does NOT error under the same condition. The
 	// distinction is no longer "partial vs whole no-op" on /metrics -- since
 	// BLO-40163 Collect skips every window series, so neither reaches /metrics
-	// here. It is that m.windows has a SECOND reader: Snapshot feeds the broker
-	// heartbeat (broker/gwclient), which is live in generic mode. A stored
-	// Window is therefore still doing its job when /metrics ignores it, and
-	// there is no honest error for PublishWindow to return.
+	// here. It is that m.windows has a SECOND reader: Snapshot returns the
+	// stored Window without consulting reportsWindows. WindowReporting is a
+	// receiver-package gate, not a mode -- this package has no concept of the
+	// caller's modes -- so a Window stored under NoWindowReporting still
+	// reaches every Snapshot consumer, and there is no honest error for
+	// PublishWindow to return.
+	//
+	// Do not re-derive this from the cmd layer. Today's only Snapshot consumer
+	// (broker/gwclient) happens to be reachable only under --mode shred, so it
+	// is tempting to read the asymmetry as dead and collapse it. That couples a
+	// receiver invariant to one caller's current flag validation, which is
+	// exactly what this package must not assume.
 	//
 	// The only caller discards this (publishWindows, main.go), so today the
 	// error names the mismatch to nobody; it is here for the next caller that
