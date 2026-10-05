@@ -494,10 +494,13 @@ func TestDescribeAndCollectAgreePerMode(t *testing.T) {
 					strings.Join(collected, "\n"), strings.Join(described, "\n"))
 			}
 			// Vacuity control: equality also holds when both sets are empty, which
-			// a broken extraction would produce. The packet path is described and
-			// collected unconditionally, so neither set can legitimately be empty.
+			// a collector emitting nothing would produce. A broken extraction is not
+			// the mechanism and cannot reach here -- fqNameOf fatals on the first
+			// unparseable Desc, long before either set is sized. The packet path is
+			// described and collected unconditionally, so neither set can
+			// legitimately be empty.
 			if len(collected) == 0 {
-				t.Error("no series at all; the extraction is broken, not the gates")
+				t.Error("no series at all; the unconditional packet path was suppressed")
 			}
 		})
 	}
