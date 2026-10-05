@@ -47,6 +47,14 @@ func scrapeErasureLines(text string) []string {
 }
 
 // runAndScrape serves one feed under mode until /metrics answers, then stops.
+//
+// It deliberately returns the pre-publication state: it breaks on the first
+// body the endpoint serves, which normally beats the first report tick, so
+// every window-derived series (grace, schema, any published value) reads as
+// its zero value here regardless of configuration. Use this helper to assert
+// which series are PRESENT, never what they hold. To assert a published value,
+// poll until that value is non-zero, as TestDefaultGraceReachesMetrics
+// (erasure_test.go) does -- otherwise the answer flips at ~40ms.
 func runAndScrape(t *testing.T, mode scoring) string {
 	t.Helper()
 	silenceStdout(t)
@@ -122,14 +130,13 @@ func TestGenericModeExportsNoErasureSeries(t *testing.T) {
 				t.Errorf("shred mode did not export %s; a silent feed must report zeros, not disappear", name)
 			}
 		}
-		// This asserts the zero VALUE, not that a window was published: no
-		// window is published pre-traffic at all. DrainWindow errors on an idle
-		// tracker, so publishWindows (main.go) hits `continue` and leaves the
-		// zero-value Window that Collect reads -- which is why grace reads 0
-		// here too rather than the configured 400. Nothing at this level can
-		// tell a published window from a merely-registered family, and nothing
-		// here needs to: receiver.TestReceiverMetricsExposePacketCountersAndExactWindow
-		// pins that directly, publishing GraceMS=400 and asserting it scrapes back.
+		// This asserts the zero VALUE, not that a window was published. Nothing
+		// at this level can tell a published window from a merely-registered
+		// family, and nothing here needs to: TestDefaultGraceReachesMetrics
+		// (erasure_test.go) pins publication directly, in this mode, by
+		// asserting the configured 400ms grace scrapes back. Grace reads 0 here
+		// only because runAndScrape's scrape wins the race against the first
+		// report tick; nothing here asserts it.
 		if value, ok := scrapeText(text, "bcast_shred_gw_erasure_fraction", `feed="default"`); !ok || value != 0 {
 			t.Errorf("shred mode erasure_fraction = %v, ok = %v; want 0 pre-traffic", value, ok)
 		}
