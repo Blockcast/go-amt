@@ -344,6 +344,20 @@ func TestReceiverMetricsRejectGuardPublishForUnknownFeed(t *testing.T) {
 	}
 }
 
+// descFQName extracts the name Desc.String() publishes. Desc has no accessor for
+// it, and exact names rather than substrings are what let an assertion state a
+// complement -- a substring match cannot.
+var descFQName = regexp.MustCompile(`fqName:\s*"([^"]+)"`)
+
+func fqNameOf(t *testing.T, descString string) string {
+	t.Helper()
+	match := descFQName.FindStringSubmatch(descString)
+	if match == nil {
+		t.Fatalf("no fqName in Desc.String() = %q; the matcher has rotted", descString)
+	}
+	return match[1]
+}
+
 // TestNoWindowReportingOmitsTheFamilyFromDescribe covers the half of the
 // NoWindowReporting contract that a /metrics scrape cannot see.
 //
@@ -366,20 +380,6 @@ func TestReceiverMetricsRejectGuardPublishForUnknownFeed(t *testing.T) {
 // reintroduces this PR's defect silently. Equality makes that case fail loudly,
 // and makes a new packet-path counter fail too -- which is the right prompt,
 // since it forces the author to classify the new descriptor as one or the other.
-// descFQName extracts the name Desc.String() publishes. Desc has no accessor for
-// it, and exact names rather than substrings are what let an assertion state a
-// complement -- a substring match cannot.
-var descFQName = regexp.MustCompile(`fqName:\s*"([^"]+)"`)
-
-func fqNameOf(t *testing.T, descString string) string {
-	t.Helper()
-	match := descFQName.FindStringSubmatch(descString)
-	if match == nil {
-		t.Fatalf("no fqName in Desc.String() = %q; the matcher has rotted", descString)
-	}
-	return match[1]
-}
-
 func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
 	// Described unconditionally: driven by the packet path, honest in every mode.
 	packetPathDescNames := []string{
