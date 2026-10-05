@@ -2,6 +2,8 @@ package receiver
 
 import (
 	"errors"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -356,7 +358,24 @@ func TestReceiverMetricsRejectGuardPublishForUnknownFeed(t *testing.T) {
 // All eight window-derived descriptors are asserted, not just the erasure five:
 // the name-reservation argument is identical for _shreds_per_second,
 // _gap_events and _report_schema, which BLO-40163 added to this gate.
+//
+// Both arms assert the COMPLETE described set rather than scanning for the
+// forbidden names, because enumerating only what must be absent fails in the
+// wrong direction: a window-derived descriptor added above the Describe gate
+// (metrics.go) is simply not in any list, so a forbidden-set scan passes and
+// reintroduces this PR's defect silently. Equality makes that case fail loudly,
+// and makes a new packet-path counter fail too -- which is the right prompt,
+// since it forces the author to classify the new descriptor as one or the other.
 func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
+	// Described unconditionally: driven by the packet path, honest in every mode.
+	packetPathDescNames := []string{
+		"bcast_shred_gw_ingress_packets_total",
+		"bcast_shred_gw_egress_packets_total",
+		"bcast_shred_gw_fanout_dropped_packets_total",
+		"bcast_shred_gw_fanout_write_errors_total",
+		"bcast_shred_gw_shreds_unparsed_total",
+	}
+	// Described only under ReportsWindows: every value is read off a drained Window.
 	windowDescNames := []string{
 		"bcast_shred_gw_erasure_sets",
 		"bcast_shred_gw_erasure_fraction",
@@ -367,6 +386,9 @@ func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
 		"bcast_shred_gw_gap_events",
 		"bcast_shred_gw_report_schema",
 	}
+	// Desc has no accessor for its name, so parse the one String() publishes.
+	// Exact names, not substrings: a substring match cannot assert a complement.
+	fqName := regexp.MustCompile(`fqName:\s*"([^"]+)"`)
 	describedNames := func(reporting WindowReporting) []string {
 		t.Helper()
 		metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, reporting)
@@ -380,25 +402,28 @@ func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
 		}()
 		var names []string
 		for desc := range descs {
-			for _, want := range windowDescNames {
-				if strings.Contains(desc.String(), want) {
-					names = append(names, desc.String())
-					break
-				}
+			match := fqName.FindStringSubmatch(desc.String())
+			if match == nil {
+				t.Errorf("no fqName in Desc.String() = %q; the matcher has rotted", desc.String())
+				continue
 			}
+			names = append(names, match[1])
 		}
+		slices.Sort(names)
 		return names
 	}
 
-	if names := describedNames(NoWindowReporting); len(names) != 0 {
-		t.Errorf("NoWindowReporting described %d window descriptors, want 0:\n%s",
-			len(names), strings.Join(names, "\n"))
+	wantQuiet := slices.Sorted(slices.Values(packetPathDescNames))
+	if got := describedNames(NoWindowReporting); !slices.Equal(got, wantQuiet) {
+		t.Errorf("NoWindowReporting described:\n%s\nwant exactly the packet path:\n%s",
+			strings.Join(got, "\n"), strings.Join(wantQuiet, "\n"))
 	}
-	// Control: the matcher really does find them when reporting is on, so the
-	// assertion above is not vacuously passing on a broken substring.
-	if names := describedNames(ReportsWindows); len(names) != len(windowDescNames) {
-		t.Errorf("ReportsWindows described %d window descriptors, want %d:\n%s",
-			len(names), len(windowDescNames), strings.Join(names, "\n"))
+	// Control: the matcher really does find the window descriptors when reporting
+	// is on, so the assertion above is not vacuously passing on a broken parse.
+	wantAll := slices.Sorted(slices.Values(append(slices.Clone(packetPathDescNames), windowDescNames...)))
+	if got := describedNames(ReportsWindows); !slices.Equal(got, wantAll) {
+		t.Errorf("ReportsWindows described:\n%s\nwant packet path + all %d window descriptors:\n%s",
+			strings.Join(got, "\n"), len(windowDescNames), strings.Join(wantAll, "\n"))
 	}
 }
 
