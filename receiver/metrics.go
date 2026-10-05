@@ -14,28 +14,33 @@ const receiverMetricsNamespace = "bcast_shred_gw"
 
 var ErrUnknownFeed = errors.New("receiver metrics feed is not configured")
 
-// ErasureScoring says whether this receiver measures FEC erasure at all.
+// WindowReporting says whether this receiver drains delivery-report windows at
+// all. It gates every window-derived series on /metrics, not only the erasure
+// family: _shreds_per_second, _gap_events and _report_schema are read off the
+// same erasure.Window and are just as unpublished without a tracker.
 //
 // It is a required constructor argument rather than an option defaulting to on,
-// because the wrong answer is silent: a receiver that registers the erasure
-// family and never drives it publishes bcast_shred_gw_erasure_fraction=0 for
-// the life of the process, which is indistinguishable from a genuinely perfect
-// feed. That is the same false attestation heartbeatOptions in
-// cmd/blockcast-shreds already refuses to emit for generic mode, and
-// publishWindows refuses to emit on a failed drain. Forcing every call site to
-// state the answer keeps a future mode from inheriting the wrong one.
+// because the wrong answer is silent: a receiver that registers these series and
+// never drives them publishes zeros for the life of the process, which is
+// indistinguishable from a genuinely perfect feed. That is the same false
+// attestation heartbeatOptions in cmd/blockcast-shreds already refuses to emit
+// for generic mode, and publishWindows refuses to emit on a failed drain.
+// Forcing every call site to state the answer keeps a future mode from
+// inheriting the wrong one.
 //
-// It is a named type so a call site reads NoErasureScoring rather than false.
-type ErasureScoring bool
+// It is a named type so a call site reads NoWindowReporting rather than false.
+type WindowReporting bool
 
 const (
-	// ScoresErasure registers the bcast_shred_gw_erasure_* family. The caller
-	// must drive it via PublishWindow and PublishGuard.
-	ScoresErasure ErasureScoring = true
-	// NoErasureScoring omits that family entirely. Absent is the point: a
-	// consumer can then tell "this mode does not measure erasure" from
-	// "erasure measured, none observed".
-	NoErasureScoring ErasureScoring = false
+	// ReportsWindows registers every window-derived series: the
+	// bcast_shred_gw_erasure_* family, _shreds_per_second, _gap_events and
+	// _report_schema. The caller must drive them via PublishWindow and
+	// PublishGuard.
+	ReportsWindows WindowReporting = true
+	// NoWindowReporting omits all of them entirely. Absent is the point: a
+	// consumer can then tell "this mode drains no delivery window" from
+	// "window drained, nothing observed" (BLO-28910, BLO-40163).
+	NoWindowReporting WindowReporting = false
 )
 
 var gapBuckets = []string{"<1", "1-2.4", "2.4-7", "7-32", ">=32"}
@@ -49,11 +54,14 @@ var _ EgressObserver = (*ReceiverMetrics)(nil)
 type ReceiverMetrics struct {
 	mu      sync.RWMutex
 	feedIDs []string
-	// scoresErasure gates the erasure_* descriptors in Describe and Collect.
-	// The descs are built either way; only publication is conditional.
-	scoresErasure bool
-	feeds         map[string]feedMetrics
-	windows       map[string]erasure.Window
+	// reportsWindows gates every window-derived descriptor in Describe and
+	// Collect. The descs are built either way; only publication is conditional.
+	// Immutable after construction: set once in NewReceiverMetrics and never
+	// mutated, which is why Describe, Collect and PublishGuard read it without
+	// holding mu. Adding a setter would make those reads a data race.
+	reportsWindows bool
+	feeds          map[string]feedMetrics
+	windows        map[string]erasure.Window
 	// liveness holds the per-feed ingress activity the broker heartbeat
 	// reports. It is kept here, beside the prometheus counters and written on
 	// the same call, because the heartbeat's packet count and
@@ -93,13 +101,13 @@ type feedMetrics struct {
 // NewReceiverMetrics registers receiver metrics and materializes zero-valued
 // series for every configured feed.
 //
-// With NoErasureScoring the bcast_shred_gw_erasure_* family is not exported at
-// all; see ErasureScoring for why that is absent rather than zero. The
-// remaining window series -- shreds_per_second, gap_events, report_schema --
-// are unaffected and still read zero on a receiver that never publishes a
-// window. That is deliberate scope: this argument answers the erasure
-// attestation only.
-func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, scoring ErasureScoring) (*ReceiverMetrics, error) {
+// With NoWindowReporting no window-derived series is exported at all -- not the
+// bcast_shred_gw_erasure_* family, and not _shreds_per_second, _gap_events or
+// _report_schema. See WindowReporting for why that is absent rather than zero.
+// The packet-path counters are unaffected: they are driven by ObserveIngress and
+// the fan-out, not by a drain, so they stay honest in every mode and remain the
+// liveness signal a consumer pairs against.
+func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, reporting WindowReporting) (*ReceiverMetrics, error) {
 	if registerer == nil {
 		return nil, errors.New("receiver metrics registerer is nil")
 	}
@@ -118,7 +126,7 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, scor
 	}
 
 	metrics := &ReceiverMetrics{
-		scoresErasure: bool(scoring),
+		reportsWindows: bool(reporting),
 
 		feedIDs:  append([]string(nil), feedIDs...),
 		feeds:    make(map[string]feedMetrics, len(feedIDs)),
@@ -213,12 +221,12 @@ func (m *ReceiverMetrics) Describe(ch chan<- *prometheus.Desc) {
 	m.dropped.Describe(ch)
 	m.writeErrors.Describe(ch)
 	m.unparsed.Describe(ch)
+	if !m.reportsWindows {
+		return
+	}
 	ch <- m.rateDesc
 	ch <- m.gapsDesc
 	ch <- m.schemaDesc
-	if !m.scoresErasure {
-		return
-	}
 	ch <- m.setsDesc
 	ch <- m.fractionDesc
 	ch <- m.graceDesc
@@ -234,6 +242,14 @@ func (m *ReceiverMetrics) Collect(ch chan<- prometheus.Metric) {
 	m.dropped.Collect(ch)
 	m.writeErrors.Collect(ch)
 	m.unparsed.Collect(ch)
+
+	// Nothing below this line is reachable without a drain: every value is read
+	// off m.windows, which only PublishWindow writes. A receiver that drains no
+	// window would publish the zero Window forever, so the whole loop is skipped
+	// rather than emitting zeros -- see WindowReporting.
+	if !m.reportsWindows {
+		return
+	}
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -252,9 +268,6 @@ func (m *ReceiverMetrics) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(m.gapsDesc, prometheus.GaugeValue, float64(gapValues[i]), feedID, bucket)
 		}
 		ch <- prometheus.MustNewConstMetric(m.schemaDesc, prometheus.GaugeValue, float64(window.Schema), feedID)
-		if !m.scoresErasure {
-			continue
-		}
 		ch <- prometheus.MustNewConstMetric(m.setsDesc, prometheus.GaugeValue, float64(window.SetsTotal), feedID, "total")
 		ch <- prometheus.MustNewConstMetric(m.setsDesc, prometheus.GaugeValue, float64(window.SetsErased), feedID, "erased")
 		ch <- prometheus.MustNewConstMetric(m.fractionDesc, prometheus.GaugeValue, window.ErasureFraction, feedID)
@@ -360,6 +373,11 @@ func (m *ReceiverMetrics) IncUnparsed(feedID string) error {
 }
 
 // PublishWindow exposes the exact delivery report used by the broker heartbeat.
+//
+// It stores the Window unconditionally, including under NoWindowReporting where
+// Collect exports none of it: Snapshot reads the same map for the heartbeat, and
+// that path does not depend on the /metrics gate. See PublishGuard for why the
+// two methods answer differently.
 func (m *ReceiverMetrics) PublishWindow(feedID string, window erasure.Window) error {
 	if _, err := m.feed(feedID); err != nil {
 		return err
@@ -380,21 +398,31 @@ func (m *ReceiverMetrics) PublishGuard(feedID string, stats erasure.Stats) error
 	if _, err := m.feed(feedID); err != nil {
 		return err
 	}
-	// Refused rather than stored: with NoErasureScoring this method is a
-	// whole-method no-op -- guards reach no surface at all -- so accepting
-	// would drop a caller's counters silently. Failing names the mismatch.
+	// Refused rather than stored: with NoWindowReporting guards reach no
+	// surface at all -- m.guards is read only by Collect -- so accepting would
+	// drop a caller's counters silently. Failing names the mismatch.
 	//
-	// PublishWindow deliberately does NOT error under the same condition, and
-	// the distinction is whole-method vs partial no-op, not "is anything
-	// dropped": it stores a Window whose erasure fields Collect also skips,
-	// but it still drives _shreds_per_second, _gap_events and _report_schema,
-	// so there is no honest error for it to return.
+	// PublishWindow deliberately does NOT error under the same condition. The
+	// distinction is no longer "partial vs whole no-op" on /metrics -- since
+	// BLO-40163 Collect skips every window series, so neither reaches /metrics
+	// here. It is that m.windows has a SECOND reader: Snapshot returns the
+	// stored Window without consulting reportsWindows. WindowReporting is a
+	// receiver-package gate, not a mode -- this package has no concept of the
+	// caller's modes -- so a Window stored under NoWindowReporting still
+	// reaches every Snapshot consumer, and there is no honest error for
+	// PublishWindow to return.
+	//
+	// Do not re-derive this from the cmd layer. Today's only Snapshot consumer
+	// (broker/gwclient) happens to be reachable only under --mode shred, so it
+	// is tempting to read the asymmetry as dead and collapse it. That couples a
+	// receiver invariant to one caller's current flag validation, which is
+	// exactly what this package must not assume.
 	//
 	// The only caller discards this (publishWindows, main.go), so today the
 	// error names the mismatch to nobody; it is here for the next caller that
 	// checks, and to make the no-op fail loudly under test.
-	if !m.scoresErasure {
-		return fmt.Errorf("receiver metrics feed %q: erasure scoring is disabled", feedID)
+	if !m.reportsWindows {
+		return fmt.Errorf("receiver metrics feed %q: window reporting is disabled", feedID)
 	}
 	m.mu.Lock()
 	m.guards[feedID] = stats

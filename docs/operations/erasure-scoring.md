@@ -58,10 +58,15 @@ of timely delivery.
 
 ## Reading the metrics
 
-`erasure_sets`, `erasure_fraction`, `shreds_per_second` and `gap_events` are all
-**windowed gauges**, drained together every `--report-interval` (default 30s, to
-match the heartbeat) and published from one snapshot so a scrape can never mix
-two windows.
+`erasure_sets`, `erasure_fraction`, `shreds_per_second`, `gap_events` and
+`report_schema` are all **windowed gauges**, drained together every
+`--report-interval` (default 30s, to match the heartbeat) and published from one
+snapshot so a scrape can never mix two windows.
+
+Because they all come from that one drain, they are all exported only under
+`--mode shred`. Generic mode drains no window, so none of them is exported there
+— absent, not zero (BLO-28910, BLO-40163). See
+[install.md](install.md#alerting-erasure_fraction-0-has-three-meanings).
 
 Because they are windowed, they fall back to zero when a window carries no
 traffic. **`erasure_fraction 0` therefore means "no erasure in the last window"

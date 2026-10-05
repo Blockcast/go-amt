@@ -366,7 +366,7 @@ func TestNewProducerRejectsBadConfigAtStartup(t *testing.T) {
 func TestSendOnceIsRaceFreeAgainstLiveIngest(t *testing.T) {
 	const feedID = "feed-a"
 
-	metrics, err := receiver.NewReceiverMetrics(prometheus.NewRegistry(), []string{feedID}, receiver.ScoresErasure)
+	metrics, err := receiver.NewReceiverMetrics(prometheus.NewRegistry(), []string{feedID}, receiver.ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}

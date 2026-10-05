@@ -2,6 +2,8 @@ package receiver
 
 import (
 	"errors"
+	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -14,7 +16,7 @@ import (
 
 func TestReceiverMetricsExposePacketCountersAndExactWindow(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"feed-a", "feed-b"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"feed-a", "feed-b"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +81,7 @@ func TestReceiverMetricsExposePacketCountersAndExactWindow(t *testing.T) {
 
 func TestReceiverMetricsRejectUnknownFeedWithoutCreatingSeries(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"configured"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"configured"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +120,7 @@ func TestReceiverMetricsRejectUnknownFeedWithoutCreatingSeries(t *testing.T) {
 
 func TestReceiverMetricsGatherNeverMixesPublishedWindows(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"feed"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"feed"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -168,7 +170,7 @@ func TestNewReceiverMetricsRegistrationFailureLeavesNoPartialSeries(t *testing.T
 	})
 	registry.MustRegister(conflict)
 
-	if _, err := NewReceiverMetrics(registry, []string{"feed"}, ScoresErasure); err == nil {
+	if _, err := NewReceiverMetrics(registry, []string{"feed"}, ReportsWindows); err == nil {
 		t.Fatal("NewReceiverMetrics() succeeded with a conflicting descriptor")
 	}
 	families, err := registry.Gather()
@@ -194,7 +196,7 @@ func TestNewReceiverMetricsValidatesConfiguredFeeds(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := NewReceiverMetrics(prometheus.NewRegistry(), test.feeds, ScoresErasure)
+			_, err := NewReceiverMetrics(prometheus.NewRegistry(), test.feeds, ReportsWindows)
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("NewReceiverMetrics() error = %v, want substring %q", err, test.wantErr)
 			}
@@ -271,7 +273,7 @@ func equalLabels(got, want map[string]string) bool {
 // reject every datagram on the wire and publish nothing at all.
 func TestReceiverMetricsExposeSlotGuardCounters(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"feed-a", "feed-b"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"feed-a", "feed-b"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +322,7 @@ func TestReceiverMetricsExposeSlotGuardCounters(t *testing.T) {
 
 func TestReceiverMetricsRejectGuardPublishForUnknownFeed(t *testing.T) {
 	registry := prometheus.NewRegistry()
-	metrics, err := NewReceiverMetrics(registry, []string{"feed"}, ScoresErasure)
+	metrics, err := NewReceiverMetrics(registry, []string{"feed"}, ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,20 +344,65 @@ func TestReceiverMetricsRejectGuardPublishForUnknownFeed(t *testing.T) {
 	}
 }
 
-// TestNoErasureScoringOmitsTheFamilyFromDescribe covers the half of the
-// NoErasureScoring contract that a /metrics scrape cannot see.
+// descFQName extracts the name Desc.String() publishes. Desc has no accessor for
+// it, and exact names rather than substrings are what let an assertion state a
+// complement -- a substring match cannot.
+var descFQName = regexp.MustCompile(`fqName:\s*"([^"]+)"`)
+
+func fqNameOf(t *testing.T, descString string) string {
+	t.Helper()
+	match := descFQName.FindStringSubmatch(descString)
+	if match == nil {
+		t.Fatalf("no fqName in Desc.String() = %q; the matcher has rotted", descString)
+	}
+	return match[1]
+}
+
+// TestNoWindowReportingOmitsTheFamilyFromDescribe covers the half of the
+// NoWindowReporting contract that a /metrics scrape cannot see.
 //
 // The text exposition writes HELP and TYPE only for families that produced a
-// sample, so suppressing Collect alone makes the erasure family vanish from a
-// scrape whether or not Describe still advertises it. Describe is therefore
-// asserted directly: a collector that describes a descriptor it never emits
-// still reserves that fully-qualified name against the registry, so a second
-// collector legitimately exporting bcast_shred_gw_erasure_* would be refused as
-// a duplicate by a receiver that does no erasure scoring at all.
-func TestNoErasureScoringOmitsTheFamilyFromDescribe(t *testing.T) {
-	describedNames := func(scoring ErasureScoring) []string {
+// sample, so suppressing Collect alone makes a family vanish from a scrape
+// whether or not Describe still advertises it. Describe is therefore asserted
+// directly: a collector that describes a descriptor it never emits still
+// reserves that fully-qualified name against the registry, so a second
+// collector legitimately exporting one of these names would be refused as a
+// duplicate by a receiver that drains no window at all.
+//
+// All eight window-derived descriptors are asserted, not just the erasure five:
+// the name-reservation argument is identical for _shreds_per_second,
+// _gap_events and _report_schema, which BLO-40163 added to this gate.
+//
+// Both arms assert the COMPLETE described set rather than scanning for the
+// forbidden names, because enumerating only what must be absent fails in the
+// wrong direction: a window-derived descriptor added above the Describe gate
+// (metrics.go) is simply not in any list, so a forbidden-set scan passes and
+// reintroduces this PR's defect silently. Equality makes that case fail loudly,
+// and makes a new packet-path counter fail too -- which is the right prompt,
+// since it forces the author to classify the new descriptor as one or the other.
+func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
+	// Described unconditionally: driven by the packet path, honest in every mode.
+	packetPathDescNames := []string{
+		"bcast_shred_gw_ingress_packets_total",
+		"bcast_shred_gw_egress_packets_total",
+		"bcast_shred_gw_fanout_dropped_packets_total",
+		"bcast_shred_gw_fanout_write_errors_total",
+		"bcast_shred_gw_shreds_unparsed_total",
+	}
+	// Described only under ReportsWindows: every value is read off a drained Window.
+	windowDescNames := []string{
+		"bcast_shred_gw_erasure_sets",
+		"bcast_shred_gw_erasure_fraction",
+		"bcast_shred_gw_erasure_grace_milliseconds",
+		"bcast_shred_gw_erasure_slot_rejections_total",
+		"bcast_shred_gw_erasure_frontier_resyncs_total",
+		"bcast_shred_gw_shreds_per_second",
+		"bcast_shred_gw_gap_events",
+		"bcast_shred_gw_report_schema",
+	}
+	describedNames := func(reporting WindowReporting) []string {
 		t.Helper()
-		metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, scoring)
+		metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, reporting)
 		if err != nil {
 			t.Fatalf("NewReceiverMetrics() error = %v", err)
 		}
@@ -366,38 +413,132 @@ func TestNoErasureScoringOmitsTheFamilyFromDescribe(t *testing.T) {
 		}()
 		var names []string
 		for desc := range descs {
-			if strings.Contains(desc.String(), "bcast_shred_gw_erasure") {
-				names = append(names, desc.String())
-			}
+			names = append(names, fqNameOf(t, desc.String()))
 		}
+		slices.Sort(names)
 		return names
 	}
 
-	if names := describedNames(NoErasureScoring); len(names) != 0 {
-		t.Errorf("NoErasureScoring described %d erasure descriptors, want 0:\n%s",
-			len(names), strings.Join(names, "\n"))
+	wantQuiet := slices.Sorted(slices.Values(packetPathDescNames))
+	if got := describedNames(NoWindowReporting); !slices.Equal(got, wantQuiet) {
+		t.Errorf("NoWindowReporting described:\n%s\nwant exactly the packet path:\n%s",
+			strings.Join(got, "\n"), strings.Join(wantQuiet, "\n"))
 	}
-	// Control: the matcher really does find them when scoring is on, so the
-	// assertion above is not vacuously passing on a broken substring.
-	if names := describedNames(ScoresErasure); len(names) != 5 {
-		t.Errorf("ScoresErasure described %d erasure descriptors, want 5:\n%s",
-			len(names), strings.Join(names, "\n"))
+	// Control: the matcher really does find the window descriptors when reporting
+	// is on, so the assertion above is not vacuously passing on a broken parse.
+	wantAll := slices.Sorted(slices.Values(append(slices.Clone(packetPathDescNames), windowDescNames...)))
+	if got := describedNames(ReportsWindows); !slices.Equal(got, wantAll) {
+		t.Errorf("ReportsWindows described:\n%s\nwant packet path + all %d window descriptors:\n%s",
+			strings.Join(got, "\n"), len(windowDescNames), strings.Join(wantAll, "\n"))
 	}
 }
 
-// TestPublishGuardRefusedWithoutErasureScoring pins the refusal rather than a
-// silent accept: with NoErasureScoring there is no surface to read guard stats
+// TestDescribeAndCollectAgreePerMode pins the two gates to each other, which
+// nothing else does. The registry will not: Registry.Gather only rejects a
+// metric whose descriptor was never described when pedantic checks are on --
+// registry.go:442-445 populates registeredDescIDs only if
+// pedanticChecksEnabled, and the "collected metric ... with unregistered
+// descriptor" error at registry.go:711 is gated on that map being non-nil.
+// cmd/blockcast-shreds builds a plain prometheus.NewRegistry() (main.go:700),
+// which is not pedantic, so a series collected ABOVE the Collect gate while
+// correctly described BELOW the Describe gate is exported with no error at all:
+// a window-derived permanent zero in generic mode, which is the exact defect
+// BLO-40163 removed.
+//
+// The sibling test above cannot catch that, because in that shape the
+// descriptor is placed correctly and only Collect is wrong. Set equality
+// catches it from either side, and does so without re-listing the taxonomy in
+// a further place -- the two gates are asserted against each other, not against
+// a hand-maintained list.
+func TestDescribeAndCollectAgreePerMode(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reporting WindowReporting
+	}{
+		{"NoWindowReporting", NoWindowReporting},
+		{"ReportsWindows", ReportsWindows},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, tc.reporting)
+			if err != nil {
+				t.Fatalf("NewReceiverMetrics() error = %v", err)
+			}
+
+			descs := make(chan *prometheus.Desc, 64)
+			go func() {
+				metrics.Describe(descs)
+				close(descs)
+			}()
+			var described []string
+			for desc := range descs {
+				described = append(described, fqNameOf(t, desc.String()))
+			}
+
+			metricCh := make(chan prometheus.Metric, 64)
+			go func() {
+				metrics.Collect(metricCh)
+				close(metricCh)
+			}()
+			var collected []string
+			for metric := range metricCh {
+				collected = append(collected, fqNameOf(t, metric.Desc().String()))
+			}
+
+			// Collect emits several series per descriptor -- two rate measures,
+			// five gap buckets, two set kinds -- so compare distinct names.
+			slices.Sort(described)
+			slices.Sort(collected)
+			described, collected = slices.Compact(described), slices.Compact(collected)
+			if !slices.Equal(collected, described) {
+				t.Errorf("the two gates disagree.\ncollected:\n%s\ndescribed:\n%s",
+					strings.Join(collected, "\n"), strings.Join(described, "\n"))
+			}
+			// Vacuity control: equality also holds when both sets are empty, which
+			// a broken extraction would produce. The packet path is described and
+			// collected unconditionally, so neither set can legitimately be empty.
+			if len(collected) == 0 {
+				t.Error("no series at all; the extraction is broken, not the gates")
+			}
+		})
+	}
+}
+
+// TestPublishGuardRefusedWithoutWindowReporting pins the refusal rather than a
+// silent accept: with NoWindowReporting there is no surface to read guard stats
 // back from, so storing them would discard a caller's counters unobserved.
-func TestPublishGuardRefusedWithoutErasureScoring(t *testing.T) {
-	metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, NoErasureScoring)
+func TestPublishGuardRefusedWithoutWindowReporting(t *testing.T) {
+	metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, NoWindowReporting)
 	if err != nil {
 		t.Fatalf("NewReceiverMetrics() error = %v", err)
 	}
 	if err := metrics.PublishGuard("feed", erasure.Stats{FrontierResyncs: 1}); err == nil {
-		t.Fatal("PublishGuard() succeeded with erasure scoring disabled; the stats would vanish")
+		t.Fatal("PublishGuard() succeeded with window reporting disabled; the stats would vanish")
 	}
 	// An unknown feed must still report the unknown feed, not the mode.
 	if err := metrics.PublishGuard("nope", erasure.Stats{}); !errors.Is(err, ErrUnknownFeed) {
 		t.Fatalf("PublishGuard(unknown) error = %v, want ErrUnknownFeed", err)
+	}
+}
+
+// TestPublishWindowAcceptedWithoutWindowReporting pins the deliberate asymmetry
+// with PublishGuard above: Snapshot returns m.windows without consulting
+// reportsWindows, so a Window stored under NoWindowReporting still reaches every
+// Snapshot consumer and PublishWindow must accept rather than refuse.
+//
+// Named for the acceptance rather than folded into the refusal test so that a
+// future "make these two consistent" edit finds this by name and has to argue
+// with it. The argument to beat is the package boundary -- receiver has no
+// concept of the caller's modes -- not any current consumer: do not retire this
+// on the grounds that broker/gwclient happens to be shred-only today.
+func TestPublishWindowAcceptedWithoutWindowReporting(t *testing.T) {
+	metrics, err := NewReceiverMetrics(prometheus.NewRegistry(), []string{"feed"}, NoWindowReporting)
+	if err != nil {
+		t.Fatalf("NewReceiverMetrics() error = %v", err)
+	}
+	if err := metrics.PublishWindow("feed", erasure.Window{Schema: 1}); err != nil {
+		t.Fatalf("PublishWindow() error = %v; Snapshot still reads this window", err)
+	}
+	if got := metrics.Snapshot()[0].Window.Schema; got != 1 {
+		t.Fatalf("Snapshot() window schema = %d, want 1; the Snapshot path lost the window", got)
 	}
 }
