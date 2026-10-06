@@ -21,49 +21,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// TestGROControlMessageLenMatchesTheABI checks the literal 24 against the
-// kernel ABI rather than against another copy of itself, exactly as
-// TestTimestampControlMessageLenMatchesTheABI does for the SOL_SOCKET term.
-//
-// GROControlMessageLen has to be a plain constant for the same reason: the
-// option is IPPROTO_UDP, so there is no x/net control-flag accessor to compute
-// it from. Over-allocating is the only safe direction, so this failing on a
-// 32-bit ABI is correct -- the constant would genuinely be wrong there.
-func TestGROControlMessageLenMatchesTheABI(t *testing.T) {
-	if got := unix.CmsgSpace(groCmsgPayloadBytes); got != GROControlMessageLen {
-		t.Errorf("the UDP_GRO cmsg occupies CmsgSpace(%d) = %d, but "+
-			"GROControlMessageLen is %d. ControlMessageOOBLen is built from that "+
-			"constant, so every caller's OOB buffer is off by %d bytes per slot "+
-			"-- and a short one is silent: MSG_CTRUNC, Dst dropped, group filter "+
-			"discards everything",
-			groCmsgPayloadBytes, got, GROControlMessageLen, got-GROControlMessageLen)
-	}
-}
-
-// TestGROCmsgPayloadIsFourBytes pins groCmsgPayloadBytes against the C type the
-// kernel reports the segment size with.
-//
-// udp_cmsg_recv does put_cmsg(..., sizeof(gso_size), &gso_size) on an `int`, so
-// the receive payload is sizeof(int) -- NOT the uint16 the send side sets
-// UDP_SEGMENT with. That asymmetry is the whole hazard: reading 2 bytes gives
-// the right answer on little-endian for every segment size under 65536 and the
-// wrong one on big-endian, so no amd64 test run would ever show it.
-// TestGROReadsCoalescedSegmentsOverLoopback measures the width against the
-// running kernel; this one only guards the constant against being edited to 2.
-//
-// It is deliberately not a measurement, and the distinction is worth keeping
-// straight: unsafe.Sizeof(int32(0)) is 4 on every Go platform by language
-// definition, so unlike control_oob_len_abi_test.go's unix.Timespec{} -- whose
-// width genuinely moves between ABIs -- this cannot vary by target. No
-// measurement is available to write instead. C int is 4 bytes on both ILP32 and
-// LP64, so there is no Go-reachable Linux ABI where groCmsgPayloadBytes should
-// differ, and nothing in Go tracks the C type to assert against.
-func TestGROCmsgPayloadIsFourBytes(t *testing.T) {
-	if got := int(unsafe.Sizeof(int32(0))); got != groCmsgPayloadBytes {
-		t.Errorf("the kernel reports gso_size as an int (%d bytes), but "+
-			"groCmsgPayloadBytes is %d", got, groCmsgPayloadBytes)
-	}
-}
+// TestGROControlMessageLenMatchesTheABI and TestGROCmsgPayloadIsFourBytes live
+// in gro_abi_test.go: they need no socket and no cgo, so they are tagged plain
+// `linux` to run on the ABIs they exist to guard.
 
 // groDial returns a receiving *net.UDPConn and a sender, reusing the existing
 // loopbackPair rather than a second copy of it. The receiver is re-typed
@@ -178,14 +138,23 @@ func TestGROReadsCoalescedSegmentsOverLoopback(t *testing.T) {
 						t.Fatalf("slot %d: SegmentSize = %d, want the %d the sender "+
 							"segmented at", slots, seg, tc.segment)
 					}
-					// Every segment but the last must be exactly seg bytes, so
-					// an interior short one means the framing is wrong.
-					for off := 0; off < len(payload); off += seg {
-						end := min(off+seg, len(payload))
-						if end-off != seg && end != len(payload) {
-							t.Fatalf("slot %d: interior segment at %d is %d bytes, not %d",
-								slots, off, end-off, seg)
-						}
+					// Only the last segment of the block may be short, so a slot
+					// that does not finish the block has to be a whole number of
+					// segments. Stated as divisibility rather than as a walk
+					// because a stride walk over a flat buffer cannot observe
+					// the property: min(off+seg, len(payload)) makes "this chunk
+					// is short" and "this chunk is the last" the same condition,
+					// so every such guard is unreachable by construction.
+					//
+					// Reachable, but not reached here: loopback coalesces all
+					// three cases into one slot, so the first conjunct is false
+					// on every slot this kernel produces. It is the kernel that
+					// splits a block which this catches.
+					if len(got)+len(payload) < total && len(payload)%seg != 0 {
+						t.Fatalf("slot %d is %d bytes at segment size %d (%d left over) "+
+							"and is not the last slot of the block, so it ends mid-segment: "+
+							"a caller striding at %d reads the next slot misaligned",
+							slots, len(payload), seg, len(payload)%seg, seg)
 					}
 				}
 				got = append(got, payload...)
