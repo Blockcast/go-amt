@@ -228,7 +228,7 @@ jobs:
           tst=$(go list -f '{{join .TestGoFiles "\n"}}{{"\n"}}{{join .XTestGoFiles "\n"}}' .)
           echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
           rc=0
-          for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go; do
+          for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go gro_abi_test.go; do
             printf '%s\n' "$tst" | grep -qxF "$t" || {
               echo "::error::$t is not in the CGO_ENABLED=0 test selection; the ManagedConn guards in it are not running in this lane"
               rc=1
@@ -325,7 +325,7 @@ jobs:
           tst=$(go list -tags purego -f '{{join .TestGoFiles "\n"}}{{"\n"}}{{join .XTestGoFiles "\n"}}' .)
           echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
           rc=0
-          for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go; do
+          for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go gro_abi_test.go; do
             printf '%s\n' "$tst" | grep -qxF "$t" || {
               echo "::error::$t is not in the -tags purego test selection; the ManagedConn guards in it are not running in the race lane"
               rc=1

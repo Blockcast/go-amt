@@ -69,6 +69,14 @@ func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {
 	return 0, errNoCGO
 }
 
+func (mc *MulticastConn) EnableGRO() error {
+	// Wrapped for the same reason WriteSegments below is: ErrGROUnsupported is
+	// how a caller detects "no segment coalescing here" and keeps reading one
+	// datagram per slot. A bare errNoCGO would make errors.Is report false and
+	// the caller surface a hard error instead.
+	return fmt.Errorf("%w: %v", ErrGROUnsupported, errNoCGO)
+}
+
 func (mc *MulticastConn) WriteSegments(b []byte, segmentSize int, cm *ipv4.ControlMessage, dst net.Addr) (int, error) {
 	// Wrapped, unlike the other stubs in this file: WriteSegments publishes
 	// ErrSegmentsUnsupported as the way a caller detects "no segmented write

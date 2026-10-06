@@ -782,6 +782,50 @@ func (mc *MulticastConn) SetWriteDeadline(t time.Time) error {
 	return net.ErrClosed
 }
 
+// EnableGRO turns on UDP GRO for the native receive socket, so the kernel
+// coalesces consecutive same-size datagrams from one source into a single
+// ReadBatch slot and the receiver pays one syscall per run instead of one per
+// datagram. It is the receive-side counterpart of WriteSegments.
+//
+// Opt-in, and called after Open rather than configured on it, because it
+// changes how a read must be framed: once a slot can hold several datagrams,
+// a caller that reads the buffer whole silently mis-frames every coalesced
+// run. Enabling it is therefore a statement that the caller consults
+// SegmentSize per slot, which no configuration flag could promise on its
+// behalf. The buffer sizing needs no coordination -- ControlMessageOOBLen
+// already counts GROControlMessageLen unconditionally.
+//
+// An error wrapping ErrGROUnsupported means the socket is unchanged and still
+// delivers one datagram per slot, which is what the caller was already doing;
+// it is a capability report, not a failure. Any other error is real.
+//
+// Call it once Open has returned, not concurrently with it. The socket fields
+// read below are published under pathMu by Open's tunnel-fallback path and are
+// read here unlocked, as WriteBatch and WriteSegments read them. (The "already
+// running receiver" in GROControlMessageLen's note is about buffer sizing --
+// no flag day needed -- not a licence to race Open.) An RLock here would not
+// be the cheap fix it looks: IsUsingTunnel RLocks pathMu already, so wrapping
+// this body makes it a recursive read lock, which sync.RWMutex documents as
+// deadlock-prone whenever a writer is waiting between the two.
+func (mc *MulticastConn) EnableGRO() error {
+	if mc.IsUsingTunnel() {
+		// Consistent with WriteSegments: the tunnel decapsulates in userspace,
+		// so there is no kernel UDP socket carrying the group's datagrams to
+		// set the option on.
+		return fmt.Errorf("%w: amt tunnel has no native receive socket", ErrGROUnsupported)
+	}
+	// Unlike WriteSegments there is no v6 carve-out: UDP_GRO is an IPPROTO_UDP
+	// option with no address-family component, and what excludes v6 there is
+	// the v4 control message, which this path does not use.
+	if mc.conn6 != nil {
+		return enableGRO(mc.conn6.PacketConn)
+	}
+	if mc.conn4 == nil {
+		return fmt.Errorf("%w: connection is not open", ErrGROUnsupported)
+	}
+	return enableGRO(mc.conn4.PacketConn)
+}
+
 func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {
 	if !mc.IsUsingTunnel() {
 		if mc.conn6 != nil {

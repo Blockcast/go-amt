@@ -131,6 +131,13 @@ func (mc *MulticastConn) WriteSegments(b []byte, segmentSize int, cm *ipv4.Contr
 	return 0, fmt.Errorf("%w: managed mobile connection", ErrSegmentsUnsupported)
 }
 
+// EnableGRO is not offered on mobile, for the same reason WriteSegments is
+// not: ManagedConn exposes no socket to set the option on, and iOS is not Linux
+// in any case. Callers read datagram-per-slot on ErrGROUnsupported.
+func (mc *MulticastConn) EnableGRO() error {
+	return fmt.Errorf("%w: managed mobile connection", ErrGROUnsupported)
+}
+
 func (mc *MulticastConn) Close() error {
 	if mc.managed == nil {
 		return nil
