@@ -9,6 +9,7 @@ import (
 	"fmt"
 	amt "github.com/blockcast/go-amt"
 	"io"
+	"net"
 	"os"
 	"reflect"
 	"strings"
@@ -882,14 +883,97 @@ func TestSSMFeedAddress(t *testing.T) {
 	}
 
 	for _, bad := range []string{
-		"ssm://232.0.0.1:5001",                // no source
-		"ssm://69.25.95.102@10.0.0.1:5001",    // group is not multicast
-		"ssm://69.25.95.102@232.0.0.1",        // no port
-		"ssm://69.25.95.102@232.0.0.1:5001/x", // stray path
-		"ssm://host@232.0.0.1:5001",           // source is not an address
+		"ssm://232.0.0.1:5001",                                  // no source
+		"ssm://69.25.95.102@10.0.0.1:5001",                      // group is not multicast
+		"ssm://69.25.95.102@232.0.0.1",                          // no port
+		"ssm://69.25.95.102@232.0.0.1:5001/x",                   // stray path
+		"ssm://host@232.0.0.1:5001",                             // source is not an address
+		"ssm://69.25.95.102@232.0.0.1:5001?relayy=69.25.95.128", // misspelt relay
+		"ssm://69.25.95.102@232.0.0.1:5001?interface=eth0",      // misspelt iface
 	} {
 		if _, err := ssmFeed(bad); err == nil {
 			t.Errorf("ssmFeed(%q) accepted", bad)
+		}
+	}
+}
+
+// TestUndeliverableWarningNamesEveryFeed: the stderr warning names a feed, so it
+// is issued once per feed. A process-wide once would name only the first v3
+// feed, and after that forwarder is fixed the second would deliver nothing
+// with no line pointing at it.
+func TestUndeliverableWarningNamesEveryFeed(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	feeds := []string{"warn-first", "warn-second"}
+	metrics, err := receiver.NewReceiverMetrics(registry, feeds, receiver.ReportsWindows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fanout, err := receiver.NewFanout([]io.WriteCloser{&captureWriter{packets: make(chan []byte, 4)}}, 4, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = fanout.Close() }()
+	scorer := shred.NewFeedScorer(feeds)
+	for _, name := range feeds {
+		processPacket(name, fixtureShred(t), time.Now(), scorer, fanout, metrics, nil)
+		if _, warned := warnedUndeliverable.Load(name); !warned {
+			t.Fatalf("feed %q delivered a v3 frame without its own warning", name)
+		}
+	}
+}
+
+// TestStopWinsAgainstASlowFeedOpen: an ssm:// feed with ?relay= can take a whole
+// probe window to open. Feeds open concurrently, so stop is read while a feed is
+// still opening, and a socket whose open completes after shutdown is closed by
+// its own goroutine rather than read.
+func TestStopWinsAgainstASlowFeedOpen(t *testing.T) {
+	silenceStdout(t)
+	release := make(chan struct{})
+	late := make(chan net.PacketConn, 1)
+	openFeedFunc = func(f feed) (net.PacketConn, error) {
+		if f.name == "slow" {
+			<-release
+		}
+		conn, err := openFeed(f)
+		if err == nil && f.name == "slow" {
+			late <- conn
+		}
+		return conn, err
+	}
+	t.Cleanup(func() { openFeedFunc = openFeed })
+
+	httpAddress := freeLocalAddr(t, "tcp")
+	stop := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		finished <- listenAndScore(
+			[]feed{{name: "default", address: freeLocalAddr(t, "udp")}, {name: "slow", address: freeLocalAddr(t, "udp")}},
+			nil, httpAddress, 30*time.Second, true, 30*time.Millisecond, 60*time.Millisecond,
+			shred.DefaultRetention, stop, scoring{mode: "shred"}, billing{}, heartbeatConfig{})
+	}()
+	waitReady(t, httpAddress)
+
+	close(stop)
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop was not read while a feed was still opening")
+	}
+
+	close(release)
+	conn := <-late
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		_, _, err := conn.ReadFrom(make([]byte, 1))
+		if errors.Is(err, net.ErrClosed) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a feed opened after shutdown was left open: last read error %v", err)
 		}
 	}
 }

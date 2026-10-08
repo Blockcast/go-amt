@@ -963,19 +963,42 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	})
 	defer closeSessions()
 
+	// Each feed goroutine sends at most one error: its open's or its read's.
 	errCh := make(chan error, len(feeds))
 	var sockets []net.PacketConn
 	var mu sync.Mutex
-	for _, feed := range feeds {
-		conn, err := openFeed(feed)
-		if err != nil {
-			for _, open := range sockets {
-				_ = open.Close()
-			}
-			return err
+	// stopping is set under mu when run stops reading. A feed whose open
+	// completes after that closes its own socket instead of reading from it.
+	stopping := false
+	closeSockets := func() {
+		mu.Lock()
+		stopping = true
+		for _, conn := range sockets {
+			_ = conn.Close()
 		}
-		sockets = append(sockets, conn)
-		go func(feedName string, conn net.PacketConn) {
+		mu.Unlock()
+	}
+	// Feeds open concurrently. An ssm:// feed with ?relay= can take a whole
+	// probe window to open, so opening in turn would stagger the joins by a
+	// window per feed, skewing the first-arrival comparison --feed exists to
+	// make. It would also leave SIGINT/SIGTERM unread for the sum of those
+	// windows, since the select below is what reads them.
+	for _, f := range feeds {
+		go func(f feed) {
+			conn, err := openFeedFunc(f)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			mu.Lock()
+			if stopping {
+				mu.Unlock()
+				_ = conn.Close()
+				return
+			}
+			sockets = append(sockets, conn)
+			mu.Unlock()
+			feedName := f.name
 			packet := make([]byte, 2048)
 			for {
 				n, _, err := conn.ReadFrom(packet)
@@ -997,21 +1020,17 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics, trackers[feedName])
 				mu.Unlock()
 			}
-		}(feed.name, conn)
+		}(f)
 	}
 
 	select {
 	case <-signals:
 	case <-stop:
 	case err := <-errCh:
-		for _, conn := range sockets {
-			_ = conn.Close()
-		}
+		closeSockets()
 		return err
 	}
-	for _, conn := range sockets {
-		_ = conn.Close()
-	}
+	closeSockets()
 	mu.Lock()
 	defer mu.Unlock()
 	// Stop the periodic reporter before the last drain so the two cannot split
@@ -1031,6 +1050,9 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	// consistent snapshot even if a late Observe lands after it.
 	return printReceipt(scorer.SessionReceipt(), asJSON)
 }
+
+// openFeedFunc is openFeed. A test swaps it to hold an open past shutdown.
+var openFeedFunc = openFeed
 
 // openFeed binds one feed. A plain IP:PORT is a unicast socket. An
 // ssm://SOURCE@GROUP:PORT feed joins that source-specific multicast group
@@ -1080,6 +1102,13 @@ func ssmFeed(address string) (*amt.ManagedConn, error) {
 	}
 	conn := &amt.ManagedConn{SrcAddr: source, GroupAddr: group.Addr(), GroupPort: group.Port(), Mode: amt.AMTModeNative}
 	query := u.Query()
+	// A misspelt key would otherwise parse clean as a native-only feed: a typo
+	// in ?relay= silently drops the AMT fallback.
+	for key := range query {
+		if key != "relay" && key != "iface" {
+			return nil, fmt.Errorf("%w: unknown parameter %q", usage, key)
+		}
+	}
 	if relay := query.Get("relay"); relay != "" {
 		if _, _, err := net.SplitHostPort(relay); err != nil {
 			relay = net.JoinHostPort(relay, strconv.Itoa(messages.DefaultPort))
@@ -1191,6 +1220,12 @@ func publishWindows(trackers map[string]*erasure.Tracker, metrics *receiver.Rece
 	}
 }
 
+// warnedUndeliverable records, per feed name, that stderr has already said why
+// destinations receive nothing from that feed's v3 frames. It is keyed by feed
+// so a second v3 feed is named too, rather than hidden behind the first one's
+// warning. The counter carries the rate.
+var warnedUndeliverable sync.Map
+
 // processPacket delivers one packet and then scores it.
 //
 // Delivery runs FIRST. Scoring is accounting: it may not sit in front of a
@@ -1221,19 +1256,15 @@ func publishWindows(trackers map[string]*erasure.Tracker, metrics *receiver.Rece
 //
 // tracker may be nil, which disables receiver-observed erasure scoring for the
 // feed without affecting delivery.
-// warnUndeliverable says once per process, on stderr, why destinations are
-// receiving nothing from a v3 feed. The counter carries the rate.
-var warnUndeliverable sync.Once
-
 func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer sessionScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics, tracker *erasure.Tracker) {
 	if fanout != nil {
 		if payload, ok := shred.TVUPayload(packet); !ok {
 			_ = metrics.IncUndeliverable(feedName)
-			warnUndeliverable.Do(func() {
+			if _, warned := warnedUndeliverable.LoadOrStore(feedName, struct{}{}); !warned {
 				fmt.Fprintf(os.Stderr, "blockcast-shreds: feed %q carries version-3 forwarder frames, "+
 					"which no validator TVU accepts; they are not forwarded. Run the shred-forwarder "+
 					"with --wire-version v4 (see bcast_shred_gw_shreds_undeliverable_total)\n", feedName)
-			})
+			}
 		} else if fanout.Enqueue(feedName, payload) == receiver.EnqueueOverflow {
 			_ = metrics.IncFanoutDrop(feedName)
 		}
