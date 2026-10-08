@@ -19,7 +19,7 @@ is not a shred a TVU will accept:
 
 | Feed packet | What each destination receives |
 |---|---|
-| Version-4 forwarder frame | The canonical shred it carries (28-byte header stripped). |
+| Version-4 forwarder frame | The canonical shred it carries (28-byte header stripped). A malformed v4 frame with no body is withheld and counted like v3 below. |
 | Version-3 forwarder frame | Nothing. Its body is an erasure shard with the signature and Merkle proof removed, which every TVU discards. Counted in `bcast_shred_gw_shreds_undeliverable_total`; the feed's forwarder must run with `--wire-version v4`. |
 | Anything else | The packet, unchanged. |
 
@@ -397,7 +397,7 @@ that is merely idle:
 | `bcast_shred_gw_fanout_dropped_packets_total` | Packets dropped because the bounded fan-out ring was full. **The receiver-overload signal — alert on any increase.** |
 | `bcast_shred_gw_fanout_write_errors_total` | Failed or short destination writes; each is a packet a target did not receive. |
 | `bcast_shred_gw_shreds_unparsed_total` | Delivered packets whose shred header would not parse. |
-| `bcast_shred_gw_shreds_undeliverable_total` | Version-3 forwarder frames withheld from every destination because no TVU accepts them. **Any increase means your validator is receiving nothing from that feed** — the forwarder must run `--wire-version v4`. |
+| `bcast_shred_gw_shreds_undeliverable_total` | Forwarder frames withheld from every destination because no TVU accepts them: version-3 frames, plus the rare malformed version-4 frame with no body. **A sustained increase means your validator is receiving nothing from that feed**, and the forwarder must run `--wire-version v4`; stderr names each feed that sends v3. |
 | `bcast_shred_gw_erasure_*`, `_shreds_per_second`, `_gap_events`, `_report_schema` | Per-feed delivery SLA for the last drained window, on the `--report-interval` cadence. **All of these are window-derived, so none is exported under `--mode generic`** — see [Alerting](#alerting-erasure_fraction-0-has-three-meanings). `erasure_fraction` is a **windowed gauge**: `0` has [three meanings](#alerting-erasure_fraction-0-has-three-meanings), only one of which is a healthy feed. Never alert on it without a liveness signal — pair it with `ingress_packets_total` and the slot-guard counters below. |
 | `bcast_shred_gw_erasure_slot_rejections_total` | Observations refused by the slot-plausibility guard, by `direction`. `ahead` is beyond the forward jump bound; a sustained `behind` rate means the frontier itself is suspect. Window-derived, so exported only under `--mode shred`. |
 | `bcast_shred_gw_erasure_frontier_resyncs_total` | Times the slot frontier was abandoned and re-adopted. Each is a discontinuity in the erasure series — sets in flight were dropped unscored, so a fraction spanning a resync is not comparable across it. Window-derived, so exported only under `--mode shred`. |

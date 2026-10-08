@@ -240,7 +240,7 @@ liveness probe on something else.
 | `bcast_shred_gw_fanout_dropped_packets_total` | packets | Rejected at enqueue because the bounded ring was full. |
 | `bcast_shred_gw_fanout_write_errors_total` | **datagrams** | Destination writes that failed or were short. |
 | `bcast_shred_gw_shreds_unparsed_total` | packets | Delivered packets whose shred header did not parse. |
-| `bcast_shred_gw_shreds_undeliverable_total` | packets | Version-3 forwarder frames withheld from destinations; run the forwarder with `--wire-version v4`. |
+| `bcast_shred_gw_shreds_undeliverable_total` | packets | Forwarder frames withheld from destinations: version-3 (run the forwarder with `--wire-version v4`) or a bodyless version-4 frame. |
 
 **Egress and write errors are counted per destination write, not per packet.**
 One received packet fanned out to N `--dest-ip-ports` targets increments

@@ -164,7 +164,7 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, repo
 	metrics.undeliverable = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: receiverMetricsNamespace,
 		Name:      "shreds_undeliverable_total",
-		Help:      "Version-3 forwarder frames withheld from validator destinations: the body is an erasure shard without signature or Merkle proof, which no TVU accepts. Run the shred-forwarder with --wire-version v4.",
+		Help:      "Forwarder frames withheld from validator destinations because they carry no shred a TVU accepts: a version-3 frame (an erasure shard without signature or Merkle proof; run the shred-forwarder with --wire-version v4) or a malformed version-4 frame with no body.",
 	}, []string{"feed"})
 	metrics.setsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(receiverMetricsNamespace, "", "erasure_sets"),
