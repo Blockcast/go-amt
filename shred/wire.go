@@ -126,7 +126,9 @@ func Parse(packet []byte, format Format) (Header, error) {
 // carries the full canonical shred as its body, so that body is the payload.
 // Version 3 carries only the erasure shard, with the signature and Merkle proof
 // stripped by the forwarder, and nothing in the datagram can rebuild a shred a
-// TVU would accept: ok is false and the packet must not be forwarded.
+// TVU would accept: ok is false and the packet must not be forwarded. A
+// version-4 frame with no body carries no shred either, and is refused the same
+// way, so a bodyless frame is never billed as a delivered packet.
 //
 // Anything that does not parse as a forwarder frame is returned unchanged,
 // which keeps a canonical Agave feed (or a malformed frame) on the existing
@@ -138,7 +140,7 @@ func TVUPayload(packet []byte) (payload []byte, ok bool) {
 	if _, err := ParseWireHeader(packet); err != nil {
 		return packet, true
 	}
-	if packet[0] == 3 {
+	if packet[0] == 3 || len(packet) == WireHeaderSize {
 		return nil, false
 	}
 	return packet[WireHeaderSize:], true

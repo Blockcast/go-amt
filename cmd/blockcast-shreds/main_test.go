@@ -895,6 +895,7 @@ func TestSSMFeedAddress(t *testing.T) {
 		"ssm://69.25.95.102@232.0.0.1:5001#relay=69.25.95.128",          // fragment
 		"ssm://69.25.95.102@232.0.0.1:5001?relay",                       // no value
 		"ssm://69.25.95.102@232.0.0.1:5001?relay=",                      // unset ${RELAY}
+		"ssm://69.25.95.102@232.0.0.1:5001?relay=69.25.95.128:",         // empty relay port
 		"ssm://69.25.95.102@232.0.0.1:5001?relay=1.1.1.1&relay=2.2.2.2", // two relays
 	} {
 		if _, err := ssmFeed(bad); err == nil {

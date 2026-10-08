@@ -1125,6 +1125,10 @@ func ssmFeed(address string) (*amt.ManagedConn, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%q relay: %w", address, err)
 		}
+		if relayAddress.Port == 0 {
+			// ?relay=IP: splits cleanly with an empty port, skipping the default.
+			return nil, fmt.Errorf("%w: relay port 0", usage)
+		}
 		conn.RelayAddr, conn.Mode = *relayAddress, amt.AMTModeAuto
 	}
 	if name := query.Get("iface"); name != "" {
@@ -1268,10 +1272,14 @@ func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer 
 	if fanout != nil {
 		if payload, ok := shred.TVUPayload(packet); !ok {
 			_ = metrics.IncUndeliverable(feedName)
-			if _, warned := warnedUndeliverable.LoadOrStore(feedName, struct{}{}); !warned {
-				fmt.Fprintf(os.Stderr, "blockcast-shreds: feed %q carries version-3 forwarder frames, "+
-					"which no validator TVU accepts; they are not forwarded. Run the shred-forwarder "+
-					"with --wire-version v4 (see bcast_shred_gw_shreds_undeliverable_total)\n", feedName)
+			// The other refusal, a bodyless v4 frame, is malformed rather than a
+			// forwarder misconfiguration, so only v3 earns the hint below.
+			if packet[0] == 3 {
+				if _, warned := warnedUndeliverable.LoadOrStore(feedName, struct{}{}); !warned {
+					fmt.Fprintf(os.Stderr, "blockcast-shreds: feed %q carries version-3 forwarder frames, "+
+						"which no validator TVU accepts; they are not forwarded. Run the shred-forwarder "+
+						"with --wire-version v4 (see bcast_shred_gw_shreds_undeliverable_total)\n", feedName)
+				}
 			}
 		} else if fanout.Enqueue(feedName, payload) == receiver.EnqueueOverflow {
 			_ = metrics.IncFanoutDrop(feedName)

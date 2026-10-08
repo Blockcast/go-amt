@@ -192,6 +192,7 @@ func TestTVUPayload(t *testing.T) {
 	}{
 		{"v4 delivers the canonical body", frame(4), []byte("agave!!!"), true},
 		{"v3 erasure shard is undeliverable", frame(3), nil, false},
+		{"v4 frame with no body is undeliverable", frame(4)[:WireHeaderSize], nil, false},
 		{"non-forwarder bytes pass unchanged", []byte{1, 2, 3}, []byte{1, 2, 3}, true},
 		{"malformed frame passes unchanged", badGeometry, badGeometry, true},
 		{"generic record passes unchanged", []byte("BCG1-generic-record-bytes"), []byte("BCG1-generic-record-bytes"), true},
