@@ -383,7 +383,8 @@ func (m *ReceiverMetrics) IncUnparsed(feedID string) error {
 }
 
 // IncUndeliverable records one packet withheld from destinations because it
-// carries no shred a TVU can accept (a version-3 forwarder frame).
+// carries no shred a TVU can accept: a version-3 forwarder frame, or a
+// version-4 frame with no body.
 func (m *ReceiverMetrics) IncUndeliverable(feedID string) error {
 	feed, err := m.feed(feedID)
 	if err != nil {

@@ -907,10 +907,18 @@ func TestSSMFeedAddress(t *testing.T) {
 // TestUndeliverableWarningNamesEveryFeed: the stderr warning names a feed, so it
 // is issued once per feed. A process-wide once would name only the first v3
 // feed, and after that forwarder is fixed the second would deliver nothing
-// with no line pointing at it.
+// with no line pointing at it. It reads the text an operator sees, not the
+// bookkeeping beside it: two v3 frames per feed must name each feed exactly once.
 func TestUndeliverableWarningNamesEveryFeed(t *testing.T) {
+	var stderr bytes.Buffer
+	warnStderr = &stderr
+	t.Cleanup(func() { warnStderr = os.Stderr })
 	registry := prometheus.NewRegistry()
 	feeds := []string{"warn-first", "warn-second"}
+	for _, name := range feeds {
+		// warnedUndeliverable is process-wide; -count=N must start clean.
+		warnedUndeliverable.Delete(name)
+	}
 	metrics, err := receiver.NewReceiverMetrics(registry, feeds, receiver.ReportsWindows)
 	if err != nil {
 		t.Fatal(err)
@@ -922,10 +930,18 @@ func TestUndeliverableWarningNamesEveryFeed(t *testing.T) {
 	defer func() { _ = fanout.Close() }()
 	scorer := shred.NewFeedScorer(feeds)
 	for _, name := range feeds {
-		processPacket(name, fixtureShred(t), time.Now(), scorer, fanout, metrics, nil)
-		if _, warned := warnedUndeliverable.Load(name); !warned {
-			t.Fatalf("feed %q delivered a v3 frame without its own warning", name)
+		for range 2 {
+			processPacket(name, fixtureShred(t), time.Now(), scorer, fanout, metrics, nil)
 		}
+	}
+	text := stderr.String()
+	for _, name := range feeds {
+		if got := strings.Count(text, fmt.Sprintf("feed %q carries version-3 forwarder frames", name)); got != 1 {
+			t.Errorf("stderr names feed %q %d times, want exactly once:\n%s", name, got, text)
+		}
+	}
+	if got := strings.Count(text, "--wire-version v4"); got != len(feeds) {
+		t.Errorf("stderr carries %d remediation lines, want %d (one per feed):\n%s", got, len(feeds), text)
 	}
 }
 

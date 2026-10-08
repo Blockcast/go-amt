@@ -9,6 +9,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -90,8 +91,9 @@ shreds: a version-4 shred-forwarder frame is delivered with its 28-byte header
 stripped. A version-3 frame carries an erasure shard with no signature or
 Merkle proof, which no TVU accepts, so it is withheld and counted in
 bcast_shred_gw_shreds_undeliverable_total; run the forwarder with
---wire-version v4. Anything that is not a forwarder frame is delivered
-unchanged.
+--wire-version v4. A malformed version-4 frame with no body is withheld and
+counted the same way, though no forwarder flag fixes it. Anything that is not
+a forwarder frame is delivered unchanged.
 
 --broker-url and --gw-uuid opt into the gateway heartbeat and must be given
 together: a broker URL without an identity produces heartbeats the broker
@@ -1238,6 +1240,9 @@ func publishWindows(trackers map[string]*erasure.Tracker, metrics *receiver.Rece
 // warning. The counter carries the rate.
 var warnedUndeliverable sync.Map
 
+// warnStderr is where that warning goes; a test swaps it to read the text.
+var warnStderr io.Writer = os.Stderr
+
 // processPacket delivers one packet and then scores it.
 //
 // Delivery runs FIRST. Scoring is accounting: it may not sit in front of a
@@ -1276,7 +1281,7 @@ func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer 
 			// forwarder misconfiguration, so only v3 earns the hint below.
 			if packet[0] == 3 {
 				if _, warned := warnedUndeliverable.LoadOrStore(feedName, struct{}{}); !warned {
-					fmt.Fprintf(os.Stderr, "blockcast-shreds: feed %q carries version-3 forwarder frames, "+
+					fmt.Fprintf(warnStderr, "blockcast-shreds: feed %q carries version-3 forwarder frames, "+
 						"which no validator TVU accepts; they are not forwarded. Run the shred-forwarder "+
 						"with --wire-version v4 (see bcast_shred_gw_shreds_undeliverable_total)\n", feedName)
 				}
