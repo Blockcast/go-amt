@@ -64,15 +64,24 @@ func TestFrameV3KeepsTheErasureShard(t *testing.T) {
 }
 
 func TestFrameV3DataAndCodeShardsAreEqualSize(t *testing.T) {
-	// Reed-Solomon needs equal shards, so in a 32:32 batch (proof 6) a data and
-	// a coding shred reduce to the same 987 bytes: every version-3 frame of
-	// such a batch is 1015 bytes.
-	data, _ := fullShredFrame(0x96, false)
-	code, _ := fullShredFrame(0x66, true)
-	dv3, _ := FrameV3(data)
-	cv3, _ := FrameV3(code)
-	if len(dv3) != 1015 || len(cv3) != 1015 {
-		t.Errorf("version-3 frame sizes: data %d, code %d; want 1015 for both", len(dv3), len(cv3))
+	// Reed-Solomon needs equal shards, so at every proof size, resigned or
+	// not, a data and a coding shred reduce to the same shard.
+	for proof := byte(0); proof < 16; proof++ {
+		for _, family := range [][2]byte{{0x90, 0x60}, {0xb0, 0x70}} { // chained, chained resigned
+			data, _ := fullShredFrame(family[0]|proof, false)
+			code, _ := fullShredFrame(family[1]|proof, true)
+			dv3, dok := FrameV3(data)
+			cv3, cok := FrameV3(code)
+			if !dok || !cok || len(dv3) != len(cv3) {
+				t.Errorf("variants %#x/%#x: data %d bytes (ok %v), code %d bytes (ok %v); want equal sizes",
+					family[0]|proof, family[1]|proof, len(dv3), dok, len(cv3), cok)
+			}
+			// A 32:32 batch is proof 6: 987-byte shards, so 1015-byte frames,
+			// inside the player's 1280-byte datagram budget.
+			if proof == 6 && family[0] == 0x90 && len(dv3) != 1015 {
+				t.Errorf("32:32 batch: version-3 frame is %d bytes, want 1015", len(dv3))
+			}
+		}
 	}
 }
 

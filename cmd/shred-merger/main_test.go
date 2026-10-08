@@ -4,7 +4,10 @@ package main
 
 import (
 	"bytes"
+	"encoding/binary"
+	"net"
 	"testing"
+	"time"
 )
 
 func TestDedupKeysOnFECSetAndLocalIndex(t *testing.T) {
@@ -74,5 +77,189 @@ func TestAsV3(t *testing.T) {
 	}
 	if _, ok := asV3(append([]byte{5}, v4[1:]...)); ok {
 		t.Error("an unknown version must not reach the version-3 group")
+	}
+}
+
+// v4Frame builds a version-4 frame for a 32:32 chained Merkle FEC set.
+// local is the unified local index: data 0..31, coding 32+position.
+func v4Frame(slot uint64, local uint32, coding bool) []byte {
+	size, variant := 1203, byte(0x96) // chained Merkle data, proof 6
+	if coding {
+		size, variant = 1228, 0x66 // chained Merkle code, proof 6
+	}
+	b := make([]byte, 28+size)
+	b[0] = 4
+	binary.LittleEndian.PutUint64(b[1:9], slot)
+	binary.LittleEndian.PutUint32(b[13:17], local)
+	if coding {
+		b[17], b[18], b[19] = 0x02, 32, 32
+	}
+	b[28+64] = variant
+	return b
+}
+
+func TestParseOutput(t *testing.T) {
+	for _, c := range []struct {
+		spec, dst string
+		kind      kind
+	}{
+		{"232.0.2.1=data", "232.0.2.1:5001", kindData},
+		{"127.0.0.1:5003=all", "127.0.0.1:5003", kindAll},
+		{"232.0.0.2=v3", "232.0.0.2:5001", kindV3},
+		{"ff3e::232:202=coding-even", "[ff3e::232:202]:5001", kindCodingEven},
+		{"[ff3e::232:203]:6000=coding-odd", "[ff3e::232:203]:6000", kindCodingOdd},
+	} {
+		o, err := parseOutput(c.spec, 5001)
+		if err != nil {
+			t.Errorf("parseOutput(%q): %v", c.spec, err)
+			continue
+		}
+		if o.dst.String() != c.dst || o.kind != c.kind {
+			t.Errorf("parseOutput(%q) = %s %s, want %s %s", c.spec, o.dst, o.kind, c.dst, c.kind)
+		}
+	}
+	for _, spec := range []string{"232.0.2.1", "232.0.2.1=coding", "relay.example=all", "232.0.2.1:0=all", "232.0.2.1:x=all", "[ff3e::1]=all"} {
+		if _, err := parseOutput(spec, 5001); err == nil {
+			t.Errorf("parseOutput(%q) accepted a malformed -out", spec)
+		}
+	}
+}
+
+func TestParseOutputsRefusesAmbiguousConfigs(t *testing.T) {
+	ingestA := &net.UDPAddr{IP: net.ParseIP("232.0.0.1"), Port: 5001}
+	ingestB := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5002}
+	for _, c := range []struct {
+		name  string
+		specs []string
+	}{
+		{"no output", nil},
+		{"one group twice", []string{"232.0.2.1=data", "232.0.2.1:5001=v3"}},
+		{"the ingest channel", []string{"232.0.0.1=v3"}},
+		{"the second listener's port", []string{"127.0.0.1:5002=all"}},
+		{"a malformed group", []string{"232.0.0.9x=v3"}},
+	} {
+		if outs, err := parseOutputs(c.specs, 5001, ingestA, ingestB); err == nil {
+			t.Errorf("%s: parseOutputs accepted %d outputs; want a refusal", c.name, len(outs))
+		}
+	}
+	outs, err := parseOutputs([]string{"232.0.2.1=data", "232.0.2.1:5011=coding-even", "232.0.0.1:5003=all", "127.0.0.1:5003=all"}, 5001, ingestA, ingestB)
+	if err != nil || len(outs) != 4 {
+		t.Errorf("distinct destinations off the ingests: %d outputs, %v; want all 4", len(outs), err)
+	}
+}
+
+func TestLayersPartitionEveryFECSet(t *testing.T) {
+	layers := []kind{kindData, kindCodingEven, kindCodingOdd}
+	for local := uint32(0); local < 64; local++ {
+		coding := local >= 32
+		b := v4Frame(9, local, coding)
+		var in []kind
+		for _, k := range layers {
+			if k.carries(b) {
+				in = append(in, k)
+			}
+		}
+		want := kindData
+		if coding {
+			want = kindCodingEven + kind((local-32)%2)
+		}
+		if len(in) != 1 || in[0] != want {
+			t.Errorf("local index %d is in layers %v, want only %s", local, in, want)
+		}
+		if !kindAll.carries(b) || !kindV3.carries(b) {
+			t.Errorf("local index %d: all and v3 must carry every frame", local)
+		}
+	}
+}
+
+func TestSendRoutesEachFrameToItsOutputs(t *testing.T) {
+	conn4, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn4.Close()
+	recv := func(network string, ip net.IP) *net.UDPConn {
+		c, err := net.ListenUDP(network, &net.UDPAddr{IP: ip})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	sinks := map[kind]*net.UDPConn{}
+	var outs []*output
+	for _, k := range []kind{kindData, kindCodingEven, kindCodingOdd, kindV3} {
+		sinks[k] = recv("udp4", net.IPv4(127, 0, 0, 1))
+		outs = append(outs, &output{dst: sinks[k].LocalAddr().(*net.UDPAddr), kind: k, conn: conn4})
+	}
+	// The IPv6 path: emitSocket6 from ::1 to an IPv6 receiver.
+	var sink6 *net.UDPConn
+	if conn6, err := emitSocket6(net.IPv6loopback, 1); err != nil {
+		t.Logf("no IPv6 loopback, skipping the IPv6 output: %v", err)
+	} else {
+		defer conn6.Close()
+		sink6 = recv("udp6", net.IPv6loopback)
+		outs = append(outs, &output{dst: sink6.LocalAddr().(*net.UDPAddr), kind: kindAll, conn: conn6})
+	}
+
+	data, even, odd := v4Frame(7, 3, false), v4Frame(7, 32+4, true), v4Frame(7, 32+5, true)
+	unknown := append([]byte{5}, data[1:]...)
+	for _, f := range [][]byte{data, even, odd} {
+		if !send(outs, f) {
+			t.Fatalf("send reported a well-formed version-4 frame unconvertible")
+		}
+	}
+	if send(outs, unknown) {
+		t.Error("send must report a frame the version-3 output cannot take")
+	}
+
+	read := func(c *net.UDPConn) [][]byte {
+		var got [][]byte
+		for {
+			c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+			b := make([]byte, maxDatagram)
+			n, err := c.Read(b)
+			if err != nil {
+				return got
+			}
+			got = append(got, b[:n])
+		}
+	}
+	// Verbatim outputs select on the header alone, whatever the version: the
+	// unknown-version frame is a data shred, so the data layer carries it.
+	for k, want := range map[kind][][]byte{
+		kindData:       {data, unknown},
+		kindCodingEven: {even},
+		kindCodingOdd:  {odd},
+	} {
+		got := read(sinks[k])
+		ok := len(got) == len(want)
+		for i := 0; ok && i < len(got); i++ {
+			ok = bytes.Equal(got[i], want[i])
+		}
+		if !ok {
+			t.Errorf("%s output received %d frames, want these %d verbatim", k, len(got), len(want))
+		}
+	}
+	// The version-3 output takes every convertible frame, converted, and
+	// drops the unknown version.
+	if got := read(sinks[kindV3]); len(got) != 3 {
+		t.Errorf("v3 output received %d frames, want 3", len(got))
+	} else {
+		for i, f := range got {
+			if f[0] != 3 || len(f) != 1015 {
+				t.Errorf("v3 frame %d: version %d, %d bytes; want 3, 1015", i, f[0], len(f))
+			}
+		}
+	}
+	if sink6 != nil {
+		if got := read(sink6); len(got) != 4 || !bytes.Equal(got[3], unknown) {
+			t.Errorf("IPv6 all output received %d frames, want all 4 verbatim", len(got))
+		}
+	}
+	for _, o := range outs {
+		if o.err != 0 {
+			t.Errorf("%s output counted %d write errors", o.kind, o.err)
+		}
 	}
 }

@@ -1,20 +1,47 @@
 //go:build linux
 
 // shred-merger merges two independent Solana turbine shred streams into one
-// deduplicated SSM multicast channel, the union feed (BLO-22812).
+// deduplicated stream, the union feed (BLO-22812), and emits it on one or
+// more outputs.
 //
 // Ingest A: SSM join (prod-src, group):port. This is the production forwarder's
 // stream.
 // Ingest B: unicast UDP on 127.0.0.1:<local-port>. This is the second
 // listener's stream.
-// Egress: SSM emit to (egress-group):port from -iface-ip, which makes a NEW
-// (S,G) channel whose source is this host.
-// v3 egress (optional, -v3-egress-group): the same deduplicated stream as
-// forwarder wire version 3, for consumers that cannot take version 4. The
-// browser player is one: its MoQ datagram budget fits a version-3 frame and
-// not a full shred. Version-4 frames are reduced to the erasure shard the
-// forwarder sends as version 3 (shred.FrameV3); version-3 frames pass through
-// unchanged.
+//
+// Outputs (-out ADDR[:PORT]=KIND, repeatable; PORT defaults to -port). A
+// multicast ADDR makes a NEW SSM channel whose source is this host: -iface-ip
+// for IPv4, -src6 for IPv6. A unicast ADDR, such as 127.0.0.1:5003 for a
+// local consumer, gets the same frames by unicast. KIND selects the frames
+// and their wire version:
+//
+//	all          every frame, verbatim
+//	v3           every frame as forwarder wire version 3, for consumers that
+//	             cannot take version 4. The browser player is one: its MoQ
+//	             datagram budget fits a version-3 frame and not a full shred.
+//	             Version-4 frames are reduced to the erasure shard the forwarder
+//	             sends as version 3 (shred.FrameV3); version-3 frames pass
+//	             through unchanged.
+//	data         data shreds only, verbatim
+//	coding-even  coding shreds at an even FEC-set position, verbatim
+//	coding-odd   coding shreds at an odd FEC-set position, verbatim
+//
+// data, coding-even and coding-odd partition the stream into layers. A
+// receiver joins the data layer, then adds coding layers as its loss requires.
+// With 32:32 FEC sets, data alone needs every data shred of a set, data plus
+// one coding layer survives 16 losses in each set of 48, and all three layers
+// survive 32 in each set of 64. Reed-Solomon recovery needs any 32 shreds of
+// the set, so a missing coding layer counts as losses.
+//
+// -egress-group G is shorthand for -out G=all. At least one output is
+// required, and none may be the ingest group and port.
+//
+// Outputs share -port, the ingest port, unless given another. A receiver
+// that binds the wildcard address gets every group the host has joined on its
+// port: Linux defaults IP_MULTICAST_ALL to 1. The layers are disjoint, so one
+// such socket can take several layers, but it must not also take the v3
+// output, or it gets most shreds twice in two versions. Bind each group
+// address, or clear IP_MULTICAST_ALL as listenUDP4 does.
 //
 // The dedup key is (slot, fec_set_index, local_index). local_index is a
 // UNIFIED data||coding coordinate produced by shred-forwarder's parse_shred:
@@ -28,10 +55,13 @@
 // the slot. The key ignores the wire version, so a shred both inputs deliver
 // is emitted once even while the inputs are on different versions.
 //
-// Frames go out on -egress-group verbatim (28-byte header + body). The emitted
-// stream is therefore byte-identical to what a single forwarder would have
-// produced, and it keeps the original send_ts_us of whichever listener saw the
-// shred first.
+// Verbatim frames (28-byte header + body) are byte-identical to what a single
+// forwarder would have produced. They keep the original send_ts_us of
+// whichever listener saw the shred first. That copy also fixes the version:
+// while one input is on version 3 and the other on version 4, every verbatim
+// output carries a per-shred mix of both, and only the version-4 frames carry
+// the producer's signature. emitted_v3 and emitted_v4 in the stats line show
+// the mix.
 //
 // Deployed on CT 140 (pve1, 69.25.95.57) as shred-merger.service. See that
 // address in onprem-k8s network/registry.yaml.
@@ -46,6 +76,8 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -165,6 +197,60 @@ func emitSocket(ifaceIP string, ttl int) (*net.UDPConn, error) {
 	return uc, serr
 }
 
+// emitSocket6 returns a UDP socket that sends from src and pins multicast to
+// the interface holding src. Binding src fixes the SSM source address, so the
+// channel is (src, G) whatever other addresses the interface carries.
+func emitSocket6(src net.IP, hops int) (*net.UDPConn, error) {
+	ifindex, err := interfaceWith(src)
+	if err != nil {
+		return nil, err
+	}
+	uc, err := net.ListenUDP("udp6", &net.UDPAddr{IP: src})
+	if err != nil {
+		return nil, err
+	}
+	rc, err := uc.SyscallConn()
+	if err != nil {
+		return nil, err
+	}
+	var serr error
+	if err := rc.Control(func(fd uintptr) {
+		if serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_IF, ifindex); serr != nil {
+			return
+		}
+		if serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_HOPS, hops); serr != nil {
+			return
+		}
+		if serr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_LOOP, 0); serr != nil {
+			return
+		}
+		_ = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<20)
+	}); err != nil {
+		return nil, err
+	}
+	return uc, serr
+}
+
+// interfaceWith returns the index of the interface that holds ip.
+func interfaceWith(ip net.IP) (int, error) {
+	ifs, err := net.Interfaces()
+	if err != nil {
+		return 0, err
+	}
+	for _, ifi := range ifs {
+		addrs, err := ifi.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.Equal(ip) {
+				return ifi.Index, nil
+			}
+		}
+	}
+	return 0, fmt.Errorf("no interface holds %s", ip)
+}
+
 func reader(c *net.UDPConn, src uint8, out chan<- frame, dropped *atomic.Uint64) {
 	for {
 		b := make([]byte, maxDatagram)
@@ -249,30 +335,176 @@ func asV3(b []byte) ([]byte, bool) {
 	return nil, false
 }
 
+// kind selects which frames an output carries, and in which wire version.
+type kind int
+
+const (
+	kindAll kind = iota
+	kindV3
+	kindData
+	kindCodingEven
+	kindCodingOdd
+)
+
+var kindNames = []string{"all", "v3", "data", "coding-even", "coding-odd"}
+
+func (k kind) String() string { return kindNames[k] }
+
+// carries reports whether an output of kind k carries the frame b.
+func (k kind) carries(b []byte) bool {
+	coding := b[17]&0x02 != 0 // flags bit1: IS_CODING_SHRED
+	switch k {
+	case kindData:
+		return !coding
+	case kindCodingEven, kindCodingOdd:
+		// A coding shred's local_index is num_data + its position in the set.
+		pos := binary.LittleEndian.Uint32(b[13:17]) - uint32(b[18])
+		return coding && pos%2 == uint32(k-kindCodingEven)
+	}
+	return true
+}
+
+// output is one destination of the union.
+type output struct {
+	dst       *net.UDPAddr
+	kind      kind
+	conn      *net.UDPConn
+	sent, err uint64
+}
+
+// parseOutput parses an -out value, ADDR[:PORT]=KIND. An IPv6 ADDR with a
+// PORT is written [ADDR]:PORT.
+func parseOutput(spec string, defaultPort int) (*output, error) {
+	addr, name, ok := strings.Cut(spec, "=")
+	if !ok {
+		return nil, fmt.Errorf("-out %q: want ADDR[:PORT]=KIND", spec)
+	}
+	k := -1
+	for i, n := range kindNames {
+		if n == name {
+			k = i
+		}
+	}
+	if k < 0 {
+		return nil, fmt.Errorf("-out %q: unknown kind %q, want one of %s", spec, name, strings.Join(kindNames, ", "))
+	}
+	host, port := addr, defaultPort
+	if h, p, err := net.SplitHostPort(addr); err == nil {
+		host = h
+		if port, err = strconv.Atoi(p); err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("-out %q: bad port %q", spec, p)
+		}
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, fmt.Errorf("-out %q: %q is not an IP address", spec, host)
+	}
+	return &output{dst: &net.UDPAddr{IP: ip, Port: port}, kind: kind(k)}, nil
+}
+
+// parseOutputs parses the -out values. It refuses an empty list, a repeated
+// destination, and a destination that is one of the ingests.
+func parseOutputs(specs []string, defaultPort int, ingests ...*net.UDPAddr) ([]*output, error) {
+	if len(specs) == 0 {
+		return nil, fmt.Errorf("no output: give -out ADDR[:PORT]=KIND or -egress-group")
+	}
+	var outs []*output
+	for _, s := range specs {
+		o, err := parseOutput(s, defaultPort)
+		if err != nil {
+			return nil, err
+		}
+		// One destination carrying two kinds would hand its receivers each
+		// shred twice, or in two versions.
+		for _, prev := range outs {
+			if o.dst.IP.Equal(prev.dst.IP) && o.dst.Port == prev.dst.Port {
+				return nil, fmt.Errorf("-out %q: %s is already an output", s, o.dst)
+			}
+		}
+		// On the second listener's port the merger would ingest its own output.
+		// On the ingest group it would not, being a different source, but a
+		// wildcard receiver of the production channel would get the union too.
+		for _, in := range ingests {
+			if o.dst.IP.Equal(in.IP) && o.dst.Port == in.Port {
+				return nil, fmt.Errorf("-out %q: %s is an ingest", s, in)
+			}
+		}
+		outs = append(outs, o)
+	}
+	return outs, nil
+}
+
+// send writes the frame b to every output that carries it. It reports false
+// when a version-3 output needed the frame and b cannot be converted.
+func send(outs []*output, b []byte) (convertible bool) {
+	var v3 []byte
+	converted := false
+	convertible = true
+	for _, o := range outs {
+		if !o.kind.carries(b) {
+			continue
+		}
+		p := b
+		if o.kind == kindV3 {
+			if !converted {
+				v3, convertible = asV3(b)
+				converted = true
+			}
+			if !convertible {
+				continue
+			}
+			p = v3
+		}
+		if _, err := o.conn.WriteToUDP(p, o.dst); err != nil {
+			o.err++
+		} else {
+			o.sent++
+		}
+	}
+	return convertible
+}
+
+type outFlags []string
+
+func (f *outFlags) String() string     { return strings.Join(*f, " ") }
+func (f *outFlags) Set(s string) error { *f = append(*f, s); return nil }
+
 func main() {
+	var specs outFlags
+	flag.Var(&specs, "out", "ADDR[:PORT]=KIND to emit the union on; repeatable. KIND is all, v3, data, coding-even or coding-odd (see the package doc)")
 	var (
 		prodSrc   = flag.String("prod-src", "69.25.95.197", "source IP of the production SSM stream to ingest")
 		group     = flag.String("group", "232.0.0.1", "SSM group to INGEST (production channel)")
-		egress    = flag.String("egress-group", "", "SSM group to EMIT the union on, frames verbatim (default: same as -group)")
-		v3Egress  = flag.String("v3-egress-group", "", "SSM group to ALSO emit the union on as wire version 3 (default: none)")
-		port      = flag.Int("port", 5001, "SSM UDP port (ingest and egress)")
-		ifaceIP   = flag.String("iface-ip", "69.25.95.57", "local IP on the shared L2 segment; SSM egress source")
+		egress    = flag.String("egress-group", "", "shorthand for -out GROUP=all")
+		port      = flag.Int("port", 5001, "SSM UDP port to ingest, and the default -out port")
+		ifaceIP   = flag.String("iface-ip", "69.25.95.57", "local IP on the shared L2 segment; SSM source of the IPv4 outputs")
+		src6      = flag.String("src6", "", "local IPv6 address; SSM source of the IPv6 outputs (required by any)")
 		localPort = flag.Int("local-port", 5002, "loopback UDP port the second listener feeds")
-		ttl       = flag.Int("ttl", 16, "IP_MULTICAST_TTL for the emitted union streams")
+		ttl       = flag.Int("ttl", 16, "IP_MULTICAST_TTL and IPV6_MULTICAST_HOPS for the outputs")
 		window    = flag.Uint64("slot-window", 64, "slots of dedup history to retain (~400ms per slot)")
 		statsSec  = flag.Int("stats-interval", 10, "seconds between stats lines")
 		rcvbuf    = flag.Int("rcvbuf", 4<<20, "SO_RCVBUF for ingest sockets")
 	)
 	flag.Parse()
 
-	if *egress == "" {
-		*egress = *group
-	}
-	if *v3Egress != "" && (*v3Egress == *egress || *v3Egress == *group) {
-		log.Fatalf("-v3-egress-group %s must differ from -egress-group and -group", *v3Egress)
-	}
-
 	log.SetFlags(log.LstdFlags | log.LUTC)
+
+	if *egress != "" {
+		specs = append(specs, *egress+"=all")
+	}
+	ingestB := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: *localPort}
+	outs, err := parseOutputs(specs, *port, &net.UDPAddr{IP: net.ParseIP(*group), Port: *port}, ingestB)
+	if err != nil {
+		log.Fatal(err)
+	}
+	var src net.IP // the IPv6 outputs' source, when there are any
+	for _, o := range outs {
+		if o.dst.IP.To4() == nil && src == nil {
+			if src = net.ParseIP(*src6); src == nil || src.To4() != nil {
+				log.Fatalf("an IPv6 -out needs -src6, a local IPv6 address; got %q", *src6)
+			}
+		}
+	}
 
 	// Ingest A: the production SSM stream. The socket binds the group address
 	// so the kernel also filters on destination group.
@@ -286,22 +518,29 @@ func main() {
 	log.Printf("ingest A: SSM join (S=%s, G=%s):%d via %s", *prodSrc, *group, *port, *ifaceIP)
 
 	// Ingest B: the second listener, over loopback unicast.
-	inB, err := listenUDP4(fmt.Sprintf("127.0.0.1:%d", *localPort), *rcvbuf, false)
+	inB, err := listenUDP4(ingestB.String(), *rcvbuf, false)
 	if err != nil {
 		log.Fatalf("bind ingest B: %v", err)
 	}
-	log.Printf("ingest B: unicast 127.0.0.1:%d", *localPort)
+	log.Printf("ingest B: unicast %s", ingestB)
 
-	out, err := emitSocket(*ifaceIP, *ttl)
+	out4, err := emitSocket(*ifaceIP, *ttl)
 	if err != nil {
 		log.Fatalf("emit socket: %v", err)
 	}
-	dst := &net.UDPAddr{IP: net.ParseIP(*egress), Port: *port}
-	log.Printf("egress: (S=%s, G=%s):%d ttl=%d", *ifaceIP, *egress, *port, *ttl)
-	var v3dst *net.UDPAddr
-	if *v3Egress != "" {
-		v3dst = &net.UDPAddr{IP: net.ParseIP(*v3Egress), Port: *port}
-		log.Printf("v3 egress: (S=%s, G=%s):%d ttl=%d", *ifaceIP, *v3Egress, *port, *ttl)
+	var out6 *net.UDPConn
+	if src != nil {
+		if out6, err = emitSocket6(src, *ttl); err != nil {
+			log.Fatalf("IPv6 emit socket from %s: %v", src, err)
+		}
+	}
+	for _, o := range outs {
+		from := *ifaceIP
+		o.conn = out4
+		if o.dst.IP.To4() == nil {
+			o.conn, from = out6, *src6
+		}
+		log.Printf("out: %s (S=%s, D=%s) ttl=%d", o.kind, from, o.dst, *ttl)
 	}
 
 	ch := make(chan frame, 1<<16)
@@ -310,8 +549,7 @@ func main() {
 	go reader(inB, 1, ch, &qdrop)
 
 	seen := newDedup(*window)
-	var rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr uint64
-	var v3Emitted, v3Unconvertible, v3EmitErr uint64
+	var rxA, rxB, emitted, emittedV3, emittedV4, dupA, dupB, firstFromB, v3Unconvertible uint64
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -341,28 +579,32 @@ func main() {
 			if f.src == 1 {
 				firstFromB++ // a marginal shred the second listener contributed
 			}
-			if _, err := out.WriteToUDP(b, dst); err != nil {
-				emitErr++
-			} else {
-				emitted++
+			emitted++
+			switch b[0] {
+			case 3:
+				emittedV3++
+			case 4:
+				emittedV4++
 			}
-			if v3dst != nil {
-				if v3, ok := asV3(b); !ok {
-					v3Unconvertible++
-				} else if _, err := out.WriteToUDP(v3, v3dst); err != nil {
-					v3EmitErr++
-				} else {
-					v3Emitted++
-				}
+			if !send(outs, b) {
+				v3Unconvertible++
 			}
 
 		case <-tick.C:
-			// The original fields keep their order; new fields are appended.
-			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d qdrop=%d slots=%d max_slot=%d v3_emitted=%d v3_unconvertible=%d v3_emit_err=%d",
-				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, qdrop.Load(), len(seen.seen), seen.maxSlot, v3Emitted, v3Unconvertible, v3EmitErr)
+			// emitted counts the shreds the union carries; each output's
+			// sent/failed writes follow as KIND@DST=SENT/ERR. emit_err sums the
+			// failures.
+			var emitErr uint64
+			var per strings.Builder
+			for _, o := range outs {
+				emitErr += o.err
+				fmt.Fprintf(&per, " %s@%s=%d/%d", o.kind, o.dst, o.sent, o.err)
+			}
+			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d qdrop=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d%s",
+				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, qdrop.Load(), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, per.String())
 
 		case s := <-sig:
-			log.Printf("signal %v; final: rx_prod=%d rx_listener2=%d emitted=%d first_from_listener2=%d v3_emitted=%d", s, rxA, rxB, emitted, firstFromB, v3Emitted)
+			log.Printf("signal %v; final: rx_prod=%d rx_listener2=%d emitted=%d first_from_listener2=%d", s, rxA, rxB, emitted, firstFromB)
 			return
 		}
 	}
