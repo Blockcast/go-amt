@@ -373,7 +373,7 @@ func TestBillingOptionsValidation(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := billingOptions(test.wal, test.records, test.dests)
+			got, err := billingOptions(test.wal, test.records, test.dests, collectorFlags{})
 			if test.wantErr != "" {
 				if err == nil {
 					t.Fatalf("billingOptions() error = nil, want substring %q", test.wantErr)
@@ -391,4 +391,136 @@ func TestBillingOptionsValidation(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCollectorFlagsValidation pins the --delivery-collector contract.
+//
+// Every case here is a configuration that would otherwise look configured and
+// ship nothing, or ship something unattributable. The two that matter most are
+// the identity ones: a collector with no --gw-uuid has no authenticated
+// producer, and a collector with no content ID produces rows Traffic Ops
+// rejects for a missing content_id — the exact 400 this issue was filed about.
+func TestCollectorFlagsValidation(t *testing.T) {
+	destinations := []string{"127.0.0.1:8001"}
+	certificate, key := writeCollectorKeyPair(t)
+
+	complete := func(mutate func(*collectorFlags)) collectorFlags {
+		flags := collectorFlags{
+			endpoint:    "blockcastd:50052",
+			gatewayID:   "7f3a1c20-0000-4000-8000-000000000001",
+			contentID:   "solana-mainnet-shreds",
+			latencyTier: "standard",
+			clientCert:  certificate,
+			clientKey:   key,
+		}
+		if mutate != nil {
+			mutate(&flags)
+		}
+		return flags
+	}
+
+	tests := []struct {
+		name    string
+		flags   collectorFlags
+		wantErr string
+		wantOn  bool
+	}{
+		{name: "complete", flags: complete(nil), wantOn: true},
+		{name: "no endpoint keeps records local-only", flags: collectorFlags{}},
+		{
+			name:    "no gateway identity",
+			flags:   complete(func(f *collectorFlags) { f.gatewayID = "" }),
+			wantErr: "requires --gw-uuid",
+		},
+		{
+			name:    "no content id",
+			flags:   complete(func(f *collectorFlags) { f.contentID = "" }),
+			wantErr: "content ID",
+		},
+		{
+			name:    "no latency tier",
+			flags:   complete(func(f *collectorFlags) { f.latencyTier = "" }),
+			wantErr: "latency tier",
+		},
+		{
+			name:    "no client certificate",
+			flags:   complete(func(f *collectorFlags) { f.clientCert = "" }),
+			wantErr: "will not run unauthenticated",
+		},
+		{
+			name:    "no client key",
+			flags:   complete(func(f *collectorFlags) { f.clientKey = "" }),
+			wantErr: "will not run unauthenticated",
+		},
+		{
+			// Set-but-inert is refused rather than ignored: an operator who
+			// configured a certificate and forgot the endpoint believes records
+			// are shipping.
+			name:    "collector flags without an endpoint",
+			flags:   complete(func(f *collectorFlags) { f.endpoint = "" }),
+			wantErr: "requires --delivery-collector",
+		},
+		{
+			name:  "whitespace endpoint is not an endpoint",
+			flags: collectorFlags{endpoint: "   "},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := billingOptions("/tmp/d.wal", "/tmp/r.jsonl", destinations, test.flags)
+			if test.wantErr != "" {
+				if err == nil {
+					t.Fatalf("billingOptions() error = nil, want substring %q", test.wantErr)
+				}
+				if !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("billingOptions() error = %v, want substring %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("billingOptions() error = %v", err)
+			}
+			if (got.collector != nil) != test.wantOn {
+				t.Fatalf("collector configured = %v, want %v", got.collector != nil, test.wantOn)
+			}
+			if !test.wantOn {
+				return
+			}
+			// Local-ledger mode stays reachable, so the record path must survive
+			// alongside the collector rather than being replaced by it.
+			if got.recordPath == "" {
+				t.Error("recordPath is empty; the local ledger was dropped when the collector was configured")
+			}
+		})
+	}
+}
+
+// TestCollectorEndpointRequiresBillingPaths pins that --delivery-collector
+// cannot be the only delivery flag. Without a WAL there is no sequence state,
+// so records would collide on (session, seq) after a restart.
+func TestCollectorEndpointRequiresBillingPaths(t *testing.T) {
+	_, err := billingOptions("", "", []string{"127.0.0.1:8001"}, collectorFlags{endpoint: "blockcastd:50052"})
+	if err == nil {
+		t.Fatal("billingOptions() error = nil; --delivery-collector was accepted with no WAL or record file")
+	}
+	if !strings.Contains(err.Error(), "--delivery-collector requires") {
+		t.Fatalf("billingOptions() error = %v, want it to name --delivery-collector", err)
+	}
+}
+
+// writeCollectorKeyPair writes a throwaway certificate and key, returning their
+// paths. The flag validation only checks that the paths are non-empty, but a
+// real pair keeps the fixture honest if that ever tightens to a load.
+func writeCollectorKeyPair(t *testing.T) (certificatePath, keyPath string) {
+	t.Helper()
+	directory := t.TempDir()
+	certificatePath = filepath.Join(directory, "client.crt")
+	keyPath = filepath.Join(directory, "client.key")
+	for _, path := range []string{certificatePath, keyPath} {
+		if err := os.WriteFile(path, []byte("placeholder\n"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	return certificatePath, keyPath
 }
