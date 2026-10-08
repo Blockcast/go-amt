@@ -883,13 +883,19 @@ func TestSSMFeedAddress(t *testing.T) {
 	}
 
 	for _, bad := range []string{
-		"ssm://232.0.0.1:5001",                                  // no source
-		"ssm://69.25.95.102@10.0.0.1:5001",                      // group is not multicast
-		"ssm://69.25.95.102@232.0.0.1",                          // no port
-		"ssm://69.25.95.102@232.0.0.1:5001/x",                   // stray path
-		"ssm://host@232.0.0.1:5001",                             // source is not an address
-		"ssm://69.25.95.102@232.0.0.1:5001?relayy=69.25.95.128", // misspelt relay
-		"ssm://69.25.95.102@232.0.0.1:5001?interface=eth0",      // misspelt iface
+		"ssm://232.0.0.1:5001",                                          // no source
+		"ssm://69.25.95.102@10.0.0.1:5001",                              // group is not multicast
+		"ssm://69.25.95.102@232.0.0.1",                                  // no port
+		"ssm://69.25.95.102@232.0.0.1:5001/x",                           // stray path
+		"ssm://host@232.0.0.1:5001",                                     // source is not an address
+		"ssm://69.25.95.102@232.0.0.1:5001?relayy=69.25.95.128",         // misspelt relay
+		"ssm://69.25.95.102@232.0.0.1:5001?interface=eth0",              // misspelt iface
+		"ssm://69.25.95.102@232.0.0.1:5001?relay=69.25.95.128;iface=lo", // ';' separator
+		"ssm://69.25.95.102@232.0.0.1:5001?relay=69.25.95.128%zz",       // bad escape
+		"ssm://69.25.95.102@232.0.0.1:5001#relay=69.25.95.128",          // fragment
+		"ssm://69.25.95.102@232.0.0.1:5001?relay",                       // no value
+		"ssm://69.25.95.102@232.0.0.1:5001?relay=",                      // unset ${RELAY}
+		"ssm://69.25.95.102@232.0.0.1:5001?relay=1.1.1.1&relay=2.2.2.2", // two relays
 	} {
 		if _, err := ssmFeed(bad); err == nil {
 			t.Errorf("ssmFeed(%q) accepted", bad)
@@ -931,11 +937,14 @@ func TestStopWinsAgainstASlowFeedOpen(t *testing.T) {
 	release := make(chan struct{})
 	late := make(chan net.PacketConn, 1)
 	openFeedFunc = func(f feed) (net.PacketConn, error) {
-		if f.name == "slow" {
-			<-release
+		if f.name != "slow" {
+			return openFeed(f)
 		}
-		conn, err := openFeed(f)
-		if err == nil && f.name == "slow" {
+		<-release
+		// Bind an ephemeral port rather than f.address: a port reserved at
+		// test start and bound only after shutdown can be taken meanwhile.
+		conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err == nil {
 			late <- conn
 		}
 		return conn, err
@@ -964,7 +973,12 @@ func TestStopWinsAgainstASlowFeedOpen(t *testing.T) {
 	}
 
 	close(release)
-	conn := <-late
+	var conn net.PacketConn
+	select {
+	case conn = <-late:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the slow feed never finished opening")
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))

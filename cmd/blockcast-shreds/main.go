@@ -1101,12 +1101,20 @@ func ssmFeed(address string) (*amt.ManagedConn, error) {
 		return nil, usage
 	}
 	conn := &amt.ManagedConn{SrcAddr: source, GroupAddr: group.Addr(), GroupPort: group.Port(), Mode: amt.AMTModeNative}
-	query := u.Query()
-	// A misspelt key would otherwise parse clean as a native-only feed: a typo
-	// in ?relay= silently drops the AMT fallback.
-	for key := range query {
+	// Anything but a well-formed relay/iface query would otherwise parse clean
+	// as a native-only feed: a misspelt key, a bad escape, a ';' separator, a
+	// fragment or an empty ?relay= (an unset ${RELAY}) silently drops the AMT
+	// fallback. u.Query() discards what it cannot parse, so parse strictly.
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil || u.Fragment != "" {
+		return nil, usage
+	}
+	for key, values := range query {
 		if key != "relay" && key != "iface" {
 			return nil, fmt.Errorf("%w: unknown parameter %q", usage, key)
+		}
+		if len(values) != 1 || values[0] == "" {
+			return nil, fmt.Errorf("%w: %s needs exactly one value", usage, key)
 		}
 	}
 	if relay := query.Get("relay"); relay != "" {

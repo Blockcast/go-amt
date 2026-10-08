@@ -133,8 +133,10 @@ func silenceStdout(t *testing.T) {
 	})
 }
 
-// waitReady blocks until the receiver's HTTP endpoint answers, which proves
-// listenAndScore has bound its sockets.
+// waitReady blocks until the receiver's HTTP endpoint has published a report.
+// Feeds open in their own goroutines, so this does not prove a feed is bound;
+// it waits out one report tick, and a plain udp:// feed binds microseconds
+// after its goroutine starts, long before that tick.
 //
 // Without this the first datagram can race socket setup, and a CONNECTED UDP
 // socket surfaces the resulting ICMP port-unreachable as ECONNREFUSED on a
