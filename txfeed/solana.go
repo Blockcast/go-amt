@@ -46,7 +46,10 @@ type Tx struct {
 	NumSigs  int
 	Sig      []byte   // the first signature, the transaction's id (sub-slice of Raw)
 	Programs []Pubkey // distinct top-level program ids, first-use order
-	Vote     bool     // simple vote: exactly one top-level instruction, to VoteProgram
+	// Vote marks a simple vote as Agave's is_simple_vote_transaction defines
+	// it: a legacy message, one or two signatures, and exactly one
+	// instruction, to VoteProgram.
+	Vote bool
 }
 
 var errTruncated = errors.New("truncated")
@@ -184,7 +187,7 @@ func parseTx(b []byte) (Tx, message, error) {
 		NumSigs:  numSigs,
 		Sig:      firstSig(sigs),
 		Programs: programs,
-		Vote:     n == 1 && programs[0] == VoteProgram,
+		Vote:     !v0 && numSigs < 3 && n == 1 && programs[0] == VoteProgram,
 	}, m, nil
 }
 
@@ -258,8 +261,7 @@ func parseTxV1(b []byte) (Tx, message, error) {
 		Raw:      b[:r.off:r.off],
 		NumSigs:  m.required,
 		Sig:      firstSig(m.sigs),
-		Programs: programs,
-		Vote:     n == 1 && programs[0] == VoteProgram,
+		Programs: programs, // never a simple vote: Agave requires a legacy message
 	}, m, nil
 }
 

@@ -166,6 +166,17 @@ func TestParseTx(t *testing.T) {
 		{"v0 with a lookup table", v0Tx, []Pubkey{ComputeBudgetProgram, jupiter}, false},
 		{"simple vote", voteTx, []Pubkey{VoteProgram}, true},
 		{"v1 with config values", v1Tx, []Pubkey{jupiter, token}, false},
+		// Agave's is_simple_vote_transaction also requires a legacy message and
+		// fewer than three signatures.
+		{"vote in a v0 message is not simple", testTx{signers: voteTx.signers, extra: voteTx.extra, ixs: voteTx.ixs, v0: true},
+			[]Pubkey{VoteProgram}, false},
+		{"vote in a v1 transaction is not simple", testTx{signers: voteTx.signers, extra: voteTx.extra, ixs: voteTx.ixs, v1: true},
+			[]Pubkey{VoteProgram}, false},
+		{"vote with three signatures is not simple", testTx{
+			signers: []ed25519.PrivateKey{key(4), key(5), key(6)},
+			extra:   voteTx.extra,
+			ixs:     []ix{{program: 3, accounts: []byte{0}, data: voteTx.ixs[0].data}},
+		}, []Pubkey{VoteProgram}, false},
 		{"vote with a compute budget instruction is not simple", testTx{
 			signers: voteTx.signers,
 			extra:   []Pubkey{VoteProgram, ComputeBudgetProgram},
