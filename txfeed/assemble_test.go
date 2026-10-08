@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/klauspost/reedsolomon"
 )
@@ -215,7 +216,7 @@ func TestAssemblerRecoversEveryBatch(t *testing.T) {
 			sets := ts.sets(t, v4)
 			// Any 32 of a set's 64 shards recover it.
 			frames, _, dups := lossy(rng, sets, func(int) int { return rng.IntN(33) })
-			a := NewAssembler(64)
+			a := NewAssembler(testKeep)
 			ts.check(t, feed(t, a, frames), func(uint32) bool { return true })
 
 			s := a.Stats()
@@ -250,7 +251,7 @@ func TestAssemblerDecodesPastAnUnrecoverableGap(t *testing.T) {
 		}
 		return rng.IntN(33)
 	})
-	a := NewAssembler(64)
+	a := NewAssembler(testKeep)
 	got := feed(t, a, frames)
 	available := func(i uint32) bool { return i/32 != 1 || !dropped[&sets[1][i%32][0]] }
 	ts.check(t, got, available)
@@ -269,7 +270,7 @@ func TestAssemblerRejectsARecoveredShardWithTheWrongHeader(t *testing.T) {
 	frames := slices.Concat(sets...)
 	frames = slices.Delete(frames, 5, 6)
 
-	a := NewAssembler(64)
+	a := NewAssembler(testKeep)
 	ts.check(t, feed(t, a, frames), func(i uint32) bool { return i != 5 })
 	if s := a.Stats(); s.RecoveredBad != 1 || s.ShardsRecovered != 0 || s.Bad != 0 {
 		t.Errorf("%+v; want the one recovered shard rejected, nothing else", s)
@@ -282,31 +283,82 @@ func TestAssemblerChecksParity(t *testing.T) {
 	set := ts.sets(t, false)[0]
 	set[40][28+100] ^= 0x01 // a coding shard's byte
 
-	a := NewAssembler(64)
+	a := NewAssembler(testKeep)
 	ts.check(t, feed(t, a, set), func(uint32) bool { return true }) // data first: nothing to recover
 	if s := a.Stats(); s.ParityChecked != 1 || s.ParityMismatch != 1 {
 		t.Errorf("%+v; want 1 set checked, 1 mismatch", s)
 	}
 }
 
-func TestAssemblerEvictsOldSlots(t *testing.T) {
+const testKeep = 10 * time.Second
+
+func TestAssemblerForgetsIdleSlots(t *testing.T) {
 	rng := rand.New(rand.NewPCG(9, 10))
 	old := newTestSlot(rng, 100, 2*testPayload) // one batch, two shreds
 	set := old.sets(t, false)[0]
 
-	a := NewAssembler(4)
+	a := NewAssembler(testKeep)
+	clock := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
+	a.now = func() time.Time { return clock }
 	feed(t, a, [][]byte{set[0]})
-	feed(t, a, [][]byte{newTestSlot(rng, 104, 1).sets(t, false)[0][0]}) // 4 slots on: kept
+	clock = clock.Add(9 * time.Second) // slot 100 idle 9s, inside keep
+	feed(t, a, [][]byte{newTestSlot(rng, 104, 1).sets(t, false)[0][0]})
 	if s := a.Stats(); s.Evicted != 0 || s.Slots != 2 {
-		t.Fatalf("%+v; slot 100 is still inside the window", s)
+		t.Fatalf("%+v; slot 100 is still inside keep", s)
 	}
+	clock = clock.Add(7 * time.Second) // idle 16s; sweeps run every keep/2
 	feed(t, a, [][]byte{newTestSlot(rng, 105, 1).sets(t, false)[0][0]})
 	if s := a.Stats(); s.Evicted != 1 || s.Slots != 2 || s.MaxSlot != 105 {
-		t.Fatalf("%+v; want slot 100 evicted", s)
+		t.Fatalf("%+v; want slot 100 forgotten", s)
 	}
-	if got := feed(t, a, [][]byte{set[1]}); len(got) != 0 || a.Stats().Slots != 2 {
-		t.Errorf("a late frame for the evicted slot completed %d batches or revived it", len(got))
+	// A late frame starts the slot afresh, without the shred before it that
+	// says where its batch starts.
+	if got := feed(t, a, [][]byte{set[1]}); len(got) != 0 {
+		t.Errorf("a late frame for a forgotten slot completed %d batches", len(got))
 	}
+}
+
+// A forged far-future slot used to move a slot window past every real slot,
+// and nothing decoded again. Arrival-time state has no window to move.
+func TestAssemblerDecodesPastAForgedSlot(t *testing.T) {
+	rng := rand.New(rand.NewPCG(13, 14))
+	ts := newTestSlot(rng, 100, 3*testPayload, 40*testPayload)
+	var frames [][]byte
+	for _, set := range ts.sets(t, false) {
+		frames = append(frames, set...)
+	}
+	a := NewAssembler(testKeep)
+	got := feed(t, a, frames[:5])
+	for _, forged := range []uint64{1 << 62, 1<<64 - 1, 1} {
+		got = append(got, feed(t, a, [][]byte{testFrame(forged, 0, 0, testDataShard(forged, 0, 0, []byte{1}), false)})...)
+	}
+	got = append(got, feed(t, a, frames[5:])...)
+	ts.check(t, got, func(uint32) bool { return true })
+}
+
+func TestAssemblerBoundsSlotsUnderAFlood(t *testing.T) {
+	rng := rand.New(rand.NewPCG(15, 16))
+	ts := newTestSlot(rng, 100, 3*testPayload, 40*testPayload)
+	var frames [][]byte
+	for _, set := range ts.sets(t, false) {
+		frames = append(frames, set...)
+	}
+	a := NewAssembler(testKeep)
+	clock := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
+	a.now = func() time.Time { clock = clock.Add(time.Microsecond); return clock }
+	var got []Batch
+	forged := uint64(1 << 40)
+	for _, f := range frames {
+		got = append(got, feed(t, a, [][]byte{f})...)
+		for range 3 * maxSlots / len(frames) {
+			a.Add(testFrame(forged, 0, 0, testDataShard(forged, 0, 0, []byte{1}), false))
+			forged++
+		}
+	}
+	if s := a.Stats(); s.Slots > maxSlots {
+		t.Errorf("holding %d slots, want at most %d", s.Slots, maxSlots)
+	}
+	ts.check(t, got, func(uint32) bool { return true }) // the slot being received survived the flood
 }
 
 func TestAssemblerCountsBadFrames(t *testing.T) {
@@ -323,7 +375,7 @@ func TestAssemblerCountsBadFrames(t *testing.T) {
 		binary.LittleEndian.PutUint16(f[28+22:], n)
 		return f
 	}
-	a := NewAssembler(64)
+	a := NewAssembler(testKeep)
 	bad := [][]byte{
 		v3[0][:27],                      // shorter than the header
 		with(v3[0], 0, 5),               // unknown version

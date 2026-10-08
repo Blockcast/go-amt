@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"slices"
+	"time"
 
 	"github.com/klauspost/reedsolomon"
 
@@ -43,6 +44,12 @@ const (
 	// Bounds on what a hostile stream can make the assembler hold.
 	maxSetShards   = 256   // data + coding shards per FEC set
 	maxSlotIndexes = 32768 // data shred indexes per slot
+
+	// maxSlots bounds the slots held under a flood of distinct forged slots.
+	// Real traffic holds keep times the slot rate, about 40 at a keep of 10s.
+	// Past it, the slot idle longest goes first, and a slot still being
+	// received is never the idlest.
+	maxSlots = 128
 
 	// Production is 32:32 on every set. Data frames carry no geometry, so a
 	// set assumes this until a coding frame states its own.
@@ -74,17 +81,25 @@ type Stats struct {
 	ParityChecked   uint64 // complete sets whose coding shards were re-encoded from their data
 	ParityMismatch  uint64 // checked sets whose re-encoded parity differs from what was received
 	Batches         uint64 // entry batches emitted
-	Evicted         uint64 // slots that left the window
+	Evicted         uint64 // slots forgotten: idle past keep, or the idlest at maxSlots
 
-	Slots   uint64 // slots in the window
+	Slots   uint64 // slots held
 	MaxSlot uint64 // highest slot seen
 }
 
 // Assembler reassembles entry batches from union frames. It is not safe for
 // concurrent use.
+//
+// It forgets a slot once keep passes with no frame of it. State is bounded by
+// arrival time, not by distance from the highest slot seen, because the slot
+// is whatever the frame's sender wrote (see the package doc). With a slot
+// window, one forged far-future slot pushed every real slot out of the window,
+// and nothing decoded again.
 type Assembler struct {
-	window   uint64
-	maxSlot  uint64
+	keep     time.Duration
+	now      func() time.Time // the arrival clock; tests replace it
+	sweep    time.Time        // when the next eviction pass runs
+	maxSlot  uint64           // for Stats only
 	slots    map[uint64]*slotState
 	encoders map[[2]int]reedsolomon.Encoder // by (num_data, num_coding)
 	complete uint64                         // sets that arrived complete
@@ -92,6 +107,7 @@ type Assembler struct {
 }
 
 type slotState struct {
+	last   time.Time          // arrival of its latest frame
 	sets   map[uint32]*fecSet // by fec_set_index
 	shreds []dataShred        // by absolute index
 }
@@ -117,11 +133,12 @@ type fecSet struct {
 func (s *fecSet) has(local uint32) bool { return s.received[local/64]&(1<<(local%64)) != 0 }
 func (s *fecSet) mark(local uint32)     { s.received[local/64] |= 1 << (local % 64) }
 
-// NewAssembler returns an Assembler that keeps slotWindow slots below the
-// highest it has seen.
-func NewAssembler(slotWindow uint64) *Assembler {
+// NewAssembler returns an Assembler that forgets a slot once keep passes with
+// no frame of it. A frame for a slot already forgotten starts the slot afresh.
+func NewAssembler(keep time.Duration) *Assembler {
 	return &Assembler{
-		window:   slotWindow,
+		keep:     keep,
+		now:      time.Now,
 		slots:    map[uint64]*slotState{},
 		encoders: map[[2]int]reedsolomon.Encoder{},
 	}
@@ -159,7 +176,7 @@ func (a *Assembler) Add(frame []byte) []Batch {
 	ts := binary.LittleEndian.Uint64(frame[20:28])
 	shard := frame[shred.WireHeaderSize:]
 
-	// Validate before the frame can move the window. A coding frame's local
+	// Validate before the frame can create state. A coding frame's local
 	// index is num_data + its position; a data frame's is its position, and
 	// its shard's own header must agree.
 	var payload []byte
@@ -176,23 +193,27 @@ func (a *Assembler) Add(frame []byte) []Batch {
 		return nil
 	}
 
-	if slot > a.maxSlot {
-		a.maxSlot = slot
-		for s := range a.slots {
-			if slot-s > a.window {
+	now := a.now()
+	a.maxSlot = max(a.maxSlot, slot)
+	if !now.Before(a.sweep) {
+		// One pass per keep/2, so a slot can outlive keep by up to half of it.
+		for s, ss := range a.slots {
+			if now.Sub(ss.last) > a.keep {
 				delete(a.slots, s)
 				a.stats.Evicted++
 			}
 		}
-	}
-	if a.maxSlot-slot > a.window {
-		return nil // late: its slot has left the window
+		a.sweep = now.Add(a.keep / 2)
 	}
 	ss := a.slots[slot]
 	if ss == nil {
+		if len(a.slots) >= maxSlots {
+			a.evictIdlest()
+		}
 		ss = &slotState{sets: map[uint32]*fecSet{}}
 		a.slots[slot] = ss
 	}
+	ss.last = now
 	set := ss.sets[fec]
 	if set == nil {
 		set = &fecSet{numData: defaultNumData, numCoding: defaultNumCoding}
@@ -227,6 +248,19 @@ func (a *Assembler) Add(frame []byte) []Batch {
 	fresh = append(fresh, a.recover(slot, fec, set, ss)...)
 	a.checkComplete(set)
 	return a.deshred(slot, ss, fresh, ts)
+}
+
+// evictIdlest forgets the slot whose latest frame arrived longest ago.
+func (a *Assembler) evictIdlest() {
+	var idlest uint64
+	var at time.Time
+	for s, ss := range a.slots {
+		if at.IsZero() || ss.last.Before(at) {
+			idlest, at = s, ss.last
+		}
+	}
+	delete(a.slots, idlest)
+	a.stats.Evicted++
 }
 
 // recover reconstructs the set's missing data shards once at least numData

@@ -39,7 +39,10 @@ import (
 const (
 	maxDatagram = txfeed.MaxFrameSize
 	rcvbuf      = 4 << 20
-	slotWindow  = 64 // slots of dedup history
+	// dedupKeep is how long a slot's dedup history outlives its latest frame.
+	// History goes by arrival time, as in txfeed.Assembler: a slot number from
+	// the wire cannot measure age.
+	dedupKeep = 10 * time.Second
 )
 
 // sub is one joined group.
@@ -193,8 +196,7 @@ func main() {
 			for {
 				n, _, err := c.ReadFromUDPAddrPort(buf)
 				if err != nil {
-					log.Printf("%s: read error: %v", s.label, err)
-					return
+					log.Fatalf("%s: read error: %v", s.label, err) // exit rather than drop a group silently
 				}
 				ch <- packet{s: s, b: bytes.Clone(buf[:n]), at: time.Now()}
 			}
@@ -203,8 +205,12 @@ func main() {
 
 	var printed, dups, filtered, bad, verOK, verBad uint64
 	var lat []float64 // ponytail: keeps every latency for the percentiles; a histogram if runs get long
-	var maxSlot uint64
-	seen := map[uint64]map[uint64]bool{} // slot -> batch start<<16 | index
+	type slotSeen struct {
+		last time.Time
+		keys map[uint64]bool // batch start<<16 | index
+	}
+	seen := map[uint64]*slotSeen{}
+	var sweep time.Time // when the next eviction pass runs
 	enc := json.NewEncoder(os.Stdout)
 
 	sig := make(chan os.Signal, 1)
@@ -247,23 +253,29 @@ func main() {
 			continue
 		}
 
-		if f.Slot > maxSlot {
-			maxSlot = f.Slot
-			for s := range seen {
-				if s+slotWindow < maxSlot {
+		if !p.at.Before(sweep) {
+			for s, ss := range seen {
+				if p.at.Sub(ss.last) > dedupKeep {
 					delete(seen, s)
 				}
 			}
+			sweep = p.at.Add(dedupKeep / 2)
 		}
+		ss := seen[f.Slot]
+		if ss == nil {
+			// ponytail: no cap on slots; a flood of forged slots holds its rate
+			// times dedupKeep entries. Cap it as txfeed.Assembler does if the
+			// subscriber outgrows a demo.
+			ss = &slotSeen{keys: map[uint64]bool{}}
+			seen[f.Slot] = ss
+		}
+		ss.last = p.at
 		k := uint64(f.BatchStart)<<16 | uint64(f.Index)
-		if seen[f.Slot][k] {
+		if ss.keys[k] {
 			dups++
 			continue
 		}
-		if seen[f.Slot] == nil {
-			seen[f.Slot] = map[uint64]bool{}
-		}
-		seen[f.Slot][k] = true
+		ss.keys[k] = true
 
 		l := line{Slot: f.Slot, Batch: f.BatchStart, Index: f.Index, Vote: f.Vote, Sig: txfeed.Base58Encode(tx.Sig),
 			LatencyMs: float64(p.at.UnixMicro()-int64(f.ShredTs)) / 1000}

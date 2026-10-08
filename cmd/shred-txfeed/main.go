@@ -104,8 +104,7 @@ func reader(c *net.UDPConn, out chan<- []byte, qdrop *atomic.Uint64) {
 	for {
 		n, _, err := c.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			log.Printf("read error: %v", err)
-			return
+			log.Fatalf("read error: %v", err) // exit rather than run on with no ingest
 		}
 		select {
 		case out <- bytes.Clone(buf[:n]): // the assembler keeps the frame
@@ -133,7 +132,7 @@ func main() {
 		port     = flag.Int("port", 5003, "partition group port; 5001 carries shreds")
 		ttl      = flag.Int("ttl", 16, "IP_MULTICAST_TTL and IPV6_MULTICAST_HOPS; 0 keeps the feed on this host")
 		loop     = flag.Bool("loop", false, "IP_MULTICAST_LOOP, for subscribers on this host")
-		window   = flag.Uint64("slot-window", 64, "slots of FEC-set and batch state to retain (~400ms per slot)")
+		keep     = flag.Duration("keep", 10*time.Second, "how long a slot's FEC-set and batch state outlives its latest frame")
 		statsSec = flag.Int("stats-interval", 10, "seconds between stats lines")
 		rcvbuf   = flag.Int("rcvbuf", 8<<20, "SO_RCVBUF for the ingest socket")
 	)
@@ -141,6 +140,9 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
+	if *keep <= 0 {
+		log.Fatalf("-keep %v: want a positive duration", *keep)
+	}
 	named, err := parsePrograms(programs)
 	if err != nil {
 		log.Fatal(err)
@@ -213,7 +215,7 @@ func main() {
 	var qdrop atomic.Uint64
 	go reader(in, ch, &qdrop)
 
-	asm := txfeed.NewAssembler(*window)
+	asm := txfeed.NewAssembler(*keep)
 	var batchErr, txs, votes, oversize, sent, sendErr uint64
 	stats := func() string {
 		s := asm.Stats()
