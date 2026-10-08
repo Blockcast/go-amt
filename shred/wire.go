@@ -118,3 +118,28 @@ func Parse(packet []byte, format Format) (Header, error) {
 		return Header{}, fmt.Errorf("unknown shred format %d", int(format))
 	}
 }
+
+// TVUPayload returns the bytes a validator TVU socket can accept for packet.
+//
+// A forwarder frame is not a shred: the 28-byte header in front of the body
+// shifts every Agave offset, so a TVU discards it at sigverify. Version 4
+// carries the full canonical shred as its body, so that body is the payload.
+// Version 3 carries only the erasure shard, with the signature and Merkle proof
+// stripped by the forwarder, and nothing in the datagram can rebuild a shred a
+// TVU would accept: ok is false and the packet must not be forwarded.
+//
+// Anything that does not parse as a forwarder frame is returned unchanged,
+// which keeps a canonical Agave feed (or a malformed frame) on the existing
+// "forward it and let the validator decide" path. ParseWireHeader's geometry
+// checks are what make that safe: an Agave shred's leading signature byte is
+// 3 or 4 once in 128 packets, but the header's num_data/num_coding/local_index
+// constraints reject it in all but ~2^-40 of those.
+func TVUPayload(packet []byte) (payload []byte, ok bool) {
+	if _, err := ParseWireHeader(packet); err != nil {
+		return packet, true
+	}
+	if packet[0] == 3 {
+		return nil, false
+	}
+	return packet[WireHeaderSize:], true
+}

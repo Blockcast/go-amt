@@ -74,11 +74,12 @@ type ReceiverMetrics struct {
 	// because it is process-lifetime totals rather than a per-window snapshot.
 	guards map[string]erasure.Stats
 
-	ingress     *prometheus.CounterVec
-	egress      *prometheus.CounterVec
-	dropped     *prometheus.CounterVec
-	writeErrors *prometheus.CounterVec
-	unparsed    *prometheus.CounterVec
+	ingress       *prometheus.CounterVec
+	egress        *prometheus.CounterVec
+	dropped       *prometheus.CounterVec
+	writeErrors   *prometheus.CounterVec
+	unparsed      *prometheus.CounterVec
+	undeliverable *prometheus.CounterVec
 
 	setsDesc      *prometheus.Desc
 	fractionDesc  *prometheus.Desc
@@ -91,11 +92,12 @@ type ReceiverMetrics struct {
 }
 
 type feedMetrics struct {
-	ingress     prometheus.Counter
-	egress      prometheus.Counter
-	dropped     prometheus.Counter
-	writeErrors prometheus.Counter
-	unparsed    prometheus.Counter
+	ingress       prometheus.Counter
+	egress        prometheus.Counter
+	dropped       prometheus.Counter
+	writeErrors   prometheus.Counter
+	unparsed      prometheus.Counter
+	undeliverable prometheus.Counter
 }
 
 // NewReceiverMetrics registers receiver metrics and materializes zero-valued
@@ -159,6 +161,11 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, repo
 		Name:      "shreds_unparsed_total",
 		Help:      "Delivered packets whose Solana shred header could not be parsed.",
 	}, []string{"feed"})
+	metrics.undeliverable = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: receiverMetricsNamespace,
+		Name:      "shreds_undeliverable_total",
+		Help:      "Version-3 forwarder frames withheld from validator destinations: the body is an erasure shard without signature or Merkle proof, which no TVU accepts. Run the shred-forwarder with --wire-version v4.",
+	}, []string{"feed"})
 	metrics.setsDesc = prometheus.NewDesc(
 		prometheus.BuildFQName(receiverMetricsNamespace, "", "erasure_sets"),
 		"Receiver-observed FEC sets in the latest reporting window.", []string{"feed", "result"}, nil,
@@ -199,11 +206,12 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, repo
 
 	for _, feedID := range feedIDs {
 		metrics.feeds[feedID] = feedMetrics{
-			ingress:     metrics.ingress.WithLabelValues(feedID),
-			egress:      metrics.egress.WithLabelValues(feedID),
-			dropped:     metrics.dropped.WithLabelValues(feedID),
-			writeErrors: metrics.writeErrors.WithLabelValues(feedID),
-			unparsed:    metrics.unparsed.WithLabelValues(feedID),
+			ingress:       metrics.ingress.WithLabelValues(feedID),
+			egress:        metrics.egress.WithLabelValues(feedID),
+			dropped:       metrics.dropped.WithLabelValues(feedID),
+			writeErrors:   metrics.writeErrors.WithLabelValues(feedID),
+			unparsed:      metrics.unparsed.WithLabelValues(feedID),
+			undeliverable: metrics.undeliverable.WithLabelValues(feedID),
 		}
 		metrics.windows[feedID] = erasure.Window{}
 		metrics.guards[feedID] = erasure.Stats{}
@@ -221,6 +229,7 @@ func (m *ReceiverMetrics) Describe(ch chan<- *prometheus.Desc) {
 	m.dropped.Describe(ch)
 	m.writeErrors.Describe(ch)
 	m.unparsed.Describe(ch)
+	m.undeliverable.Describe(ch)
 	if !m.reportsWindows {
 		return
 	}
@@ -242,6 +251,7 @@ func (m *ReceiverMetrics) Collect(ch chan<- prometheus.Metric) {
 	m.dropped.Collect(ch)
 	m.writeErrors.Collect(ch)
 	m.unparsed.Collect(ch)
+	m.undeliverable.Collect(ch)
 
 	// Nothing below this line is reachable without a drain: every value is read
 	// off m.windows, which only PublishWindow writes. A receiver that drains no
@@ -369,6 +379,17 @@ func (m *ReceiverMetrics) IncUnparsed(feedID string) error {
 		return err
 	}
 	feed.unparsed.Inc()
+	return nil
+}
+
+// IncUndeliverable records one packet withheld from destinations because it
+// carries no shred a TVU can accept (a version-3 forwarder frame).
+func (m *ReceiverMetrics) IncUndeliverable(feedID string) error {
+	feed, err := m.feed(feedID)
+	if err != nil {
+		return err
+	}
+	feed.undeliverable.Inc()
 	return nil
 }
 

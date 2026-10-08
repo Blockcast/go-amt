@@ -240,6 +240,7 @@ liveness probe on something else.
 | `bcast_shred_gw_fanout_dropped_packets_total` | packets | Rejected at enqueue because the bounded ring was full. |
 | `bcast_shred_gw_fanout_write_errors_total` | **datagrams** | Destination writes that failed or were short. |
 | `bcast_shred_gw_shreds_unparsed_total` | packets | Delivered packets whose shred header did not parse. |
+| `bcast_shred_gw_shreds_undeliverable_total` | packets | Version-3 forwarder frames withheld from destinations; run the forwarder with `--wire-version v4`. |
 
 **Egress and write errors are counted per destination write, not per packet.**
 One received packet fanned out to N `--dest-ip-ports` targets increments
@@ -254,7 +255,10 @@ The two silent drop sites are `fanout_dropped_packets_total` (ring overflow,
 counted at enqueue) and `fanout_write_errors_total` (counted at the write).
 Both represent packets that did not reach a destination; ingress minus drops is
 not by itself a delivery guarantee. Scoring and metrics never gate delivery, so
-a malformed or unattributable packet is still forwarded byte-identically.
+a malformed or unattributable packet is still forwarded byte-identically. The
+framing does: a version-4 forwarder frame is delivered as the canonical shred
+it carries, and a version-3 frame -- an erasure shard no TVU accepts -- is
+withheld and counted in `bcast_shred_gw_shreds_undeliverable_total`.
 
 `fanout_dropped_packets_total` counts **ring overflow only.** Enqueue also
 refuses packets once the fan-out is closed, but that is a shutdown artifact

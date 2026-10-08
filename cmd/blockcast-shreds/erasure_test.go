@@ -17,10 +17,11 @@ import (
 
 // dataShred builds one shred-forwarder-framed data shred. Data shreds carry a
 // local index of 0..31, so a set is complete at all 32 of them and erased below
-// the 32-of-64 threshold.
+// the 32-of-64 threshold. It is version 4 because that is the only framing the
+// fan-out delivers: destinations receive the 16-byte body, header stripped.
 func dataShred(slot uint64, fecSet uint32, indexWithinSet uint8) []byte {
 	packet := make([]byte, shred.WireHeaderSize+16)
-	packet[0] = 3 // erasure-shard body
+	packet[0] = 4 // full-shred body
 	binary.LittleEndian.PutUint64(packet[1:9], slot)
 	binary.LittleEndian.PutUint32(packet[9:13], fecSet)
 	binary.LittleEndian.PutUint32(packet[13:17], uint32(indexWithinSet))
@@ -342,12 +343,10 @@ func TestListenAndScorePublishesRealErasureToMetrics(t *testing.T) {
 	}
 	select {
 	case packet := <-delivered:
-		parsed, err := shred.Parse(packet, shred.FormatForwarder)
-		if err != nil {
-			t.Fatalf("forwarded packet is not a shred: %v", err)
-		}
-		if want := dataShred(parsed.Slot, parsed.FECSetIndex, parsed.IndexWithinSet); string(packet) != string(want) {
-			t.Fatalf("forwarded packet = %x, want %x", packet, want)
+		// The destination is a TVU: it gets the v4 frame's body, never the
+		// 28-byte forwarder header, which would shift every Agave offset.
+		if want := dataShred(0, 0, 0)[shred.WireHeaderSize:]; string(packet) != string(want) {
+			t.Fatalf("forwarded packet = %x, want the %d-byte body %x", packet, len(want), want)
 		}
 	default:
 		t.Fatal("no packet reached the fan-out destination")

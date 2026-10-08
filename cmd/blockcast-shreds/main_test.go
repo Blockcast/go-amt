@@ -7,6 +7,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	amt "github.com/blockcast/go-amt"
 	"io"
 	"os"
 	"reflect"
@@ -356,7 +357,7 @@ func TestUnparsablePacketPublishesUnparsedToTheScrapedRegistry(t *testing.T) {
 	scorer := shred.NewFeedScorer([]string{"feed"})
 
 	processPacket("feed", []byte{0x01, 0x02, 0x03}, time.Now(), scorer, fanout, metrics, nil)
-	processPacket("feed", fixtureShred(t), time.Now(), scorer, fanout, metrics, nil)
+	processPacket("feed", fullShredFrame(fixtureShred(t)), time.Now(), scorer, fanout, metrics, nil)
 	for range 2 {
 		select {
 		case <-writer.packets:
@@ -378,21 +379,21 @@ func TestUnparsablePacketPublishesUnparsedToTheScrapedRegistry(t *testing.T) {
 	}
 }
 
-// TestValidShredDuplicateIsForwardedByteIdentically covers what
+// TestValidShredDuplicateIsForwardedAsItsCanonicalShred covers what
 // TestPacketDeliveryDoesNotDependOnScoring cannot. That test's 3-byte packet
 // fails to parse, so both copies are rejected for the same reason and it never
-// reaches the duplicate path its name claims -- nor does it show that a
-// well-formed shred survives the path unchanged. Here the first copy parses and
+// reaches the duplicate path its name claims -- nor does it show what a
+// well-formed shred becomes on the way through. Here the first copy parses and
 // is accepted, first-arrival-wins dedup rejects the second (Scorer.Observe
-// returns accepted=false), and both must still reach every destination byte for
-// byte: what to do with a duplicate is the validator's decision, not this
-// process's.
-func TestValidShredDuplicateIsForwardedByteIdentically(t *testing.T) {
-	packet := fixtureShred(t)
+// returns accepted=false), and both must still reach every destination as the
+// canonical shred the v4 frame carries, header stripped: what to do with a
+// duplicate is the validator's decision, not this process's.
+func TestValidShredDuplicateIsForwardedAsItsCanonicalShred(t *testing.T) {
+	packet := fullShredFrame(fixtureShred(t))
 	// Compare against an independent copy: if processPacket mutated the caller's
 	// slice in place, comparing the delivered bytes back to packet would compare
 	// the corruption with itself and pass.
-	want := append([]byte(nil), packet...)
+	want := append([]byte(nil), packet[shred.WireHeaderSize:]...)
 	writer := &captureWriter{packets: make(chan []byte, 2)}
 	registry := prometheus.NewRegistry()
 	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"}, receiver.ReportsWindows)
@@ -427,6 +428,52 @@ func TestValidShredDuplicateIsForwardedByteIdentically(t *testing.T) {
 	}
 	if got := gaugeValue(t, registry, "bcast_shred_gw_egress_packets_total", "feed"); got != 2 {
 		t.Fatalf("scraped egress_packets_total = %v, want 2; the duplicate must still be delivered", got)
+	}
+}
+
+// fullShredFrame relabels a captured production frame as version 4. The
+// fixture is a real v3 capture, and the fan-out withholds v3 (see
+// shred.TVUPayload); the body bytes are irrelevant to delivery, which keys on
+// the framing alone.
+func fullShredFrame(packet []byte) []byte {
+	packet = append([]byte(nil), packet...)
+	packet[0] = 4
+	return packet
+}
+
+// TestVersion3FrameIsWithheldAndCounted pins the other half of the egress
+// rule. A v3 body is an erasure shard with the signature and Merkle proof
+// stripped, which every TVU discards: forwarding it would bill the customer for
+// bytes their validator throws away. It must be counted, not silently dropped,
+// and it must still be scored -- the feed's delivery SLA is measured on what
+// arrived, not on what this receiver could forward.
+func TestVersion3FrameIsWithheldAndCounted(t *testing.T) {
+	writer := &captureWriter{packets: make(chan []byte, 2)}
+	registry := prometheus.NewRegistry()
+	metrics, err := receiver.NewReceiverMetrics(registry, []string{"feed"}, receiver.ReportsWindows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fanout, err := receiver.NewFanout([]io.WriteCloser{writer}, 2, metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scorer := shred.NewFeedScorer([]string{"feed"})
+
+	processPacket("feed", fixtureShred(t), time.Now(), scorer, fanout, metrics, nil)
+	if err := fanout.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-writer.packets:
+		t.Fatalf("v3 frame reached a destination: %x", got)
+	default:
+	}
+	if got := gaugeValue(t, registry, "bcast_shred_gw_shreds_undeliverable_total", "feed"); got != 1 {
+		t.Fatalf("scraped shreds_undeliverable_total = %v, want 1", got)
+	}
+	if got := gaugeValue(t, registry, "bcast_shred_gw_shreds_unparsed_total", "feed"); got != 0 {
+		t.Fatalf("scraped shreds_unparsed_total = %v, want 0; a withheld v3 frame is still a scored shred", got)
 	}
 }
 
@@ -558,7 +605,7 @@ func TestRunRejectsNonPositiveHealthMaxAge(t *testing.T) {
 // test helper and is not importable from here.
 func forwarderDataShred(slot uint64, fecSet uint32, localIndex uint32) []byte {
 	packet := make([]byte, 28+64)
-	packet[0] = 3 // wire version
+	packet[0] = 4 // wire version: full-shred body, the only one the fan-out delivers
 	binary.LittleEndian.PutUint64(packet[1:9], slot)
 	binary.LittleEndian.PutUint32(packet[9:13], fecSet)
 	binary.LittleEndian.PutUint32(packet[13:17], localIndex)
@@ -809,5 +856,40 @@ func TestScoringValidate(t *testing.T) {
 				t.Fatalf("validate() = %v, want error containing %q", err, testCase.wantErr)
 			}
 		})
+	}
+}
+
+func TestSSMFeedAddress(t *testing.T) {
+	conn, err := ssmFeed("ssm://69.25.95.102@232.0.0.1:5001")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn.SrcAddr.String() != "69.25.95.102" || conn.GroupAddr.String() != "232.0.0.1" || conn.GroupPort != 5001 {
+		t.Fatalf("parsed (S,G):port = (%s,%s):%d", conn.SrcAddr, conn.GroupAddr, conn.GroupPort)
+	}
+	// No relay is a native-only join: there is nothing to fall back to, so a
+	// silent group must surface as a silent feed, not a tunnel attempt.
+	if conn.Mode != amt.AMTModeNative || len(conn.RelayAddr.IP) != 0 {
+		t.Fatalf("no-relay feed: mode %v relay %v, want native with no relay", conn.Mode, conn.RelayAddr)
+	}
+
+	conn, err = ssmFeed("ssm://69.25.95.102@232.0.0.1:5001?relay=69.25.95.128")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if conn.Mode != amt.AMTModeAuto || conn.RelayAddr.String() != "69.25.95.128:2268" {
+		t.Fatalf("relay feed: mode %v relay %v, want auto via 69.25.95.128:2268", conn.Mode, &conn.RelayAddr)
+	}
+
+	for _, bad := range []string{
+		"ssm://232.0.0.1:5001",                // no source
+		"ssm://69.25.95.102@10.0.0.1:5001",    // group is not multicast
+		"ssm://69.25.95.102@232.0.0.1",        // no port
+		"ssm://69.25.95.102@232.0.0.1:5001/x", // stray path
+		"ssm://host@232.0.0.1:5001",           // source is not an address
+	} {
+		if _, err := ssmFeed(bad); err == nil {
+			t.Errorf("ssmFeed(%q) accepted", bad)
+		}
 	}
 }

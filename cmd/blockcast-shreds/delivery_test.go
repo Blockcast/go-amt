@@ -182,9 +182,10 @@ func TestDeliveryRecordsBillLedgerTotalExactlyOnce(t *testing.T) {
 	if billedPackets == 0 {
 		t.Fatal("records billed zero packets despite delivered traffic")
 	}
-	// One shred is WireHeaderSize+16 bytes; every delivered packet is billed
-	// exactly once, so bytes must be an exact multiple of the packet size.
-	packetSize := uint64(shred.WireHeaderSize + 16)
+	// One shred is WireHeaderSize+16 bytes on the wire, but a destination is
+	// sent -- and billed for -- the 16-byte canonical body alone. Every delivered
+	// packet is billed exactly once, so bytes must be an exact multiple of that.
+	packetSize := uint64(16)
 	if billedBytes != billedPackets*packetSize {
 		t.Errorf("billed %d bytes for %d packets, want exactly %d (%d-byte packets); a mismatch means bytes and packets disagree about the delta",
 			billedBytes, billedPackets, billedPackets*packetSize, packetSize)
