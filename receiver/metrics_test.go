@@ -388,6 +388,7 @@ func TestNoWindowReportingOmitsTheFamilyFromDescribe(t *testing.T) {
 		"bcast_shred_gw_fanout_dropped_packets_total",
 		"bcast_shred_gw_fanout_write_errors_total",
 		"bcast_shred_gw_shreds_unparsed_total",
+		"bcast_shred_gw_shreds_undeliverable_total",
 	}
 	// Described only under ReportsWindows: every value is read off a drained Window.
 	windowDescNames := []string{

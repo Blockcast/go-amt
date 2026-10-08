@@ -6,13 +6,27 @@ sidecar.
 
 It does two jobs:
 
-1. **Deliver.** Receive Solana shreds over a unicast UDP feed and fan them out,
-   byte-identically, to every configured validator TVU port.
+1. **Deliver.** Receive Solana shreds over a unicast UDP feed or a
+   source-specific multicast group and fan them out, as canonical shreds, to
+   every configured validator TVU port.
 2. **Score.** Independently measure delivery quality, so you can audit the SLA
    from your own hardware rather than taking a vendor dashboard on trust.
 
 Delivery never waits on scoring. Malformed and duplicate packets are forwarded
-unchanged; scoring failures cannot drop or delay a packet.
+unchanged; scoring failures cannot drop or delay a packet. The one thing
+delivery does inspect is the shred-forwarder framing, because a framed packet
+is not a shred a TVU will accept:
+
+| Feed packet | What each destination receives |
+|---|---|
+| Version-4 forwarder frame | The canonical shred it carries (28-byte header stripped). A malformed v4 frame with no body is withheld and counted like v3 below. |
+| Version-3 forwarder frame | Nothing. Its body is an erasure shard with the signature and Merkle proof removed, which every TVU discards. Counted in `bcast_shred_gw_shreds_undeliverable_total`; the feed's forwarder must run with `--wire-version v4`. |
+| Anything else | The packet, unchanged. |
+
+Point every destination at the validator's **TVU** port. It is not a fixed
+number: Jito's [`get_tvu_port.sh`](https://github.com/jito-labs/shredstream-proxy/tree/master/scripts)
+reports it from the ledger directory or an RPC endpoint. `<TVU_PORT>` below is a
+placeholder for that value.
 
 > **Read [What the score actually means](#what-the-score-actually-means) before
 > you rely on these numbers in a dispute.** The metric is receiver-observed. It
@@ -65,7 +79,7 @@ Configuration is an environment file so the unit itself never needs editing:
 ```sh
 sudo install -d -m 0755 /etc/blockcast
 sudo tee /etc/blockcast/shreds.env >/dev/null <<'EOF'
-BLOCKCAST_SHREDS_ARGS=--listen 0.0.0.0:20000 --dest-ip-ports 127.0.0.1:8001 --http-addr 127.0.0.1:8080
+BLOCKCAST_SHREDS_ARGS=--listen 0.0.0.0:20000 --dest-ip-ports 127.0.0.1:<TVU_PORT> --http-addr 127.0.0.1:8080
 EOF
 sudo install -m 0644 packaging/systemd/blockcast-shreds.service /etc/systemd/system/
 sudo systemctl daemon-reload
@@ -107,7 +121,7 @@ docker build -t blockcast-shreds:local .
 docker run --rm \
   -p 20000:20000/udp -p 8080:8080 \
   blockcast-shreds:local \
-  --listen 0.0.0.0:20000 --dest-ip-ports 10.0.0.5:8001 --http-addr 0.0.0.0:8080
+  --listen 0.0.0.0:20000 --dest-ip-ports 10.0.0.5:<TVU_PORT> --http-addr 0.0.0.0:8080
 ```
 
 Once publishing lands the image will be `ghcr.io/blockcast/blockcast-shreds:<tag>`.
@@ -139,8 +153,8 @@ remaining checks and reports the delivery assertion as `UNVERIFIED`.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--listen` | `0.0.0.0:20000` | Unicast UDP ingress address. |
-| `--feed NAME=IP:PORT` | — | Repeatable. Enables multi-feed first-arrival-wins scoring. Replaces `--listen` when given. |
-| `--dest-ip-ports` | *(none)* | Comma-separated validator TVU targets. Empty means score-only, no forwarding. |
+| `--feed NAME=IP:PORT` | — | Repeatable. Enables multi-feed first-arrival-wins scoring. Replaces `--listen` when given. `NAME=ssm://SOURCE@GROUP:PORT` joins that source-specific multicast group natively instead; add `?relay=IP[:PORT]` to fall back to an AMT tunnel when native multicast is silent, `?iface=NAME` to pin the join's interface. |
+| `--dest-ip-ports` | *(none)* | Comma-separated validator TVU targets; each receives canonical shreds (see the delivery table above). Empty means score-only, no forwarding. |
 | `--http-addr` | `127.0.0.1:8080` | `/metrics` and `/healthz`. Empty disables HTTP. |
 | `--json` | off | Emit the shutdown receipt as JSON instead of a table. |
 | `--mode` | `shred` | Scoring mode. `shred` parses Solana shred headers; `generic` scores framed records by size and arrival instead — see [the D5 note](../demo/d5-payload-agnostic-receipt.md). |
@@ -328,8 +342,9 @@ Why all three, including the shred rate:
 
 The packet-path counters are unaffected and are exported in every mode:
 `ingress_packets_total`, `egress_packets_total`,
-`fanout_dropped_packets_total`, `fanout_write_errors_total` and
-`shreds_unparsed_total` are driven by the packet path, not by a drain. They
+`fanout_dropped_packets_total`, `fanout_write_errors_total`,
+`shreds_unparsed_total` and `shreds_undeliverable_total` are driven by the
+packet path, not by a drain. They
 remain the liveness signal to alert on under `--mode generic`.
 
 ### The gap histogram
@@ -382,6 +397,7 @@ that is merely idle:
 | `bcast_shred_gw_fanout_dropped_packets_total` | Packets dropped because the bounded fan-out ring was full. **The receiver-overload signal — alert on any increase.** |
 | `bcast_shred_gw_fanout_write_errors_total` | Failed or short destination writes; each is a packet a target did not receive. |
 | `bcast_shred_gw_shreds_unparsed_total` | Delivered packets whose shred header would not parse. |
+| `bcast_shred_gw_shreds_undeliverable_total` | Forwarder frames withheld from every destination because no TVU accepts them: version-3 frames, plus the rare malformed version-4 frame with no body. **A sustained increase means your validator is receiving nothing from that feed**, and the forwarder must run `--wire-version v4`; stderr names each feed that sends v3. |
 | `bcast_shred_gw_erasure_*`, `_shreds_per_second`, `_gap_events`, `_report_schema` | Per-feed delivery SLA for the last drained window, on the `--report-interval` cadence. **All of these are window-derived, so none is exported under `--mode generic`** — see [Alerting](#alerting-erasure_fraction-0-has-three-meanings). `erasure_fraction` is a **windowed gauge**: `0` has [three meanings](#alerting-erasure_fraction-0-has-three-meanings), only one of which is a healthy feed. Never alert on it without a liveness signal — pair it with `ingress_packets_total` and the slot-guard counters below. |
 | `bcast_shred_gw_erasure_slot_rejections_total` | Observations refused by the slot-plausibility guard, by `direction`. `ahead` is beyond the forward jump bound; a sustained `behind` rate means the frontier itself is suspect. Window-derived, so exported only under `--mode shred`. |
 | `bcast_shred_gw_erasure_frontier_resyncs_total` | Times the slot frontier was abandoned and re-adopted. Each is a discontinuity in the erasure series — sets in flight were dropped unscored, so a fraction spanning a resync is not comparable across it. Window-derived, so exported only under `--mode shred`. |

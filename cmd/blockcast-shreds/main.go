@@ -9,18 +9,24 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
+	amt "github.com/blockcast/go-amt"
 	"github.com/blockcast/go-amt/broker"
 	"github.com/blockcast/go-amt/broker/gwclient"
 	"github.com/blockcast/go-amt/erasure"
+	"github.com/blockcast/go-amt/messages"
 	"github.com/blockcast/go-amt/receiver"
 	"github.com/blockcast/go-amt/receiver/config"
 	"github.com/blockcast/go-amt/receiver/delivery"
@@ -60,7 +66,7 @@ const maxReportInterval = 5 * time.Minute
 const help = `blockcast-shreds demo mode
 
 Usage:
-  blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
+  blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT|NAME=ssm://SOURCE@GROUP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
    blockcast-shreds [--broker-url URL --gw-uuid UUID --broker-client-cert FILE --broker-client-key FILE]
   blockcast-shreds selftest --fixture [--json]
   blockcast-shreds selftest --generic [--json]
@@ -73,6 +79,21 @@ UDP feeds. With two or more feeds the receipt reports the measured worth of a
 second feed: each feed's own erasure fraction, the union's, and the FEC sets
 the extra feeds rescued. It measures this run only — it cannot tell whether
 the inputs are independently operated or share one tap.
+
+A feed of the form NAME=ssm://SOURCE@GROUP:PORT joins that source-specific
+multicast group natively instead of binding a unicast port. Adding
+?relay=IP[:PORT] (default port 2268) falls back to an AMT tunnel through that
+relay when no native traffic arrives within the probe window; ?iface=NAME pins
+the join to one interface.
+
+--dest-ip-ports targets are validator TVU ports and receive canonical Solana
+shreds: a version-4 shred-forwarder frame is delivered with its 28-byte header
+stripped. A version-3 frame carries an erasure shard with no signature or
+Merkle proof, which no TVU accepts, so it is withheld and counted in
+bcast_shred_gw_shreds_undeliverable_total; run the forwarder with
+--wire-version v4. A malformed version-4 frame with no body is withheld and
+counted the same way, though no forwarder flag fixes it. Anything that is not
+a forwarder frame is delivered unchanged.
 
 --broker-url and --gw-uuid opt into the gateway heartbeat and must be given
 together: a broker URL without an identity produces heartbeats the broker
@@ -170,9 +191,9 @@ func run(args []string) error {
 	var configuredFeeds feeds
 	var listen, destinations, httpAddress string
 	var healthMaxAge time.Duration
-	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed")
+	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed, or NAME=ssm://SOURCE@GROUP:PORT[?relay=IP[:PORT]&iface=NAME] multicast feed")
 	flags.StringVar(&listen, "listen", "0.0.0.0:20000", "unicast UDP listen address")
-	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated UDP forward destinations")
+	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated validator TVU IP:PORT destinations")
 	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
 	flags.StringVar(&httpAddress, "http-addr", "127.0.0.1:8080", "metrics and health HTTP address; empty disables HTTP")
 	score := scoringFlags(flags)
@@ -244,7 +265,7 @@ func run(args []string) error {
 		for _, value := range configuredFeeds {
 			name, address, ok := strings.Cut(value, "=")
 			if !ok || name == "" || address == "" {
-				return fmt.Errorf("--feed %q must be NAME=IP:PORT", value)
+				return fmt.Errorf("--feed %q must be NAME=IP:PORT or NAME=ssm://SOURCE@GROUP:PORT", value)
 			}
 			if _, exists := seen[name]; exists {
 				return fmt.Errorf("duplicate --feed name %q", name)
@@ -944,23 +965,45 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	})
 	defer closeSessions()
 
+	// Each feed goroutine sends at most one error: its open's or its read's.
 	errCh := make(chan error, len(feeds))
-	var sockets []*net.UDPConn
+	var sockets []net.PacketConn
 	var mu sync.Mutex
-	for _, feed := range feeds {
-		udpAddress, err := net.ResolveUDPAddr("udp", feed.address)
-		if err != nil {
-			return fmt.Errorf("resolve feed %q: %w", feed.name, err)
+	// stopping is set under mu when run stops reading. A feed whose open
+	// completes after that closes its own socket instead of reading from it.
+	stopping := false
+	closeSockets := func() {
+		mu.Lock()
+		stopping = true
+		for _, conn := range sockets {
+			_ = conn.Close()
 		}
-		conn, err := net.ListenUDP("udp", udpAddress)
-		if err != nil {
-			return fmt.Errorf("listen feed %q at %q: %w", feed.name, feed.address, err)
-		}
-		sockets = append(sockets, conn)
-		go func(feedName string, conn *net.UDPConn) {
+		mu.Unlock()
+	}
+	// Feeds open concurrently. An ssm:// feed with ?relay= can take a whole
+	// probe window to open, so opening in turn would stagger the joins by a
+	// window per feed, skewing the first-arrival comparison --feed exists to
+	// make. It would also leave SIGINT/SIGTERM unread for the sum of those
+	// windows, since the select below is what reads them.
+	for _, f := range feeds {
+		go func(f feed) {
+			conn, err := openFeedFunc(f)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			mu.Lock()
+			if stopping {
+				mu.Unlock()
+				_ = conn.Close()
+				return
+			}
+			sockets = append(sockets, conn)
+			mu.Unlock()
+			feedName := f.name
 			packet := make([]byte, 2048)
 			for {
-				n, _, err := conn.ReadFromUDP(packet)
+				n, _, err := conn.ReadFrom(packet)
 				if err != nil {
 					errCh <- err
 					return
@@ -979,21 +1022,17 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics, trackers[feedName])
 				mu.Unlock()
 			}
-		}(feed.name, conn)
+		}(f)
 	}
 
 	select {
 	case <-signals:
 	case <-stop:
 	case err := <-errCh:
-		for _, conn := range sockets {
-			_ = conn.Close()
-		}
+		closeSockets()
 		return err
 	}
-	for _, conn := range sockets {
-		_ = conn.Close()
-	}
+	closeSockets()
 	mu.Lock()
 	defer mu.Unlock()
 	// Stop the periodic reporter before the last drain so the two cannot split
@@ -1012,6 +1051,94 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	// sessionScorer take their own lock in Receipt, so the receipt is a
 	// consistent snapshot even if a late Observe lands after it.
 	return printReceipt(scorer.SessionReceipt(), asJSON)
+}
+
+// openFeedFunc is openFeed. A test swaps it to hold an open past shutdown.
+var openFeedFunc = openFeed
+
+// openFeed binds one feed. A plain IP:PORT is a unicast socket. An
+// ssm://SOURCE@GROUP:PORT feed joins that source-specific multicast group
+// natively; adding ?relay=IP[:PORT] lets it fall back to an AMT tunnel through
+// that relay when no native traffic arrives within the probe window, and
+// ?iface=NAME pins the join to one interface on a multi-homed host.
+func openFeed(f feed) (net.PacketConn, error) {
+	if !strings.HasPrefix(f.address, "ssm://") {
+		udpAddress, err := net.ResolveUDPAddr("udp", f.address)
+		if err != nil {
+			return nil, fmt.Errorf("resolve feed %q: %w", f.name, err)
+		}
+		conn, err := net.ListenUDP("udp", udpAddress)
+		if err != nil {
+			return nil, fmt.Errorf("listen feed %q at %q: %w", f.name, f.address, err)
+		}
+		return conn, nil
+	}
+	conn, err := ssmFeed(f.address)
+	if err != nil {
+		return nil, fmt.Errorf("feed %q: %w", f.name, err)
+	}
+	if err := conn.Open(); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("join feed %q at %q: %w", f.name, f.address, err)
+	}
+	return conn, nil
+}
+
+// ssmFeed parses an ssm:// feed address into an unopened ManagedConn.
+func ssmFeed(address string) (*amt.ManagedConn, error) {
+	u, err := url.Parse(address)
+	if err != nil {
+		return nil, fmt.Errorf("parse %q: %w", address, err)
+	}
+	usage := fmt.Errorf("%q must be ssm://SOURCE@GROUP:PORT[?relay=IP[:PORT]&iface=NAME]", address)
+	if u.User == nil || u.Path != "" {
+		return nil, usage
+	}
+	source, err := netip.ParseAddr(u.User.Username())
+	if err != nil || !source.Is4() {
+		return nil, usage
+	}
+	group, err := netip.ParseAddrPort(u.Host)
+	if err != nil || !group.Addr().Is4() || !group.Addr().IsMulticast() || group.Port() == 0 {
+		return nil, usage
+	}
+	conn := &amt.ManagedConn{SrcAddr: source, GroupAddr: group.Addr(), GroupPort: group.Port(), Mode: amt.AMTModeNative}
+	// Anything but a well-formed relay/iface query would otherwise parse clean
+	// as a native-only feed: a misspelt key, a bad escape, a ';' separator, a
+	// fragment or an empty ?relay= (an unset ${RELAY}) silently drops the AMT
+	// fallback. u.Query() discards what it cannot parse, so parse strictly.
+	query, err := url.ParseQuery(u.RawQuery)
+	if err != nil || u.Fragment != "" {
+		return nil, usage
+	}
+	for key, values := range query {
+		if key != "relay" && key != "iface" {
+			return nil, fmt.Errorf("%w: unknown parameter %q", usage, key)
+		}
+		if len(values) != 1 || values[0] == "" {
+			return nil, fmt.Errorf("%w: %s needs exactly one value", usage, key)
+		}
+	}
+	if relay := query.Get("relay"); relay != "" {
+		if _, _, err := net.SplitHostPort(relay); err != nil {
+			relay = net.JoinHostPort(relay, strconv.Itoa(messages.DefaultPort))
+		}
+		relayAddress, err := net.ResolveUDPAddr("udp4", relay)
+		if err != nil {
+			return nil, fmt.Errorf("%q relay: %w", address, err)
+		}
+		if relayAddress.Port == 0 {
+			// ?relay=IP: splits cleanly with an empty port, skipping the default.
+			return nil, fmt.Errorf("%w: relay port 0", usage)
+		}
+		conn.RelayAddr, conn.Mode = *relayAddress, amt.AMTModeAuto
+	}
+	if name := query.Get("iface"); name != "" {
+		if conn.IFace, err = net.InterfaceByName(name); err != nil {
+			return nil, fmt.Errorf("%q iface: %w", address, err)
+		}
+	}
+	return conn, nil
 }
 
 // ledgerSamples reads the fan-out's per-destination ledger as delivery samples.
@@ -1107,12 +1234,27 @@ func publishWindows(trackers map[string]*erasure.Tracker, metrics *receiver.Rece
 	}
 }
 
+// warnedUndeliverable records, per feed name, that stderr has already said why
+// destinations receive nothing from that feed's v3 frames. It is keyed by feed
+// so a second v3 feed is named too, rather than hidden behind the first one's
+// warning. The counter carries the rate.
+var warnedUndeliverable sync.Map
+
+// warnStderr is where that warning goes; a test swaps it to read the text.
+var warnStderr io.Writer = os.Stderr
+
 // processPacket delivers one packet and then scores it.
 //
-// Delivery runs FIRST and unconditionally. Scoring is accounting: it may not
-// sit in front of a validator's packet, and it may not decide whether a packet
-// is forwarded. Malformed and duplicate packets reach every destination
-// unchanged; what to do with them is the validator's decision.
+// Delivery runs FIRST. Scoring is accounting: it may not sit in front of a
+// validator's packet, and it may not decide whether a packet is forwarded.
+// What reaches a destination is shred.TVUPayload's answer, which depends on the
+// framing alone: a version-4 forwarder frame is delivered as the canonical shred
+// it carries, a version-3 frame is withheld (no TVU can accept an erasure shard
+// stripped of its signature, and billing a customer for it would charge for
+// bytes the validator throws away), and anything else -- a canonical Agave
+// shred, a malformed or duplicate packet -- reaches every destination
+// unchanged, and a duplicate is delivered like its original; what to do with
+// either is the validator's decision.
 //
 // Every value used here is internally synchronized -- Fanout copies the packet
 // under its own lock, both sessionScorer implementations serialize their own
@@ -1132,8 +1274,21 @@ func publishWindows(trackers map[string]*erasure.Tracker, metrics *receiver.Rece
 // tracker may be nil, which disables receiver-observed erasure scoring for the
 // feed without affecting delivery.
 func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer sessionScorer, fanout *receiver.Fanout, metrics *receiver.ReceiverMetrics, tracker *erasure.Tracker) {
-	if fanout != nil && fanout.Enqueue(feedName, packet) == receiver.EnqueueOverflow {
-		_ = metrics.IncFanoutDrop(feedName)
+	if fanout != nil {
+		if payload, ok := shred.TVUPayload(packet); !ok {
+			_ = metrics.IncUndeliverable(feedName)
+			// The other refusal, a bodyless v4 frame, is malformed rather than a
+			// forwarder misconfiguration, so only v3 earns the hint below.
+			if packet[0] == 3 {
+				if _, warned := warnedUndeliverable.LoadOrStore(feedName, struct{}{}); !warned {
+					fmt.Fprintf(warnStderr, "blockcast-shreds: feed %q carries version-3 forwarder frames, "+
+						"which no validator TVU accepts; they are not forwarded. Run the shred-forwarder "+
+						"with --wire-version v4 (see bcast_shred_gw_shreds_undeliverable_total)\n", feedName)
+				}
+			}
+		} else if fanout.Enqueue(feedName, payload) == receiver.EnqueueOverflow {
+			_ = metrics.IncFanoutDrop(feedName)
+		}
 	}
 
 	_, parseErr := scorer.Observe(feedName, packet, receivedAt)
