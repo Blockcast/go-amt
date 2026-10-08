@@ -10,8 +10,10 @@ import (
 	"time"
 )
 
+var t0 = time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
+
 func TestDedupKeysOnFECSetAndLocalIndex(t *testing.T) {
-	d := newDedup(64)
+	d := newDedup(25 * time.Second)
 	for _, step := range []struct {
 		name     string
 		slot     uint64
@@ -24,28 +26,71 @@ func TestDedupKeysOnFECSetAndLocalIndex(t *testing.T) {
 		{"same coordinates, next slot: a different shred", 101, 0, 5, emit},
 		{"slot 0 is never emitted", 0, 0, 5, skip},
 	} {
-		if got := d.observe(step.slot, step.fec, step.idx); got != step.want {
+		if got := d.observe(t0, step.slot, step.fec, step.idx); got != step.want {
 			t.Errorf("%s: observe = %d, want %d", step.name, got, step.want)
 		}
 	}
 }
 
-func TestDedupDropsShredsOlderThanTheWindow(t *testing.T) {
-	d := newDedup(64)
-	d.observe(100, 0, 1)
-	if got := d.observe(200, 0, 1); got != emit {
-		t.Fatalf("slot 200 first sighting: observe = %d, want emit", got)
+func TestDedupForgetsASlotIdleForKeep(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	at := func(sec int) time.Time { return t0.Add(time.Duration(sec) * time.Second) }
+	d.observe(at(0), 100, 0, 1)
+	if got := d.observe(at(20), 100, 0, 1); got != duplicate {
+		t.Fatalf("slot 100 inside keep: observe = %d, want duplicate", got)
 	}
+	// History runs from a slot's latest shred, not its first: 24s after the
+	// latest, a sweep keeps it.
+	d.observe(at(44), 300, 0, 1)
+	if _, kept := d.seen[100]; !kept {
+		t.Fatal("slot 100 was swept 24s after its latest shred, inside keep")
+	}
+	// Sweeps run every keep/2. The next one, 37s after the latest shred,
+	// forgets the slot, and its shreds are emitted again.
+	d.observe(at(57), 300, 0, 2)
 	if _, kept := d.seen[100]; kept {
-		t.Error("slot 100 is outside the 64-slot window but its history was not evicted")
+		t.Error("slot 100 sat idle past keep but its history was not swept")
 	}
-	// Its history is gone, so re-emitting it could repeat a shred the union
-	// already carried.
-	if got := d.observe(100, 0, 1); got != skip {
-		t.Errorf("slot 100 after the window moved past it: observe = %d, want skip", got)
+	if got := d.observe(at(57), 100, 0, 1); got != emit {
+		t.Errorf("slot 100 after its history was swept: observe = %d, want emit", got)
 	}
-	if got := d.observe(150, 0, 1); got != emit {
-		t.Errorf("slot 150 is inside the window: observe = %d, want emit", got)
+}
+
+// One forged far-future slot used to move a slot window past every real slot
+// and stop the union for good (Ally, go-amt#144 comment 6066225989). History
+// by arrival time has no window to move.
+func TestDedupIgnoresTheSlotNumberOfAForgedShred(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	d.observe(t0, 100, 0, 1)
+	for _, forged := range []uint64{1 << 62, 1<<64 - 1, 1} {
+		if got := d.observe(t0, forged, 0, 1); got != emit {
+			t.Errorf("forged slot %d: observe = %d, want emit (the merger does not authenticate)", forged, got)
+		}
+	}
+	for i := uint32(2); i < 52; i++ {
+		if got := d.observe(t0.Add(time.Duration(i)*time.Millisecond), 100, 0, i); got != emit {
+			t.Fatalf("real shred %d after forged slots: observe = %d, want emit", i, got)
+		}
+	}
+	if got := d.observe(t0.Add(time.Second), 100, 0, 1); got != duplicate {
+		t.Errorf("real slot's history after forged slots: observe = %d, want duplicate", got)
+	}
+}
+
+func TestDedupBoundsHistoryUnderAFloodOfSlots(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	at := t0
+	d.observe(at, 100, 0, 1)
+	for s := uint64(1 << 40); s < 1<<40+3*maxDedupSlots; s++ {
+		at = at.Add(time.Microsecond)
+		d.observe(at, s, 0, 1)
+		d.observe(at, 100, 0, uint32(s)) // the real slot keeps receiving
+	}
+	if len(d.seen) > maxDedupSlots {
+		t.Errorf("dedup holds %d slots, want at most %d", len(d.seen), maxDedupSlots)
+	}
+	if got := d.observe(at, 100, 0, 1); got != duplicate {
+		t.Errorf("the slot being received lost its history in the flood: observe = %d, want duplicate", got)
 	}
 }
 

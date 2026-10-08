@@ -54,6 +54,9 @@
 // the FEC set (0..63), so it would collapse distinct shreds across FEC sets in
 // the slot. The key ignores the wire version, so a shred both inputs deliver
 // is emitted once even while the inputs are on different versions.
+// History of a slot lasts -dedup-keep past its latest shred: an arrival
+// clock, not a slot window, because the forwarders do not authenticate slots
+// (see dedup).
 //
 // Verbatim frames (28-byte header + body) are byte-identical to what a single
 // forwarder would have produced. They keep the original send_ts_us of
@@ -256,8 +259,9 @@ func reader(c *net.UDPConn, src uint8, out chan<- frame, dropped *atomic.Uint64)
 		b := make([]byte, maxDatagram)
 		n, _, err := c.ReadFromUDP(b)
 		if err != nil {
-			log.Printf("read error (src=%d): %v", src, err)
-			return
+			// The union needs both ingests: exit so systemd restarts the
+			// merger, rather than run on half of them with healthy stats.
+			log.Fatalf("read error (src=%d): %v", src, err)
 		}
 		if n < hdrLen {
 			continue
@@ -275,53 +279,86 @@ type verdict int
 const (
 	emit      verdict = iota // first sighting: forward it
 	duplicate                // the union already carries this shred
-	skip                     // slot 0, or older than the dedup window
+	skip                     // slot 0: no real shred has it
 )
 
-// dedup remembers, per slot, which shreds the union has already emitted.
+// dedup remembers, per slot, which shreds the union has already emitted. It
+// forgets a slot once keep passes with no shred of it.
+//
+// History is bounded by arrival time, not by distance from the highest slot
+// seen, for the reason shred/retention.go gives: the slot is whatever the
+// sender wrote. The forwarders take shreds on a TVU port open to any host and
+// check no signature. When history was a window below the highest slot, one
+// forged far-future slot moved the window past every real slot, and the union
+// emitted nothing more until a restart. Now a forged slot only costs one entry
+// that ages out, and real shreds are never refused.
 type dedup struct {
-	window  uint64
-	maxSlot uint64
-	seen    map[uint64]map[uint64]struct{} // slot -> fec_set_index<<32 | local_index
+	keep    time.Duration
+	maxSlot uint64 // the highest slot seen, for the stats line only
+	seen    map[uint64]*slotSeen
+	sweep   time.Time // when the next eviction pass runs
 }
 
-func newDedup(window uint64) *dedup {
-	return &dedup{window: window, seen: make(map[uint64]map[uint64]struct{}, 256)}
+type slotSeen struct {
+	last time.Time           // arrival of its latest shred
+	ids  map[uint64]struct{} // fec_set_index<<32 | local_index
 }
 
-func (d *dedup) observe(slot uint64, fec, idx uint32) verdict {
+// maxDedupSlots bounds history under a flood of distinct forged slots. Real
+// traffic holds keep times the slot rate, about 140 slots at the default.
+// Past the cap, the slot idle longest goes first, and a slot still being
+// received is never the idlest.
+const maxDedupSlots = 256
+
+func newDedup(keep time.Duration) *dedup {
+	return &dedup{keep: keep, seen: map[uint64]*slotSeen{}}
+}
+
+func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
 	if slot == 0 {
 		return skip
 	}
-	if slot > d.maxSlot {
-		d.maxSlot = slot
-		// Evict slots that have fallen out of the dedup window.
-		if d.maxSlot > d.window {
-			cutoff := d.maxSlot - d.window
-			for s := range d.seen {
-				if s < cutoff {
-					delete(d.seen, s)
-				}
+	d.maxSlot = max(d.maxSlot, slot)
+	if !now.Before(d.sweep) {
+		// One pass per keep/2 rather than per shred, so a slot can outlive
+		// keep by up to half of it.
+		for s, ss := range d.seen {
+			if now.Sub(ss.last) > d.keep {
+				delete(d.seen, s)
 			}
 		}
+		d.sweep = now.Add(d.keep / 2)
 	}
-	// A shred older than the window is dropped, not emitted: its history is
-	// gone, so it could be a repeat. At 64 slots (~25s) of history against
-	// sub-second skew between the listeners, this should not fire in practice.
-	if d.maxSlot > d.window && slot < d.maxSlot-d.window {
-		return skip
+	ss := d.seen[slot]
+	if ss == nil {
+		if len(d.seen) >= maxDedupSlots {
+			d.forgetIdlest()
+		}
+		ss = &slotSeen{ids: map[uint64]struct{}{}}
+		d.seen[slot] = ss
 	}
-	set, ok := d.seen[slot]
-	if !ok {
-		set = make(map[uint64]struct{}, 4096)
-		d.seen[slot] = set
-	}
+	ss.last = now
+	// A shred of a slot already forgotten is emitted again. After keep with
+	// no shred of its slot, a repeat is rarer than the harm of refusing a
+	// slot on its number alone.
 	k := uint64(fec)<<32 | uint64(idx)
-	if _, dup := set[k]; dup {
+	if _, dup := ss.ids[k]; dup {
 		return duplicate
 	}
-	set[k] = struct{}{}
+	ss.ids[k] = struct{}{}
 	return emit
+}
+
+// forgetIdlest forgets the slot whose latest shred arrived longest ago.
+func (d *dedup) forgetIdlest() {
+	var idlest uint64
+	var at time.Time
+	for s, ss := range d.seen {
+		if at.IsZero() || ss.last.Before(at) {
+			idlest, at = s, ss.last
+		}
+	}
+	delete(d.seen, idlest)
 }
 
 // asV3 returns b as a forwarder wire-version-3 frame.
@@ -481,7 +518,7 @@ func main() {
 		src6      = flag.String("src6", "", "local IPv6 address; SSM source of the IPv6 outputs (required by any)")
 		localPort = flag.Int("local-port", 5002, "loopback UDP port the second listener feeds")
 		ttl       = flag.Int("ttl", 16, "IP_MULTICAST_TTL and IPV6_MULTICAST_HOPS for the outputs")
-		window    = flag.Uint64("slot-window", 64, "slots of dedup history to retain (~400ms per slot)")
+		keep      = flag.Duration("dedup-keep", 25*time.Second, "how long a slot's dedup history outlives its latest shred")
 		statsSec  = flag.Int("stats-interval", 10, "seconds between stats lines")
 		rcvbuf    = flag.Int("rcvbuf", 4<<20, "SO_RCVBUF for ingest sockets")
 	)
@@ -489,6 +526,9 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
+	if *keep <= 0 {
+		log.Fatalf("-dedup-keep %v: want a positive duration", *keep)
+	}
 	if *egress != "" {
 		specs = append(specs, *egress+"=all")
 	}
@@ -548,8 +588,8 @@ func main() {
 	go reader(inA, 0, ch, &qdrop)
 	go reader(inB, 1, ch, &qdrop)
 
-	seen := newDedup(*window)
-	var rxA, rxB, emitted, emittedV3, emittedV4, dupA, dupB, firstFromB, v3Unconvertible uint64
+	seen := newDedup(*keep)
+	var rxA, rxB, emitted, emittedV3, emittedV4, dupA, dupB, firstFromB, v3Unconvertible, skipped uint64
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -565,8 +605,9 @@ func main() {
 			} else {
 				rxB++
 			}
-			switch seen.observe(binary.LittleEndian.Uint64(b[1:9]), binary.LittleEndian.Uint32(b[9:13]), binary.LittleEndian.Uint32(b[13:17])) {
+			switch seen.observe(time.Now(), binary.LittleEndian.Uint64(b[1:9]), binary.LittleEndian.Uint32(b[9:13]), binary.LittleEndian.Uint32(b[13:17])) {
 			case skip:
+				skipped++
 				continue
 			case duplicate:
 				if f.src == 0 {
@@ -600,8 +641,8 @@ func main() {
 				emitErr += o.err
 				fmt.Fprintf(&per, " %s@%s=%d/%d", o.kind, o.dst, o.sent, o.err)
 			}
-			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d qdrop=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d%s",
-				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, qdrop.Load(), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, per.String())
+			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d qdrop=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d%s",
+				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, qdrop.Load(), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, per.String())
 
 		case s := <-sig:
 			log.Printf("signal %v; final: rx_prod=%d rx_listener2=%d emitted=%d first_from_listener2=%d", s, rxA, rxB, emitted, firstFromB)
