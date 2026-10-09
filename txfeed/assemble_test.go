@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"math/rand/v2"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -414,17 +415,16 @@ func TestAssemblerKeepsDataFramesOffCodingPositions(t *testing.T) {
 		t.Errorf("%+v; want the 32 data frames past num_data rejected", s)
 	}
 
-	// Nor can a set's first coding frame shrink num_data below a data frame
-	// already received.
+	// Nor can a coding frame move the boundary by stating another geometry.
 	for local := range uint32(21) {
 		a.Add(data(2, local))
 	}
 	f := testFrame(2, 0, 25, make([]byte, testShardSize), false)
-	f[17], f[18], f[19] = 0x02, 16, 16 // 16:16 makes local 25 coding position 9
+	f[17], f[18], f[19] = 0x02, 16, 16 // 16:16 would make local 25 coding position 9
 	before := a.Stats().Bad
 	a.Add(f)
 	if s := a.Stats(); s.Bad != before+1 {
-		t.Errorf("%+v; want the coding frame that shrinks num_data to 16 under data shred 20 rejected", s)
+		t.Errorf("%+v; want the 16:16 coding frame refused", s)
 	}
 
 	// And a rejected frame does not fix the set's shard size.
@@ -436,25 +436,77 @@ func TestAssemblerKeepsDataFramesOffCodingPositions(t *testing.T) {
 	}
 }
 
-// The geometry comes off the wire, so the encoder cache keyed by it must stay
-// bounded however many geometries a stream names.
-func TestAssemblerBoundsTheEncoderCache(t *testing.T) {
+// The geometry comes off the wire, and Reed-Solomon work grows with it: a
+// stream rotating large geometries made every set rebuild an encoder (Ally,
+// go-amt#145, the supplementary pass on bb7e505). Only 32:32 is accepted, as
+// shred/header.go requires.
+func TestAssemblerRefusesGeometriesButThirtyTwoThirtyTwo(t *testing.T) {
 	a := NewAssembler(testKeep)
-	for nc := range 255 {
-		f := testFrame(3, uint32(nc), 1, make([]byte, testShardSize), false)
-		f[17], f[18], f[19] = 0x02, 1, byte(nc+1) // 1:nc+1, one coding shard: enough to recover
+	for i, g := range [][2]byte{{1, 1}, {16, 16}, {32, 33}, {33, 32}, {64, 64}, {128, 128}, {32, 32}} {
+		f := testFrame(3, uint32(32*i), 40, make([]byte, testShardSize), false)
+		f[18], f[19] = g[0], g[1]
 		a.Add(f)
 	}
-	if len(a.encoders) > maxEncoders {
-		t.Errorf("caching %d encoders, want at most %d", len(a.encoders), maxEncoders)
+	if s := a.Stats(); s.Bad != 6 || s.Held != 1 {
+		t.Errorf("%+v; want the six geometries other than 32:32 refused, the 32:32 frame held", s)
+	}
+}
+
+// A slot's data shreds are indexed in fixed bitmaps, not in a slice sized by
+// the highest index seen, which let one forged frame at 32767 pin a megabyte
+// (Ally, go-amt#145 review 5464388445).
+func TestAssemblerMemoryDoesNotFollowTheIndex(t *testing.T) {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	a := NewAssembler(testKeep)
+	for slot := range uint64(maxSlots) {
+		s := testDataShard(slot+1, 32767, 0, []byte{1})
+		a.Add(testFrame(slot+1, 32767/32*32, 31, s, false))
+	}
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	if s := a.Stats(); s.Held != maxSlots || s.Bad != 0 {
+		t.Fatalf("%+v; want one frame held in each of %d slots", s, maxSlots)
+	}
+	// 12 KiB of index and one frame per slot is 1.7 MiB; an index-sized slice
+	// was 128 MiB.
+	if grew := int64(after.HeapAlloc) - int64(before.HeapAlloc); grew > 16<<20 {
+		t.Errorf("%d frames at index 32767 hold %d MiB", maxSlots, grew>>20)
+	}
+	runtime.KeepAlive(a)
+}
+
+// Finding a batch's ends along a run with no DATA_COMPLETE used to walk the
+// run shred by shred, so a run sent in reverse cost quadratic time: 1.6 s for
+// 32768 shreds, against 0.07 s in order. The bitmaps keep the reverse order
+// within a small factor of the forward one.
+func TestAssemblerReverseRunCostsAboutWhatForwardDoes(t *testing.T) {
+	frames := make([][]byte, maxSlotIndexes)
+	for i := range uint32(maxSlotIndexes) {
+		frames[i] = testFrame(7, i/32*32, i%32, testDataShard(7, i, 0, []byte{1}), false)
+	}
+	run := func(order func(int) int) time.Duration {
+		a := NewAssembler(testKeep)
+		start := time.Now()
+		for k := range frames {
+			a.Add(frames[order(k)])
+		}
+		return time.Since(start)
+	}
+	fwd := run(func(k int) int { return k })
+	rev := run(func(k int) int { return len(frames) - 1 - k })
+	if rev > 4*fwd+50*time.Millisecond {
+		t.Errorf("reverse order took %v, forward %v: the search for a batch's ends is no longer cheap", rev, fwd)
 	}
 }
 
 // FuzzAssembler feeds frames built from the input. Their headers agree with
 // their framing, so they get past validation into the set logic, which must
 // never panic or outgrow its bounds. Each 8-byte op is a run of frames:
-// slot, FEC set, first local index, run length, kind and num_coding,
-// num_data or data flags, payload, and how far the clock then moves.
+// slot, FEC set, first local index, run length, kind (and whether a coding
+// frame states another geometry), its num_data or the data flags, payload,
+// and how far the clock then moves.
 func FuzzAssembler(f *testing.F) {
 	f.Add([]byte{1, 0, 0, 31, 0, 0x40, 9, 0, 1, 0, 32, 31, 65, 32, 7, 1})
 	f.Fuzz(func(t *testing.T, ops []byte) {
@@ -462,7 +514,7 @@ func FuzzAssembler(f *testing.F) {
 		clock := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
 		a.now = func() time.Time { return clock }
 		for ; len(ops) >= 8; ops = ops[8:] {
-			slot, fec := uint64(ops[0]%4), uint32(ops[1]%128)
+			slot, fec := uint64(ops[0]%4), uint32(ops[1])<<7 // up to 32640, near the last index
 			for local := uint32(ops[2]); local <= uint32(ops[2])+uint32(ops[3]%64); local++ {
 				var fr []byte
 				if ops[4]&1 == 0 {
@@ -472,30 +524,32 @@ func FuzzAssembler(f *testing.F) {
 					fr[17], fr[18], fr[19] = 0, 0, 0
 				} else {
 					fr = testFrame(slot, fec, local, bytes.Repeat([]byte{ops[6]}, testShardSize), false)
-					fr[17], fr[18], fr[19] = 0x02, ops[5], ops[4]>>1
+					fr[17], fr[18], fr[19] = 0x02, 32, 32
+					if ops[4]&2 != 0 {
+						fr[18], fr[19] = ops[5], ops[4]>>2 // another geometry, to be refused
+					}
 				}
 				a.Add(fr)
 			}
 			clock = clock.Add(time.Duration(ops[7]) * time.Second / 16)
 		}
-		if s := a.Stats(); s.Slots > maxSlots || len(a.encoders) > maxEncoders {
-			t.Errorf("%+v, %d encoders: past the bounds", s, len(a.encoders))
+		if s := a.Stats(); s.Slots > maxSlots {
+			t.Errorf("%+v: past the slot bound", s)
 		}
 	})
 }
 
-// A flood of distinct sets and local indexes on one slot number keeps that
-// slot fresh, so only a cap on what the slot holds bounds it. This is the
-// merger's per-slot finding (Ally, go-amt#144 review 5464269530) in the
-// assembler.
+// A set starts at a multiple of 32, so a flood of distinct set indexes on one
+// slot number holds at most 1024 sets. Taking any index let one 52-byte frame
+// per index pin 1.9 KiB of set: 59 MiB a slot, 36 times what was sent.
 func TestAssemblerBoundsWhatOneSlotHolds(t *testing.T) {
 	a := NewAssembler(testKeep)
 	shard := make([]byte, testShardSize)
-	for i := range maxSlotFrames + 10 {
-		fec, local := uint32(i/31), uint32(32+i%31) // 31 coding frames a set: too few to recover
-		a.Add(testFrame(5, fec, local, shard, false))
+	for fec := range uint32(maxSlotIndexes) {
+		a.Add(testFrame(5, fec, 32, shard, false)) // one coding frame a set
 	}
-	if s := a.Stats(); s.Held != 10 || s.Evicted != 1 || s.Bad != 0 {
-		t.Errorf("%+v; want the slot started over once at %d frames, holding the 10 since", s, maxSlotFrames)
+	sets := uint64(maxSlotIndexes / numData)
+	if s := a.Stats(); s.Held != sets || s.Bad != maxSlotIndexes-sets {
+		t.Errorf("%+v; want the %d sets starting at a multiple of %d held, the rest refused", s, sets, numData)
 	}
 }

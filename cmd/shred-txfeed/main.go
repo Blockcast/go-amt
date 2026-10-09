@@ -30,6 +30,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/netip"
 	"os"
@@ -44,7 +45,6 @@ import (
 
 const (
 	maxDatagram = 2048
-	maxNamed    = 16 // named partitions occupy offsets 16..31
 )
 
 // output is one address family's partition groups.
@@ -81,8 +81,8 @@ func parsePrograms(specs []string) ([]txfeed.Named, error) {
 	if len(specs) == 0 {
 		return txfeed.DefaultPrograms, nil
 	}
-	if len(specs) > maxNamed {
-		return nil, fmt.Errorf("%d -program values, at most %d", len(specs), maxNamed)
+	if len(specs) > txfeed.NumNamed {
+		return nil, fmt.Errorf("%d -program values, at most %d", len(specs), txfeed.NumNamed)
 	}
 	var named []txfeed.Named
 	for _, s := range specs {
@@ -142,6 +142,9 @@ func main() {
 
 	if *keep <= 0 {
 		log.Fatalf("-keep %v: want a positive duration", *keep)
+	}
+	if *statsSec <= 0 {
+		log.Fatalf("-stats-interval %d: want a positive number of seconds", *statsSec)
 	}
 	named, err := parsePrograms(programs)
 	if err != nil {
@@ -216,11 +219,11 @@ func main() {
 	go reader(in, ch, &qdrop)
 
 	asm := txfeed.NewAssembler(*keep)
-	var batchErr, txs, votes, oversize, sent, sendErr uint64
+	var batchErr, txs, votes, oversize, overflow, sent, sendErr uint64
 	stats := func() string {
 		s := asm.Stats()
-		return fmt.Sprintf("frames=%d dups=%d bad=%d sets_recovered=%d shards_recovered=%d recovered_bad=%d parity_checked=%d parity_mismatch=%d batches=%d batch_err=%d txs=%d votes=%d oversize=%d sent=%d send_err=%d queue=%d qdrop=%d slots=%d held=%d evicted=%d max_slot=%d",
-			s.Frames, s.Dups, s.Bad, s.SetsRecovered, s.ShardsRecovered, s.RecoveredBad, s.ParityChecked, s.ParityMismatch, s.Batches, batchErr, txs, votes, oversize, sent, sendErr, len(ch), qdrop.Load(), s.Slots, s.Held, s.Evicted, s.MaxSlot)
+		return fmt.Sprintf("frames=%d dups=%d bad=%d sets_recovered=%d shards_recovered=%d recovered_bad=%d parity_checked=%d parity_mismatch=%d batches=%d batch_err=%d txs=%d votes=%d oversize=%d index_overflow=%d sent=%d send_err=%d queue=%d qdrop=%d slots=%d held=%d evicted=%d max_slot=%d",
+			s.Frames, s.Dups, s.Bad, s.SetsRecovered, s.ShardsRecovered, s.RecoveredBad, s.ParityChecked, s.ParityMismatch, s.Batches, batchErr, txs, votes, oversize, overflow, sent, sendErr, len(ch), qdrop.Load(), s.Slots, s.Held, s.Evicted, s.MaxSlot)
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -245,6 +248,10 @@ func main() {
 					txs++
 					if len(tx.Raw) > txfeed.MaxTxSize {
 						oversize++ // its frame would overrun a subscriber's MaxFrameSize buffer
+						continue
+					}
+					if i > math.MaxUint16 {
+						overflow++ // past a txframe's u16 index; only a forged batch holds that many
 						continue
 					}
 					if tx.Vote {

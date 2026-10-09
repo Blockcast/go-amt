@@ -146,6 +146,11 @@ func parseTx(b []byte) (Tx, message, error) {
 		v0 = true
 	}
 	m.required = int(r.u8())
+	if r.err == nil && m.required == 0 {
+		// The fee payer always signs; with no signer VerifyTx would have
+		// nothing to check and report a pass.
+		return Tx{}, m, errors.New("transaction without a signer")
+	}
 	r.bytes(2) // num_readonly_signed, num_readonly_unsigned
 	m.keys = r.bytes(32 * r.shortVec())
 	r.bytes(32) // recent_blockhash

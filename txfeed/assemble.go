@@ -16,6 +16,7 @@ package txfeed
 import (
 	"bytes"
 	"encoding/binary"
+	"math/bits"
 	"slices"
 	"time"
 
@@ -41,8 +42,15 @@ const (
 	dataHeaderSize   = 24
 	flagDataComplete = 0x40
 
-	// Bounds on what a hostile stream can make the assembler hold.
-	maxSetShards   = 256   // data + coding shards per FEC set
+	// Every FEC set is 32 data shreds and 32 coding, as shred/header.go
+	// requires, so a set starts at a multiple of 32, as every set on the live
+	// union does. A data frame's local index is its position, below numData; a
+	// coding frame's is numData plus its position. A frame stating any other
+	// geometry or start is refused, so the wire cannot choose the Reed-Solomon
+	// work, and one slot holds at most 1024 sets of 64 frames.
+	numData   = 32
+	numCoding = 32
+
 	maxSlotIndexes = 32768 // data shred indexes per slot
 
 	// maxSlots bounds the slots held under a flood of distinct forged slots.
@@ -50,21 +58,6 @@ const (
 	// Past it, the slot idle longest goes first, and a slot still being
 	// received is never the idlest.
 	maxSlots = 128
-
-	// maxSlotFrames bounds what one slot holds. A flood of distinct sets and
-	// local indexes on one slot number keeps that slot fresh, so neither keep
-	// nor maxSlots ever forgets it. A real slot carries at most 32768 data
-	// shreds and as many coding. Past it, the slot starts over.
-	maxSlotFrames = 1 << 16
-
-	// maxEncoders bounds the Reed-Solomon encoders cached by geometry, which
-	// comes off the wire. Production uses one.
-	maxEncoders = 8
-
-	// Production is 32:32 on every set. Data frames carry no geometry, so a
-	// set assumes this until a coding frame states its own.
-	defaultNumData   = 32
-	defaultNumCoding = 32
 
 	// The parity check samples sets that arrive complete: the first
 	// parityWarmup, then every parityEvery-th.
@@ -84,14 +77,14 @@ type Batch struct {
 type Stats struct {
 	Frames          uint64 // frames added
 	Dups            uint64 // frames whose (slot, fec_set_index, local_index) was already received
-	Bad             uint64 // malformed frames, dropped
+	Bad             uint64 // malformed frames, and frames of a set not 32:32 or not starting at a multiple of 32, dropped
 	SetsRecovered   uint64 // FEC sets that recovered at least one data shard
 	ShardsRecovered uint64 // data shards recovered
 	RecoveredBad    uint64 // recovered data shards whose own header contradicts their position, discarded
 	ParityChecked   uint64 // complete sets whose coding shards were re-encoded from their data
 	ParityMismatch  uint64 // checked sets whose re-encoded parity differs from what was received
 	Batches         uint64 // entry batches emitted
-	Evicted         uint64 // slots forgotten: idle past keep, the idlest at maxSlots, or full at maxSlotFrames
+	Evicted         uint64 // slots forgotten: idle past keep, or the idlest at maxSlots
 
 	Slots   uint64 // slots held
 	Held    uint64 // frames accepted into the slots held
@@ -112,47 +105,52 @@ type Assembler struct {
 	sweep    time.Time        // when the next eviction pass runs
 	maxSlot  uint64           // for Stats only
 	slots    map[uint64]*slotState
-	encoders map[[2]int]reedsolomon.Encoder // by (num_data, num_coding)
-	complete uint64                         // sets that arrived complete
+	enc      reedsolomon.Encoder // 32:32
+	complete uint64              // sets that arrived complete
 	stats    Stats
 }
 
 type slotState struct {
-	last   time.Time          // arrival of its latest frame
-	frames int                // frames accepted, toward maxSlotFrames
-	sets   map[uint32]*fecSet // by fec_set_index
-	shreds []dataShred        // by absolute index
+	last    time.Time          // arrival of its latest frame
+	frames  int                // frames accepted, for Stats.Held
+	sets    map[uint32]*fecSet // by fec_set_index
+	data    *slotIndex         // the data shreds available to deshred; nil until the first
+	payload map[uint32][]byte  // their payloads by absolute index, until their batch decodes
 }
 
-// dataShred is a data shred available to deshred, received or recovered.
-type dataShred struct {
-	payload []byte // released once its batch is decoded
-	flags   byte
-	have    bool
-	decoded bool // the batch starting here was emitted
+// slotIndex records, by absolute data shred index, which data shreds are
+// available (received or recovered), which carry DATA_COMPLETE, and which
+// start a batch already decoded. It is 12 KiB whatever index a frame names:
+// a slice sized by index let one forged frame at 32767 pin a megabyte. Read a
+// word at a time, it also keeps the search for a batch's ends cheap along a
+// long run with no DATA_COMPLETE, which a hostile stream sent in reverse once
+// made quadratic.
+type slotIndex struct {
+	have, complete, decoded [maxSlotIndexes / 64]uint64
 }
 
 type fecSet struct {
-	numData, numCoding int
-	geometry           bool                      // a coding frame fixed numData and numCoding
-	size               int                       // shard length, the same for every shard of the set
-	data, coding       [][]byte                  // by position, nil when missing; data includes recovered shards
-	received           [maxSetShards / 64]uint64 // bitmap of received local indexes
-	tried              bool                      // reconstruction has run
-	done               bool                      // every shard was received; data and coding are released
+	size     int        // shard length, the same for every shard of the set
+	shards   [64][]byte // by local index, nil when missing; data includes recovered shards
+	received uint64     // bitmap of received local indexes
+	tried    bool       // reconstruction has run
+	done     bool       // every shard was received; shards are released
 }
-
-func (s *fecSet) has(local uint32) bool { return s.received[local/64]&(1<<(local%64)) != 0 }
-func (s *fecSet) mark(local uint32)     { s.received[local/64] |= 1 << (local % 64) }
 
 // NewAssembler returns an Assembler that forgets a slot once keep passes with
 // no frame of it. A frame for a slot already forgotten starts the slot afresh.
 func NewAssembler(keep time.Duration) *Assembler {
+	// No inversion cache: it keeps a matrix per pattern of missing shards, and
+	// live sets miss a different pattern nearly every time.
+	enc, err := reedsolomon.New(numData, numCoding, reedsolomon.WithInversionCache(false))
+	if err != nil {
+		panic(err) // fixed, valid arguments
+	}
 	return &Assembler{
-		keep:     keep,
-		now:      time.Now,
-		slots:    map[uint64]*slotState{},
-		encoders: map[[2]int]reedsolomon.Encoder{},
+		keep:  keep,
+		now:   time.Now,
+		slots: map[uint64]*slotState{},
+		enc:   enc,
 	}
 }
 
@@ -191,17 +189,19 @@ func (a *Assembler) Add(frame []byte) []Batch {
 	ts := binary.LittleEndian.Uint64(frame[20:28])
 	shard := frame[shred.WireHeaderSize:]
 
-	// Validate before the frame can create state. A coding frame's local
-	// index is num_data + its position; a data frame's is its position, and
-	// its shard's own header must agree.
+	// Validate before the frame can create state. The local index alone says
+	// which kind of shard a position takes, so data and coding never claim
+	// the same one.
 	var payload []byte
 	var flags byte
-	ok := fec < maxSlotIndexes && local < maxSetShards
-	if ok && coding {
-		ok = nd > 0 && nc > 0 && nd+nc <= maxSetShards && int(local) >= nd && int(local) < nd+nc
-	} else if ok {
-		payload, flags, ok = dataShard(shard, slot, fec, fec+local)
-		ok = ok && fec+local < maxSlotIndexes
+	ok := fec < maxSlotIndexes && fec%numData == 0
+	if coding {
+		ok = ok && nd == numData && nc == numCoding && local >= numData && local < numData+numCoding
+	} else {
+		ok = ok && local < numData
+		if ok {
+			payload, flags, ok = dataShard(shard, slot, fec, fec+local)
+		}
 	}
 	if !ok {
 		a.stats.Bad++
@@ -221,11 +221,6 @@ func (a *Assembler) Add(frame []byte) []Batch {
 		a.sweep = now.Add(a.keep / 2)
 	}
 	ss := a.slots[slot]
-	if ss != nil && ss.frames >= maxSlotFrames {
-		delete(a.slots, slot) // more frames than a real slot has: start it over
-		a.stats.Evicted++
-		ss = nil
-	}
 	if ss == nil {
 		if len(a.slots) >= maxSlots {
 			a.evictIdlest()
@@ -236,40 +231,28 @@ func (a *Assembler) Add(frame []byte) []Batch {
 	ss.last = now
 	set := ss.sets[fec]
 	if set == nil {
-		set = &fecSet{numData: defaultNumData, numCoding: defaultNumCoding}
+		set = &fecSet{}
 		ss.sets[fec] = set
 	}
 
-	if set.has(local) {
+	if set.received&(1<<local) != 0 {
 		a.stats.Dups++
 		return nil
 	}
-	// The bitmap of received local indexes says nothing of which kind of frame
-	// took each one, so keep the kinds apart: data below num_data, coding from
-	// it on (checked above), and the set's first coding frame cannot set a
-	// num_data that a data frame already received reaches.
-	if set.size != 0 && len(shard) != set.size ||
-		!coding && int(local) >= set.numData ||
-		coding && set.geometry && (nd != set.numData || nc != set.numCoding) ||
-		coding && !set.geometry && len(set.data) > nd {
+	if set.size != 0 && len(shard) != set.size {
 		a.stats.Bad++
 		return nil
 	}
 	set.size = len(shard)
-	set.mark(local)
+	set.received |= 1 << local
 	ss.frames++
+	// A received data shard replaces a recovered one, so a complete set's
+	// parity is checked against received data only.
+	set.shards[local] = shard
 
 	var fresh []uint32 // absolute indexes of data shreds this frame made available
-	if coding {
-		set.numData, set.numCoding, set.geometry = nd, nc, true
-		set.coding = put(set.coding, int(local)-nd, shard)
-	} else {
-		// A received shard replaces a recovered one, so a complete set's
-		// parity is checked against received data only.
-		set.data = put(set.data, int(local), shard)
-		if ss.add(fec+local, payload, flags) {
-			fresh = append(fresh, fec+local)
-		}
+	if !coding && ss.add(fec+local, payload, flags) {
+		fresh = append(fresh, fec+local)
 	}
 	fresh = append(fresh, a.recover(slot, fec, set, ss)...)
 	a.checkComplete(set)
@@ -293,49 +276,30 @@ func (a *Assembler) evictIdlest() {
 // shards are present, and returns the absolute indexes that became
 // available. It runs once per set.
 func (a *Assembler) recover(slot uint64, fec uint32, set *fecSet, ss *slotState) []uint32 {
-	nd, nc := set.numData, set.numCoding
-	if set.tried || !set.geometry {
-		return nil
-	}
-	present, missing := 0, false
-	for i := range nd {
-		if i < len(set.data) && set.data[i] != nil {
-			present++
-		} else {
-			missing = true
-		}
-	}
-	for i := range min(nc, len(set.coding)) {
-		if set.coding[i] != nil {
-			present++
-		}
-	}
-	if !missing || present < nd {
+	const allData = 1<<numData - 1
+	if set.tried || set.received&allData == allData || bits.OnesCount64(set.received) < numData {
 		return nil
 	}
 	set.tried = true
-	enc := a.encoder(nd, nc)
-	shards := make([][]byte, nd+nc)
-	copy(shards[:nd], set.data)
-	copy(shards[nd:], set.coding)
-	if enc == nil || enc.ReconstructData(shards) != nil {
+	shards := set.shards
+	if a.enc.ReconstructData(shards[:]) != nil {
 		return nil
 	}
 	var fresh []uint32
 	recovered := false
-	for i := range nd {
-		if i < len(set.data) && set.data[i] != nil {
+	for i := range uint32(numData) {
+		if set.shards[i] != nil {
 			continue
 		}
 		// A recovered shard carries its own header. If it contradicts the
 		// shard's position, recovery produced garbage: never feed it on.
-		idx := fec + uint32(i)
+		idx := fec + i
 		payload, flags, ok := dataShard(shards[i], slot, fec, idx)
-		if !ok || idx >= maxSlotIndexes {
+		if !ok {
 			a.stats.RecoveredBad++
 			continue
 		}
-		set.data = put(set.data, i, shards[i])
+		set.shards[i] = shards[i]
 		a.stats.ShardsRecovered++
 		recovered = true
 		if ss.add(idx, payload, flags) {
@@ -355,90 +319,76 @@ func (a *Assembler) recover(slot uint64, fec uint32, set *fecSet, ss *slotState)
 // which is Backblaze-compatible, as klauspost/reedsolomon should be. Any
 // mismatch means recovered shards cannot be trusted.
 func (a *Assembler) checkComplete(set *fecSet) {
-	if set.done {
+	if set.done || set.received != 1<<(numData+numCoding)-1 {
 		return
-	}
-	for i := range set.numData + set.numCoding {
-		if !set.has(uint32(i)) {
-			return
-		}
 	}
 	set.done = true
 	a.complete++
-	if enc := a.encoder(set.numData, set.numCoding); enc != nil && (a.complete <= parityWarmup || a.complete%parityEvery == 0) {
-		shards := make([][]byte, set.numData+set.numCoding)
-		copy(shards, set.data[:set.numData])
-		for i := set.numData; i < len(shards); i++ {
+	if a.complete <= parityWarmup || a.complete%parityEvery == 0 {
+		shards := set.shards
+		for i := numData; i < numData+numCoding; i++ {
 			shards[i] = make([]byte, set.size)
 		}
-		if enc.Encode(shards) == nil {
+		if a.enc.Encode(shards[:]) == nil {
 			a.stats.ParityChecked++
-			for i, c := range set.coding[:set.numCoding] {
-				if !bytes.Equal(shards[set.numData+i], c) {
+			for i := numData; i < numData+numCoding; i++ {
+				if !bytes.Equal(shards[i], set.shards[i]) {
 					a.stats.ParityMismatch++
 					break
 				}
 			}
 		}
 	}
-	set.data, set.coding = nil, nil
-}
-
-// encoder returns the cached encoder for a geometry, nil if there is none.
-func (a *Assembler) encoder(nd, nc int) reedsolomon.Encoder {
-	k := [2]int{nd, nc}
-	enc, ok := a.encoders[k]
-	if !ok {
-		if len(a.encoders) >= maxEncoders {
-			clear(a.encoders)
-		}
-		// No inversion cache: it keeps a matrix per pattern of missing shards,
-		// and live sets miss a different pattern nearly every time.
-		enc, _ = reedsolomon.New(nd, nc, reedsolomon.WithInversionCache(false))
-		a.encoders[k] = enc
-	}
-	return enc
+	set.shards = [64][]byte{}
 }
 
 // add makes data shred i available and reports whether it was new.
 func (ss *slotState) add(i uint32, payload []byte, flags byte) bool {
-	if int(i) >= len(ss.shreds) {
-		ss.shreds = append(ss.shreds, make([]dataShred, int(i)+1-len(ss.shreds))...)
+	if ss.data == nil {
+		ss.data, ss.payload = &slotIndex{}, map[uint32][]byte{}
 	}
-	if ss.shreds[i].have {
+	w, m := i/64, uint64(1)<<(i%64)
+	if ss.data.have[w]&m != 0 {
 		return false
 	}
-	ss.shreds[i] = dataShred{payload: payload, flags: flags, have: true}
+	ss.data.have[w] |= m
+	if flags&flagDataComplete != 0 {
+		ss.data.complete[w] |= m
+	}
+	if len(payload) > 0 {
+		ss.payload[i] = payload
+	}
 	return true
 }
 
 // deshred decodes, once each, the complete batches around the fresh data
 // shreds. Batches decode out of order, and past a gap that never fills.
 func (a *Assembler) deshred(slot uint64, ss *slotState, fresh []uint32, ts uint64) []Batch {
+	x := ss.data
 	var at []uint32
 	for _, i := range fresh {
 		at = append(at, i)
 		// A DATA_COMPLETE shred also says where the next batch starts.
-		if ss.shreds[i].flags&flagDataComplete != 0 && int(i)+1 < len(ss.shreds) && ss.shreds[i+1].have {
+		if x.complete[i/64]&(1<<(i%64)) != 0 && i+1 < maxSlotIndexes && x.has(i+1) {
 			at = append(at, i+1)
 		}
 	}
 	slices.Sort(at)
 	var out []Batch
 	for _, i := range at {
-		s, e, ok := ss.batchAround(i)
-		if !ok || ss.shreds[s].decoded {
+		s, e, ok := x.batchAround(i)
+		if !ok || x.decoded[s/64]&(1<<(s%64)) != 0 {
 			continue
 		}
-		ss.shreds[s].decoded = true
+		x.decoded[s/64] |= 1 << (s % 64)
 		n := 0
-		for _, d := range ss.shreds[s : e+1] {
-			n += len(d.payload)
+		for j := s; j <= e; j++ {
+			n += len(ss.payload[j])
 		}
 		payload := make([]byte, 0, n)
 		for j := s; j <= e; j++ {
-			payload = append(payload, ss.shreds[j].payload...)
-			ss.shreds[j].payload = nil
+			payload = append(payload, ss.payload[j]...)
+			delete(ss.payload, j)
 		}
 		a.stats.Batches++
 		out = append(out, Batch{Slot: slot, StartIndex: s, Payload: payload, ShredTs: ts})
@@ -446,26 +396,48 @@ func (a *Assembler) deshred(slot uint64, ss *slotState, fresh []uint32, ts uint6
 	return out
 }
 
-// batchAround returns the batch [s..e] holding the present data shred i, if
+func (x *slotIndex) has(i uint32) bool { return x.have[i/64]&(1<<(i%64)) != 0 }
+
+// stops returns word w of the stops: shreds not available, or carrying
+// DATA_COMPLETE. A batch runs from just past one stop to the next.
+func (x *slotIndex) stops(w uint32) uint64 { return ^x.have[w] | x.complete[w] }
+
+// batchAround returns the batch [s..e] holding the available data shred i, if
 // it is complete: s is 0 or follows a DATA_COMPLETE shred, e is the first
-// DATA_COMPLETE shred from i on, and every shred from s-1 to e is present.
-func (ss *slotState) batchAround(i uint32) (s, e uint32, ok bool) {
-	sh := ss.shreds
-	for e = i; sh[e].flags&flagDataComplete == 0; {
-		e++
-		if int(e) == len(sh) || !sh[e].have {
-			return 0, 0, false
+// DATA_COMPLETE shred from i on, and every shred from s-1 to e is available.
+func (x *slotIndex) batchAround(i uint32) (s, e uint32, ok bool) {
+	// e is the first stop from i on, and must be available, so DATA_COMPLETE.
+	w := i / 64
+	m := x.stops(w) & (^uint64(0) << (i % 64))
+	for m == 0 {
+		if w++; w == uint32(len(x.have)) {
+			return 0, 0, false // no DATA_COMPLETE before the slot's last index
 		}
+		m = x.stops(w)
 	}
-	for s = i; s > 0; s-- {
-		if !sh[s-1].have {
-			return 0, 0, false
-		}
-		if sh[s-1].flags&flagDataComplete != 0 {
-			break
-		}
+	e = w*64 + uint32(bits.TrailingZeros64(m))
+	if !x.has(e) {
+		return 0, 0, false
 	}
-	return s, e, true
+	// s is just past the last stop before i, which must be available, so
+	// DATA_COMPLETE; or 0 when every shred before i is available.
+	if i == 0 {
+		return 0, e, true
+	}
+	w = (i - 1) / 64
+	m = x.stops(w) & (^uint64(0) >> (63 - (i-1)%64))
+	for m == 0 {
+		if w == 0 {
+			return 0, e, true
+		}
+		w--
+		m = x.stops(w)
+	}
+	p := w*64 + 63 - uint32(bits.LeadingZeros64(m))
+	if !x.has(p) {
+		return 0, 0, false
+	}
+	return p + 1, e, true
 }
 
 // dataShard checks a data shard's own header against where it was framed and
@@ -482,13 +454,4 @@ func dataShard(shard []byte, slot uint64, fec, index uint32) (payload []byte, fl
 		return nil, 0, false
 	}
 	return shard[dataHeaderSize : size-64], shard[21], true
-}
-
-// put stores b at s[i], growing s as needed.
-func put(s [][]byte, i int, b []byte) [][]byte {
-	if i >= len(s) {
-		s = append(s, make([][]byte, i+1-len(s))...)
-	}
-	s[i] = b
-	return s
 }

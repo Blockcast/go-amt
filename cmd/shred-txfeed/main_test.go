@@ -18,10 +18,10 @@ func TestParsePrograms(t *testing.T) {
 		t.Errorf("parsePrograms = %v, %v; want jup then memo, replacing the defaults", got, err)
 	}
 	for _, specs := range [][]string{
-		{"JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"},                                   // no name
-		{"=JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"},                                  // empty name
-		{"x=JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV"},                                  // 31 bytes
-		strings.Fields(strings.Repeat("s=11111111111111111111111111111111 ", maxNamed+1)), // too many
+		{"JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"},                                          // no name
+		{"=JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"},                                         // empty name
+		{"x=JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV"},                                         // 31 bytes
+		strings.Fields(strings.Repeat("s=11111111111111111111111111111111 ", txfeed.NumNamed+1)), // too many
 	} {
 		if _, err := parsePrograms(specs); err == nil {
 			t.Errorf("parsePrograms(%q): want an error", specs)

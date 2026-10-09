@@ -114,3 +114,14 @@ func TestParseSSM(t *testing.T) {
 		}
 	}
 }
+
+// Only the first NumNamed named programs have partitions: offsets past them
+// would land on the buckets.
+func TestPartitionsCapsTheNamedPrograms(t *testing.T) {
+	p := mustPubkey("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4")
+	named := slices.Repeat([]Pubkey{p}, 3*NumNamed)
+	parts := Partitions(Tx{Programs: []Pubkey{p}}, named)
+	if want := 1 + NumNamed + 1; len(parts) != want || parts[len(parts)-2] != PartNamedBase+NumNamed-1 {
+		t.Errorf("Partitions = %v; want non-vote, offsets %d..%d and one bucket", parts, PartNamedBase, PartNamedBase+NumNamed-1)
+	}
+}

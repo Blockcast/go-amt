@@ -13,7 +13,8 @@ import (
 const (
 	PartNonVote    = 1
 	PartVote       = 2
-	PartNamedBase  = 16 // up to 16 named programs, offsets 16..31
+	PartNamedBase  = 16 // NumNamed named programs at most, offsets 16..31
+	NumNamed       = 16
 	PartBucketBase = 64 // NumBuckets program buckets, offsets 64..127
 	NumBuckets     = 64
 )
@@ -54,15 +55,16 @@ func Bucket(p Pubkey) int {
 
 // Partitions returns the partitions tx is carried on, ascending. A vote goes
 // to PartVote only. Any other transaction goes to PartNonVote, to
-// PartNamedBase+i for each named[i] it invokes (named has at most 16
-// entries), and to the bucket of each program it invokes except the compute
-// budget program, which nearly every transaction invokes.
+// PartNamedBase+i for each named[i] it invokes, and to the bucket of each
+// program it invokes except the compute budget program, which nearly every
+// transaction invokes. Only the first NumNamed of named have partitions: past
+// them, offsets would run into the buckets.
 func Partitions(tx Tx, named []Pubkey) []int {
 	if tx.Vote {
 		return []int{PartVote}
 	}
 	parts := []int{PartNonVote}
-	for i, p := range named {
+	for i, p := range named[:min(len(named), NumNamed)] {
 		if slices.Contains(tx.Programs, p) {
 			parts = append(parts, PartNamedBase+i)
 		}

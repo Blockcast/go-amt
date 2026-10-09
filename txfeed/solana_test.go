@@ -222,6 +222,8 @@ func TestParseTxRefuses(t *testing.T) {
 		{"a short_vec with a zero continuation byte", append([]byte{0x82, 0x00}, make([]byte, 200)...)},
 		{"a v1 program index outside the addresses", v1BadProgram.build()},
 		{"a v1 transaction without a signer", append([]byte{0x81}, make([]byte, 200)...)},
+		{"a legacy transaction without a signer", testTx{extra: []Pubkey{VoteProgram}, ixs: []ix{{program: 0}}}.build()},
+		{"a v0 transaction without a signer", testTx{extra: []Pubkey{VoteProgram}, ixs: []ix{{program: 0}}, v0: true}.build()},
 		{"a short_vec whose third byte continues", append([]byte{0x80, 0x80, 0x80}, make([]byte, 200)...)},
 	} {
 		if _, _, err := ParseTx(c.raw); err == nil {
