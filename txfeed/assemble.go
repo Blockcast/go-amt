@@ -79,7 +79,7 @@ type Batch struct {
 type Stats struct {
 	Frames          uint64 // frames added
 	Dups            uint64 // frames whose (slot, fec_set_index, local_index) was already received
-	Bad             uint64 // malformed frames, coding frames stating a geometry but 32:32, and frames of a set not starting at a multiple of 32, dropped
+	Bad             uint64 // malformed frames, coding frames stating a geometry other than 32:32, and frames of a set not starting at a multiple of 32, dropped
 	SetsRecovered   uint64 // FEC sets that recovered at least one data shard
 	ShardsRecovered uint64 // data shards recovered
 	RecoveredBad    uint64 // recovered data shards whose own header contradicts their position, discarded

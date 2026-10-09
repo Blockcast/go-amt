@@ -504,19 +504,20 @@ func TestAssemblerReverseRunCostsAboutWhatForwardDoes(t *testing.T) {
 // FuzzAssembler feeds frames built from the input. Their headers agree with
 // their framing, so they get past validation into the set logic, which must
 // never panic or outgrow its bounds. Each 8-byte op is a run of frames:
-// slot, FEC set, first local index, run length, kind (and whether a coding
+// slot (and, with its top two bits set, a set not starting at a multiple of
+// 32), FEC set, first local index, run length, kind (and whether a coding
 // frame states another geometry), its num_data or the data flags, payload,
 // and how far the clock then moves.
 func FuzzAssembler(f *testing.F) {
 	f.Add([]byte{1, 0, 0, 31, 0, 0x40, 9, 0, 1, 0, 32, 31, 65, 32, 7, 1})
-	f.Add([]byte{0x95, 3, 0, 31, 0, 0x40, 9, 0, 0x95, 3, 32, 31, 1, 0, 7, 1}) // a set starting at 389
+	f.Add([]byte{0xd5, 3, 0, 31, 0, 0x40, 9, 0, 0xd5, 3, 32, 31, 1, 0, 7, 1}) // a set starting at 405
 	f.Fuzz(func(t *testing.T, ops []byte) {
 		a := NewAssembler(testKeep)
 		clock := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
 		a.now = func() time.Time { return clock }
 		for ; len(ops) >= 8; ops = ops[8:] {
 			slot, fec := uint64(ops[0]%4), uint32(ops[1])<<7 // up to 32640, near the last index
-			if ops[0]&0x80 != 0 {
+			if ops[0]&0xc0 == 0xc0 {
 				fec += uint32(ops[0]>>2) & 31 // a set not starting at a multiple of 32, to be refused
 			}
 			for local := uint32(ops[2]); local <= uint32(ops[2])+uint32(ops[3]%64); local++ {
