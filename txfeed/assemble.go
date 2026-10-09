@@ -51,6 +51,12 @@ const (
 	// received is never the idlest.
 	maxSlots = 128
 
+	// maxSlotFrames bounds what one slot holds. A flood of distinct sets and
+	// local indexes on one slot number keeps that slot fresh, so neither keep
+	// nor maxSlots ever forgets it. A real slot carries at most 32768 data
+	// shreds and as many coding. Past it, the slot starts over.
+	maxSlotFrames = 1 << 16
+
 	// maxEncoders bounds the Reed-Solomon encoders cached by geometry, which
 	// comes off the wire. Production uses one.
 	maxEncoders = 8
@@ -85,9 +91,10 @@ type Stats struct {
 	ParityChecked   uint64 // complete sets whose coding shards were re-encoded from their data
 	ParityMismatch  uint64 // checked sets whose re-encoded parity differs from what was received
 	Batches         uint64 // entry batches emitted
-	Evicted         uint64 // slots forgotten: idle past keep, or the idlest at maxSlots
+	Evicted         uint64 // slots forgotten: idle past keep, the idlest at maxSlots, or full at maxSlotFrames
 
 	Slots   uint64 // slots held
+	Held    uint64 // frames accepted into the slots held
 	MaxSlot uint64 // highest slot seen
 }
 
@@ -112,6 +119,7 @@ type Assembler struct {
 
 type slotState struct {
 	last   time.Time          // arrival of its latest frame
+	frames int                // frames accepted, toward maxSlotFrames
 	sets   map[uint32]*fecSet // by fec_set_index
 	shreds []dataShred        // by absolute index
 }
@@ -152,6 +160,9 @@ func NewAssembler(keep time.Duration) *Assembler {
 func (a *Assembler) Stats() Stats {
 	s := a.stats
 	s.Slots, s.MaxSlot = uint64(len(a.slots)), a.maxSlot
+	for _, ss := range a.slots {
+		s.Held += uint64(ss.frames)
+	}
 	return s
 }
 
@@ -210,6 +221,11 @@ func (a *Assembler) Add(frame []byte) []Batch {
 		a.sweep = now.Add(a.keep / 2)
 	}
 	ss := a.slots[slot]
+	if ss != nil && ss.frames >= maxSlotFrames {
+		delete(a.slots, slot) // more frames than a real slot has: start it over
+		a.stats.Evicted++
+		ss = nil
+	}
 	if ss == nil {
 		if len(a.slots) >= maxSlots {
 			a.evictIdlest()
@@ -241,6 +257,7 @@ func (a *Assembler) Add(frame []byte) []Batch {
 	}
 	set.size = len(shard)
 	set.mark(local)
+	ss.frames++
 
 	var fresh []uint32 // absolute indexes of data shreds this frame made available
 	if coding {

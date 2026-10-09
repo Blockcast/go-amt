@@ -483,3 +483,19 @@ func FuzzAssembler(f *testing.F) {
 		}
 	})
 }
+
+// A flood of distinct sets and local indexes on one slot number keeps that
+// slot fresh, so only a cap on what the slot holds bounds it. This is the
+// merger's per-slot finding (Ally, go-amt#144 review 5464269530) in the
+// assembler.
+func TestAssemblerBoundsWhatOneSlotHolds(t *testing.T) {
+	a := NewAssembler(testKeep)
+	shard := make([]byte, testShardSize)
+	for i := range maxSlotFrames + 10 {
+		fec, local := uint32(i/31), uint32(32+i%31) // 31 coding frames a set: too few to recover
+		a.Add(testFrame(5, fec, local, shard, false))
+	}
+	if s := a.Stats(); s.Held != 10 || s.Evicted != 1 || s.Bad != 0 {
+		t.Errorf("%+v; want the slot started over once at %d frames, holding the 10 since", s, maxSlotFrames)
+	}
+}
