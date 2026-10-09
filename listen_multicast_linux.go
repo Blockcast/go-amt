@@ -15,9 +15,9 @@ import (
 	"unsafe"
 )
 
-// ListenMulticastUDP4 listens for multicast UDP packets on the given address. This actually binds
-// to the IP address given vs the built-in net.ListenMulticastUDP will listen to ALL IP addresses
-// regardless of the address you tell it to listen on.
+// ListenMulticastUDP4 listens for multicast UDP packets sent to gaddr. It binds
+// 0.0.0.0 on gaddr's port, so several groups can share one port, and receives
+// only the group it joins (see IP_MULTICAST_ALL below).
 func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, gaddr *net.UDPAddr, f []bpf.RawInstruction, timestamp bool, ttl int, flags4 ipv4.ControlFlags, rcvBufBytes int, sndBufBytes int) (*ipv4.PacketConn, error) {
 
 	if gaddr == nil || gaddr.IP.To4() == nil {
@@ -41,6 +41,16 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 	if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, SO_REUSEPORT, 1); err != nil {
 		_ = syscall.Close(sock)
 		return nil, fmt.Errorf("could not set socket reuseport: %w", err)
+	}
+
+	// Receive only the groups this socket joins. Linux defaults
+	// IP_MULTICAST_ALL to 1, which also hands every socket bound to this port
+	// any group that another socket on the host joined: one blockcast-shreds
+	// --feed per layer, all on :5001, read every layer (BLO-41383). A kernel or
+	// sandbox without the option keeps that behaviour rather than failing.
+	if err := unix.SetsockoptInt(sock, unix.IPPROTO_IP, unix.IP_MULTICAST_ALL, 0); err != nil && !errors.Is(err, unix.ENOPROTOOPT) {
+		_ = syscall.Close(sock)
+		return nil, fmt.Errorf("could not clear IP_MULTICAST_ALL: %w", err)
 	}
 
 	if err := applyForcedBuffers(sock, rcvBufBytes, sndBufBytes); err != nil {

@@ -42,6 +42,14 @@ func ListenMulticastUDP6(network string, ifi *net.Interface, saddr netip.Addr, g
 		return nil, fmt.Errorf("could not set socket reuseport: %w", err)
 	}
 
+	// Receive only the groups this socket joins, as ListenMulticastUDP4 does
+	// with IP_MULTICAST_ALL. IPV6_MULTICAST_ALL needs Linux 4.20; an older
+	// kernel keeps the host-wide delivery rather than failing the join.
+	if err := unix.SetsockoptInt(sock, unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_ALL, 0); err != nil && !errors.Is(err, unix.ENOPROTOOPT) {
+		_ = syscall.Close(sock)
+		return nil, fmt.Errorf("could not clear IPV6_MULTICAST_ALL: %w", err)
+	}
+
 	if err := applyForcedBuffers(sock, rcvBufBytes, sndBufBytes); err != nil {
 		_ = syscall.Close(sock)
 		return nil, err

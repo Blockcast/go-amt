@@ -3,12 +3,16 @@
 package amt
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"os"
+	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 // countOpenFDs reports how many descriptors this process currently holds.
@@ -76,5 +80,135 @@ func TestListenMulticastUDP4RejectsNonIPv4Group(t *testing.T) {
 
 	if after := countOpenFDs(t); after > before {
 		t.Errorf("descriptor leaked on the validation path: %d -> %d", before, after)
+	}
+}
+
+// loopbackInterface returns the host's loopback interface. The tests below join
+// and send on it, so no IGMP report or datagram reaches a real network.
+func loopbackInterface(t *testing.T) *net.Interface {
+	t.Helper()
+	ifs, err := net.Interfaces()
+	if err != nil {
+		t.Skipf("list interfaces: %v", err)
+	}
+	for i := range ifs {
+		if ifs[i].Flags&net.FlagLoopback != 0 && ifs[i].Flags&net.FlagUp != 0 {
+			return &ifs[i]
+		}
+	}
+	t.Skip("no loopback interface is up")
+	return nil
+}
+
+// TestListenMulticastUDP4ReceivesOnlyItsOwnGroup pins IP_MULTICAST_ALL=0. Two
+// listeners share a port, as blockcast-shreds' one --feed per layer does, each
+// joined to its own group. Under the kernel default each also read the other's
+// group, so every layer arrived once per feed (BLO-41383). The sender uses TTL
+// 0 with loopback, so nothing leaves the host.
+func TestListenMulticastUDP4ReceivesOnlyItsOwnGroup(t *testing.T) {
+	lo := loopbackInterface(t)
+	// A port nothing on the host holds. The listeners bind it with
+	// SO_REUSEPORT, so the probe that found it must let go first.
+	probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.LocalAddr().(*net.UDPAddr).Port
+	probe.Close()
+
+	groups := []*net.UDPAddr{
+		{IP: net.IPv4(239, 255, 41, 1), Port: port},
+		{IP: net.IPv4(239, 255, 41, 2), Port: port},
+	}
+	var listeners []*ipv4.PacketConn
+	for _, g := range groups {
+		c, err := ListenMulticastUDP4("udp4", lo, netip.Addr{}, g, nil, false, 0, 0, 0, 0)
+		if err != nil {
+			t.Skipf("join %v on %s: %v", g.IP, lo.Name, err)
+		}
+		defer c.Close()
+		listeners = append(listeners, c)
+	}
+
+	tx, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Close()
+	ptx := ipv4.NewPacketConn(tx)
+	if err := ptx.SetMulticastInterface(lo); err != nil {
+		t.Skipf("send on %s: %v", lo.Name, err)
+	}
+	if err := ptx.SetMulticastTTL(0); err != nil {
+		t.Fatal(err)
+	}
+	if err := ptx.SetMulticastLoopback(true); err != nil {
+		t.Fatal(err)
+	}
+	for i, g := range groups {
+		if _, err := tx.WriteToUDP([]byte{byte('A' + i)}, g); err != nil {
+			t.Skipf("send to %v: %v", g.IP, err)
+		}
+	}
+
+	for i, c := range listeners {
+		var got []byte
+		buf := make([]byte, 64)
+		if err := c.SetReadDeadline(time.Now().Add(300 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			n, _, _, err := c.ReadFrom(buf)
+			if err != nil {
+				break
+			}
+			got = append(got, buf[:n]...)
+		}
+		if len(got) == 0 {
+			t.Skipf("multicast loopback delivered nothing to %v on %s", groups[i].IP, lo.Name)
+		}
+		if want := string(rune('A' + i)); string(got) != want {
+			t.Errorf("listener joined to %v read %q, want only %q", groups[i].IP, got, want)
+		}
+	}
+}
+
+// TestListenMulticastUDP6ClearsMulticastAll pins the IPv6 half,
+// IPV6_MULTICAST_ALL=0. IPv6 multicast has no route on lo, so it cannot be
+// sent there; this reads the option back off the joined socket instead.
+func TestListenMulticastUDP6ClearsMulticastAll(t *testing.T) {
+	lo := loopbackInterface(t)
+	probe, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
+	if err != nil {
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	port := probe.LocalAddr().(*net.UDPAddr).Port
+	probe.Close()
+	g := &net.UDPAddr{IP: net.ParseIP("ff15::4113:1"), Port: port}
+	c, err := ListenMulticastUDP6("udp6", lo, netip.Addr{}, g, nil, false, 0, 0, 0, 0)
+	if err != nil {
+		t.Skipf("join %v on %s: %v", g.IP, lo.Name, err)
+	}
+	defer c.Close()
+
+	raw, err := c.PacketConn.(syscall.Conn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var value int
+	var getErr error
+	if err := raw.Control(func(fd uintptr) {
+		value, getErr = unix.GetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_ALL)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if errors.Is(getErr, unix.ENOPROTOOPT) {
+		t.Skip("kernel predates IPV6_MULTICAST_ALL (Linux 4.20)")
+	}
+	if getErr != nil {
+		t.Fatal(getErr)
+	}
+	if value != 0 {
+		t.Errorf("IPV6_MULTICAST_ALL = %d, want 0", value)
 	}
 }
