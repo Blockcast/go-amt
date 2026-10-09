@@ -16,8 +16,8 @@ import (
 )
 
 // ListenMulticastUDP4 listens for multicast UDP packets sent to gaddr. It binds
-// 0.0.0.0 on gaddr's port, so several groups can share one port, and receives
-// only the group it joins (see IP_MULTICAST_ALL below).
+// 0.0.0.0 on gaddr's port and receives only the group it joins (see
+// IP_MULTICAST_ALL below).
 func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, gaddr *net.UDPAddr, f []bpf.RawInstruction, timestamp bool, ttl int, flags4 ipv4.ControlFlags, rcvBufBytes int, sndBufBytes int) (*ipv4.PacketConn, error) {
 
 	if gaddr == nil || gaddr.IP.To4() == nil {
