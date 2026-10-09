@@ -394,3 +394,92 @@ func TestAssemblerCountsBadFrames(t *testing.T) {
 		t.Errorf("%+v; want %d bad frames", s, len(bad))
 	}
 }
+
+// Data frames carry no geometry, so a forged one could claim a coding
+// position in the bitmap of received local indexes. Sixty-four of them once
+// "completed" a set with no coding shards, and the parity check panicked.
+func TestAssemblerKeepsDataFramesOffCodingPositions(t *testing.T) {
+	data := func(slot uint64, local uint32) []byte {
+		s := testDataShard(slot, local, 0, []byte{1})
+		binary.LittleEndian.PutUint32(s[15:19], 0) // every frame in FEC set 0
+		f := testFrame(slot, 0, local, s, false)
+		f[17], f[18], f[19] = 0, 0, 0 // a data frame, whatever its local index
+		return f
+	}
+	a := NewAssembler(testKeep)
+	for local := range uint32(64) {
+		a.Add(data(1, local))
+	}
+	if s := a.Stats(); s.Bad != 32 {
+		t.Errorf("%+v; want the 32 data frames past num_data rejected", s)
+	}
+
+	// Nor can a set's first coding frame shrink num_data below a data frame
+	// already received.
+	for local := range uint32(21) {
+		a.Add(data(2, local))
+	}
+	f := testFrame(2, 0, 25, make([]byte, testShardSize), false)
+	f[17], f[18], f[19] = 0x02, 16, 16 // 16:16 makes local 25 coding position 9
+	before := a.Stats().Bad
+	a.Add(f)
+	if s := a.Stats(); s.Bad != before+1 {
+		t.Errorf("%+v; want the coding frame that shrinks num_data to 16 under data shred 20 rejected", s)
+	}
+
+	// And a rejected frame does not fix the set's shard size.
+	before = a.Stats().Bad
+	a.Add(data(4, 40)[:28+32]) // past num_data, and short
+	a.Add(data(4, 0))
+	if s := a.Stats(); s.Bad != before+1 {
+		t.Errorf("%+v; want only the rejected frame bad", s)
+	}
+}
+
+// The geometry comes off the wire, so the encoder cache keyed by it must stay
+// bounded however many geometries a stream names.
+func TestAssemblerBoundsTheEncoderCache(t *testing.T) {
+	a := NewAssembler(testKeep)
+	for nc := range 255 {
+		f := testFrame(3, uint32(nc), 1, make([]byte, testShardSize), false)
+		f[17], f[18], f[19] = 0x02, 1, byte(nc+1) // 1:nc+1, one coding shard: enough to recover
+		a.Add(f)
+	}
+	if len(a.encoders) > maxEncoders {
+		t.Errorf("caching %d encoders, want at most %d", len(a.encoders), maxEncoders)
+	}
+}
+
+// FuzzAssembler feeds frames built from the input. Their headers agree with
+// their framing, so they get past validation into the set logic, which must
+// never panic or outgrow its bounds. Each 8-byte op is a run of frames:
+// slot, FEC set, first local index, run length, kind and num_coding,
+// num_data or data flags, payload, and how far the clock then moves.
+func FuzzAssembler(f *testing.F) {
+	f.Add([]byte{1, 0, 0, 31, 0, 0x40, 9, 0, 1, 0, 32, 31, 65, 32, 7, 1})
+	f.Fuzz(func(t *testing.T, ops []byte) {
+		a := NewAssembler(testKeep)
+		clock := time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
+		a.now = func() time.Time { return clock }
+		for ; len(ops) >= 8; ops = ops[8:] {
+			slot, fec := uint64(ops[0]%4), uint32(ops[1]%128)
+			for local := uint32(ops[2]); local <= uint32(ops[2])+uint32(ops[3]%64); local++ {
+				var fr []byte
+				if ops[4]&1 == 0 {
+					s := testDataShard(slot, fec+local, ops[5]&0xc0, bytes.Repeat([]byte{ops[6]}, int(ops[6])))
+					binary.LittleEndian.PutUint32(s[15:19], fec)
+					fr = testFrame(slot, fec, local, s, false)
+					fr[17], fr[18], fr[19] = 0, 0, 0
+				} else {
+					fr = testFrame(slot, fec, local, bytes.Repeat([]byte{ops[6]}, testShardSize), false)
+					fr[17], fr[18], fr[19] = 0x02, ops[5], ops[4]>>1
+				}
+				a.Add(fr)
+			}
+			clock = clock.Add(time.Duration(ops[7]) * time.Second / 16)
+		}
+		if s := a.Stats(); s.Slots > maxSlots || len(a.encoders) > maxEncoders {
+			t.Errorf("%+v, %d encoders: past the bounds", s, len(a.encoders))
+		}
+	})
+}

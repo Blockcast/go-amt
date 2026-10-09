@@ -51,6 +51,10 @@ const (
 	// received is never the idlest.
 	maxSlots = 128
 
+	// maxEncoders bounds the Reed-Solomon encoders cached by geometry, which
+	// comes off the wire. Production uses one.
+	maxEncoders = 8
+
 	// Production is 32:32 on every set. Data frames carry no geometry, so a
 	// set assumes this until a coding frame states its own.
 	defaultNumData   = 32
@@ -224,13 +228,18 @@ func (a *Assembler) Add(frame []byte) []Batch {
 		a.stats.Dups++
 		return nil
 	}
-	if set.size == 0 {
-		set.size = len(shard)
-	}
-	if len(shard) != set.size || coding && set.geometry && (nd != set.numData || nc != set.numCoding) {
+	// The bitmap of received local indexes says nothing of which kind of frame
+	// took each one, so keep the kinds apart: data below num_data, coding from
+	// it on (checked above), and the set's first coding frame cannot set a
+	// num_data that a data frame already received reaches.
+	if set.size != 0 && len(shard) != set.size ||
+		!coding && int(local) >= set.numData ||
+		coding && set.geometry && (nd != set.numData || nc != set.numCoding) ||
+		coding && !set.geometry && len(set.data) > nd {
 		a.stats.Bad++
 		return nil
 	}
+	set.size = len(shard)
 	set.mark(local)
 
 	var fresh []uint32 // absolute indexes of data shreds this frame made available
@@ -363,6 +372,9 @@ func (a *Assembler) encoder(nd, nc int) reedsolomon.Encoder {
 	k := [2]int{nd, nc}
 	enc, ok := a.encoders[k]
 	if !ok {
+		if len(a.encoders) >= maxEncoders {
+			clear(a.encoders)
+		}
 		// No inversion cache: it keeps a matrix per pattern of missing shards,
 		// and live sets miss a different pattern nearly every time.
 		enc, _ = reedsolomon.New(nd, nc, reedsolomon.WithInversionCache(false))
