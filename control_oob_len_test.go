@@ -264,6 +264,10 @@ var sockoptsWithoutCmsg = map[string]bool{
 	"SO_ATTACH_FILTER": true,
 	"IP_BOUND_IF":      true,
 	"IPV6_BOUND_IF":    true,
+	// Delivery filters: they decide which groups reach the socket and add
+	// nothing to a datagram that does.
+	"IP_MULTICAST_ALL":   true,
+	"IPV6_MULTICAST_ALL": true,
 }
 
 // sockoptsCoveredByGROLen are the IPPROTO_UDP options whose control message
