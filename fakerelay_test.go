@@ -41,6 +41,19 @@ type fakeRelay struct {
 	advertised atomic.Int64
 	queried    atomic.Int64
 
+	// discoveries and requests count what arrived, before any loss below.
+	discoveries atomic.Int64
+	requests    atomic.Int64
+	// dropDiscoveries and dropRequests are how many more of each the relay
+	// ignores, standing in for a datagram lost on the way.
+	dropDiscoveries atomic.Int64
+	dropRequests    atomic.Int64
+	// advertDelay and queryDelay hold each Relay Advertisement or Membership
+	// Query back, standing in for a slow answer rather than a lost one.
+	// Immutable once serve starts.
+	advertDelay time.Duration
+	queryDelay  time.Duration
+
 	// queryIntervalCode is the QQIC byte of the Membership Query. The gateway
 	// decodes it into RelayManager.intervalTime, which drives the keepalive
 	// ticker and its data-liveness threshold -- so a test that must not race the
@@ -62,6 +75,44 @@ type fakeRelayOption func(*fakeRelay)
 // below 0x80 means code*100ms: 0x0a is 1s (the default), 0x7f is 12.7s.
 func withQueryIntervalCode(code byte) fakeRelayOption {
 	return func(fr *fakeRelay) { fr.queryIntervalCode = code }
+}
+
+// withLostDiscoveries makes the relay ignore the first n Relay Discoveries.
+func withLostDiscoveries(n int64) fakeRelayOption {
+	return func(fr *fakeRelay) { fr.dropDiscoveries.Store(n) }
+}
+
+// withLostRequests makes the relay ignore the first n Requests.
+func withLostRequests(n int64) fakeRelayOption {
+	return func(fr *fakeRelay) { fr.dropRequests.Store(n) }
+}
+
+// withAdvertisementDelay holds every Relay Advertisement back by d.
+func withAdvertisementDelay(d time.Duration) fakeRelayOption {
+	return func(fr *fakeRelay) { fr.advertDelay = d }
+}
+
+// withQueryDelay holds every Membership Query back by d.
+func withQueryDelay(d time.Duration) fakeRelayOption {
+	return func(fr *fakeRelay) { fr.queryDelay = d }
+}
+
+// sendAfter writes b to addr after d, or at once when d is zero. A delayed send
+// is dropped if the relay closes first.
+func (fr *fakeRelay) sendAfter(d time.Duration, b []byte, addr *net.UDPAddr) {
+	if d == 0 {
+		_, _ = fr.conn.WriteToUDP(b, addr)
+		return
+	}
+	fr.wg.Add(1)
+	go func() {
+		defer fr.wg.Done()
+		select {
+		case <-fr.done:
+		case <-time.After(d):
+			_, _ = fr.conn.WriteToUDP(b, addr)
+		}
+	}()
 }
 
 // newFakeRelay starts a relay bound to an ephemeral loopback port.
@@ -145,8 +196,16 @@ func (fr *fakeRelay) serve() {
 		msg := append([]byte(nil), buf[:n]...)
 		switch m.MessageType(msg[0] & 0x0F) {
 		case m.RelayDiscoveryType:
+			fr.discoveries.Add(1)
+			if fr.dropDiscoveries.Add(-1) >= 0 {
+				continue
+			}
 			fr.handleDiscovery(msg, addr)
 		case m.RequestType:
+			fr.requests.Add(1)
+			if fr.dropRequests.Add(-1) >= 0 {
+				continue
+			}
 			fr.handleRequest(msg, addr)
 		case m.MembershipUpdateType:
 			fr.handleUpdate(msg)
@@ -170,7 +229,7 @@ func (fr *fakeRelay) handleDiscovery(msg []byte, addr *net.UDPAddr) {
 	// asserts on it once the handshake has completed -- the relay goroutine may
 	// not have run yet. Race instrumentation widens that window enough to fail.
 	fr.advertised.Add(1)
-	_, _ = fr.conn.WriteToUDP(adv, addr)
+	fr.sendAfter(fr.advertDelay, adv, addr)
 }
 
 // handleRequest answers a Request with a Membership Query.
@@ -186,7 +245,7 @@ func (fr *fakeRelay) handleRequest(msg []byte, addr *net.UDPAddr) {
 	// -- is relying on the send that follows, which over loopback UDP is
 	// effectively immediate but is not what the count itself proves.
 	fr.queried.Add(1)
-	_, _ = fr.conn.WriteToUDP(fr.buildQuery(nonce), addr)
+	fr.sendAfter(fr.queryDelay, fr.buildQuery(nonce), addr)
 }
 
 func (fr *fakeRelay) handleUpdate(msg []byte) {

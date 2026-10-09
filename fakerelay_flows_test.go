@@ -54,6 +54,65 @@ func TestFakeRelayCompletesHandshake(t *testing.T) {
 	}
 }
 
+// openWithin opens rm against its fake relay and fails the test on error.
+func openWithin(t *testing.T, rm *RelayManager, d time.Duration) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	if err := rm.Open(ctx); err != nil {
+		t.Fatalf("Open against fake relay: %v", err)
+	}
+	if got := rm.State(); got != RelayStateActive {
+		t.Fatalf("state after handshake = %v, want %v", got, RelayStateActive)
+	}
+}
+
+// TestHandshakeRetransmitsLostDiscovery pins Relay Discovery retransmission
+// (RFC 7450 section 5.2.3.4.3). One lost Discovery used to fail Open after 10s,
+// which stopped blockcast-shreds at startup (BLO-41383). The resent Discovery
+// must keep the first one's nonce: the relay echoes it and HandleAdvertisement
+// checks it.
+func TestHandshakeRetransmitsLostDiscovery(t *testing.T) {
+	fr := newFakeRelay(t, withLostDiscoveries(1))
+	openWithin(t, newTestManager(t, fr), handshakeTimeout)
+
+	if n := fr.discoveries.Load(); n != 2 {
+		t.Errorf("Relay Discoveries the relay saw = %d, want 2: the lost one and its retransmission", n)
+	}
+	if n := fr.advertised.Load(); n != 1 {
+		t.Errorf("relay advertisements sent = %d, want 1", n)
+	}
+}
+
+// TestHandshakeRetransmitsLostRequest is the Request half (RFC 7450 section
+// 5.2.3.5.3). The resent Request keeps its nonce, so the Membership Query that
+// answers it passes HandleQuery's nonce check.
+func TestHandshakeRetransmitsLostRequest(t *testing.T) {
+	fr := newFakeRelay(t, withLostRequests(1))
+	openWithin(t, newTestManager(t, fr), handshakeTimeout)
+
+	if n := fr.requests.Load(); n != 2 {
+		t.Errorf("Requests the relay saw = %d, want 2: the lost one and its retransmission", n)
+	}
+	if n := fr.queried.Load(); n != 1 {
+		t.Errorf("membership queries sent = %d, want 1", n)
+	}
+}
+
+// TestHandshakeIgnoresLateDuplicateAdvertisement covers an Advertisement that
+// was slow rather than lost. The relay holds each Advertisement back 1.5s, so
+// the Discovery is resent at 1s and both copies are answered. The second
+// Advertisement lands at 2.5s, while the gateway waits for a Query held back
+// 2s, and must not restart the Request leg.
+func TestHandshakeIgnoresLateDuplicateAdvertisement(t *testing.T) {
+	fr := newFakeRelay(t, withAdvertisementDelay(1500*time.Millisecond), withQueryDelay(2*time.Second))
+	openWithin(t, newTestManager(t, fr), handshakeTimeout)
+
+	if n := fr.advertised.Load(); n != 2 {
+		t.Errorf("relay advertisements sent = %d, want 2: the late answer and the one to the retransmission", n)
+	}
+}
+
 // TestHandshakeAnswersQueryWithCurrentStateUpdate pins the invariant that a
 // handshake completes the Query -> Update exchange even with no subscriptions,
 // leaving the protocol in Active rather than parked in Querying.

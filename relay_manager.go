@@ -2,9 +2,12 @@ package amt
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/netip"
+	"os"
 	"sync"
 	"time"
 
@@ -611,6 +614,17 @@ func (rm *RelayManager) Stats() RelayManagerStats {
 	return stats
 }
 
+// Handshake timing. handshakeTimeout bounds the whole exchange. Within it, an
+// unanswered Relay Discovery or Request is resent after a random timeout in
+// [handshakeRetransmit, handshakeRetransmit*2^retries]: RFC 7450 sections
+// 5.2.3.4.3 and 5.2.3.5.3 recommend a 1s initial timeout with random
+// exponential back-off. Without it, one lost datagram among the four failed
+// Open outright (BLO-41383, 2026-10-09).
+const (
+	handshakeTimeout    = 10 * time.Second
+	handshakeRetransmit = time.Second
+)
+
 // performHandshake performs the AMT discovery handshake
 func (rm *RelayManager) performHandshake() error {
 	rm.handshakeMu.Lock()
@@ -627,23 +641,45 @@ func (rm *RelayManager) performHandshake() error {
 		return fmt.Errorf("failed to send discovery: %w", err)
 	}
 
+	// outstanding is the message awaiting an answer. A retransmission resends
+	// its exact bytes, so the relay sees the same nonce (RFC 7450 sections
+	// 5.2.3.4.5 and 5.2.3.5.6).
+	outstanding := discovery
+	retries := 0
+	deadline := time.Now().Add(handshakeTimeout)
+	resendAt := time.Now().Add(handshakeRetransmit)
+	advertised := false
+
 	// Wait for responses
 	buffer := make([]byte, rm.config.MTU)
-	if err := rm.transport.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
-		return err
-	}
-
 	for {
+		if err := rm.transport.SetReadDeadline(earliest(resendAt, deadline)); err != nil {
+			return err
+		}
 		rm.receiveMu.Lock()
 		n, _, err := rm.transport.Receive(buffer)
 		rm.receiveMu.Unlock()
 		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) && time.Now().Before(deadline) {
+				if err := rm.transport.Send(outstanding); err != nil {
+					return fmt.Errorf("failed to retransmit: %w", err)
+				}
+				retries++
+				resendAt = time.Now().Add(handshakeRetransmit + rand.N(handshakeRetransmit<<retries-handshakeRetransmit+1))
+				continue
+			}
 			return fmt.Errorf("failed to receive response: %w", err)
 		}
 
 		msgType := m.MessageType(buffer[0] & 0x0F)
 		switch msgType {
 		case m.RelayAdvertisementType:
+			if advertised {
+				// The answer to a retransmitted Discovery whose first copy
+				// was only late. The handshake has already moved on.
+				continue
+			}
+			advertised = true
 			rm.state.Store(RelayStateRequesting)
 			if err := rm.protocol.HandleAdvertisement(buffer[:n]); err != nil {
 				return fmt.Errorf("failed to handle advertisement: %w", err)
@@ -657,6 +693,8 @@ func (rm *RelayManager) performHandshake() error {
 			if err := rm.transport.Send(request); err != nil {
 				return fmt.Errorf("failed to send request: %w", err)
 			}
+			outstanding, retries = request, 0
+			resendAt = time.Now().Add(handshakeRetransmit)
 
 		case m.MembershipQueryType:
 			rm.state.Store(RelayStateQuerying)
@@ -706,6 +744,14 @@ func (rm *RelayManager) performHandshake() error {
 			return fmt.Errorf("unexpected message type during handshake: %d", msgType)
 		}
 	}
+}
+
+// earliest returns the earlier of two times.
+func earliest(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }
 
 // scheduleBatchedJoin schedules a batched IGMP join
