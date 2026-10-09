@@ -315,7 +315,15 @@ const maxDedupSlots = 256
 // maxSlotIDs bounds one slot's history. A flood of distinct (fec_set_index,
 // local_index) pairs on one slot number keeps that slot fresh, so neither the
 // sweep nor maxDedupSlots ever forgets it. A real slot carries at most 32768
-// data shreds and as many coding.
+// data shreds and as many coding. A new id past the cap starts the slot over;
+// a duplicate never does, so a full real slot is not reset by a repeat.
+//
+// The ceiling is maxDedupSlots x maxSlotIDs = 16.8M ids, about 577 MiB at 36 B
+// an id (measured by Ally, go-amt#144 review 5464391246). A flood can hold it:
+// one duplicate per slot per keep keeps every slot fresh. Live traffic holds
+// 130k-190k ids across 100-140 slots (CT 140, 2026-10-09), so a dedup_ids that
+// stays in the millions is a flood: slots=1 with forgotten climbing is the
+// one-slot shape, slots=256 the many-slot one.
 const maxSlotIDs = 1 << 16
 
 func newDedup(keep time.Duration) *dedup {
@@ -338,11 +346,6 @@ func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
 		d.sweep = now.Add(d.keep / 2)
 	}
 	ss := d.seen[slot]
-	if ss != nil && len(ss.ids) >= maxSlotIDs {
-		d.drop(slot) // more shreds than a real slot has: start it over
-		d.forgotten++
-		ss = nil
-	}
 	if ss == nil {
 		if len(d.seen) >= maxDedupSlots {
 			d.forgetIdlest()
@@ -357,6 +360,12 @@ func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
 	k := uint64(fec)<<32 | uint64(idx)
 	if _, dup := ss.ids[k]; dup {
 		return duplicate
+	}
+	if len(ss.ids) >= maxSlotIDs {
+		// More shreds than a real slot has: start it over.
+		d.ids -= len(ss.ids)
+		ss.ids = map[uint64]struct{}{}
+		d.forgotten++
 	}
 	ss.ids[k] = struct{}{}
 	d.ids++

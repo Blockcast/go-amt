@@ -56,7 +56,9 @@ const (
 	// maxSlots bounds the slots held under a flood of distinct forged slots.
 	// Real traffic holds keep times the slot rate, about 40 at a keep of 10s.
 	// Past it, the slot idle longest goes first, and a slot still being
-	// received is never the idlest.
+	// received is never the idlest. One 52-byte frame per set index across
+	// every slot holds about 237 MiB, nearly all of it the 1.5 KiB shards
+	// array of each set (measured by Ally, go-amt#145 review 5465850517).
 	maxSlots = 128
 
 	// The parity check samples sets that arrive complete: the first
@@ -77,7 +79,7 @@ type Batch struct {
 type Stats struct {
 	Frames          uint64 // frames added
 	Dups            uint64 // frames whose (slot, fec_set_index, local_index) was already received
-	Bad             uint64 // malformed frames, and frames of a set not 32:32 or not starting at a multiple of 32, dropped
+	Bad             uint64 // malformed frames, coding frames stating a geometry but 32:32, and frames of a set not starting at a multiple of 32, dropped
 	SetsRecovered   uint64 // FEC sets that recovered at least one data shard
 	ShardsRecovered uint64 // data shards recovered
 	RecoveredBad    uint64 // recovered data shards whose own header contradicts their position, discarded

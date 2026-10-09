@@ -130,6 +130,23 @@ func TestDedupBoundsTheHistoryOfOneSlot(t *testing.T) {
 	checkIDs(t, d)
 }
 
+// A slot holding every id a real slot can have is not reset by a repeat,
+// which a union receives continuously; only a new id past the cap resets it
+// (Ally, go-amt#144 review 5464391246).
+func TestDedupDoesNotResetAFullSlotOnADuplicate(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	for i := range uint64(maxSlotIDs) {
+		d.observe(t0, 100, uint32(i>>6), uint32(i&63))
+	}
+	if v := d.observe(t0, 100, 0, 0); v != duplicate || d.forgotten != 0 || d.ids != maxSlotIDs {
+		t.Errorf("repeat into a full slot: %v, forgotten=%d ids=%d; want duplicate, 0, %d", v, d.forgotten, d.ids, maxSlotIDs)
+	}
+	if v := d.observe(t0, 100, 1<<20, 0); v != emit || d.forgotten != 1 || d.ids != 1 {
+		t.Errorf("new id past the cap: %v, forgotten=%d ids=%d; want emit, 1, 1", v, d.forgotten, d.ids)
+	}
+	checkIDs(t, d)
+}
+
 func TestAsV3(t *testing.T) {
 	// A version-4 frame: forwarder header, then a 32:32 chained data shred
 	// (variant 0x96: chained Merkle data, proof 6).
