@@ -297,7 +297,7 @@ type dedup struct {
 	maxSlot   uint64 // the highest slot seen, for the stats line only
 	seen      map[uint64]*slotSeen
 	ids       int       // shreds remembered across every slot
-	forgotten uint64    // slots forgotten at a cap rather than for idling
+	forgotten uint64    // slots forgotten or reset at a cap rather than for idling
 	sweep     time.Time // when the next eviction pass runs
 }
 
@@ -315,8 +315,23 @@ const maxDedupSlots = 256
 // maxSlotIDs bounds one slot's history. A flood of distinct (fec_set_index,
 // local_index) pairs on one slot number keeps that slot fresh, so neither the
 // sweep nor maxDedupSlots ever forgets it. A real slot carries at most 32768
-// data shreds and as many coding.
+// data shreds and as many coding. A new id past the cap starts the slot over;
+// a duplicate never does, so a full real slot is not reset by a repeat.
 const maxSlotIDs = 1 << 16
+
+// maxDedupIDs bounds history across slots. The two caps above allow 16.8M ids,
+// about 577 MiB at 36 B an id (Ally, go-amt#144 review 5464391246), and a flood
+// could hold that forever with one duplicate per slot per keep (Ally,
+// go-amt#147 review 5468443886). Past this cap a new id first forgets the
+// idlest other slot. That bounds memory, not the hold: a flood can still hold
+// up to the cap, and one that refreshes its slots faster than live slots go
+// idle makes the live slots the idlest, so their history shortens instead.
+// 2M ids is about 72 MiB, ten times the 130k-190k ids live traffic holds across
+// 100-140 slots (CT 140, 2026-10-09). A dedup_ids pinned near it is a flood of
+// full slots, and slots pinned at 256 one of distinct slots. A one-slot flood
+// leaves both at live levels and shows only as forgotten climbing, one per
+// 65536 new ids.
+const maxDedupIDs = 1 << 21
 
 func newDedup(keep time.Duration) *dedup {
 	return &dedup{keep: keep, seen: map[uint64]*slotSeen{}}
@@ -338,14 +353,9 @@ func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
 		d.sweep = now.Add(d.keep / 2)
 	}
 	ss := d.seen[slot]
-	if ss != nil && len(ss.ids) >= maxSlotIDs {
-		d.drop(slot) // more shreds than a real slot has: start it over
-		d.forgotten++
-		ss = nil
-	}
 	if ss == nil {
 		if len(d.seen) >= maxDedupSlots {
-			d.forgetIdlest()
+			d.forgetIdlest(slot)
 		}
 		ss = &slotSeen{ids: map[uint64]struct{}{}}
 		d.seen[slot] = ss
@@ -358,6 +368,15 @@ func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
 	if _, dup := ss.ids[k]; dup {
 		return duplicate
 	}
+	if len(ss.ids) >= maxSlotIDs {
+		// More shreds than a real slot has: start it over.
+		d.ids -= len(ss.ids)
+		ss.ids = map[uint64]struct{}{}
+		d.forgotten++
+	}
+	for d.ids >= maxDedupIDs && len(d.seen) > 1 {
+		d.forgetIdlest(slot)
+	}
 	ss.ids[k] = struct{}{}
 	d.ids++
 	return emit
@@ -369,12 +388,13 @@ func (d *dedup) drop(s uint64) {
 	delete(d.seen, s)
 }
 
-// forgetIdlest forgets the slot whose latest shred arrived longest ago.
-func (d *dedup) forgetIdlest() {
+// forgetIdlest forgets the slot, other than except, whose latest shred arrived
+// longest ago.
+func (d *dedup) forgetIdlest(except uint64) {
 	var idlest uint64
 	var at time.Time
 	for s, ss := range d.seen {
-		if at.IsZero() || ss.last.Before(at) {
+		if s != except && (at.IsZero() || ss.last.Before(at)) {
 			idlest, at = s, ss.last
 		}
 	}

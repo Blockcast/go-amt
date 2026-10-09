@@ -130,6 +130,54 @@ func TestDedupBoundsTheHistoryOfOneSlot(t *testing.T) {
 	checkIDs(t, d)
 }
 
+// A slot holding every id a real slot can have is not reset by a repeat,
+// which a union receives continuously; only a new id past the cap resets it
+// (Ally, go-amt#144 review 5464391246).
+func TestDedupDoesNotResetAFullSlotOnADuplicate(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	for i := range uint64(maxSlotIDs) {
+		d.observe(t0, 100, uint32(i>>6), uint32(i&63))
+	}
+	if v := d.observe(t0, 100, 0, 0); v != duplicate || d.forgotten != 0 || d.ids != maxSlotIDs {
+		t.Errorf("repeat into a full slot: %v, forgotten=%d ids=%d; want duplicate, 0, %d", v, d.forgotten, d.ids, maxSlotIDs)
+	}
+	if v := d.observe(t0, 100, 1<<20, 0); v != emit || d.forgotten != 1 || d.ids != 1 {
+		t.Errorf("new id past the cap: %v, forgotten=%d ids=%d; want emit, 1, 1", v, d.forgotten, d.ids)
+	}
+	checkIDs(t, d)
+}
+
+// Full slots kept fresh by one duplicate each cannot hold more than
+// maxDedupIDs between them: past it, a new id forgets the idlest other slot
+// (Ally, go-amt#147 review 5468443886).
+func TestDedupBoundsIDsAcrossSlots(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	at := t0
+	const full = maxDedupIDs/maxSlotIDs + 1 // one full slot more than the cap holds
+	for s := uint64(1); s <= full; s++ {
+		for r := uint64(1); r < s; r++ { // one duplicate keeps each earlier slot fresh
+			at = at.Add(time.Nanosecond)
+			d.observe(at, r, 0, 0)
+		}
+		for i := range uint64(maxSlotIDs) {
+			at = at.Add(time.Nanosecond)
+			d.observe(at, s, uint32(i>>6), uint32(i&63))
+			if d.ids > maxDedupIDs {
+				t.Fatalf("dedup holds %d ids filling slot %d, want at most %d", d.ids, s, maxDedupIDs)
+			}
+		}
+	}
+	if ss := d.seen[full]; ss == nil || len(ss.ids) != maxSlotIDs || d.forgotten != 1 || d.seen[1] != nil {
+		t.Errorf("slot %d kept=%v, forgotten=%d, slot 1 kept=%v; want all %d ids, 1, false: the idlest other slot gives way",
+			full, ss != nil, d.forgotten, d.seen[1] != nil, maxSlotIDs)
+	}
+	// A slot is not forgotten for its own new id, even stamped earliest of all.
+	if v := d.observe(t0, full+1, 0, 0); v != emit || d.seen[full+1] == nil {
+		t.Errorf("new slot at the cap: %v, kept=%v; want emit, true", v, d.seen[full+1] != nil)
+	}
+	checkIDs(t, d)
+}
+
 func TestAsV3(t *testing.T) {
 	// A version-4 frame: forwarder header, then a 32:32 chained data shred
 	// (variant 0x96: chained Merkle data, proof 6).
