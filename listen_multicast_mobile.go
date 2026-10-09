@@ -17,7 +17,9 @@ import (
 // ListenMulticastUDP4 listens for IPv4 multicast on mobile platforms using
 // Go's UDP socket path plus x/net/ipv4 multicast controls. The desktop
 // implementation uses raw socket setup and optional BPF attachment; those are
-// not suitable for gomobile targets.
+// not suitable for gomobile targets. Go binds the wildcard for a group
+// address, so on Android the socket clears IP_MULTICAST_ALL to receive only
+// the groups it joins (clearMulticastAll).
 func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, gaddr *net.UDPAddr, f []bpf.RawInstruction, timestamp bool, ttl int, flags4 ipv4.ControlFlags, rcvBufBytes int, sndBufBytes int) (*ipv4.PacketConn, error) {
 	if gaddr == nil || gaddr.IP.To4() == nil {
 		return nil, errors.New("invalid ipv4 address")
@@ -31,6 +33,9 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 			var controlErr error
 			if err := c.Control(func(fd uintptr) {
 				controlErr = applyForcedBuffers(int(fd), rcvBufBytes, sndBufBytes)
+				if controlErr == nil {
+					controlErr = clearMulticastAll(int(fd))
+				}
 				if controlErr != nil || !timestamp {
 					return
 				}
