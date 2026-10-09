@@ -293,10 +293,12 @@ const (
 // emitted nothing more until a restart. Now a forged slot only costs one entry
 // that ages out, and real shreds are never refused.
 type dedup struct {
-	keep    time.Duration
-	maxSlot uint64 // the highest slot seen, for the stats line only
-	seen    map[uint64]*slotSeen
-	sweep   time.Time // when the next eviction pass runs
+	keep      time.Duration
+	maxSlot   uint64 // the highest slot seen, for the stats line only
+	seen      map[uint64]*slotSeen
+	ids       int       // shreds remembered across every slot
+	forgotten uint64    // slots forgotten at a cap rather than for idling
+	sweep     time.Time // when the next eviction pass runs
 }
 
 type slotSeen struct {
@@ -309,6 +311,12 @@ type slotSeen struct {
 // Past the cap, the slot idle longest goes first, and a slot still being
 // received is never the idlest.
 const maxDedupSlots = 256
+
+// maxSlotIDs bounds one slot's history. A flood of distinct (fec_set_index,
+// local_index) pairs on one slot number keeps that slot fresh, so neither the
+// sweep nor maxDedupSlots ever forgets it. A real slot carries at most 32768
+// data shreds and as many coding.
+const maxSlotIDs = 1 << 16
 
 func newDedup(keep time.Duration) *dedup {
 	return &dedup{keep: keep, seen: map[uint64]*slotSeen{}}
@@ -324,12 +332,17 @@ func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
 		// keep by up to half of it.
 		for s, ss := range d.seen {
 			if now.Sub(ss.last) > d.keep {
-				delete(d.seen, s)
+				d.drop(s)
 			}
 		}
 		d.sweep = now.Add(d.keep / 2)
 	}
 	ss := d.seen[slot]
+	if ss != nil && len(ss.ids) >= maxSlotIDs {
+		d.drop(slot) // more shreds than a real slot has: start it over
+		d.forgotten++
+		ss = nil
+	}
 	if ss == nil {
 		if len(d.seen) >= maxDedupSlots {
 			d.forgetIdlest()
@@ -346,7 +359,14 @@ func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
 		return duplicate
 	}
 	ss.ids[k] = struct{}{}
+	d.ids++
 	return emit
+}
+
+// drop forgets slot s.
+func (d *dedup) drop(s uint64) {
+	d.ids -= len(d.seen[s].ids)
+	delete(d.seen, s)
 }
 
 // forgetIdlest forgets the slot whose latest shred arrived longest ago.
@@ -358,7 +378,8 @@ func (d *dedup) forgetIdlest() {
 			idlest, at = s, ss.last
 		}
 	}
-	delete(d.seen, idlest)
+	d.drop(idlest)
+	d.forgotten++
 }
 
 // asV3 returns b as a forwarder wire-version-3 frame.
@@ -641,8 +662,8 @@ func main() {
 				emitErr += o.err
 				fmt.Fprintf(&per, " %s@%s=%d/%d", o.kind, o.dst, o.sent, o.err)
 			}
-			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d qdrop=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d%s",
-				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, qdrop.Load(), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, per.String())
+			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d qdrop=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d dedup_ids=%d forgotten=%d%s",
+				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, qdrop.Load(), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, seen.ids, seen.forgotten, per.String())
 
 		case s := <-sig:
 			log.Printf("signal %v; final: rx_prod=%d rx_listener2=%d emitted=%d first_from_listener2=%d", s, rxA, rxB, emitted, firstFromB)

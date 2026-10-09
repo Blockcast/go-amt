@@ -54,6 +54,19 @@ func TestDedupForgetsASlotIdleForKeep(t *testing.T) {
 	if got := d.observe(at(57), 100, 0, 1); got != emit {
 		t.Errorf("slot 100 after its history was swept: observe = %d, want emit", got)
 	}
+	checkIDs(t, d)
+}
+
+// checkIDs checks the stats line's dedup_ids against the history held.
+func checkIDs(t *testing.T, d *dedup) {
+	t.Helper()
+	n := 0
+	for _, ss := range d.seen {
+		n += len(ss.ids)
+	}
+	if d.ids != n {
+		t.Errorf("dedup_ids = %d, but the slots hold %d", d.ids, n)
+	}
 }
 
 // One forged far-future slot used to move a slot window past every real slot
@@ -92,6 +105,29 @@ func TestDedupBoundsHistoryUnderAFloodOfSlots(t *testing.T) {
 	if got := d.observe(at, 100, 0, 1); got != duplicate {
 		t.Errorf("the slot being received lost its history in the flood: observe = %d, want duplicate", got)
 	}
+	// Slot 100 and the first 255 forged slots fill the cap; each later forged
+	// slot forgets one.
+	if want := uint64(3*maxDedupSlots - (maxDedupSlots - 1)); d.forgotten != want {
+		t.Errorf("forgotten = %d, want %d", d.forgotten, want)
+	}
+	checkIDs(t, d)
+}
+
+// A flood of distinct (fec_set_index, local_index) pairs on one slot number
+// keeps that slot fresh, so only a cap on the slot's own history bounds it
+// (Ally, go-amt#144 review 5464269530).
+func TestDedupBoundsTheHistoryOfOneSlot(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	for i := range uint64(maxSlotIDs + 10) {
+		d.observe(t0, 100, uint32(i>>6), uint32(i&63))
+	}
+	if n := len(d.seen[100].ids); n > maxSlotIDs || d.ids > maxSlotIDs {
+		t.Errorf("slot 100 holds %d ids, %d in all; want at most %d", n, d.ids, maxSlotIDs)
+	}
+	if d.forgotten != 1 {
+		t.Errorf("forgotten = %d, want 1: the slot started over once", d.forgotten)
+	}
+	checkIDs(t, d)
 }
 
 func TestAsV3(t *testing.T) {
