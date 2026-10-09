@@ -78,7 +78,18 @@ func NewTeeSink(sinks ...Sink) (TeeSink, error) {
 }
 
 // Ship delivers record to every member, stopping at the first failure.
+//
+// An empty tee is an error, not a no-op, and the check is here rather than
+// only in NewTeeSink because TeeSink is an exported slice type: TeeSink(nil)
+// and TeeSink{} are both constructible without the constructor, and ranging
+// over either returns nil having shipped the record nowhere. Reporter reads
+// that nil as "durably accepted, never retransmit", so the zero value bills
+// nothing while every other signal reads healthy — the worst failure in this
+// package, reachable by skipping one call.
 func (t TeeSink) Ship(record Record) error {
+	if len(t) == 0 {
+		return errors.New("delivery: tee sink has no members")
+	}
 	for _, sink := range t {
 		if err := sink.Ship(record); err != nil {
 			return err

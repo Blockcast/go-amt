@@ -312,6 +312,26 @@ func TestShipAcceptsOnlyDurablyPersistedAcks(t *testing.T) {
 			{RecordIndex: 0, ReasonCodes: []string{"SOMETHING_NEW"}},
 		}},
 		wantErr: true,
+	}, {
+		// The MUST NOT the proto calls out by name, and the PR's whole thesis:
+		// ACCEPTED is an acknowledgement that the record was taken, NOT a
+		// durability receipt. Without this row a regression adding
+		// `case ACCEPTED: return nil` to the switch passes the entire table,
+		// because every other ACCEPTED-bearing row also has Persisted: true.
+		name: "accepted but not persisted",
+		ack: &cdnilog.LogAck{Success: true, Persisted: false, RecordsProcessed: 1, Outcomes: []*cdnilog.RecordOutcome{
+			{RecordIndex: 0, Disposition: cdnilog.RecordDisposition_ACCEPTED},
+		}},
+		wantErr: true,
+	}, {
+		// A list that exists must name the only record the batch carried. A
+		// collector that renumbered or dropped the entry would otherwise be
+		// indistinguishable from one that stayed silent, i.e. from acceptance.
+		name: "outcomes naming no record 0",
+		ack: &cdnilog.LogAck{Success: true, Persisted: true, RecordsProcessed: 1, Outcomes: []*cdnilog.RecordOutcome{
+			{RecordIndex: 1, Disposition: cdnilog.RecordDisposition_ACCEPTED},
+		}},
+		wantErr: true,
 	}} {
 		t.Run(testCase.name, func(t *testing.T) {
 			err := ackAccepted(testCase.ack, record)
@@ -462,6 +482,12 @@ func TestCollectorConfigRefusesUnauthenticatedOrUnattributableConfig(t *testing.
 		{"no gateway ID", func(c *CollectorConfig) { c.GatewayID = "" }},
 		{"no content ID", func(c *CollectorConfig) { c.ContentID = "" }},
 		{"no latency tier", func(c *CollectorConfig) { c.LatencyTier = "" }},
+		// Not unattributable but unshippable, and in the same way that only
+		// shows up at runtime: Traffic Ops validates transport against a closed
+		// vocabulary, so a config that reaches Ship with an empty one nacks
+		// every record forever while the ledger grows a duplicate line per
+		// tick. There is deliberately no default to fall back on.
+		{"no transport", func(c *CollectorConfig) { c.Transport = "" }},
 		{"no client certificate", func(c *CollectorConfig) { c.ClientCert = "" }},
 		{"no client key", func(c *CollectorConfig) { c.ClientKey = "" }},
 	} {

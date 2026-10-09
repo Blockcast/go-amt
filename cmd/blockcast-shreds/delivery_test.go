@@ -410,6 +410,7 @@ func TestCollectorFlagsValidation(t *testing.T) {
 			gatewayID:   "7f3a1c20-0000-4000-8000-000000000001",
 			contentID:   "solana-mainnet-shreds",
 			latencyTier: "standard",
+			transport:   delivery.TransportShredUnicast,
 			clientCert:  certificate,
 			clientKey:   key,
 		}
@@ -441,6 +442,16 @@ func TestCollectorFlagsValidation(t *testing.T) {
 			name:    "no latency tier",
 			flags:   complete(func(f *collectorFlags) { f.latencyTier = "" }),
 			wantErr: "latency tier",
+		},
+		{
+			// No default to fall back on, deliberately: Traffic Ops validates
+			// transport against a closed vocabulary, so a defaulted token is a
+			// permanent nack rather than a transient one — the pending record
+			// is re-shipped every tick and the local ledger grows a duplicate
+			// line each time while the destination bills nothing.
+			name:    "no transport",
+			flags:   complete(func(f *collectorFlags) { f.transport = "" }),
+			wantErr: "transport token",
 		},
 		{
 			name:    "no client certificate",

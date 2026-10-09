@@ -194,7 +194,8 @@ func run(args []string) error {
 	deliveryLatencyTier := flags.String("delivery-latency-tier", "",
 		"commercial latency tier this feed is sold under; required by --delivery-collector")
 	deliveryTransport := flags.String("delivery-transport", "",
-		"delivery-class token stamped on each record; empty means "+delivery.TransportShredUnicast)
+		"delivery-class token stamped on each record; required by --delivery-collector, "+
+			"pass "+delivery.TransportShredUnicast+" for the shred fan-out")
 	deliveryCollectorCert := flags.String("delivery-collector-cert", "", "PEM client certificate for --delivery-collector")
 	deliveryCollectorKey := flags.String("delivery-collector-key", "", "PEM private key for --delivery-collector-cert")
 	deliveryCollectorCA := flags.String("delivery-collector-ca", "", "PEM CA bundle for --delivery-collector")

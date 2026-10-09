@@ -34,8 +34,8 @@ const DefaultCollectorEndpoint = "blockcastd:50052"
 // not AMT (GATE 0 removed multicast for it) and it is not MoQ, and tagging it
 // "moq-unicast" would make shred traffic indistinguishable from moq-relay
 // traffic in the invoice rollup. Stamping an honest token that TO must learn is
-// the lesser error, and Transport is configurable so an operator can override
-// it without a rebuild once the vocabulary moves.
+// the lesser error — but it is NOT the default, and deliberately so: see
+// CollectorConfig.Transport.
 const TransportShredUnicast = "shred-unicast"
 
 // collectorBatchSource names this producer in CDNILogBatch.source.
@@ -73,7 +73,14 @@ type CollectorConfig struct {
 	// because it sits in the invoice rollup's GROUP BY: an empty one does not
 	// degrade gracefully, it collapses every session into a single NULL tier.
 	LatencyTier string
-	// Transport tags the delivery class. Empty means TransportShredUnicast.
+	// Transport tags the delivery class. Required, with NO default, because
+	// every token this producer could default to is wrong in a way that only
+	// shows up at runtime: TransportShredUnicast is rejected 400 by today's
+	// Traffic Ops vocabulary, and the two tokens TO does accept misattribute
+	// shred traffic. A default would turn that into a permanent nack loop —
+	// Reporter re-ships the pending record every tick, so the ledger grows a
+	// duplicate line per interval per destination while the target bills
+	// nothing. Making the operator state the token fails at startup instead.
 	Transport string
 	// ClientVersion is the producer version, forward-compat for TO's minimum
 	// -version rejection. Optional.
@@ -100,6 +107,8 @@ func (c CollectorConfig) Validate() error {
 		return errors.New("delivery: collector requires a content ID (s_ccid); Traffic Ops rejects a record without one")
 	case c.LatencyTier == "":
 		return errors.New("delivery: collector requires a latency tier; it is in the invoice rollup's GROUP BY and an empty one collapses every session into one NULL tier")
+	case c.Transport == "":
+		return fmt.Errorf("delivery: collector requires a transport token (%q for the shred fan-out); Traffic Ops validates it against a closed vocabulary, so a defaulted one nacks every record forever instead of failing here", TransportShredUnicast)
 	case c.ClientCert == "" || c.ClientKey == "":
 		return errors.New("delivery: collector requires a client certificate and key; this path carries billing identity and will not run unauthenticated")
 	}
@@ -136,9 +145,6 @@ func NewCollectorSink(config CollectorConfig) (*CollectorSink, error) {
 	}
 	if config.Endpoint == "" {
 		config.Endpoint = DefaultCollectorEndpoint
-	}
-	if config.Transport == "" {
-		config.Transport = TransportShredUnicast
 	}
 	timeout := config.Timeout
 	if timeout <= 0 {
@@ -201,10 +207,13 @@ func ackAccepted(ack *cdnilog.LogAck, record Record) error {
 	// accepted, and then for EVERY record — so an empty list here is not
 	// evidence of acceptance and is deliberately not read as one. A populated
 	// list, though, states this record's disposition explicitly.
-	for _, outcome := range ack.GetOutcomes() {
+	outcomes := ack.GetOutcomes()
+	stated := false
+	for _, outcome := range outcomes {
 		if outcome.GetRecordIndex() != 0 {
 			continue
 		}
+		stated = true
 		switch outcome.GetDisposition() {
 		case cdnilog.RecordDisposition_ACCEPTED, cdnilog.RecordDisposition_DUPLICATE:
 			// DUPLICATE means an identical replay is already stored, which is
@@ -217,6 +226,17 @@ func ackAccepted(ack *cdnilog.LogAck, record Record) error {
 			return fmt.Errorf("delivery: collector did not accept %s: disposition %s %v",
 				where, outcome.GetDisposition(), outcome.GetReasonCodes())
 		}
+	}
+	// A populated list that never mentions record 0 is the same shape of
+	// ambiguity as an unset disposition, and is treated the same way. The batch
+	// carried exactly one record, so a list that exists at all must name it;
+	// falling through to the weaker checks instead would make a collector that
+	// renumbered or dropped the entry indistinguishable from one that accepted
+	// the record. Unreachable for a well-behaved collector, which is the point
+	// — this reads the ill-behaved one as not-accepted rather than as silence.
+	if len(outcomes) > 0 && !stated {
+		return fmt.Errorf("delivery: collector returned %d outcomes for %s but none for record 0; treating as not accepted",
+			len(outcomes), where)
 	}
 	// The version-independent check for whether anything went missing: a server
 	// too old to populate outcomes still reports how many records it took.
@@ -283,10 +303,6 @@ func (s *CollectorSink) batch(record Record) *cdnilog.CDNILogBatch {
 // other free-form field. TestDeliverySessionCarriesNoSubscriberIdentity pins
 // that against the marshalled bytes rather than against this comment.
 func (c CollectorConfig) deliverySession(record Record) *cdnilog.DeliverySession {
-	transport := c.Transport
-	if transport == "" {
-		transport = TransportShredUnicast
-	}
 	return &cdnilog.DeliverySession{
 		SSid:  record.SessionID,
 		SCcid: c.ContentID,
@@ -294,7 +310,7 @@ func (c CollectorConfig) deliverySession(record Record) *cdnilog.DeliverySession
 		// dimension, and TO's natural key (server_session_id, track, seq) is
 		// well-formed with an empty one. Synthesising a value would invent a
 		// billing dimension the producer cannot attest to.
-		Transport:      transport,
+		Transport:      c.Transport,
 		CIp:            clientIP(record.Destination),
 		SessionStartMs: unixMilli(record.OpenedAt),
 		SessionEndMs:   unixMilli(record.EmittedAt),
