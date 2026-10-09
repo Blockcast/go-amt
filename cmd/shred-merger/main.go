@@ -323,10 +323,14 @@ const maxSlotIDs = 1 << 16
 // about 577 MiB at 36 B an id (Ally, go-amt#144 review 5464391246), and a flood
 // could hold that forever with one duplicate per slot per keep (Ally,
 // go-amt#147 review 5468443886). Past this cap a new id first forgets the
-// idlest other slot, so a held slot has to be flooded afresh. 2M ids is about
-// 72 MiB, ten times the 130k-190k ids live traffic holds across 100-140 slots
-// (CT 140, 2026-10-09). A dedup_ids pinned near it is a flood: slots=1 with
-// forgotten climbing is the one-slot shape.
+// idlest other slot. That bounds memory, not the hold: a flood can still hold
+// up to the cap, and one that refreshes its slots faster than live slots go
+// idle makes the live slots the idlest, so their history shortens instead.
+// 2M ids is about 72 MiB, ten times the 130k-190k ids live traffic holds across
+// 100-140 slots (CT 140, 2026-10-09). A dedup_ids pinned near it is a flood of
+// full slots, and slots pinned at 256 one of distinct slots. A one-slot flood
+// leaves both at live levels and shows only as forgotten climbing, one per
+// 65536 new ids.
 const maxDedupIDs = 1 << 21
 
 func newDedup(keep time.Duration) *dedup {
