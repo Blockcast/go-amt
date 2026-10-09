@@ -259,6 +259,7 @@ func TestNoUndefinedFlagMentionedAnywhereInDoc(t *testing.T) {
 		"now":            true, // systemctl enable --now
 		"version":        true, // systemctl --version
 		"since":          true, // journalctl --since
+		"wire-version":   true, // libmmt shred-forwarder (the feed sender)
 	}
 
 	token := regexp.MustCompile(`--([a-z][a-z0-9-]{2,})`)

@@ -173,3 +173,33 @@ func TestScorerWithAgaveFormatStillParsesAgaveShreds(t *testing.T) {
 		t.Fatal("forwarder framing should not parse as an Agave shred")
 	}
 }
+
+func TestTVUPayload(t *testing.T) {
+	frame := func(version byte) []byte {
+		packet := make([]byte, WireHeaderSize+8)
+		packet[0] = version
+		copy(packet[WireHeaderSize:], "agave!!!")
+		return packet
+	}
+	badGeometry := frame(4)
+	badGeometry[18] = 7 // a data shred advertising geometry is not a forwarder frame
+
+	for _, testCase := range []struct {
+		name   string
+		packet []byte
+		want   []byte
+		ok     bool
+	}{
+		{"v4 delivers the canonical body", frame(4), []byte("agave!!!"), true},
+		{"v3 erasure shard is undeliverable", frame(3), nil, false},
+		{"v4 frame with no body is undeliverable", frame(4)[:WireHeaderSize], nil, false},
+		{"non-forwarder bytes pass unchanged", []byte{1, 2, 3}, []byte{1, 2, 3}, true},
+		{"malformed frame passes unchanged", badGeometry, badGeometry, true},
+		{"generic record passes unchanged", []byte("BCG1-generic-record-bytes"), []byte("BCG1-generic-record-bytes"), true},
+	} {
+		got, ok := TVUPayload(testCase.packet)
+		if ok != testCase.ok || string(got) != string(testCase.want) {
+			t.Errorf("%s: TVUPayload = %q, %v; want %q, %v", testCase.name, got, ok, testCase.want, testCase.ok)
+		}
+	}
+}
