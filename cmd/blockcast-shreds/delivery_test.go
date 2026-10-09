@@ -550,6 +550,7 @@ func TestCollectorFlagsAreNeverSilentlyInertWithBillingOff(t *testing.T) {
 		{"client key alone", collectorFlags{clientKey: keyPath}, "--delivery-collector-key"},
 		{"content id alone", collectorFlags{contentID: "feed-1"}, "--delivery-content-id"},
 		{"latency tier alone", collectorFlags{latencyTier: "tier-1"}, "--delivery-latency-tier"},
+		{"ca bundle alone", collectorFlags{caBundle: certificatePath}, "--delivery-collector-ca"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := billingOptions("", "", destinations, test.flags)
