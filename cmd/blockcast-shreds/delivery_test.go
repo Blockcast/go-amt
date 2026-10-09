@@ -521,6 +521,61 @@ func TestCollectorEndpointRequiresBillingPaths(t *testing.T) {
 	}
 }
 
+// TestCollectorFlagsAreNeverSilentlyInertWithBillingOff pins the other side of
+// TestCollectorEndpointRequiresBillingPaths, and it is the asymmetry that makes
+// it worth its own test: the same operator mistake is caught loudly when
+// --delivery-collector is set and was caught by nothing when it is not.
+//
+// With no --delivery-wal and no --delivery-records, billingOptions returns an
+// empty billing{} and the caller skips the whole billing block. Every other
+// --delivery-collector-* flag the operator set is then ignored with no error,
+// no warning and no log line: the relay forwards shreds, bills nothing, and
+// reads as configured. The endpoint case was already covered because it is
+// tested before the early return; the ancillary flags were not, because the
+// set-but-inert check used to sit after it.
+//
+// Each case names exactly one flag, so a regression tells you which arm of
+// setCollectorFlagNames stopped being reachable rather than just that one did.
+func TestCollectorFlagsAreNeverSilentlyInertWithBillingOff(t *testing.T) {
+	certificatePath, keyPath := writeCollectorKeyPair(t)
+	destinations := []string{"127.0.0.1:8001"}
+
+	for _, test := range []struct {
+		name     string
+		flags    collectorFlags
+		wantFlag string
+	}{
+		{"transport alone", collectorFlags{transport: "shred-unicast"}, "--delivery-transport"},
+		{"client certificate alone", collectorFlags{clientCert: certificatePath}, "--delivery-collector-cert"},
+		{"client key alone", collectorFlags{clientKey: keyPath}, "--delivery-collector-key"},
+		{"content id alone", collectorFlags{contentID: "feed-1"}, "--delivery-content-id"},
+		{"latency tier alone", collectorFlags{latencyTier: "tier-1"}, "--delivery-latency-tier"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := billingOptions("", "", destinations, test.flags)
+			if err == nil {
+				t.Fatalf("billingOptions() error = nil; %s was accepted and silently ignored "+
+					"with billing off — the operator gets no signal that it does nothing",
+					test.wantFlag)
+			}
+			if !strings.Contains(err.Error(), test.wantFlag) {
+				t.Fatalf("billingOptions() error = %v, want it to name %s", err, test.wantFlag)
+			}
+			if !strings.Contains(err.Error(), "requires --delivery-collector") {
+				t.Fatalf("billingOptions() error = %v, want it to say what is missing", err)
+			}
+		})
+	}
+
+	// Control. Billing off with no collector flags set at all is the ordinary
+	// shred-forwarding configuration and must stay silent — without this row
+	// the test above would pass against a function that rejected everything.
+	if _, err := billingOptions("", "", destinations, collectorFlags{}); err != nil {
+		t.Fatalf("billingOptions() error = %v; billing off with no collector flags is the "+
+			"default configuration and must be accepted", err)
+	}
+}
+
 // writeCollectorKeyPair writes a throwaway certificate and key, returning their
 // paths. The flag validation only checks that the paths are non-empty, but a
 // real pair keeps the fixture honest if that ever tightens to a load.

@@ -462,6 +462,23 @@ func heartbeatHTTPClient(beat heartbeatConfig) (*http.Client, error) {
 func billingOptions(walPath, recordPath string, destinations []string, collector collectorFlags) (billing, error) {
 	walPath = strings.TrimSpace(walPath)
 	recordPath = strings.TrimSpace(recordPath)
+
+	// Set-but-inert collector flags are refused before anything else, because
+	// the two configurations that reach them are not the same shape and only
+	// one of them used to be covered. With billing off entirely this function
+	// returns an empty billing{} below and never looks at the collector at all,
+	// so --delivery-transport and the mTLS pair read as configured while the
+	// relay bills nothing and says nothing — the same silent-no-op this
+	// function's doc comment is about, reached from the other side. Hoisting it
+	// above the switch covers the no-billing path and the local-ledger path
+	// together, so a mistake with --delivery-collector and the identical
+	// mistake without it both fail the same way.
+	if strings.TrimSpace(collector.endpoint) == "" {
+		if set := setCollectorFlagNames(collector); len(set) > 0 {
+			return billing{}, fmt.Errorf("%s requires --delivery-collector", strings.Join(set, ", "))
+		}
+	}
+
 	switch {
 	case walPath == "" && recordPath == "":
 		if strings.TrimSpace(collector.endpoint) != "" {
@@ -479,12 +496,8 @@ func billingOptions(walPath, recordPath string, destinations []string, collector
 
 	endpoint := strings.TrimSpace(collector.endpoint)
 	if endpoint == "" {
-		// Local-ledger mode. Flagging the other --delivery-collector-* values as
-		// set-but-inert is the point: silently ignoring a configured certificate
-		// is how an operator believes records are shipping when they are not.
-		if set := setCollectorFlagNames(collector); len(set) > 0 {
-			return billing{}, fmt.Errorf("%s requires --delivery-collector", strings.Join(set, ", "))
-		}
+		// Local-ledger mode. The set-but-inert refusal already ran above; it is
+		// deliberately not repeated here, so there is one place to change it.
 		return bill, nil
 	}
 	// The gateway identity is --gw-uuid, deliberately not a second flag that
