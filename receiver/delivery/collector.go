@@ -26,16 +26,17 @@ const DefaultCollectorEndpoint = "blockcastd:50052"
 
 // TransportShredUnicast tags records from the Solana shred unicast fan-out.
 //
-// ⚠ Traffic Ops validates transport against a CLOSED vocabulary —
-// tc.ValidCDNIDeliveryTransport accepts "amt" and "moq-unicast" and nothing
-// else (lib/go-tc/cdni_logs.go) — so until that vocabulary carries this token
-// a record stamped with it is rejected 400 "transport %q is not supported".
-// The two existing tokens are both wrong for this producer: the shred class is
-// not AMT (GATE 0 removed multicast for it) and it is not MoQ, and tagging it
-// "moq-unicast" would make shred traffic indistinguishable from moq-relay
-// traffic in the invoice rollup. Stamping an honest token that TO must learn is
-// the lesser error — but it is NOT the default, and deliberately so: see
-// CollectorConfig.Transport.
+// Traffic Ops validates transport against a CLOSED vocabulary
+// (tc.ValidCDNIDeliveryTransport, lib/go-tc/cdni_logs.go), which carries this
+// token as of trafficcontrol 7142ffc6 (BLO-41837). Before that a record
+// stamped with it was rejected 400 "transport %q is not supported".
+//
+// The vocabulary was widened rather than this producer reusing an existing
+// token because both are wrong for it: the shred class is not AMT (GATE 0
+// removed multicast for it) and it is not MoQ, and "moq-unicast" would make
+// shred traffic indistinguishable from moq-relay traffic in the invoice rollup
+// and in the delivery-session drift counter, which both group by transport.
+// Still NOT the default, and deliberately so: see CollectorConfig.Transport.
 const TransportShredUnicast = "shred-unicast"
 
 // collectorBatchSource names this producer in CDNILogBatch.source.
@@ -73,14 +74,16 @@ type CollectorConfig struct {
 	// because it sits in the invoice rollup's GROUP BY: an empty one does not
 	// degrade gracefully, it collapses every session into a single NULL tier.
 	LatencyTier string
-	// Transport tags the delivery class. Required, with NO default, because
-	// every token this producer could default to is wrong in a way that only
-	// shows up at runtime: TransportShredUnicast is rejected 400 by today's
-	// Traffic Ops vocabulary, and the two tokens TO does accept misattribute
-	// shred traffic. A default would turn that into a permanent nack loop —
-	// Reporter re-ships the pending record every tick, so the ledger grows a
-	// duplicate line per interval per destination while the target bills
-	// nothing. Making the operator state the token fails at startup instead.
+	// Transport tags the delivery class. Required, with NO default, because a
+	// defaulted token fails in two directions and neither shows up here. A
+	// token TO's closed vocabulary has not learned is rejected 400 forever —
+	// permanent, not transient: Reporter re-ships the pending record every
+	// tick, so the ledger grows a duplicate line per interval per destination
+	// while the target bills nothing. A token it HAS learned but that is wrong
+	// for this feed is worse, because nothing errors at all: transport is a
+	// grouping key in the invoice rollup and the drift counter, so the feed is
+	// silently billed under another delivery class. Making the operator state
+	// the token turns both into a startup error.
 	Transport string
 	// ClientVersion is the producer version, forward-compat for TO's minimum
 	// -version rejection. Optional.

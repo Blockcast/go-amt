@@ -128,8 +128,10 @@ func TestMappedRecordCarriesEveryFieldTrafficOpsRequires(t *testing.T) {
 	if session.ServerSessionID != record.SessionID {
 		t.Fatalf("server_session_id = %q, want %q", session.ServerSessionID, record.SessionID)
 	}
-	// TO rejects a non-UUID server_session_id outright on some transports, and
-	// the dedup key is useless without it; an empty one is the row-0 failure.
+	// TO's server_session_id guard is exhaustive-by-default: "amt" is the only
+	// transport exempted, so "shred-unicast" takes the default arm and a
+	// non-UUID id is a 400 (trafficcontrol delivery_session.go, BLO-41837).
+	// The dedup key is useless without it; an empty one is the row-0 failure.
 	if len(session.ServerSessionID) != 36 {
 		t.Fatalf("server_session_id %q is not UUID-shaped", session.ServerSessionID)
 	}
@@ -162,6 +164,17 @@ func TestMappedRecordCarriesEveryFieldTrafficOpsRequires(t *testing.T) {
 	}
 	if session.LatencyTier != config.LatencyTier {
 		t.Fatalf("latency_tier = %q, want %q", session.LatencyTier, config.LatencyTier)
+	}
+	// transport is validated against TO's closed vocabulary
+	// (tc.ValidCDNIDeliveryTransport), which learned this token in
+	// trafficcontrol 7142ffc6 (BLO-41837), and it is a grouping key in both the
+	// invoice rollup and the delivery-session drift counter. Asserted against
+	// the LITERAL rather than TransportShredUnicast on purpose: the literal is
+	// the contract with TO, so this catches the mapping dropping transport
+	// AND the constant being re-pointed at "moq-unicast", which would silently
+	// merge shred traffic into moq-relay's billing rather than erroring.
+	if session.Transport != "shred-unicast" {
+		t.Fatalf("transport = %q, want %q", session.Transport, "shred-unicast")
 	}
 	// The port is dropped rather than folded into c_ip, where it would read as
 	// part of the address: DeliverySession carries no client_port.
