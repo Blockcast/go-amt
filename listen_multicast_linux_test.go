@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 )
@@ -81,6 +82,57 @@ func TestListenMulticastUDP4RejectsNonIPv4Group(t *testing.T) {
 
 	if after := countOpenFDs(t); after > before {
 		t.Errorf("descriptor leaked on the validation path: %d -> %d", before, after)
+	}
+}
+
+// TestListenMulticastUDP6ClosesFDOnErrorPaths is the IPv6 twin of
+// TestListenMulticastUDP4ClosesFDOnErrorPaths. A filter the kernel rejects
+// fails before the raw socket is wrapped; a non-existent interface fails at
+// SetMulticastInterface, after it. Each case checks it failed at that step, so
+// it cannot pass by failing somewhere that allocates nothing.
+func TestListenMulticastUDP6ClosesFDOnErrorPaths(t *testing.T) {
+	// Port 0, so the bind succeeds and the interface case reaches the wrap.
+	gaddr := &net.UDPAddr{IP: net.ParseIP("ff3e::4321:1234")}
+	for _, tc := range []struct {
+		name string
+		ifi  *net.Interface
+		f    []bpf.RawInstruction
+		step string
+	}{
+		{"raw socket", nil, []bpf.RawInstruction{{Op: 0xffff}}, "failed to set bpf"},
+		{"wrapped conn", &net.Interface{Index: 999999, Name: "amt-nonexistent0"}, nil, "set multicast interface"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listen := func() error {
+				c, err := ListenMulticastUDP6("udp6", tc.ifi, netip.Addr{}, gaddr, tc.f, false, 0, 0, 0, 0)
+				if err == nil {
+					_ = c.Close()
+				}
+				return err
+			}
+
+			// The warm-up call also opens any lazily-initialised runtime state.
+			err := listen()
+			switch {
+			case err == nil:
+				t.Skip("expected a failure; environment permits the call")
+			case strings.Contains(err.Error(), "could not get socket"):
+				t.Skipf("no IPv6 sockets: %v", err)
+			case !strings.Contains(err.Error(), tc.step):
+				t.Fatalf("failed at the wrong step, want %q: %v", tc.step, err)
+			}
+
+			before := countOpenFDs(t)
+			const iterations = 50
+			for i := 0; i < iterations; i++ {
+				if listen() == nil {
+					t.Fatalf("iteration %d unexpectedly succeeded", i)
+				}
+			}
+			if grew := countOpenFDs(t) - before; grew > iterations/10 {
+				t.Errorf("descriptor leak: grew %d over %d failed calls", grew, iterations)
+			}
+		})
 	}
 }
 
