@@ -44,15 +44,19 @@ type fakeRelay struct {
 	// discoveries and requests count what arrived, before any loss below.
 	discoveries atomic.Int64
 	requests    atomic.Int64
+	// requestTimes is when each Request arrived, lost ones included. Guarded
+	// by mu.
+	requestTimes []time.Time
 	// dropDiscoveries and dropRequests are how many more of each the relay
 	// ignores, standing in for a datagram lost on the way.
 	dropDiscoveries atomic.Int64
 	dropRequests    atomic.Int64
-	// advertDelay and queryDelay hold each Relay Advertisement or Membership
-	// Query back, standing in for a slow answer rather than a lost one.
-	// Immutable once serve starts.
-	advertDelay time.Duration
-	queryDelay  time.Duration
+	// advertDelays and queryDelay hold Relay Advertisements and Membership
+	// Queries back, standing in for a slow answer rather than a lost one: the
+	// n-th Advertisement waits advertDelays[n-1], or the last entry once they
+	// run out. Immutable once serve starts.
+	advertDelays []time.Duration
+	queryDelay   time.Duration
 
 	// queryIntervalCode is the QQIC byte of the Membership Query. The gateway
 	// decodes it into RelayManager.intervalTime, which drives the keepalive
@@ -87,9 +91,10 @@ func withLostRequests(n int64) fakeRelayOption {
 	return func(fr *fakeRelay) { fr.dropRequests.Store(n) }
 }
 
-// withAdvertisementDelay holds every Relay Advertisement back by d.
-func withAdvertisementDelay(d time.Duration) fakeRelayOption {
-	return func(fr *fakeRelay) { fr.advertDelay = d }
+// withAdvertisementDelays holds the n-th Relay Advertisement back by ds[n-1],
+// and every one after the last entry by that entry.
+func withAdvertisementDelays(ds ...time.Duration) fakeRelayOption {
+	return func(fr *fakeRelay) { fr.advertDelays = ds }
 }
 
 // withQueryDelay holds every Membership Query back by d.
@@ -203,6 +208,9 @@ func (fr *fakeRelay) serve() {
 			fr.handleDiscovery(msg, addr)
 		case m.RequestType:
 			fr.requests.Add(1)
+			fr.mu.Lock()
+			fr.requestTimes = append(fr.requestTimes, time.Now())
+			fr.mu.Unlock()
 			if fr.dropRequests.Add(-1) >= 0 {
 				continue
 			}
@@ -228,8 +236,19 @@ func (fr *fakeRelay) handleDiscovery(msg []byte, addr *net.UDPAddr) {
 	// packet, so a counter bumped afterwards can still read stale to a test that
 	// asserts on it once the handshake has completed -- the relay goroutine may
 	// not have run yet. Race instrumentation widens that window enough to fail.
-	fr.advertised.Add(1)
-	fr.sendAfter(fr.advertDelay, adv, addr)
+	n := fr.advertised.Add(1)
+	var delay time.Duration
+	if len(fr.advertDelays) > 0 {
+		delay = fr.advertDelays[min(int(n), len(fr.advertDelays))-1]
+	}
+	fr.sendAfter(delay, adv, addr)
+}
+
+// requestArrivals returns when each Request arrived, lost ones included.
+func (fr *fakeRelay) requestArrivals() []time.Time {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	return append([]time.Time(nil), fr.requestTimes...)
 }
 
 // handleRequest answers a Request with a Membership Query.

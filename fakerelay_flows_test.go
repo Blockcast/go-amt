@@ -70,8 +70,9 @@ func openWithin(t *testing.T, rm *RelayManager, d time.Duration) {
 // TestHandshakeRetransmitsLostDiscovery pins Relay Discovery retransmission
 // (RFC 7450 section 5.2.3.4.3). One lost Discovery used to fail Open after 10s,
 // which stopped blockcast-shreds at startup (BLO-41383). The resent Discovery
-// must keep the first one's nonce: the relay echoes it and HandleAdvertisement
-// checks it.
+// keeps the first one's nonce (section 5.2.3.4.5), but this test cannot tell:
+// the relay drops the first copy, so a fresh nonce would be echoed and accepted
+// too. TestHandshakeIgnoresLateDuplicateAdvertisement is what pins it.
 func TestHandshakeRetransmitsLostDiscovery(t *testing.T) {
 	fr := newFakeRelay(t, withLostDiscoveries(1))
 	openWithin(t, newTestManager(t, fr), handshakeTimeout)
@@ -100,16 +101,35 @@ func TestHandshakeRetransmitsLostRequest(t *testing.T) {
 }
 
 // TestHandshakeIgnoresLateDuplicateAdvertisement covers an Advertisement that
-// was slow rather than lost. The relay holds each Advertisement back 1.5s, so
-// the Discovery is resent at 1s and both copies are answered. The second
-// Advertisement lands at 2.5s, while the gateway waits for a Query held back
-// 2s, and must not restart the Request leg.
+// was slow rather than lost. The relay answers the first Discovery after 1.1s,
+// so the gateway resends it at 1s, and answers the resent copy after 0.4s. The
+// first answer lands at 1.1s and starts the Request leg. The second lands at
+// 1.4s, while the gateway waits for a Query held back 2s, and must be ignored.
+//
+// The second Request's arrival time is what pins the advertised guard. A
+// gateway that ignores the duplicate sends it as the 1s retransmission, at
+// about 2.1s. One that handles it sends a fresh Request at 1.4s. The Rust
+// state machine behind CGOProtocol also rejects the duplicate outright, but
+// PureGoProtocol accepts it, so without this check the CGO_ENABLED=0 and
+// purego lanes would not notice the guard going.
+//
+// Answering the original Discovery first also pins nonce reuse (RFC 7450
+// section 5.2.3.4.5). A retransmission with a fresh nonce would leave the 1.1s
+// answer carrying the stale one, and HandleAdvertisement rejects it.
 func TestHandshakeIgnoresLateDuplicateAdvertisement(t *testing.T) {
-	fr := newFakeRelay(t, withAdvertisementDelay(1500*time.Millisecond), withQueryDelay(2*time.Second))
+	fr := newFakeRelay(t, withAdvertisementDelays(1100*time.Millisecond, 400*time.Millisecond), withQueryDelay(2*time.Second))
 	openWithin(t, newTestManager(t, fr), handshakeTimeout)
 
 	if n := fr.advertised.Load(); n != 2 {
 		t.Errorf("relay advertisements sent = %d, want 2: the late answer and the one to the retransmission", n)
+	}
+	// 650ms sits between the ~0.3s a restarted Request leg gives and the 1s
+	// retransmission.
+	if at := fr.requestArrivals(); len(at) >= 2 {
+		if gap := at[1].Sub(at[0]); gap < 650*time.Millisecond {
+			t.Errorf("second Request arrived %v after the first, want the %v retransmission: the duplicate Advertisement restarted the Request leg",
+				gap.Round(time.Millisecond), handshakeRetransmit)
+		}
 	}
 }
 

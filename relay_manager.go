@@ -668,7 +668,7 @@ func (rm *RelayManager) performHandshake() error {
 				resendAt = time.Now().Add(handshakeRetransmit + rand.N(handshakeRetransmit<<retries-handshakeRetransmit+1))
 				continue
 			}
-			return fmt.Errorf("failed to receive response: %w", err)
+			return fmt.Errorf("failed to receive response in %v after %d retransmissions: %w", rm.State(), retries, err)
 		}
 
 		msgType := m.MessageType(buffer[0] & 0x0F)
