@@ -306,9 +306,15 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 	// it is also where the COMPLETED log now sits.
 	//
 	// waitTunnel blocks on tunnelReady, which openTunnel closes on every exit
-	// path, so this needs no polling. It is bounded anyway: an unbounded wait
-	// here would turn a regression into a package-wide 10-minute timeout instead
-	// of a named failure, and the handshake is itself bounded at Timeout (2s).
+	// path it reaches, so this needs no polling. The bound is not just about
+	// slowness: the defer that guarantees that close is not installed until
+	// conn.go:359, after the unbounded `<-decision` at conn.go:345, so a
+	// tunnelDecision that never closes wedges waitTunnel with no deferred close
+	// to rescue it. Unreachable from here — the advertisement observed above
+	// proves sendDiscovery ran, so the decision already resolved — but the bound
+	// covers that gap rather than merely turning a regression into a
+	// package-wide 10-minute timeout. The handshake is itself bounded at
+	// Timeout (2s).
 	gwReady := make(chan *Gateway, 1)
 	go func() { gwReady <- mc.waitTunnel() }()
 	select {
@@ -317,7 +323,9 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 			t.Fatal("no gateway after the tunnel was selected: Gateway.Open failed " +
 				"and openTunnel aborted it. Nothing returns that error — it is " +
 				"discarded by `go mc.openTunnel()` — so the reason is only in the " +
-				"`amt: relay handshake failed` line logged above.")
+				"`amt: relay handshake failed` line logged above. If that line is " +
+				"absent, openTunnel returned before calling Gateway.Open (conn.go:356 " +
+				"or :388), and the preconditions asserted above have moved.")
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("openTunnel neither published a gateway nor gave up within 5s; " +

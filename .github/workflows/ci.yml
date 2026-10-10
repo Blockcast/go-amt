@@ -824,6 +824,14 @@ jobs:
             echo "::error::the handover test reported an incomplete handshake (BLO-29437 regression)"
             rc=1
           fi
+          # Negative: the phrase the post-handshake wait uses when openTunnel
+          # aborted Gateway.Open. That is the BLO-42175 shape, and it is a
+          # different failure from the one above — kept separate so the
+          # diagnostic names the ticket that actually regressed.
+          if grep -qF -- 'no gateway after the tunnel was selected' /tmp/switchover.log; then
+            echo "::error::the handover test saw openTunnel abort the handshake (BLO-42175 regression)"
+            rc=1
+          fi
           exit $rc
 
       # The shared half, in this lane too.
