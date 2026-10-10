@@ -62,7 +62,15 @@ const (
 	// path would have published a /v2/ whose only /v1/ caller never existed.
 	// A shape change made after a gateway ships is a different decision and
 	// does need the route.
-	TransportSchema = "gateway.transport.v2"
+	//
+	// v3 added CodeInternal (BLO-30269). The routes stay /v1/ for the same
+	// reason, and the degradation for a client compiled against v2 is the one
+	// the closed-taxonomy rule already specifies: an unknown code is RetryNever
+	// plus ErrUnknownErrorCode, which is no worse than the bodyless 500 this
+	// code replaces and is reached by a documented path rather than by a parse
+	// failure. The error taxonomy is part of this file's contract, so it takes
+	// the bump even though no envelope field moved.
+	TransportSchema = "gateway.transport.v3"
 
 	// TicketTTL is the maximum lifetime the broker will grant a ticket.
 	//
@@ -522,12 +530,57 @@ const (
 	CodeBodyTooLarge ErrorCode = "body_too_large"
 
 	// CodePublicationFailed is a broker-side failure to publish an accepted
-	// change. It is the broker's fault and is transient, so it is the one code
-	// that takes ordinary backoff.
+	// change. It is the broker's fault and is transient, so it takes ordinary
+	// backoff.
 	CodePublicationFailed ErrorCode = "publication_failed"
+
+	// CodeInternal is a broker fault with no client-attributable cause: a
+	// datastore outage, a panic recovered at the handler boundary, a bug.
+	//
+	// It is the taxonomy's deliberately uninformative member and the only one
+	// that names no specific condition. That is its job. Every other code
+	// answers "what, on your side or mine, is wrong"; this one answers only
+	// "nothing you sent was wrong, and I could not serve it" — which is both
+	// all a client can act on and all a broker should disclose, since the real
+	// error carries DSNs, hostnames and query text. The broker logs that error
+	// and puts a fixed string in Message.
+	//
+	// # Why a borrowed code was refused
+	//
+	// CodePublicationFailed is the tempting substitute, being the only other
+	// retryable code, and it was refused on BLO-30269: clients branch on Code,
+	// so it would tell a gateway that a Postgres outage was a relay
+	// publication problem, misdirect operators on both sides, and corrupt any
+	// metric keyed on the code. A code that lies is worse than one that admits
+	// it knows nothing.
+	//
+	// # Why no code at all was also refused
+	//
+	// The alternative was to let an internal fault be a 500 with no body and
+	// narrow ErrorResponse's doc to match. That is not merely untidy: a client
+	// reading the taxonomy as this contract instructs gets Code "" from an
+	// absent body, RetryForCode rejects it as unknown, and the unknown-code
+	// rule — correctly — says RetryNever. So a conforming gateway stops
+	// permanently on a transient fault that would have cleared on the next
+	// attempt, and the failure is silent, because every component behaved as
+	// specified. Naming the fault is what makes the contract's own safe default
+	// stop firing on the one condition where it is wrong.
+	//
+	// 500 rather than CodePublicationFailed's 503: this is not a statement that
+	// the broker is down or that a dependency is unavailable, and a client or
+	// intermediary that treats 503 as "shed load, come back later" would be
+	// acting on a claim this code does not make.
+	CodeInternal ErrorCode = "internal"
 )
 
 // ErrorResponse is the body accompanying every 4xx and 5xx from the broker.
+//
+// Every, without exception: there is no status the broker answers with a bare
+// body-less error. CodeInternal exists so that the fault with no
+// client-attributable cause still has a code to carry, which is what keeps that
+// sentence true rather than aspirational. A client may therefore decode this
+// envelope on any non-2xx and treat a failure to do so as a broken peer, not as
+// a case the contract left open.
 type ErrorResponse struct {
 	// Code is the closed-taxonomy discriminator clients branch on.
 	Code ErrorCode `json:"code"`
@@ -691,6 +744,7 @@ var statusByCode = map[ErrorCode]struct {
 	CodeTicketNotRenewable:   {http.StatusNotFound, RetryNever},
 	CodeBodyTooLarge:         {http.StatusRequestEntityTooLarge, RetryNever},
 	CodePublicationFailed:    {http.StatusServiceUnavailable, RetryBackoff},
+	CodeInternal:             {http.StatusInternalServerError, RetryBackoff},
 }
 
 // ErrUnknownErrorCode reports a code outside the closed taxonomy.
