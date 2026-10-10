@@ -1,11 +1,14 @@
 package amt
 
 import (
+	"cmp"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"math/rand/v2"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"time"
 
@@ -88,13 +91,8 @@ func DiscoverRelay(ctx context.Context, config DRIADConfig) (*net.UDPAddr, error
 		return nil, fmt.Errorf("no AMTRELAY records found for %s", config.SourceAddr)
 	}
 
-	// Select best relay (lowest precedence)
-	var bestRecord *AMTRelayRecord
-	for i := range records {
-		if bestRecord == nil || records[i].Precedence < bestRecord.Precedence {
-			bestRecord = &records[i]
-		}
-	}
+	// Lowest precedence wins, chosen at random among equal precedence.
+	bestRecord := &OrderRelays(records, rand.Shuffle)[0]
 
 	// Resolve relay address if needed
 	relayAddr, err := resolveRelayAddr(ctx, bestRecord, config)
@@ -106,6 +104,21 @@ func DiscoverRelay(ctx context.Context, config DRIADConfig) (*net.UDPAddr, error
 		IP:   relayAddr.AsSlice(),
 		Port: m.DefaultPort,
 	}, nil
+}
+
+// OrderRelays returns the records in the order a gateway should try them:
+// lowest precedence first, with the order randomized within each precedence.
+// RFC 8777 §3.1.2 has a gateway choose non-deterministically among
+// equal-precedence relays so that DNS configurations listing several relays
+// can spread load. Taking the first relay in wire order instead sends every
+// gateway behind one resolver cache to the same relay. Walking the result in
+// order also gives precedence-respecting failover. shuffle has the signature
+// of rand.Shuffle. records is not modified.
+func OrderRelays(records []AMTRelayRecord, shuffle func(n int, swap func(i, j int))) []AMTRelayRecord {
+	ordered := slices.Clone(records)
+	shuffle(len(ordered), func(i, j int) { ordered[i], ordered[j] = ordered[j], ordered[i] })
+	slices.SortStableFunc(ordered, func(a, b AMTRelayRecord) int { return cmp.Compare(a.Precedence, b.Precedence) })
+	return ordered
 }
 
 // BuildDRIADQuery builds the DNS query name for DRIAD discovery (RFC 8777)
