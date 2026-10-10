@@ -260,6 +260,16 @@ func TestNoUndefinedFlagMentionedAnywhereInDoc(t *testing.T) {
 		"version":        true, // systemctl --version
 		"since":          true, // journalctl --since
 		"wire-version":   true, // libmmt shred-forwarder (the feed sender)
+		// Release-artifact verification. The cosign entries are the install
+		// doc's signature-check command; dropping one of them from that command
+		// is not a weaker check but a refusal to run, so they appear together or
+		// not at all.
+		"signature":                   true, // cosign verify-blob
+		"certificate":                 true, // cosign verify-blob
+		"certificate-oidc-issuer":     true, // cosign verify-blob
+		"certificate-identity-regexp": true, // cosign verify-blob
+		"tags":                        true, // git describe --tags
+		"format":                      true, // docker inspect --format
 	}
 
 	token := regexp.MustCompile(`--([a-z][a-z0-9-]{2,})`)
