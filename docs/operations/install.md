@@ -411,6 +411,93 @@ that is merely idle:
 
 Drops are counted at the drop site; there is no silent discard path.
 
+### Confirming your validator accepted them
+
+Everything on `/metrics` is receiver-side: at best it proves we *wrote to a
+socket*. The fan-out socket is unconnected, so a write to a closed port, or to
+the wrong port on the right host, still succeeds and still increments
+`egress_packets_total` — the same reason the smoke test refuses to pass without
+a sink. Only the validator's own counters say whether it accepted anything.
+
+Agave reports these through `datapoint_info!`, which logs the point at `Info`
+**before** any metrics writer runs
+([`metrics/src/metrics.rs`](https://github.com/anza-xyz/agave/blob/v4.3.0/metrics/src/metrics.rs),
+`MetricsCommand::Submit(point, level) => { log!(level, "{point}"); … }`), and the
+writer is `None` unless `SOLANA_METRICS_CONFIG` is set. **So you do not need
+InfluxDB or Grafana** — the points are already in the validator log at the
+default `RUST_LOG`:
+
+```sh
+LOG=/path/to/agave-validator.log   # or: journalctl -u <unit> --since '10 min ago'
+for n in shred_fetch shred_sigverify recv-window-insert-shreds blockstore-insert-shreds; do
+  printf '== %s\n' "$n"; grep -F "datapoint: $n " "$LOG" | tail -2
+done
+```
+
+Every one of these resets itself immediately after it reports — 1 s for
+`shred_fetch`, 2 s for the other three. **They are per-interval deltas: sum them
+over your window, never difference the first and last.**
+
+```sh
+sum() { grep -F "datapoint: $1 " "$LOG" | grep -oE "$2=[0-9]+" | cut -d= -f2 | awk '{s+=$1} END{print s+0}'; }
+sum shred_fetch                shred_count            # received — see the warning below
+sum recv-window-insert-shreds  num_shreds_received    # passed sigverify
+sum blockstore-insert-shreds   num_inserted           # written to the blockstore
+sum blockstore-insert-shreds   num_repair             # …of which came from the repair socket, not us
+```
+
+#### `shred_fetch` is not evidence of acceptance
+
+`shred_count` is incremented on the whole batch the moment it leaves the socket,
+before any filter runs
+([`core/src/shred_fetch_stage.rs`](https://github.com/anza-xyz/agave/blob/v4.3.0/core/src/shred_fetch_stage.rs)).
+It moves identically whether every packet is accepted or every packet is
+rejected. Use it only as the liveness control that proves your packets arrived
+at all; never as the signal that they were any good.
+
+| Observable | Stage | What a non-zero value proves |
+|---|---|---|
+| `shred_fetch.shred_count` | socket read | The UDP reached the TVU port. Nothing more. |
+| `shred_sigverify.num_packets − num_discards_post` | after sigverify | Leader signature verified. **No single field reports this** — it is a subtraction. |
+| `recv-window-insert-shreds.num_shreds_received` | after sigverify | Handed to the window service. The cheapest honest "it passed". |
+| `blockstore-insert-shreds.num_inserted` | blockstore write | Actually stored. Subtract `num_repair`, which arrives on a different socket. |
+
+Inside `shred_sigverify`, `num_discards_pre` and `num_discards_post` are both
+cumulative counts over the same buffer, sampled before dedup and after
+verification. So rejections attributable to the signature check are
+`num_discards_post − num_discards_pre − num_duplicates`, and survivors are
+`num_packets − num_discards_post`.
+
+#### Two things will make a healthy feed read as a total failure
+
+**The deduper runs before signature verification.** We forward the canonical
+shred, byte for byte — which is exactly what turbine delivers. On a validator
+still taking turbine traffic, whichever copy loses the race is discarded into
+`shred_sigverify.num_duplicates` and never reaches sigverify or the blockstore,
+so our delivery can be working perfectly and every downstream counter stays
+flat. To attribute anything, keep turbine off that socket for the window —
+firewall the TVU port to the receiver's source address only. Repair arrives on a
+*separate* socket (`shred_fetch_repair`) and keeps backfilling regardless, which
+is what `blockstore-insert-shreds.num_repair` is for.
+
+**The slot and version filters run before that.** A shred is dropped at
+`shred_fetch` if its `shred_version` differs from the validator's, or if its slot
+is past `max_slot` or at/below the validator's root
+([`ledger/src/shred/filter.rs`](https://github.com/anza-xyz/agave/blob/v4.3.0/ledger/src/shred/filter.rs)).
+A validator that is still catching up therefore rejects *every* shred we send,
+at the first filter, while `shred_count` climbs the whole time. Before believing
+any downstream zero, confirm `shred_version_mismatch` and `slot_out_of_range`
+are flat:
+
+```sh
+grep -F 'datapoint: shred_fetch ' "$LOG" | tail -1 \
+  | grep -oE '(shred_version_mismatch|slot_out_of_range|index_overrun|bad_shred_type)=[0-9]+i'
+```
+
+> **Read against Agave `v4.3.0`.** These names have moved before. Check them
+> against the tag your node actually runs (`agave-validator --version`) rather
+> than trusting this table — the four `grep -F` lines above are the whole check.
+
 ### Shutdown
 
 `SIGTERM` and `SIGINT` close the ingress sockets, drain, print the delivery
@@ -440,3 +527,11 @@ Honest scope of this build, so you are not surprised in an audit:
   whole-run summary. See above before filing a discrepancy.
 - **No AMT, no relay, no FEC decode or repair.** Scoring is counting only; the
   receiver never reconstructs a shred.
+- **Delivery has never been proven into a live validator socket.** That the
+  forwarded bytes are a sigverify-valid shred is proven in-process against real
+  captured frames (`shred/tvu_golden_test.go`: Agave offsets, Merkle proof
+  rebuilt to the FEC-set root, leader signature verified). What is untested is
+  the wire itself — UDP framing and MTU, the socket really being TVU, and the
+  validator's batching and dedup stages ahead of sigverify. The procedure for
+  closing that, and the counters it turns on, are in
+  [Confirming your validator accepted them](#confirming-your-validator-accepted-them).
