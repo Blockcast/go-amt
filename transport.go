@@ -50,7 +50,9 @@ type TransportConfig struct {
 	// RelayAddr is the AMT relay address
 	RelayAddr net.UDPAddr
 
-	// Timeout for connection establishment
+	// Timeout bounds the AMT relay handshake, retransmissions included. Zero
+	// selects the default, 10 s. ManagedConn sets it from
+	// RelayHandshakeTimeout.
 	Timeout time.Duration
 
 	// EnableTimestamp enables packet timestamping (if supported)
