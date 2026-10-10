@@ -517,3 +517,49 @@ func TestReaderDropsDatagramsFromOtherSources(t *testing.T) {
 		t.Fatal("reader passed nothing from the production source")
 	}
 }
+
+// Each frame a reader passes on must own its buffer. reader reuses its read
+// buffer for a datagram it drops, so it has to replace the buffer once out owns
+// one: otherwise the next read overwrites a frame still queued on an output
+// (BLO-43063).
+func TestReaderGivesEachPassedFrameItsOwnBuffer(t *testing.T) {
+	// reader exits the process on a read error, so this socket and its reader
+	// stay open until the test binary exits.
+	in, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan frame, 2)
+	var dropped, foreign atomic.Uint64
+	go reader(in, 0, netip.Addr{}, ch, &dropped, &foreign) // unfiltered: this is about buffers
+
+	c, err := net.DialUDP("udp4", nil, in.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// Take delivery of one slot before sending the next, so a reader that reuses
+	// the buffer overwrites a frame this test is already holding.
+	recv := func(slot uint64) frame {
+		t.Helper()
+		if _, err := c.Write(v4Frame(slot, 3, false)[:hdrLen]); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case f := <-ch:
+			return f
+		case <-time.After(2 * time.Second):
+			t.Fatalf("reader passed nothing for slot %d", slot)
+		}
+		return frame{}
+	}
+	first, second := recv(1), recv(2)
+
+	if &first.buf[0] == &second.buf[0] {
+		t.Error("two passed frames share a buffer: the next read overwrites a frame still in flight")
+	}
+	if slot := binary.LittleEndian.Uint64(first.buf[1:9]); slot != 1 {
+		t.Errorf("the first frame now reads slot %d, want 1: a later read wrote over it", slot)
+	}
+}
