@@ -442,12 +442,38 @@ func (k kind) carries(b []byte) bool {
 	return true
 }
 
-// output is one destination of the union.
+// output is one destination of the union. Each has its own socket, queue and
+// sender goroutine. On CT 140 a write costs tens of microseconds, a veth into a
+// bridge that floods multicast to every port, and one loop writing every frame
+// to every output fell behind when a fourth output was added (BLO-41705). Now
+// the processor only queues, the outputs write in parallel, and an output that
+// falls behind drops its own frames instead of delaying the rest.
 type output struct {
-	dst       *net.UDPAddr
-	kind      kind
-	conn      *net.UDPConn
-	sent, err uint64
+	dst             *net.UDPAddr
+	kind            kind
+	conn            *net.UDPConn
+	q               chan []byte
+	sent, err, drop atomic.Uint64
+}
+
+// outQueue is each output's backlog in frames. At 5.5k shreds/s that is about
+// 1.5 s for an all or v3 output, 3 s for data and 6 s for a coding layer. The
+// stats line shows each queue's depth, so a backlog shows before it drops.
+const outQueue = 1 << 13
+
+// start makes the output's queue and starts its sender, which writes the
+// queued frames to dst in order.
+func (o *output) start() {
+	o.q = make(chan []byte, outQueue)
+	go func() {
+		for p := range o.q {
+			if _, err := o.conn.WriteToUDP(p, o.dst); err != nil {
+				o.err.Add(1)
+			} else {
+				o.sent.Add(1)
+			}
+		}
+	}()
 }
 
 // parseOutput parses an -out value, ADDR[:PORT]=KIND. An IPv6 ADDR with a
@@ -512,8 +538,11 @@ func parseOutputs(specs []string, defaultPort int, ingests ...*net.UDPAddr) ([]*
 	return outs, nil
 }
 
-// send writes the frame b to every output that carries it. It reports false
-// when a version-3 output needed the frame and b cannot be converted.
+// send queues the frame b on every output that carries it, without waiting:
+// an output whose queue is full loses the frame and counts it in drop. It
+// reports false when a version-3 output needed the frame and b cannot be
+// converted. Queued frames are shared and never written to: each read has its
+// own buffer, and asV3 copies.
 func send(outs []*output, b []byte) (convertible bool) {
 	var v3 []byte
 	converted := false
@@ -533,10 +562,10 @@ func send(outs []*output, b []byte) (convertible bool) {
 			}
 			p = v3
 		}
-		if _, err := o.conn.WriteToUDP(p, o.dst); err != nil {
-			o.err++
-		} else {
-			o.sent++
+		select {
+		case o.q <- p:
+		default:
+			o.drop.Add(1)
 		}
 	}
 	return convertible
@@ -587,8 +616,9 @@ func main() {
 		}
 	}
 
-	// Ingest A: the production SSM stream. The socket binds the group address
-	// so the kernel also filters on destination group.
+	// Ingest A: the production SSM stream. Go binds the wildcard for a multicast
+	// address, so what keeps the socket to this channel's multicast is its own
+	// join, with IP_MULTICAST_ALL cleared. Unicast to the port still reaches it.
 	inA, err := listenUDP4(fmt.Sprintf("%s:%d", *group, *port), *rcvbuf, true)
 	if err != nil {
 		log.Fatalf("bind ingest A: %v", err)
@@ -605,22 +635,18 @@ func main() {
 	}
 	log.Printf("ingest B: unicast %s", ingestB)
 
-	out4, err := emitSocket(*ifaceIP, *ttl)
-	if err != nil {
-		log.Fatalf("emit socket: %v", err)
-	}
-	var out6 *net.UDPConn
-	if src != nil {
-		if out6, err = emitSocket6(src, *ttl); err != nil {
-			log.Fatalf("IPv6 emit socket from %s: %v", src, err)
-		}
-	}
+	// One socket per output: writes on a shared socket serialize on its lock.
 	for _, o := range outs {
 		from := *ifaceIP
-		o.conn = out4
 		if o.dst.IP.To4() == nil {
-			o.conn, from = out6, *src6
+			if o.conn, err = emitSocket6(src, *ttl); err != nil {
+				log.Fatalf("IPv6 emit socket from %s for %s: %v", src, o.dst, err)
+			}
+			from = *src6
+		} else if o.conn, err = emitSocket(*ifaceIP, *ttl); err != nil {
+			log.Fatalf("emit socket for %s: %v", o.dst, err)
 		}
+		o.start()
 		log.Printf("out: %s (S=%s, D=%s) ttl=%d", o.kind, from, o.dst, *ttl)
 	}
 
@@ -673,17 +699,23 @@ func main() {
 			}
 
 		case <-tick.C:
-			// emitted counts the shreds the union carries; each output's
-			// sent/failed writes follow as KIND@DST=SENT/ERR. emit_err sums the
-			// failures.
-			var emitErr uint64
+			// emitted counts the shreds the union carries. Each output follows
+			// as KIND@DST=SENT/ERR/DROP/QUEUED: frames written, failed, dropped
+			// with its queue full, and still queued; for an all output they add
+			// up to emitted. A unicast output with no listener still counts its
+			// frames as SENT: its socket is unconnected, so it never sees the
+			// ICMP port unreachable. emit_err and out_drop sum ERR and DROP.
+			// queue is the input backlog, which qdrop counts once it is full.
+			var emitErr, outDrop uint64
 			var per strings.Builder
 			for _, o := range outs {
-				emitErr += o.err
-				fmt.Fprintf(&per, " %s@%s=%d/%d", o.kind, o.dst, o.sent, o.err)
+				sent, e, d := o.sent.Load(), o.err.Load(), o.drop.Load()
+				emitErr += e
+				outDrop += d
+				fmt.Fprintf(&per, " %s@%s=%d/%d/%d/%d", o.kind, o.dst, sent, e, d, len(o.q))
 			}
-			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d qdrop=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d dedup_ids=%d forgotten=%d%s",
-				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, qdrop.Load(), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, seen.ids, seen.forgotten, per.String())
+			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d out_drop=%d qdrop=%d queue=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d dedup_ids=%d forgotten=%d%s",
+				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, outDrop, qdrop.Load(), len(ch), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, seen.ids, seen.forgotten, per.String())
 
 		case s := <-sig:
 			log.Printf("signal %v; final: rx_prod=%d rx_listener2=%d emitted=%d first_from_listener2=%d", s, rxA, rxB, emitted, firstFromB)
