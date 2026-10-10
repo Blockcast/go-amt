@@ -1,0 +1,507 @@
+// Copyright 2026 The Magma Authors.
+//
+// This source code is licensed under the BSD-style license found in the
+// LICENSE file in the root directory of this source tree.
+//
+// CDNi Logging proto per draft-ietf-cdni-logging-extensions
+// Field names follow SVTA naming convention:
+//   cs- = client→server, sc- = server→client, s- = server, c- = client
+//   x_tc_ = Traffic Control extensions (not in IETF spec)
+
+syntax = "proto3";
+package magma.cdn;
+
+option java_package = "magma.cdn.cloud.protos";
+option java_multiple_files = true;
+option go_package = "github.com/blockcast/go-amt/receiver/delivery/cdnilog";
+
+// RecordTier per draft-ietf-cdni-logging-extensions
+enum RecordTier {
+  RECORD_TIER_UNSPECIFIED = 0;
+  MINIMAL = 1;            // 8 fields — billing
+  STANDARD = 2;           // 13 fields — operational monitoring
+  EXTENDED = 3;           // 28 fields — troubleshooting
+  MULTICAST_BILLING = 4;  // per-(gw, S, G, window) aggregated multicast billing — record carries the MulticastBilling message, no HTTP fields
+  DELIVERY_SESSION = 5;   // Blockcast delivery-session tier using standard CDNi logging vocabulary — record carries the DeliverySession message
+  MVPN_DELIVERY = 6;      // per-leaf MVPN delivery claim; distinct from legacy AMT multicast billing
+}
+
+// CDNILogRecord per draft-ietf-cdni-logging-extensions
+message CDNILogRecord {
+  // ---- Minimal tier (billing) ----
+  int64  timestamp_ns = 1;                 // Unix nanoseconds (IETF: timestamp-ns)
+  string cs_uri = 2;                       // Request URI before transforms (IETF: cs-uri)
+  string sc_status = 3;                    // HTTP status code as string (IETF: sc-status)
+  int64  sc_total_bytes = 4;               // Response total bytes incl headers (IETF: sc-total-bytes)
+  string s_ccid = 5;                       // Content collection ID (IETF: s-ccid)
+  int64  s_upstream_header_size_bytes = 6; // Upstream header size (IETF: s-upstream-header-size-bytes)
+  int64  s_upstream_total_bytes = 7;       // Upstream total bytes (IETF: s-upstream-total-bytes)
+  string c_groupid = 8;                    // Client group ID / ASN (IETF: c-groupid)
+
+  // ---- Standard tier (operational) ----
+  int64  s_time_total_ms = 10;             // Request duration ms (IETF: s-time-total-ms)
+  string s_sid = 11;                       // Session ID (IETF: s-sid)
+  bool   s_cached = 12;                    // Cache hit (IETF: s-cached)
+  string c_ip = 13;                        // Client IP (IETF: c-ip)
+  string s_shortname = 14;                 // dCDN short identifier (IETF: s-shortname)
+  string cs_hdr_user_agent = 15;           // User-Agent (IETF: cs-hdr-User-Agent)
+
+  // ---- Extended tier (troubleshooting) ----
+  string timestamp_iso8601 = 20;           // ISO-8601 timestamp (IETF: timestamp-iso8601)
+  string cs_method = 21;                   // HTTP method (IETF: cs-method)
+  string cs_version = 22;                  // Protocol version (IETF: cs-version)
+  string cs_uri_transformed = 23;          // URI after transforms (IETF: cs-uri-transformed)
+  string s_upstream_status = 24;           // Upstream status code (IETF: s-upstream-status)
+  string s_id = 25;                        // Server instance ID (IETF: s-id)
+  int64  s_time_first_ms = 26;             // Time to first byte ms (IETF: s-time-first-ms)
+  int64  s_sdur_ms = 27;                   // Session duration ms (IETF: s-sdur-ms)
+  int64  s_time_upstream_ms = 28;          // Upstream latency ms (IETF: s-time-upstream-ms)
+  string s_upstream_ip = 29;               // Upstream source IP (IETF: s-upstream-ip)
+  int64  sc_header_size_bytes = 30;        // Response header size (IETF: sc-header-size-bytes)
+
+  // ---- Headers (standard/extended) ----
+  map<string, string> cs_headers = 40;     // Request headers (IETF: cs-hdr-*)
+  map<string, string> sc_headers = 41;     // Response headers (IETF: sc-hdr-*)
+
+  // ---- Traffic Control extensions (x-tc- prefix) ----
+  string x_tc_delivery_service = 50;       // DS XML ID
+  int32  x_tc_delivery_service_id = 51;    // DS numeric ID
+  int32  x_tc_cdn_id = 52;                 // CDN ID
+  string x_tc_cdn_name = 53;               // CDN name
+  string x_tc_cache_group = 54;            // Cache group name
+  string x_tc_cache_location = 55;         // lat,lon of cache
+  string x_tc_gateway_id = 56;             // orc8r gateway ID
+  string x_tc_network_id = 57;             // orc8r network ID
+  string x_tc_log_source = 58;             // Source: ats, varnish, tr, amt
+  string x_tc_log_version = 59;            // Log format version
+
+  // ---- DNS routing extensions (Traffic Router) ----
+  string x_tc_dns_query_name = 60;         // DNS query FQDN
+  string x_tc_dns_query_type = 61;         // A, AAAA, CNAME, etc.
+  string x_tc_dns_zone = 62;               // DNS zone
+  bool   x_tc_dns_dnssec = 63;             // DNSSEC requested
+  string x_tc_routing_result = 64;         // CZ, GEO, MISS, DEEP_CZ, FED, etc.
+  string x_tc_routing_details = 65;        // Additional routing info
+  repeated string x_tc_dns_answers = 66;   // DNS answer records
+  int32  x_tc_dns_answer_count = 67;       // Answer count
+  int32  x_tc_dns_ttl = 68;                // DNS TTL
+
+  // ---- Error ----
+  string error_code = 70;
+  string error_message = 71;
+
+  // ---- Record metadata ----
+  RecordTier record_tier = 80;             // Which tier this record conforms to
+
+  // ---- Multicast billing tier ----
+  // Populated only when record_tier == MULTICAST_BILLING. Other-tier
+  // records leave this nil. Field number 100 is in the reserved-for-
+  // extensions range above 80; producers MUST set record_tier = 4
+  // whenever this field is set.
+  MulticastBilling multicast_billing = 100;
+
+  // ---- Delivery-session tier ----
+  // Delivery-session extension using standard CDNi logging field vocabulary.
+  // Populated only when record_tier == DELIVERY_SESSION (moq-relay unicast +
+  // future AMT per-session). Field number 101 is in the reserved-for-
+  // extensions range above 80; producers MUST set record_tier = 5 whenever
+  // this field is set.
+  DeliverySession delivery_session = 101;
+
+  // ---- MVPN delivery tier ----
+  // Populated only when record_tier == MVPN_DELIVERY. This is a supplier
+  // delivery claim, not payable settlement evidence by itself.
+  MVPNDelivery mvpn_delivery = 102;
+}
+
+// MulticastBilling carries per-(gateway, source, group, window) multicast
+// accounting tuples emitted by amt-astats recordshaper. Populated only
+// when CDNILogRecord.record_tier == MULTICAST_BILLING.
+//
+// Dedup key is (window_id, CDNILogBatch.gateway_id, multicast_source,
+// multicast_group) — Traffic Ops enforces this via PRIMARY KEY on the
+// cdni_multicast_billing table with ON CONFLICT DO NOTHING semantics, so
+// producer-side WAL replay can safely re-send the same record.
+//
+// subscriber_endpoint / subscriber_port are optional forward-compat fields
+// for the milestone N+1 unified delivery billing schema: amt-astats today
+// aggregates per-(S, G) and emits these empty; a future producer-side
+// change will emit per-AMT-tunnel records with the tunnel endpoint IP
+// populated. The columns are nullable and NOT in the dedup PK in
+// milestone N.
+message MulticastBilling {
+  string multicast_source   = 1;  // S in (S, G), IP literal e.g. "198.51.100.1"; empty for ASM. Producers MUST NOT send literal "0.0.0.0" or "::" — those are reserved as ASM sentinels and the validator rejects them.
+  string multicast_group    = 2;  // G in (S, G), IP literal e.g. "232.1.1.1"
+  int64  window_id          = 3;  // floor(ts_window_start_ns / 1e9 / window_length_sec)
+  int64  pkt_count          = 4;  // packets aggregated in this (gw, S, G, window)
+  int64  byte_count         = 5;  // bytes  aggregated in this (gw, S, G, window)
+  int64  ts_window_start_ns = 6;  // earliest ev.TsStart in window (Unix ns)
+  int64  ts_window_end_ns   = 7;  // latest   ev.TsEnd   in window (Unix ns)
+  string subscriber_endpoint = 8; // OPTIONAL: per-subscriber dimension, empty in milestone N. AMT tunnel endpoint IP or MoQ session ID (N+1 unification).
+  int32  subscriber_port     = 9; // OPTIONAL: per-subscriber port (e.g. AMT tunnel UDP source port). 0 in milestone N.
+  // gateway_id intentionally NOT here — it is on CDNILogBatch.gateway_id (per-batch attribution).
+}
+
+// DeliverySession carries per-(server session, track, seq) delivery-session
+// accounting samples. Populated only when CDNILogRecord.record_tier ==
+// DELIVERY_SESSION. Field names intentionally follow the standard CDNi
+// logging vocabulary (IETF draft-ietf-cdni-logging-extensions); seq/closed
+// are internal rollup controls and are NOT wire directives in the draft.
+//
+// Traffic Ops dedup key is (server_session_id, track, seq) with ON CONFLICT
+// DO NOTHING, so producer-side WAL replay can safely re-send. The terminal
+// rollup picks closed=true rows first (else max(seq)) — producers MUST emit a
+// monotonic seq per (session, track) and a closed=true terminal record.
+message DeliverySession {
+  string s_sid             = 1;   // IETF: s-sid; server_session_id (UUID for moq-unicast)
+  string s_ccid            = 2;   // IETF: s-ccid; content_id
+  string ccid              = 3;   // IETF: ccid; content_id alias when producer uses the non-server directive
+  int64  sc_total_bytes    = 4;   // IETF: sc-total-bytes; bytes_out
+  int64  s_sdur_ms         = 5;   // IETF: s-sdur-ms; duration_ms
+  string c_ip              = 6;   // IETF: c-ip; client_ip
+  int64  s_time_total_ms   = 7;   // IETF: s-time-total-ms; end-to-end session time when producer has one value
+  int64  session_start_ms  = 8;   // record date/time lower bound, Unix ms
+  int64  session_end_ms    = 9;   // record date/time upper bound, Unix ms
+  string track             = 10;  // custom-fields/include-fields extension: MoQ track
+  string transport         = 11;  // custom-fields/include-fields extension: moq-unicast
+  int64  objects_out       = 12;  // custom-fields/include-fields extension
+  int64  seq               = 13;  // INTERNAL rollup sequence, not a CDNi directive
+  bool   closed            = 14;  // INTERNAL terminal marker, not a CDNi directive
+  // Relay-reported billing dimensions. Traffic Ops has accepted and persisted
+  // all three since BLO-22819, but until now no producer field carried them, so
+  // every magma-originated session stored NULL. latency_tier in particular is
+  // in the invoice rollup's GROUP BY, so a NULL there collapses the commercial
+  // differentiation axis Q1 pricing settled on.
+  //
+  // subscriber_id is deliberately absent: Traffic Ops resolves the billing
+  // subject exclusively from the presented mTLS client certificate and silently
+  // discards any body-supplied value, so a producer field would be a trap.
+  string latency_tier      = 15;  // constant for the session's duration
+  string close_reason      = 16;  // producer-reported closure; TO's reaper sets its own on force-close
+  string client_version    = 17;  // forward-compat for a future minimum-version rejection
+}
+
+// MVPNDelivery carries one per-leaf supplier delivery claim. It deliberately
+// does not reuse MulticastBilling: gateway_id in that legacy record identifies
+// the AMT gateway and its four-column Traffic Ops key cannot represent two
+// subscriber leaves in the same window.
+//
+// Traffic Ops dedup key is (window_id, supplier_id, subscriber_endpoint,
+// multicast_source, multicast_group), so producer-side WAL replay does not
+// collapse distinct subscriber leaves in the same delivery window.
+message MVPNDelivery {
+  string multicast_source = 1;
+  string multicast_group = 2;
+  int64 window_id = 3;
+  int64 pkt_count = 4;
+  int64 byte_count = 5;
+  int64 ts_window_start_ns = 6;
+  int64 ts_window_end_ns = 7;
+  string supplier_id = 8;           // NOP gateways.author_id
+  string subscriber_endpoint = 9;   // IR leaf or tunnel endpoint
+  string lease_id = 10;
+  string delivery_mode = 11;        // amt-tunnel | ir-leaf | mx-tunnel
+  uint32 origin_as = 12;
+  string origin_umh = 13;            // canonical LC-UMH <sourceAS>:1:<UMH-u32>
+  string origin_route_version = 14;  // opaque producer-monotonic route version
+  uint32 settlement_version = 15;
+  string sid = 16;                   // lease-bound pseudonymous demand session
+  string replay_id = 17;             // producer batch/WAL replay identifier
+  string lease_nonce = 18;
+  string challenge_nonce = 19;
+  repeated PayloadSlice payload_slices = 20;
+}
+
+// PayloadSlice is the v1 content coordinate. packet_high_water is deliberately
+// not part of this message and cannot be used as payable evidence.
+message PayloadSlice {
+  string rung_id = 1;
+  uint64 packet_id = 2;
+  uint64 payload_offset = 3;
+  uint64 payload_length = 4;
+  string packet_payload_digest = 5;
+  int64 coverage_start_ns = 6;
+  int64 coverage_end_ns = 7;
+}
+
+// CDNILogBatch for efficient batch transmission
+message CDNILogBatch {
+  string batch_id = 1;
+  string source = 2;                       // Service that generated logs
+  string gateway_id = 3;                   // Gateway identifier
+  string network_id = 4;                   // Network identifier
+  int64  batch_time_ns = 5;                // Batch creation time (nanoseconds)
+  int32  count = 6;                        // Number of records
+  string record_type = 7;                  // e.g. "opencaching_standard_json_v1"
+  repeated CDNILogRecord records = 8;
+}
+
+// LogStreamRequest for subscribing to log streams
+message LogStreamRequest {
+  string network_id = 1;
+  string gateway_id = 2;                   // Filter by gateway (empty = all)
+  string log_source = 3;                   // Filter by source (ats, tr, etc.)
+  RecordTier min_tier = 4;                 // Minimum tier to stream
+  int32 lines = 5;                         // Initial historical lines
+}
+
+// RecordDisposition is the stable machine-readable ingestion result for one
+// submitted record. DUPLICATE means an identical replay was already persisted.
+enum RecordDisposition {
+  RECORD_DISPOSITION_UNSPECIFIED = 0;
+  // ACCEPTED means the record was accepted INTO the WAL, not that it has been
+  // fsynced. magma's SubmitLogBatch appends into a bufio.Writer and durability
+  // comes from a periodic Flush afterwards, so an ACCEPTED record is still lost
+  // if the process or the mount dies before that flush lands. It is exactly as
+  // strong a claim as records_processed already made and no stronger.
+  //
+  // A consumer MUST NOT treat ACCEPTED as a durability receipt, and in
+  // particular MUST NOT discard its own only copy on the strength of it. That
+  // guarantee is a separate signal and does not exist on this field yet; see
+  // BLO-31771. Reading ACCEPTED as "stored" is the BLO-18944 defect.
+  ACCEPTED = 1;
+  REJECTED = 2;
+  DUPLICATE = 3;
+}
+
+// RecordOutcome carries the evidence needed to reconcile or remediate one
+// submitted record without parsing LogAck.message.
+message RecordOutcome {
+  int32 record_index = 1;
+  string record_kind = 2;
+  string replay_id = 3;
+  string record_digest_sha256 = 4;
+  RecordDisposition disposition = 5;
+  // Machine-readable reasons for a non-ACCEPTED disposition, in an open
+  // vocabulary of SCREAMING_SNAKE_CASE tokens. Carried as strings rather than
+  // an enum precisely so a producer can mint a new reason without a wire
+  // break; the cost is that the vocabulary lives here, in prose, and this
+  // block is the authority for it.
+  //
+  // VOCABULARY:
+  //   RECORD_ENCODE_FAILED — the producer could not proto-marshal the record.
+  //     Emitted with disposition REJECTED. magma's SubmitLogBatch is the only
+  //     producer that mints it; see cdn/cloud/go/cdnilog/server.go.
+  //
+  // RULES. Codes are additive and MUST be treated as an open set: a consumer
+  // that does not recognise a code MUST NOT reject the outcome, and MUST fall
+  // back to `disposition`, which is a closed enum and — under the producer
+  // rule below — always an explicitly set value. Codes ride with REJECTED or
+  // DUPLICATE only: an ACCEPTED outcome carries none, and neither does one
+  // left at RECORD_DISPOSITION_UNSPECIFIED, which is the proto3 default and
+  // therefore indistinguishable from "the producer never set it". Naming the
+  // two dispositions rather than negating ACCEPTED is what makes the fallback
+  // above meaningful. A consumer that nevertheless receives codes alongside an
+  // unset disposition MUST NOT read the outcome as ACCEPTED, and SHOULD treat
+  // it as REJECTED — failing toward "not accepted" for the same reason an
+  // empty LogAck.outcomes list is not evidence of acceptance. The list may
+  // hold more than one code; a consumer matching a specific code MUST scan the
+  // list rather than reading index 0.
+  //
+  // Anything a client is expected to branch on belongs in this list, NOT in
+  // LogAck.message, which is prose and carries no compatibility promise.
+  repeated string reason_codes = 6;
+  map<string, string> expected = 7;
+  map<string, string> observed = 8;
+}
+
+// Retryability tells a client whether resubmitting the IDENTICAL batch can
+// succeed. It describes the peer's ability to accept, not the payload's
+// validity — a WAL/storage fault is RETRYABLE even though success=false.
+//
+// Complementary to RecordDisposition, not a replacement for it. Disposition is
+// per-record and indexed by RecordOutcome.record_index; the fault this enum
+// exists for — a WAL append failing before any record is stored — is
+// attributable to no record at all, so RecordOutcome structurally cannot
+// express it. A batch may carry both.
+//
+// Values are prefixed because proto3 enum value names are scoped to the
+// enclosing package, not the enum: bare UNKNOWN/PERMANENT would occupy
+// `magma.cdn` globally, alongside the 16 bare values this package already
+// carries (ACCEPTED, REJECTED, DUPLICATE, ...).
+enum Retryability {
+  // Server did not classify. On the wire this is indistinguishable from a
+  // server too old to know the field, which is deliberate: both mean "no
+  // answer", and a client must fall back to its own default rather than read
+  // silence as either permission to retry or permission to stop.
+  RETRYABILITY_UNSPECIFIED = 0;
+  // Peer-side or transient (storage fault, saturation, lost metadata). An
+  // identical resubmit may succeed; retrying is the only path to unattended
+  // recovery.
+  RETRYABILITY_RETRYABLE = 1;
+  // Payload, schema, version or authz. An identical resubmit will not succeed,
+  // so a client should stop rather than wedge its WAL on a poison batch.
+  RETRYABILITY_PERMANENT = 2;
+}
+
+// LogAck acknowledges receipt
+//
+// FIELD NUMBER AUTHORITY (BLO-29906). This message is checked in twice — here
+// and at trafficcontrol `traffic_router/core/src/main/proto/magma/cdn/
+// cdni_log.proto` — under the same `package magma.cdn`, so the two copies share
+// one field-number space. THIS FILE IS THE SOURCE OF TRUTH; the trafficcontrol
+// copy is a byte-identical mirror enforced by `make proto-check` there. Never
+// assign a number here without regenerating both copies.
+//
+// History: 5 was independently assigned to `bool persisted` (magma, 2026-08-02,
+// 9b3e0dd3b) and to `repeated RecordOutcome outcomes` (trafficcontrol,
+// 2026-08-17, 05f9fd287) — incompatible wire types (varint vs length-delimited)
+// on the same number. `persisted` keeps 5: it shipped 15 days earlier and is
+// emitted in production by cdni_log_servicer.go. `outcomes` moved to 7, which
+// was free because no deployed path populated it (the only producer,
+// trafficcontrol cdniloggrpc/mvpn_servicer.go, is reachable only behind
+// `to_cdni_log_listener_enabled`, which is set nowhere).
+message LogAck {
+  bool   success = 1;
+  string message = 2;
+  string batch_id = 3;
+  int32  records_processed = 4;
+  // True only when every tier represented by the batch has been accepted by
+  // Traffic Ops. Success without persisted means the batch was accepted for
+  // asynchronous forwarding; the gateway must retain and retry its WAL copy.
+  bool   persisted = 5;
+  // Whether an identical resubmit can succeed (BLO-29695). Producers MUST set
+  // this whenever success=false; consumers MUST ignore it when success=true,
+  // where acceptance is already unambiguous and a retryability value riding
+  // alongside would be a third conflicting signal rather than a fix.
+  //
+  // Additive and wire-compatible in both directions: the zero value is
+  // RETRYABILITY_UNSPECIFIED, so a server that never sets it produces exactly
+  // "server didn't say" on the wire, and a client built before the field
+  // drops it into unknown fields. Neither side needs a rebuild.
+  Retryability retryability = 6;
+  // Per-record ingestion results, indexed by RecordOutcome.record_index.
+  //
+  // EMISSION RULE. A producer emits outcomes only when at least one record in
+  // the batch was not accepted; when it does, it emits one outcome for EVERY
+  // record in the batch, not just the unaccepted ones. So within a populated
+  // list, absent-from-list cannot happen and ACCEPTED is stated explicitly.
+  //
+  // An EMPTY list is therefore three-ways ambiguous and is NOT evidence of
+  // acceptance: it means the batch was fully accepted, or the producer
+  // predates this field, or the producer never populates it (as of 2026-09-04
+  // magma's SubmitLogBatch is the only producer anywhere; trafficcontrol
+  // cdniloggrpc/mvpn_servicer.go declares it but is reachable only behind
+  // `to_cdni_log_listener_enabled`, which is set nowhere). Consumers MUST use
+  // records_processed as the version-independent check for whether anything
+  // went missing, and treat outcomes as the escalation from "how many" to
+  // "which" — available only when the producer populates it.
+  //
+  // Not emitted on a success=false storage fault even when the producer knows
+  // some records were bad: on that fault the producer cannot tell WHICH of the
+  // already-appended records survived. Since BLO-33474 the WAL drops only the
+  // buffered remainder and keeps — and forwards — the bytes that already
+  // reached the file, so an unknown prefix of this batch may well be persisted
+  // and streamed; the bufio boundary deciding which is not visible from the
+  // call site. A per-record ACCEPTED here would therefore be unverifiable, not
+  // merely unflushed, and asserting it at the one moment the distinction
+  // decides whether the client keeps its only copy is not something a
+  // settlement path should do. That is a statement about this fault, not
+  // a durability rule for ACCEPTED — ACCEPTED never means fsynced, on this path
+  // or any other; see RecordDisposition.ACCEPTED. See
+  // cdn/cloud/go/cdnilog/server.go for the full reasoning.
+  //
+  // Whole-line comments are excluded from the `make proto-check` diff when they
+  // change on their own, so this block does not oblige the trafficcontrol mirror
+  // to be regenerated — but it also means the gate will NOT catch the two
+  // copies' prose drifting apart. (The exclusion is hunk-granular: a comment
+  // edited immediately adjacent to a field change is reported along with it.)
+  // A field change here is detectable: since BLO-39611 (trafficcontrol ed96d8a4)
+  // proto-check has a second arm diffing the pinned MAGMA_AUTHORITY_REF against
+  // magma's default branch, which fails "pinned authority is STALE". Nothing in
+  // magma triggers that check. trafficcontrol runs it on a daily cron
+  // (BLO-39637, proto-sync-check.yml) and opens an issue there when it fails, so
+  // the red lands within a day, on that issue rather than on whoever authored
+  // the change.
+  // Keeping them in sync is a human obligation; update both: re-mirror this file
+  // to traffic_router/core/src/main/proto/magma/cdn/cdni_log.proto and bump
+  // MAGMA_AUTHORITY_REF in its Makefile. That red is not mirror divergence — the
+  // mirror still matches the pin; the pin is behind magma. If the mirror has
+  // ALSO drifted you get "diverged from magma authority" instead: that arm exits
+  // before the staleness check runs, so absence of STALE is not evidence the pin
+  // is current.
+  repeated RecordOutcome outcomes = 7;
+}
+
+// CDNILogService for log streaming and collection
+service CDNILogService {
+  rpc StreamLogs(LogStreamRequest) returns (stream CDNILogRecord);
+  rpc SubmitLogBatch(CDNILogBatch) returns (LogAck);
+  rpc SubmitLogRecord(CDNILogRecord) returns (LogAck);
+}
+
+// TypedIdentity is a typed-prefix identifier used by the BLO-3606 unified
+// identity model. The Kind discriminator makes mis-assignment between
+// principal types a structural error rather than a string-prefix convention.
+// `uuid` is the bare UUID body without the `dt_` / `st_` / `fp_` / `op_`
+// prefix — the prefix is encoded by Kind.
+message TypedIdentity {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    DEMAND_TENANT = 1;     // wire prefix: dt_
+    SUPPLY_TENANT = 2;     // wire prefix: st_
+    FEDERATION_PEER = 3;   // wire prefix: fp_
+    OPERATOR_KEY = 4;      // wire prefix: op_  (BEACON-origin decisions only)
+  }
+  Kind kind = 1;
+  string uuid = 2;  // bare UUID body, no prefix
+}
+
+// RoutingAuditEnvelope carries the typed-UUID identity quadruple plus the
+// claim schema version stamped from the originating cert SAN. Emitted by
+// routing services (TR + cdnilog) alongside each routing decision so the
+// audit log captures the principal identity that drove the decision.
+//
+// Phase 0 (BLO-5295 / BLO-3606): NULL-tolerant fields. The `supplier`
+// oneof encodes that a routing decision is driven by EXACTLY ONE of a
+// SupplyTenant or a FederationPeer — never both — preventing wire-format
+// states the model considers invalid. `operator_key` is set only for
+// BEACON-origin decisions; `demand` is set when the decision is keyed to
+// a DemandTenant in addition to the supplier.
+//
+// Wire format: top-level message rather than embedded in CDNILogRecord so
+// it composes onto any log envelope (HTTP access logs, routing decision
+// logs, audit trail). Consumers correlate with their log record via a
+// producer-defined correlator carried on the outer transport envelope —
+// the specific correlator is out of scope here.
+message RoutingAuditEnvelope {
+  optional TypedIdentity demand = 1;
+  oneof supplier {
+    TypedIdentity supply_tenant = 2;
+    TypedIdentity federation_peer = 3;
+  }
+  optional TypedIdentity operator_key = 4;
+
+  // claim_schema_version is the version of the SAN claim contract in force
+  // when the cert that drove the decision was issued.
+  //
+  // Proto3 explicit-presence (BLO-5295 review-pass): `optional` so consumers
+  // can distinguish "producer didn't set the field" (legacy cert / pre-
+  // Phase-0) from "producer explicitly set version 1".
+  //
+  // Go access pattern: protoc-gen-go renders proto3 `optional` as a
+  // pointer-typed field (here: `ClaimSchemaVersion *uint32`). Consumers
+  // check presence via the nil-pointer (NOT a generated HasField() method,
+  // which protoc-gen-go does not emit for proto3 optional):
+  //
+  //   if env.ClaimSchemaVersion != nil {           // explicit value set
+  //       v := *env.ClaimSchemaVersion             // 1, 2, ...
+  //   } else {                                     // legacy cert path
+  //       // pre-Phase-0; SAN claim not yet emitted by the issuer
+  //   }
+  //
+  // The generated GetClaimSchemaVersion() returns 0 when the pointer is
+  // nil — that's an ambiguous zero-or-unset signal, so prefer the
+  // `!= nil` pattern at any code path that drives Phase 1 go/no-go.
+  //
+  // Value semantics:
+  //   field unset = legacy cert (pre-Phase-0, no SAN claim) — UNSPECIFIED
+  //   1           = explicit legacy SAN format (Uid/AssociatedName)
+  //   2+          = typed-claim era (typed-UUID SAN, Phase 1+)
+  //
+  // This presence bit is the Phase 1 go/no-go signal for the
+  // certifier_cert_san_legacy_format_auths_total metric: once the field
+  // is present and >=2 on >=99% of authenticated requests, the legacy
+  // dual-read path can be deprecated.
+  optional uint32 claim_schema_version = 5;
+}

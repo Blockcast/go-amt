@@ -207,6 +207,19 @@ func run(args []string) error {
 		"path to the delivery-session sequence WAL; enables per-destination billing records, requires --delivery-records")
 	deliveryRecords := flags.String("delivery-records", "",
 		"path to the delivery-session record file (JSON lines); requires --delivery-wal")
+	deliveryCollector := flags.String("delivery-collector", "",
+		"magma CDNILogService host:port to ship delivery-session records to; empty keeps records local-only. "+
+			"Pass "+delivery.DefaultCollectorEndpoint+" for the in-namespace collector")
+	deliveryContentID := flags.String("delivery-content-id", "",
+		"s_ccid, the content collection this fan-out serves; required by --delivery-collector")
+	deliveryLatencyTier := flags.String("delivery-latency-tier", "",
+		"commercial latency tier this feed is sold under; required by --delivery-collector")
+	deliveryTransport := flags.String("delivery-transport", "",
+		"delivery-class token stamped on each record; required by --delivery-collector, "+
+			"pass "+delivery.TransportShredUnicast+" for the shred fan-out")
+	deliveryCollectorCert := flags.String("delivery-collector-cert", "", "PEM client certificate for --delivery-collector")
+	deliveryCollectorKey := flags.String("delivery-collector-key", "", "PEM private key for --delivery-collector-cert")
+	deliveryCollectorCA := flags.String("delivery-collector-ca", "", "PEM CA bundle for --delivery-collector")
 	brokerURL := flags.String("broker-url", "",
 		"session broker base URL; enables the gateway heartbeat, requires --gw-uuid")
 	gwUUID := flags.String("gw-uuid", "",
@@ -300,7 +313,16 @@ func run(args []string) error {
 	if warning := destinationCountWarning(len(forwardTo)); warning != "" {
 		fmt.Fprintln(os.Stderr, warning)
 	}
-	bill, err := billingOptions(*deliveryWAL, *deliveryRecords, forwardTo)
+	bill, err := billingOptions(*deliveryWAL, *deliveryRecords, forwardTo, collectorFlags{
+		endpoint:    *deliveryCollector,
+		gatewayID:   *gwUUID,
+		contentID:   *deliveryContentID,
+		latencyTier: *deliveryLatencyTier,
+		transport:   *deliveryTransport,
+		clientCert:  *deliveryCollectorCert,
+		clientKey:   *deliveryCollectorKey,
+		caBundle:    *deliveryCollectorCA,
+	})
 	if err != nil {
 		return err
 	}
@@ -317,9 +339,26 @@ func run(args []string) error {
 type billing struct {
 	walPath    string
 	recordPath string
+	// collector, when non-nil, ships every record to magma's CDNILogService in
+	// addition to the local record file. Nil keeps records local-only, which is
+	// the offline/local-ledger mode and remains a supported configuration.
+	collector *delivery.CollectorConfig
 }
 
 func (b billing) enabled() bool { return b.walPath != "" }
+
+// collectorFlags is the raw --delivery-collector* flag set, validated as a
+// group by billingOptions.
+type collectorFlags struct {
+	endpoint    string
+	gatewayID   string
+	contentID   string
+	latencyTier string
+	transport   string
+	clientCert  string
+	clientKey   string
+	caBundle    string
+}
 
 // heartbeatConfig holds the gateway heartbeat producer's configuration. A zero
 // value disables the heartbeat, which is what every existing invocation gets:
@@ -420,11 +459,31 @@ func heartbeatHTTPClient(beat heartbeatConfig) (*http.Client, error) {
 // destination: sessions are opened per destination, so billing with nothing to
 // forward to would open a WAL, emit no records, and look configured while
 // producing nothing — the exact silent-no-op this issue exists to remove.
-func billingOptions(walPath, recordPath string, destinations []string) (billing, error) {
+func billingOptions(walPath, recordPath string, destinations []string, collector collectorFlags) (billing, error) {
 	walPath = strings.TrimSpace(walPath)
 	recordPath = strings.TrimSpace(recordPath)
+
+	// Set-but-inert collector flags are refused before anything else, because
+	// the two configurations that reach them are not the same shape and only
+	// one of them used to be covered. With billing off entirely this function
+	// returns an empty billing{} below and never looks at the collector at all,
+	// so --delivery-transport and the mTLS pair read as configured while the
+	// relay bills nothing and says nothing — the same silent-no-op this
+	// function's doc comment is about, reached from the other side. Hoisting it
+	// above the switch covers the no-billing path and the local-ledger path
+	// together, so a mistake with --delivery-collector and the identical
+	// mistake without it both fail the same way.
+	if strings.TrimSpace(collector.endpoint) == "" {
+		if set := setCollectorFlagNames(collector); len(set) > 0 {
+			return billing{}, fmt.Errorf("%s requires --delivery-collector", strings.Join(set, ", "))
+		}
+	}
+
 	switch {
 	case walPath == "" && recordPath == "":
+		if strings.TrimSpace(collector.endpoint) != "" {
+			return billing{}, errors.New("--delivery-collector requires --delivery-wal and --delivery-records")
+		}
 		return billing{}, nil
 	case walPath == "":
 		return billing{}, errors.New("--delivery-records requires --delivery-wal")
@@ -433,7 +492,59 @@ func billingOptions(walPath, recordPath string, destinations []string) (billing,
 	case len(destinations) == 0:
 		return billing{}, errors.New("--delivery-wal requires at least one --dest-ip-ports destination to bill")
 	}
-	return billing{walPath: walPath, recordPath: recordPath}, nil
+	bill := billing{walPath: walPath, recordPath: recordPath}
+
+	endpoint := strings.TrimSpace(collector.endpoint)
+	if endpoint == "" {
+		// Local-ledger mode. The set-but-inert refusal already ran above; it is
+		// deliberately not repeated here, so there is one place to change it.
+		return bill, nil
+	}
+	// The gateway identity is --gw-uuid, deliberately not a second flag that
+	// could disagree with the heartbeat's, and deliberately not os.Hostname():
+	// magma authenticates the batch's gateway_id against the mTLS caller, so a
+	// hostname that happens to resolve bills traffic under another gateway.
+	config := delivery.CollectorConfig{
+		Endpoint:      endpoint,
+		GatewayID:     strings.TrimSpace(collector.gatewayID),
+		ContentID:     strings.TrimSpace(collector.contentID),
+		LatencyTier:   strings.TrimSpace(collector.latencyTier),
+		Transport:     strings.TrimSpace(collector.transport),
+		ClientCert:    strings.TrimSpace(collector.clientCert),
+		ClientKey:     strings.TrimSpace(collector.clientKey),
+		CABundle:      strings.TrimSpace(collector.caBundle),
+		ClientVersion: broker.Version(),
+	}
+	if config.GatewayID == "" {
+		return billing{}, errors.New("--delivery-collector requires --gw-uuid; the collector authenticates the batch's gateway identity")
+	}
+	if err := config.Validate(); err != nil {
+		return billing{}, err
+	}
+	bill.collector = &config
+	return bill, nil
+}
+
+// setCollectorFlagNames returns the --delivery-collector-* flags that carry a
+// value, for the error that refuses them without --delivery-collector.
+func setCollectorFlagNames(collector collectorFlags) []string {
+	var set []string
+	for _, pair := range []struct {
+		name  string
+		value string
+	}{
+		{"--delivery-content-id", collector.contentID},
+		{"--delivery-latency-tier", collector.latencyTier},
+		{"--delivery-transport", collector.transport},
+		{"--delivery-collector-cert", collector.clientCert},
+		{"--delivery-collector-key", collector.clientKey},
+		{"--delivery-collector-ca", collector.caBundle},
+	} {
+		if strings.TrimSpace(pair.value) != "" {
+			set = append(set, pair.name)
+		}
+	}
+	return set
 }
 
 // retentionWarning returns an early-hint warning for a retention window at or
@@ -818,9 +929,24 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 			return err
 		}
 		defer recordFile.Close()
-		sink, err := delivery.NewWriterSink(recordFile)
+		ledger, err := delivery.NewWriterSink(recordFile)
 		if err != nil {
 			return err
+		}
+		var sink delivery.Sink = ledger
+		if bill.collector != nil {
+			collector, err := delivery.NewCollectorSink(*bill.collector)
+			if err != nil {
+				return err
+			}
+			defer collector.Close()
+			// Local ledger first, collector second: a collector failure makes
+			// Reporter retransmit the record verbatim, and a duplicate audit line
+			// is cheaper than an interval the ledger recorded and the collector
+			// never received.
+			if sink, err = delivery.NewTeeSink(ledger, collector); err != nil {
+				return err
+			}
 		}
 		tracker, err := delivery.NewTracker(wal)
 		if err != nil {

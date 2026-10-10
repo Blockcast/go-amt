@@ -167,6 +167,16 @@ func TestDocumentedFlagsAreAccepted(t *testing.T) {
 		"delivery-records": {"--delivery-records"},
 		"erasure-grace-ms": {"--erasure-grace-ms"},
 		"report-interval":  {"--report-interval"},
+		// The collector flag set, probed with no value for the same reason: a
+		// probe supplying real values would parse, and --delivery-collector's
+		// own validation runs after the parser.
+		"delivery-collector":      {"--delivery-collector"},
+		"delivery-content-id":     {"--delivery-content-id"},
+		"delivery-latency-tier":   {"--delivery-latency-tier"},
+		"delivery-transport":      {"--delivery-transport"},
+		"delivery-collector-cert": {"--delivery-collector-cert"},
+		"delivery-collector-key":  {"--delivery-collector-key"},
+		"delivery-collector-ca":   {"--delivery-collector-ca"},
 		// Probed with no value for the same reason as --delivery-wal above: the
 		// pair is validated together at startup, so a probe supplying both real
 		// values would parse, fall through to listenAndScore and hang the
