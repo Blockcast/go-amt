@@ -13,12 +13,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// ListenSSM binds group:port and joins the SSM channel (source, group) on the
+// ListenSSM listens on port and joins the SSM channel (source, group) on the
 // interface holding ifaceIP.
 //
-// It binds the group, not the wildcard, and clears IP_MULTICAST_ALL or
-// IPV6_MULTICAST_ALL. Linux defaults them to 1, which hands the socket every
-// group the host has joined on the port, whatever the socket joined itself.
+// Go binds the wildcard for a multicast address, so the socket clears
+// IP_MULTICAST_ALL or IPV6_MULTICAST_ALL to receive only the channel it joins.
+// Linux defaults them to 1, which hands the socket every group the host has
+// joined on the port, whatever the socket joined itself. Unicast to the port
+// still reaches it.
 func ListenSSM(source, group netip.Addr, port int, ifaceIP netip.Addr, rcvbuf int) (*net.UDPConn, error) {
 	ifi, err := interfaceWith(ifaceIP)
 	if err != nil {

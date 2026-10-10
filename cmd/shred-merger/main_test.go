@@ -331,6 +331,11 @@ func TestSendRoutesEachFrameToItsOutputs(t *testing.T) {
 		outs = append(outs, &output{dst: sink6.LocalAddr().(*net.UDPAddr), kind: kindAll, conn: conn6})
 	}
 
+	for _, o := range outs {
+		o.start()
+		t.Cleanup(func() { close(o.q) })
+	}
+
 	data, even, odd := v4Frame(7, 3, false), v4Frame(7, 32+4, true), v4Frame(7, 32+5, true)
 	unknown := append([]byte{5}, data[1:]...)
 	for _, f := range [][]byte{data, even, odd} {
@@ -387,8 +392,84 @@ func TestSendRoutesEachFrameToItsOutputs(t *testing.T) {
 		}
 	}
 	for _, o := range outs {
-		if o.err != 0 {
-			t.Errorf("%s output counted %d write errors", o.kind, o.err)
+		if e, d := o.err.Load(), o.drop.Load(); e != 0 || d != 0 {
+			t.Errorf("%s output counted %d write errors and %d drops", o.kind, e, d)
 		}
+	}
+}
+
+// An output whose queue is full loses frames. It holds up neither send, which
+// runs on the merger's only processing loop, nor the other outputs, which still
+// get every frame in order.
+func TestSendDoesNotWaitForAFullOutput(t *testing.T) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	sink, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close()
+
+	// stuck has room for one frame and no sender, so it is full from then on.
+	stuck := &output{dst: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}, kind: kindAll, conn: conn, q: make(chan []byte, 1)}
+	live := &output{dst: sink.LocalAddr().(*net.UDPAddr), kind: kindAll, conn: conn}
+	live.start()
+	t.Cleanup(func() { close(live.q) })
+
+	// Headers only, one slot each, to check the order. send and an all output
+	// read nothing past the header, and 100 full frames would overflow the
+	// sink's default receive buffer before the test reads it.
+	const n, more = 100, 10000
+	frames := make([][]byte, n)
+	for i := range frames {
+		frames[i] = v4Frame(uint64(i+1), 3, false)[:hdrLen]
+	}
+	took := make(chan time.Duration)
+	go func() {
+		start := time.Now()
+		for _, f := range frames {
+			send([]*output{stuck, live}, f)
+		}
+		// Then many to the full output alone: waiting even 0.1 ms a frame
+		// would take a second.
+		for range more {
+			send([]*output{stuck}, frames[0])
+		}
+		took <- time.Since(start)
+	}()
+	select {
+	case d := <-took:
+		if d > time.Second {
+			t.Errorf("send took %v for %d frames: it waits on a full output", d, n+more)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("send waited on a full output")
+	}
+
+	var slots []uint64
+	for b := make([]byte, maxDatagram); len(slots) < n; {
+		sink.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := sink.Read(b); err != nil {
+			break
+		}
+		slots = append(slots, binary.LittleEndian.Uint64(b[1:9]))
+	}
+	if len(slots) != n {
+		t.Errorf("the live output delivered %d of %d frames", len(slots), n)
+	}
+	for i, s := range slots {
+		if s != uint64(i+1) {
+			t.Errorf("the live output's frame %d carries slot %d, want %d", i, s, i+1)
+			break
+		}
+	}
+	if d := stuck.drop.Load(); d != n-1+more {
+		t.Errorf("the full output counted %d drops, want %d", d, n-1+more)
+	}
+	if d := live.drop.Load(); d != 0 {
+		t.Errorf("the live output counted %d drops, want 0", d)
 	}
 }
