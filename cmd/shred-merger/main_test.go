@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -471,5 +473,47 @@ func TestSendDoesNotWaitForAFullOutput(t *testing.T) {
 	}
 	if d := live.drop.Load(); d != 0 {
 		t.Errorf("the live output counted %d drops, want 0", d)
+	}
+}
+
+// Ingest A takes only the production source's datagrams. Its socket binds the
+// wildcard on its port, so any host can reach it by unicast, and a forged
+// shred that arrived first would win dedup over the real one (BLO-43063).
+func TestReaderDropsDatagramsFromOtherSources(t *testing.T) {
+	// reader exits the process on a read error, so this socket and its reader
+	// stay open until the test binary exits.
+	in, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := make(chan frame, 2)
+	var dropped, foreign atomic.Uint64
+	go reader(in, 0, netip.MustParseAddr("127.0.0.2"), ch, &dropped, &foreign)
+
+	sendFrom := func(ip string, slot uint64) {
+		c, err := net.DialUDP("udp4", &net.UDPAddr{IP: net.ParseIP(ip)}, in.LocalAddr().(*net.UDPAddr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		if _, err := c.Write(v4Frame(slot, 3, false)[:hdrLen]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sendFrom("127.0.0.3", 1) // a forger
+	for deadline := time.Now().Add(2 * time.Second); foreign.Load() == 0 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if n := foreign.Load(); n != 1 {
+		t.Fatalf("foreign = %d after a datagram from 127.0.0.3, want 1; %d frame(s) passed", n, len(ch))
+	}
+	sendFrom("127.0.0.2", 2) // the production source
+	select {
+	case f := <-ch:
+		if slot := binary.LittleEndian.Uint64(f.buf[1:9]); slot != 2 {
+			t.Fatalf("reader passed slot %d, want only the production source's slot 2", slot)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reader passed nothing from the production source")
 	}
 }
