@@ -108,18 +108,13 @@ func loopbackInterface(t *testing.T) *net.Interface {
 // 0 with loopback, so nothing leaves the host.
 func TestListenMulticastUDP4ReceivesOnlyItsOwnGroup(t *testing.T) {
 	lo := loopbackInterface(t)
-	// A port nothing on the host holds. The listeners bind it with
-	// SO_REUSEPORT, so the probe that found it must let go first.
-	probe, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	port := probe.LocalAddr().(*net.UDPAddr).Port
-	probe.Close()
-
+	// The first listener binds port 0, so the kernel picks a free port, and
+	// the second shares it with SO_REUSEPORT. Probing for a free port and
+	// closing the probe would leave a gap another socket could take it in,
+	// and the skip that followed would fail CI's PASS-line step.
 	groups := []*net.UDPAddr{
-		{IP: net.IPv4(239, 255, 41, 1), Port: port},
-		{IP: net.IPv4(239, 255, 41, 2), Port: port},
+		{IP: net.IPv4(239, 255, 41, 1)},
+		{IP: net.IPv4(239, 255, 41, 2)},
 	}
 	var listeners []*ipv4.PacketConn
 	for _, g := range groups {
@@ -134,6 +129,10 @@ func TestListenMulticastUDP4ReceivesOnlyItsOwnGroup(t *testing.T) {
 		}
 		defer c.Close()
 		listeners = append(listeners, c)
+		if g.Port == 0 {
+			port := c.LocalAddr().(*net.UDPAddr).Port
+			groups[0].Port, groups[1].Port = port, port
+		}
 	}
 
 	tx, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -184,13 +183,8 @@ func TestListenMulticastUDP4ReceivesOnlyItsOwnGroup(t *testing.T) {
 // sent there; this reads the option back off the joined socket instead.
 func TestListenMulticastUDP6ClearsMulticastAll(t *testing.T) {
 	lo := loopbackInterface(t)
-	probe, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback})
-	if err != nil {
-		t.Skipf("no IPv6 loopback: %v", err)
-	}
-	port := probe.LocalAddr().(*net.UDPAddr).Port
-	probe.Close()
-	g := &net.UDPAddr{IP: net.ParseIP("ff15::4113:1"), Port: port}
+	// Port 0: the kernel picks a free one, with no probe-then-close gap.
+	g := &net.UDPAddr{IP: net.ParseIP("ff15::4113:1")}
 	c, err := ListenMulticastUDP6("udp6", lo, netip.Addr{}, g, nil, false, 0, 0, 0, 0)
 	if err != nil {
 		if strings.Contains(err.Error(), "MULTICAST_ALL") {

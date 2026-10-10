@@ -906,11 +906,17 @@ jobs:
   # managed_conn_plan_test.go:modeIsSettableUnderEveryBuildConfiguration catches
   # the drift, and vet is what type-checks test files.
   #
-  # android only, deliberately. conn_mobile.go is tagged `android || ios`, so
-  # vetting android type-checks the same file ios would; and GOOS=ios cannot be
-  # vetted on ubuntu at all — the toolchain refuses with "ios/arm64 requires
-  # external (cgo) linking" under CGO_ENABLED=0 and wants clang under =1. That is
-  # a pre-existing toolchain limit, not something this job introduced.
+  # vet runs for android only. conn_mobile.go is tagged `android || ios`, so
+  # vetting android type-checks the mobile files ios shares; and GOOS=ios
+  # cannot be vetted on ubuntu at all — the toolchain refuses with "ios/arm64
+  # requires external (cgo) linking" under CGO_ENABLED=0 and wants clang
+  # under =1. That is a pre-existing toolchain limit, not something this job
+  # introduced.
+  #
+  # The android vet does not reach files tagged ios alone, such as
+  # listen_multicast_mobile_ios.go (go-amt#150). `go build` for ios does work
+  # under CGO_ENABLED=0, so the second step compiles those. It builds the root
+  # package only: ./... includes the cmd/ mains, which need the external link.
   mobile-typecheck:
     runs-on: ubuntu-latest
     env:
@@ -922,6 +928,8 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: GOOS=android GOARCH=arm64 go vet ./...
+      - name: Build the ios-only files
+        run: GOOS=ios GOARCH=arm64 go build .
 
   # Android and iOS select the mobile/native files because their GOOS values
   # satisfy linux or darwin. Windows is the intentional non-native selection:
