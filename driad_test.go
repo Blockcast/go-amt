@@ -1,6 +1,8 @@
 package amt
 
 import (
+	"github.com/miekg/dns"
+	"math/rand/v2"
 	"net/netip"
 	"testing"
 )
@@ -250,5 +252,59 @@ func TestDefaultDRIADConfig(t *testing.T) {
 	}
 	if len(config.DNSServers) != 0 {
 		t.Errorf("DNSServers = %v, want empty", config.DNSServers)
+	}
+}
+
+func TestOrderRelays_PrecedenceFirstAndEqualPrecedenceSpread(t *testing.T) {
+	// RFC 8777 §3.1.2: lowest precedence first, and a non-deterministic choice
+	// among equal precedence so several listed relays share the load.
+	records := []AMTRelayRecord{
+		{Precedence: 20, RelayAddr: "backup.example.com"},
+		{Precedence: 10, RelayAddr: "relay1.example.com"},
+		{Precedence: 10, RelayAddr: "relay2.example.com"},
+	}
+	rng := rand.New(rand.NewPCG(8777, 7450))
+	leaders := map[string]bool{}
+	for range 64 {
+		ordered := OrderRelays(records, rng.Shuffle)
+		if len(ordered) != 3 || ordered[0].Precedence != 10 || ordered[1].Precedence != 10 || ordered[2].RelayAddr != "backup.example.com" {
+			t.Fatalf("order %+v: want both precedence-10 relays before the precedence-20 backup", ordered)
+		}
+		leaders[ordered[0].RelayAddr] = true
+	}
+	if !leaders["relay1.example.com"] || !leaders["relay2.example.com"] {
+		t.Fatalf("leaders %v: both equal-precedence relays must lead some orderings", leaders)
+	}
+	if records[0].RelayAddr != "backup.example.com" {
+		t.Fatalf("OrderRelays modified its input: %+v", records)
+	}
+}
+
+func TestParseAMTRelayRR_NativeMiekgType(t *testing.T) {
+	// miekg/dns decodes TYPE260 as *dns.AMTRELAY, which is what a real
+	// resolver answer yields; the parser must accept it, not only RFC 3597.
+	cases := []struct {
+		rr   string
+		want AMTRelayRecord
+	}{
+		{"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 10 0 3 relay.example.com.",
+			AMTRelayRecord{Precedence: 10, RelayType: 3, RelayAddr: "relay.example.com."}},
+		{"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 20 1 1 192.0.2.7",
+			AMTRelayRecord{Precedence: 20, DFlag: true, RelayType: 1, RelayAddr: "192.0.2.7", ResolvedAddr: netip.MustParseAddr("192.0.2.7")}},
+		{"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 30 0 2 2001:db8::7",
+			AMTRelayRecord{Precedence: 30, RelayType: 2, RelayAddr: "2001:db8::7", ResolvedAddr: netip.MustParseAddr("2001:db8::7")}},
+	}
+	for _, tc := range cases {
+		rr, err := dns.NewRR(tc.rr)
+		if err != nil {
+			t.Fatalf("NewRR(%q): %v", tc.rr, err)
+		}
+		if _, native := rr.(*dns.AMTRELAY); !native {
+			t.Fatalf("miekg/dns returned %T, want *dns.AMTRELAY", rr)
+		}
+		got, ok := parseAMTRelayRR(rr)
+		if !ok || got != tc.want {
+			t.Fatalf("parseAMTRelayRR(%q) = %+v, %v; want %+v, true", tc.rr, got, ok, tc.want)
+		}
 	}
 }
