@@ -5,8 +5,9 @@
 // more outputs.
 //
 // Ingest A: SSM join (prod-src, group):port. This is the production forwarder's
-// stream. A datagram on the port from any other source is dropped, and counted
-// as foreign.
+// stream. A datagram on the port from any other claimed source is dropped, and
+// counted as foreign. A host that can spoof prod-src still gets in: this is a
+// filter, not authentication.
 // Ingest B: unicast UDP on 127.0.0.1:<local-port>. This is the second
 // listener's stream.
 //
@@ -256,8 +257,8 @@ func interfaceWith(ip net.IP) (int, error) {
 	return 0, fmt.Errorf("no interface holds %s", ip)
 }
 
-// reader passes c's datagrams to out. A valid from admits only datagrams sent
-// from that address and counts the rest in foreign. Ingest A needs it: its
+// reader passes c's datagrams to out. A valid from admits only datagrams whose
+// claimed source is that address and counts the rest in foreign. Ingest A needs it: its
 // socket binds the wildcard on its port, so unicast from any host reaches it,
 // and a forged shred that arrives before the real one wins dedup (BLO-43063).
 func reader(c *net.UDPConn, src uint8, from netip.Addr, out chan<- frame, dropped, foreign *atomic.Uint64) {
@@ -269,6 +270,9 @@ func reader(c *net.UDPConn, src uint8, from netip.Addr, out chan<- frame, droppe
 			// merger, rather than run on half of them with healthy stats.
 			log.Fatalf("read error (src=%d): %v", src, err)
 		}
+		// Unmap is a no-op on this udp4 socket. On a dual-stack socket the
+		// source arrives v4-mapped, and without Unmap every datagram, prod-src's
+		// included, would count as foreign.
 		if from.IsValid() && ap.Addr().Unmap() != from {
 			foreign.Add(1)
 			continue
@@ -718,8 +722,8 @@ func main() {
 			// frames as SENT: its socket is unconnected, so it never sees the
 			// ICMP port unreachable. emit_err and out_drop sum ERR and DROP.
 			// queue is the input backlog, which qdrop counts once it is full.
-			// foreign counts datagrams to ingest A from a host other than
-			// -prod-src, dropped unread.
+			// foreign counts datagrams to ingest A whose claimed source is not
+			// -prod-src: read, then dropped.
 			var emitErr, outDrop uint64
 			var per strings.Builder
 			for _, o := range outs {
