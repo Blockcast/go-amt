@@ -8,6 +8,7 @@ import (
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -40,6 +41,19 @@ func ListenMulticastUDP6(network string, ifi *net.Interface, saddr netip.Addr, g
 	const SO_REUSEPORT = 0x0f
 	if err := syscall.SetsockoptInt(sock, syscall.SOL_SOCKET, SO_REUSEPORT, 1); err != nil {
 		return nil, fmt.Errorf("could not set socket reuseport: %w", err)
+	}
+
+	// Receive only the groups this socket joins, as ListenMulticastUDP4 does
+	// with IP_MULTICAST_ALL. IPV6_MULTICAST_ALL needs Linux 4.20; a kernel or
+	// sandbox without it keeps the host-wide delivery rather than failing the
+	// join, and logs it.
+	if err := unix.SetsockoptInt(sock, unix.IPPROTO_IPV6, unix.IPV6_MULTICAST_ALL, 0); err != nil {
+		if !errors.Is(err, unix.ENOPROTOOPT) {
+			_ = syscall.Close(sock)
+			return nil, fmt.Errorf("could not clear IPV6_MULTICAST_ALL: %w", err)
+		}
+		slog.Warn("amt: IPV6_MULTICAST_ALL unsupported, host-wide delivery stays on: this socket also receives groups other sockets joined on its port",
+			"group", gaddr.IP, "port", gaddr.Port)
 	}
 
 	if err := applyForcedBuffers(sock, rcvBufBytes, sndBufBytes); err != nil {

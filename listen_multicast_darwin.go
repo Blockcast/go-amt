@@ -14,11 +14,9 @@ import (
 	"syscall"
 )
 
-// ListenMulticastUDP4 listens for multicast UDP packets on the given address. This actually binds
-// to the IP address given vs the built-in net.ListenMulticastUDP will listen to ALL IP addresses
-// regardless of the address you tell it to listen on. The network and address gaddr parameters
-// work like any others and if ifname is not specified it lets the OS decide
-// which interface to listen on.
+// ListenMulticastUDP4 listens for multicast UDP packets sent to gaddr. It binds
+// 0.0.0.0 on gaddr's port; Darwin delivers a group only to sockets that joined
+// it. With a nil ifi the OS picks the interface to join on.
 func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, gaddr *net.UDPAddr, f []bpf.RawInstruction, timestamp bool, ttl int, flags4 ipv4.ControlFlags, rcvBufBytes int, sndBufBytes int) (*ipv4.PacketConn, error) {
 
 	if gaddr == nil || gaddr.IP.To4() == nil {

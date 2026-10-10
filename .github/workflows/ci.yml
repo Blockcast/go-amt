@@ -138,7 +138,7 @@ permissions:
 # in parens is not a separator: the whole `Parent/Sub` is matched against the
 # top-level name alone, nothing matches, and go reports `[no tests to run]`.
 # Using each of these as the -run expression (spelled without the flag here, so
-# this illustration is not counted by a grep auditing the six real sites):
+# this illustration is not counted by a grep auditing the seven real sites):
 #
 #     'Parent/subA'        -> parent + subA run
 #     '^(Parent/subA)$'    -> testing: warning: no tests to run
@@ -149,7 +149,7 @@ permissions:
 # come along; if you need one subtest specifically, assert it from inside the
 # test rather than by narrowing -run.
 #
-# This is a property of all six loops across `test`, `race` and `cgo-test`, not
+# This is a property of all seven loops across `test`, `race` and `cgo-test`, not
 # of any one step. When BLO-32655 normalised the grep half, four of the six
 # matched unanchored; BLO-32663 then anchored all six -run expressions. What
 # that measurement asserted was narrow, and is the invariant to preserve: no
@@ -264,6 +264,30 @@ jobs:
           for t in $names; do
             # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
             grep -qF -- "--- PASS: $t " /tmp/native-harness.log || {
+              echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
+              rc=1
+            }
+          done
+          exit $rc
+
+      # By name, for the same reason. These two are the only regression guard for
+      # BLO-41383's cross-delivery (go-amt#150): with IP_MULTICAST_ALL /
+      # IPV6_MULTICAST_ALL left at the kernel default of 1, every feed sharing a
+      # port read every group and the ledger billed each layer once per feed.
+      # Both t.Skip when the runner cannot loop multicast on lo or lacks IPv6
+      # loopback, and a skip prints no PASS line, so here it goes red instead of
+      # green.
+      - name: Prove the IP_MULTICAST_ALL guards ran
+        run: |
+          set -euo pipefail
+          names='TestListenMulticastUDP4ReceivesOnlyItsOwnGroup
+          TestListenMulticastUDP6ClearsMulticastAll'
+          rc=0
+          # Anchored selection; see the prove-it-ran note above `jobs:`.
+          go test -v -count=1 -run "^($(echo $names | tr ' ' '|'))$" . 2>&1 | tee /tmp/multicast-all.log || rc=$?
+          for t in $names; do
+            # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
+            grep -qF -- "--- PASS: $t " /tmp/multicast-all.log || {
               echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
               rc=1
             }
@@ -882,11 +906,17 @@ jobs:
   # managed_conn_plan_test.go:modeIsSettableUnderEveryBuildConfiguration catches
   # the drift, and vet is what type-checks test files.
   #
-  # android only, deliberately. conn_mobile.go is tagged `android || ios`, so
-  # vetting android type-checks the same file ios would; and GOOS=ios cannot be
-  # vetted on ubuntu at all — the toolchain refuses with "ios/arm64 requires
-  # external (cgo) linking" under CGO_ENABLED=0 and wants clang under =1. That is
-  # a pre-existing toolchain limit, not something this job introduced.
+  # vet runs for android only. conn_mobile.go is tagged `android || ios`, so
+  # vetting android type-checks the mobile files ios shares; and GOOS=ios
+  # cannot be vetted on ubuntu at all — the toolchain refuses with "ios/arm64
+  # requires external (cgo) linking" under CGO_ENABLED=0 and wants clang
+  # under =1. That is a pre-existing toolchain limit, not something this job
+  # introduced.
+  #
+  # The android vet does not reach files tagged ios alone, such as
+  # listen_multicast_mobile_ios.go (go-amt#150). `go build` for ios does work
+  # under CGO_ENABLED=0, so the second step compiles those. It builds the root
+  # package only: ./... includes the cmd/ mains, which need the external link.
   mobile-typecheck:
     runs-on: ubuntu-latest
     env:
@@ -898,6 +928,8 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: GOOS=android GOARCH=arm64 go vet ./...
+      - name: Build the ios-only files
+        run: GOOS=ios GOARCH=arm64 go build .
 
   # Android and iOS select the mobile/native files because their GOOS values
   # satisfy linux or darwin. Windows is the intentional non-native selection:
