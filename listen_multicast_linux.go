@@ -8,6 +8,7 @@ import (
 	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
+	"log/slog"
 	"net"
 	"net/netip"
 	"os"
@@ -47,10 +48,15 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 	// IP_MULTICAST_ALL to 1, which also hands every socket bound to this port
 	// any group that another socket on the host joined: one blockcast-shreds
 	// --feed per layer, all on :5001, read every layer (BLO-41383). A kernel or
-	// sandbox without the option keeps that behaviour rather than failing.
-	if err := unix.SetsockoptInt(sock, unix.IPPROTO_IP, unix.IP_MULTICAST_ALL, 0); err != nil && !errors.Is(err, unix.ENOPROTOOPT) {
-		_ = syscall.Close(sock)
-		return nil, fmt.Errorf("could not clear IP_MULTICAST_ALL: %w", err)
+	// sandbox without the option keeps that behaviour rather than failing, and
+	// logs it.
+	if err := unix.SetsockoptInt(sock, unix.IPPROTO_IP, unix.IP_MULTICAST_ALL, 0); err != nil {
+		if !errors.Is(err, unix.ENOPROTOOPT) {
+			_ = syscall.Close(sock)
+			return nil, fmt.Errorf("could not clear IP_MULTICAST_ALL: %w", err)
+		}
+		slog.Warn("amt: IP_MULTICAST_ALL unsupported, host-wide delivery stays on: this socket also receives groups other sockets joined on its port",
+			"group", gaddr.IP, "port", gaddr.Port)
 	}
 
 	if err := applyForcedBuffers(sock, rcvBufBytes, sndBufBytes); err != nil {

@@ -34,7 +34,7 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 			if err := c.Control(func(fd uintptr) {
 				controlErr = applyForcedBuffers(int(fd), rcvBufBytes, sndBufBytes)
 				if controlErr == nil {
-					controlErr = clearMulticastAll(int(fd))
+					controlErr = clearMulticastAll(int(fd), gaddr)
 				}
 				if controlErr != nil || !timestamp {
 					return

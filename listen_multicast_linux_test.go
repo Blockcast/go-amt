@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -124,6 +125,11 @@ func TestListenMulticastUDP4ReceivesOnlyItsOwnGroup(t *testing.T) {
 	for _, g := range groups {
 		c, err := ListenMulticastUDP4("udp4", lo, netip.Addr{}, g, nil, false, 0, 0, 0, 0)
 		if err != nil {
+			// Failing to clear the option is the regression itself, not an
+			// environment gap.
+			if strings.Contains(err.Error(), "MULTICAST_ALL") {
+				t.Fatalf("join %v on %s: %v", g.IP, lo.Name, err)
+			}
 			t.Skipf("join %v on %s: %v", g.IP, lo.Name, err)
 		}
 		defer c.Close()
@@ -187,6 +193,9 @@ func TestListenMulticastUDP6ClearsMulticastAll(t *testing.T) {
 	g := &net.UDPAddr{IP: net.ParseIP("ff15::4113:1"), Port: port}
 	c, err := ListenMulticastUDP6("udp6", lo, netip.Addr{}, g, nil, false, 0, 0, 0, 0)
 	if err != nil {
+		if strings.Contains(err.Error(), "MULTICAST_ALL") {
+			t.Fatalf("join %v on %s: %v", g.IP, lo.Name, err)
+		}
 		t.Skipf("join %v on %s: %v", g.IP, lo.Name, err)
 	}
 	defer c.Close()
