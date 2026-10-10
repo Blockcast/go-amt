@@ -1,6 +1,7 @@
 package amt
 
 import (
+	"github.com/miekg/dns"
 	"math/rand/v2"
 	"net/netip"
 	"testing"
@@ -276,5 +277,34 @@ func TestOrderRelays_PrecedenceFirstAndEqualPrecedenceSpread(t *testing.T) {
 	}
 	if records[0].RelayAddr != "backup.example.com" {
 		t.Fatalf("OrderRelays modified its input: %+v", records)
+	}
+}
+
+func TestParseAMTRelayRR_NativeMiekgType(t *testing.T) {
+	// miekg/dns decodes TYPE260 as *dns.AMTRELAY, which is what a real
+	// resolver answer yields; the parser must accept it, not only RFC 3597.
+	cases := []struct {
+		rr   string
+		want AMTRelayRecord
+	}{
+		{"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 10 0 3 relay.example.com.",
+			AMTRelayRecord{Precedence: 10, RelayType: 3, RelayAddr: "relay.example.com."}},
+		{"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 20 1 1 192.0.2.7",
+			AMTRelayRecord{Precedence: 20, DFlag: true, RelayType: 1, RelayAddr: "192.0.2.7", ResolvedAddr: netip.MustParseAddr("192.0.2.7")}},
+		{"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 30 0 2 2001:db8::7",
+			AMTRelayRecord{Precedence: 30, RelayType: 2, RelayAddr: "2001:db8::7", ResolvedAddr: netip.MustParseAddr("2001:db8::7")}},
+	}
+	for _, tc := range cases {
+		rr, err := dns.NewRR(tc.rr)
+		if err != nil {
+			t.Fatalf("NewRR(%q): %v", tc.rr, err)
+		}
+		if _, native := rr.(*dns.AMTRELAY); !native {
+			t.Fatalf("miekg/dns returned %T, want *dns.AMTRELAY", rr)
+		}
+		got, ok := parseAMTRelayRR(rr)
+		if !ok || got != tc.want {
+			t.Fatalf("parseAMTRelayRR(%q) = %+v, %v; want %+v, true", tc.rr, got, ok, tc.want)
+		}
 	}
 }

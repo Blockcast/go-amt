@@ -261,6 +261,34 @@ func parseAMTRelayRR(rr dns.RR) (AMTRelayRecord, bool) {
 		}
 
 		return record, true
+
+	case *dns.AMTRELAY:
+		// miekg/dns decodes TYPE260 natively (go.mod pins v1.1.70), so a live
+		// answer arrives here rather than as *dns.RFC3597. Without this case
+		// DiscoverRelay found no record in any real response.
+		record.Precedence = v.Precedence
+		record.DFlag = v.GatewayType&0x80 != 0
+		record.RelayType = v.GatewayType & 0x7F
+		switch record.RelayType {
+		case dns.AMTRELAYIPv4, dns.AMTRELAYIPv6:
+			ip, ok := netip.AddrFromSlice(v.GatewayAddr)
+			if !ok {
+				return AMTRelayRecord{}, false
+			}
+			if record.RelayType == dns.AMTRELAYIPv4 {
+				ip = ip.Unmap()
+			}
+			record.RelayAddr = ip.String()
+			record.ResolvedAddr = ip
+		case dns.AMTRELAYHost:
+			if v.GatewayHost == "" {
+				return AMTRelayRecord{}, false
+			}
+			record.RelayAddr = dns.Fqdn(v.GatewayHost)
+		default:
+			return AMTRelayRecord{}, false
+		}
+		return record, true
 	}
 
 	return AMTRelayRecord{}, false
