@@ -209,6 +209,7 @@ var allErrorCodes = []ErrorCode{
 	CodeTicketNotRenewable,
 	CodeBodyTooLarge,
 	CodePublicationFailed,
+	CodeInternal,
 }
 
 func TestErrorTaxonomyIsClosed(t *testing.T) {
@@ -241,6 +242,8 @@ func TestStatusAndRetryForCode(t *testing.T) {
 		{CodeTicketNotRenewable, http.StatusNotFound, RetryNever},
 		{CodeBodyTooLarge, http.StatusRequestEntityTooLarge, RetryNever},
 		{CodePublicationFailed, http.StatusServiceUnavailable, RetryBackoff},
+		// 500 rather than publication_failed's 503 — see CodeInternal.
+		{CodeInternal, http.StatusInternalServerError, RetryBackoff},
 	} {
 		t.Run(string(tc.code), func(t *testing.T) {
 			status, err := StatusForCode(tc.code)
@@ -312,6 +315,52 @@ func TestUnknownErrorCodeIsNeverRetried(t *testing.T) {
 	}
 	if retry != RetryNever {
 		t.Errorf("RetryForCode(unknown) = %v, want RetryNever", retry)
+	}
+}
+
+// TestInternalFaultIsNameableAndRetryable pins the decision BLO-30269 took, and
+// pins it next to the trap it closes rather than only as a row in the table
+// above.
+//
+// The trap: a 500 with no body leaves a client decoding ErrorResponse with Code
+// "", RetryForCode rejects the empty code as unknown, and the closed-taxonomy
+// rule — correctly, for any code it has never heard of — answers RetryNever. So
+// before CodeInternal existed, a conforming gateway stopped permanently on a
+// transient broker fault, with every component behaving exactly as specified.
+//
+// Two mutations this catches that the table does not state the reason for:
+// re-classifying CodeInternal as RetryNever reinstates the permanent stop in a
+// form that now looks deliberate, and answering an internal fault with no body
+// at all reinstates it via the empty-code path below.
+func TestInternalFaultIsNameableAndRetryable(t *testing.T) {
+	// The bodyless 500 as a client sees it: no body decodes to the zero
+	// ErrorResponse, whose Code is "".
+	const bodyless ErrorCode = ""
+	retry, err := RetryForCode(bodyless)
+	if !errors.Is(err, ErrUnknownErrorCode) {
+		t.Errorf("RetryForCode(%q) error = %v, want ErrUnknownErrorCode", bodyless, err)
+	}
+	if retry != RetryNever {
+		t.Errorf("RetryForCode(%q) = %v, want RetryNever", bodyless, retry)
+	}
+
+	retry, err = RetryForCode(CodeInternal)
+	if err != nil {
+		t.Fatalf("RetryForCode(%q): %v", CodeInternal, err)
+	}
+	if retry != RetryBackoff {
+		t.Errorf("RetryForCode(%q) = %v, want RetryBackoff: an internal fault a client "+
+			"must not retry is indistinguishable from the bodyless 500 this code replaced",
+			CodeInternal, retry)
+	}
+
+	status, err := StatusForCode(CodeInternal)
+	if err != nil {
+		t.Fatalf("StatusForCode(%q): %v", CodeInternal, err)
+	}
+	if status < 500 || status > 599 {
+		t.Errorf("StatusForCode(%q) = %d, want a 5xx: an internal fault is not the client's",
+			CodeInternal, status)
 	}
 }
 
@@ -434,14 +483,15 @@ func TestMintRequestFieldsAreExactlyTheContract(t *testing.T) {
 }
 
 // TestTransportSchemaTracksEnvelopeChanges pins the schema string against the
-// revision that introduced dst_port. TransportSchema's own doc requires a new
-// string for any shape change, and the constant is the only thing a broker can
-// assert at build time to prove it compiled against the contract it thinks it
-// did — so leaving it at v1 after changing MintRequest is the exact silent edit
-// it exists to prevent.
+// revision that introduced CodeInternal. TransportSchema's own doc requires a
+// new string for any change to the shapes in that file — the error taxonomy
+// included — and the constant is the only thing a broker can assert at build
+// time to prove it compiled against the contract it thinks it did, so leaving
+// it behind after changing the taxonomy is the exact silent edit it exists to
+// prevent.
 func TestTransportSchemaTracksEnvelopeChanges(t *testing.T) {
-	if got, want := TransportSchema, "gateway.transport.v2"; got != want {
-		t.Errorf("TransportSchema = %q, want %q: adding MintRequest.DstPort is a shape change", got, want)
+	if got, want := TransportSchema, "gateway.transport.v3"; got != want {
+		t.Errorf("TransportSchema = %q, want %q: adding CodeInternal is a contract change", got, want)
 	}
 }
 
