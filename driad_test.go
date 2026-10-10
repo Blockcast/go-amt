@@ -1,6 +1,7 @@
 package amt
 
 import (
+	"math/rand/v2"
 	"net/netip"
 	"testing"
 )
@@ -250,5 +251,30 @@ func TestDefaultDRIADConfig(t *testing.T) {
 	}
 	if len(config.DNSServers) != 0 {
 		t.Errorf("DNSServers = %v, want empty", config.DNSServers)
+	}
+}
+
+func TestOrderRelays_PrecedenceFirstAndEqualPrecedenceSpread(t *testing.T) {
+	// RFC 8777 §3.1.2: lowest precedence first, and a non-deterministic choice
+	// among equal precedence so several listed relays share the load.
+	records := []AMTRelayRecord{
+		{Precedence: 20, RelayAddr: "backup.example.com"},
+		{Precedence: 10, RelayAddr: "relay1.example.com"},
+		{Precedence: 10, RelayAddr: "relay2.example.com"},
+	}
+	rng := rand.New(rand.NewPCG(8777, 7450))
+	leaders := map[string]bool{}
+	for range 64 {
+		ordered := OrderRelays(records, rng.Shuffle)
+		if len(ordered) != 3 || ordered[0].Precedence != 10 || ordered[1].Precedence != 10 || ordered[2].RelayAddr != "backup.example.com" {
+			t.Fatalf("order %+v: want both precedence-10 relays before the precedence-20 backup", ordered)
+		}
+		leaders[ordered[0].RelayAddr] = true
+	}
+	if !leaders["relay1.example.com"] || !leaders["relay2.example.com"] {
+		t.Fatalf("leaders %v: both equal-precedence relays must lead some orderings", leaders)
+	}
+	if records[0].RelayAddr != "backup.example.com" {
+		t.Fatalf("OrderRelays modified its input: %+v", records)
 	}
 }
