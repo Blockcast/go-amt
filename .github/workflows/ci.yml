@@ -507,7 +507,7 @@ jobs:
       #
       # loopclosure is deliberately NOT in that list even though it looks like it
       # belongs: it only reports when the module's language version is below
-      # go1.22, and go.mod declares go 1.24.0, so it cannot fire here at all.
+      # go1.22, and go.mod declares go 1.25.0, so it cannot fire here at all.
       # Naming it would be the same overstated-coverage error this step exists to
       # correct, in the one file whose header says to keep the table honest.
       #
