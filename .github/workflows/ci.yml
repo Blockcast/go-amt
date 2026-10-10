@@ -440,7 +440,7 @@ jobs:
               rc=1
             }
           done
-          for t in gateway_timeout_test.go gateway_logging_test.go gateway_advertisement_length_test.go; do
+          for t in gateway_timeout_test.go gateway_logging_test.go gateway_advertisement_length_test.go gateway_retransmit_test.go; do
             printf '%s\n' "$tst" | grep -qxF "$t" || {
               echo "::error::$t is not in the test selection; the Gateway.Open guards are not running"
               rc=1

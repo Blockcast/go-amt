@@ -125,11 +125,33 @@ func TestHandshakeIgnoresLateDuplicateAdvertisement(t *testing.T) {
 	}
 	// 650ms sits between the ~0.3s a restarted Request leg gives and the 1s
 	// retransmission.
-	if at := fr.requestArrivals(); len(at) >= 2 {
-		if gap := at[1].Sub(at[0]); gap < 650*time.Millisecond {
-			t.Errorf("second Request arrived %v after the first, want the %v retransmission: the duplicate Advertisement restarted the Request leg",
-				gap.Round(time.Millisecond), handshakeRetransmit)
-		}
+	at := fr.requestArrivals()
+	if len(at) < 2 {
+		t.Fatalf("the relay saw %d Request(s), want 2: the gap below is what pins the guard", len(at))
+	}
+	if gap := at[1].Sub(at[0]); gap < 650*time.Millisecond {
+		t.Errorf("second Request arrived %v after the first, want the %v retransmission: the duplicate Advertisement restarted the Request leg",
+			gap.Round(time.Millisecond), handshakeRetransmit)
+	}
+}
+
+// TestHandshakeHonoursTransportTimeout: TransportConfig.Timeout bounds the
+// handshake, retransmissions included. MulticastConn.RelayHandshakeTimeout
+// reaches the RelayManager only through it, and before BLO-43016 the hard-coded
+// handshakeTimeout ignored it.
+func TestHandshakeHonoursTransportTimeout(t *testing.T) {
+	fr := newFakeRelay(t, withLostDiscoveries(1<<30))
+	cfg := DefaultRelayManagerConfig(fr.Addr())
+	cfg.TransportConfig.Timeout = 1500 * time.Millisecond
+	rm := NewRelayManager(cfg)
+	t.Cleanup(func() { _ = rm.Close() })
+
+	start := time.Now()
+	if err := rm.Open(context.Background()); err == nil {
+		t.Fatal("Open succeeded against a relay that drops every Discovery")
+	}
+	if d := time.Since(start); d > 4*time.Second {
+		t.Errorf("Open failed after %v, want about the 1.5s TransportConfig.Timeout", d.Round(time.Millisecond))
 	}
 }
 
