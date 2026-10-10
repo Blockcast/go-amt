@@ -34,16 +34,64 @@ placeholder for that value.
 
 ## Install
 
-> ⚠ **No release artifacts are published yet.** The repository has tags but zero
-> GitHub releases, and no image is pushed to a registry — CI builds both on every
-> commit (`goreleaser build --snapshot`, `docker build --push=false`) but nothing
-> publishes them. **The tarball and Docker commands below will 404 today.** Until
-> [BLO-28464](https://paperclip.blockcast.net/BLO/issues/BLO-28464) adds the
-> tag-triggered release job and the image push, use *Build from source* below.
-> Both sections are written and verified against the artifacts CI already
-> produces, so they become correct the moment publishing lands.
+Three routes, all equivalent: a signed release tarball, a container image, or a
+build from source. Pick one.
 
-### Build from source (works today)
+### Binary
+
+```sh
+# Pick a release from https://github.com/Blockcast/go-amt/releases
+TAG=v0.3.0                      # the release tag, with its leading v
+VERSION="${TAG#v}"              # the artifact filenames carry it WITHOUT the v
+BASE="https://github.com/Blockcast/go-amt/releases/download/${TAG}"
+curl -fsSLO "${BASE}/blockcast-shreds_${VERSION}_linux_amd64.tar.gz"
+curl -fsSLO "${BASE}/checksums.txt"
+curl -fsSLO "${BASE}/checksums.txt.sig"
+curl -fsSLO "${BASE}/checksums.txt.pem"
+sha256sum --check --ignore-missing checksums.txt
+tar -xzf "blockcast-shreds_${VERSION}_linux_amd64.tar.gz"
+sudo install -m 0755 blockcast-shreds /usr/local/bin/blockcast-shreds
+```
+
+The tag carries a leading `v` and the filenames do not — that asymmetry is
+goreleaser's `{{ .Version }}`, and a single `VERSION=v0.3.0` gets you a 404 on
+the tarball while the release URL itself resolves.
+
+### Verify the download is ours, not just intact
+
+`sha256sum --check` above proves the tarball matches the checksum file, and
+nothing more: both travelled the same channel, so whoever could serve you a bad
+tarball could serve a matching `checksums.txt`. That is integrity, not
+authenticity. Verify the signature before you install on validator hardware:
+
+```sh
+cosign verify-blob \
+  --signature checksums.txt.sig \
+  --certificate checksums.txt.pem \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp \
+    '^https://github\.com/Blockcast/go-amt/\.github/workflows/release\.yml@refs/tags/' \
+  checksums.txt
+```
+
+Signing is keyless ([sigstore](https://docs.sigstore.dev/)), so there is no
+Blockcast public key for you to fetch and no private key for us to lose. What
+you verify instead is the *identity that produced the artifact*:
+`.github/workflows/release.yml` in this repository, running on a tag. That
+identity is the trust root, which is why `cosign verify-blob` refuses to run
+without `--certificate-identity-regexp` and `--certificate-oidc-issuer` — they
+are not optional hardening — and why loosening the regexp to match any workflow
+or any ref throws the guarantee away.
+
+Signing `checksums.txt` covers the tarball transitively: verify the signature,
+then `sha256sum --check` against the file you just verified. One signature, no
+per-artifact signature to forget.
+
+Install `cosign` from
+[sigstore/cosign releases](https://github.com/sigstore/cosign/releases) if you
+do not have it.
+
+### Build from source
 
 ```sh
 git clone https://github.com/Blockcast/go-amt
@@ -53,24 +101,14 @@ sudo install -m 0755 blockcast-shreds /usr/local/bin/blockcast-shreds
 ```
 
 `CGO_ENABLED=0` is what makes the result dependency-free; CI asserts the release
-binary is statically linked so this cannot regress silently.
-
-### Binary (pending BLO-28464)
+binary is statically linked so this cannot regress silently. A source build
+carries no version stamp — it reports `dev-unstamped`, which is deliberate, so a
+hand-built binary is distinguishable from a released one in the broker's records
+rather than blending in. Stamp it yourself if you need it attributable:
 
 ```sh
-VERSION=<release>
-curl -fsSLO "https://github.com/Blockcast/go-amt/releases/download/${VERSION}/blockcast-shreds_${VERSION}_linux_amd64.tar.gz"
-curl -fsSLO "https://github.com/Blockcast/go-amt/releases/download/${VERSION}/checksums.txt"
-sha256sum --check --ignore-missing checksums.txt
-tar -xzf "blockcast-shreds_${VERSION}_linux_amd64.tar.gz"
-sudo install -m 0755 blockcast-shreds /usr/local/bin/blockcast-shreds
+go build -ldflags="-X github.com/blockcast/go-amt/broker.version=$(git describe --tags)" ...
 ```
-
-`checksums.txt` travels over the same channel as the artifact it validates, so it
-gives integrity against corruption but **not** authenticity: anyone who can serve
-a bad tarball can serve a matching checksum file. Artifact signing is tracked on
-[BLO-28464](https://paperclip.blockcast.net/BLO/issues/BLO-28464) and should land
-with the release job rather than after it.
 
 ### systemd
 
@@ -111,20 +149,41 @@ journalctl -u blockcast-shreds | grep -i 'unknown lvalue'
 `/etc/blockcast/shreds.env` fails the unit loudly rather than starting the
 receiver with default arguments that silently forward nowhere.
 
-### Docker (pending BLO-28464)
-
-No image is published yet — `.goreleaser.yaml` has no `dockers:` block and CI
-builds with `push: false`. Build it locally in the meantime:
+### Docker
 
 ```sh
-docker build -t blockcast-shreds:local .
 docker run --rm \
   -p 20000:20000/udp -p 8080:8080 \
-  blockcast-shreds:local \
+  registry.blockcast.net/blockcast/go-amt/blockcast-shreds:v0.3.0 \
   --listen 0.0.0.0:20000 --dest-ip-ports 10.0.0.5:<TVU_PORT> --http-addr 0.0.0.0:8080
 ```
 
-Once publishing lands the image will be `ghcr.io/blockcast/blockcast-shreds:<tag>`.
+Tags published on a release: `:<tag>` (immutable), `:sha-<commit>` (immutable,
+always published), and `:latest` — which moves only for a release with no
+prerelease segment, so an `-rc` rehearsal never becomes what `:latest` hands
+you. `:main` tracks the default branch and is not a release.
+
+**Pin by digest for anything unattended.** Every tag above except `:sha-<commit>`
+and `:<tag>` can be moved; a digest cannot:
+
+```sh
+docker pull registry.blockcast.net/blockcast/go-amt/blockcast-shreds:v0.3.0
+docker inspect --format='{{index .RepoDigests 0}}' \
+  registry.blockcast.net/blockcast/go-amt/blockcast-shreds:v0.3.0
+```
+
+Confirm you got what you meant to — the image reports the release tag it was
+built from, and a source or hand build reports `dev-unstamped`:
+
+```sh
+docker run --rm registry.blockcast.net/blockcast/go-amt/blockcast-shreds:v0.3.0 --version
+```
+
+Build it locally instead if you would rather not pull a binary:
+
+```sh
+docker build -t blockcast-shreds:local .
+```
 
 Fan-out targets must be reachable from inside the container: `127.0.0.1` refers
 to the container, not the host.
@@ -429,8 +488,10 @@ Honest scope of this build, so you are not surprised in an audit:
 
 - **No broker session.** mTLS identity, ticket renewal, certificate renewal and
   the 30-second heartbeat are not in this binary yet. It runs standalone.
-- **No version string.** The binary cannot report its own version; identify a
-  deployment by release artifact checksum until the broker lane lands.
+- **A source build has no version string.** `--version` reports the release tag
+  on a release artifact or a published image, and `dev-unstamped` on anything
+  built by hand — see [Build from source](#build-from-source) for the `-ldflags`
+  that stamps it.
 - **Erasure metrics are windowed gauges.** `/metrics` reports the last drained
   window, so `erasure_fraction 0` is not by itself evidence of a healthy feed —
   see [Alerting](#alerting-erasure_fraction-0-has-three-meanings) above and

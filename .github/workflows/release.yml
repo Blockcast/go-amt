@@ -1,0 +1,107 @@
+name: release
+
+# Publishes the operator-facing GitHub release for a v* tag: the linux/amd64
+# tarball, checksums.txt, and a keyless cosign signature over the checksum file.
+#
+# The IMAGE half of a release is NOT here. packaging.yml already builds the
+# image, proves its entrypoint with `selftest --fixture --json`, and asserts the
+# version stamp before it pushes to registry.blockcast.net (BLO-40067); a tag
+# push is a `push` event, so that lane runs on tags too and publishes the tagged
+# image. Duplicating the push here would mean publishing an image that had not
+# been through that gate.
+#
+# LOAD-BEARING FILE PATH. Keyless signing binds the signature to this workflow's
+# identity, and the verify command in docs/operations/install.md pins
+#   https://github.com/Blockcast/go-amt/.github/workflows/release.yml@refs/tags/v*
+# Renaming or moving this file makes every already-published verify command fail
+# against artifacts it should accept. Same constraint bc-elevation-controller's
+# release.yaml documents for its kyverno image policy.
+on:
+  push:
+    tags:
+      - "v*"
+  # Rehearsal only. goreleaser refuses to release off a non-tag ref, so this
+  # cannot publish anything — it exists so the config can be exercised without
+  # minting a tag.
+  workflow_dispatch: {}
+
+permissions:
+  contents: write   # create the GitHub release and upload its assets
+  id-token: write   # Fulcio OIDC for keyless cosign
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # goreleaser derives the changelog from history and the version from
+          # the tag; a shallow clone gives it neither.
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Publish the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # goreleaser exits 0 having uploaded whatever it managed to upload, so a
+      # signing step that silently produced nothing would still look like a
+      # successful release — and the failure would surface as a 404 on an
+      # operator's verify command rather than here. Assert the assets exist.
+      - name: Release carries the tarball, checksums and signature
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          assets="$(gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+                      --json assets --jq '.assets[].name')"
+          echo "${assets}"
+          for want in \
+            "blockcast-shreds_${GITHUB_REF_NAME#v}_linux_amd64.tar.gz" \
+            checksums.txt checksums.txt.sig checksums.txt.pem
+          do
+            printf '%s\n' "${assets}" | grep -qx -- "${want}" \
+              || { echo "::error::release ${GITHUB_REF_NAME} is missing asset ${want}"; exit 1; }
+          done
+
+      # The published signature is only worth anything if it verifies with the
+      # exact command docs/operations/install.md tells an operator to run. Run
+      # that command, here, against the downloaded assets — a drifted identity
+      # regexp or a wrong OIDC issuer is otherwise discovered by the customer.
+      - name: The documented verify command accepts the published artifacts
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p /tmp/verify && cd /tmp/verify
+          gh release download "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'checksums.txt*' --clobber
+          cosign verify-blob \
+            --signature checksums.txt.sig \
+            --certificate checksums.txt.pem \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp \
+              '^https://github\.com/Blockcast/go-amt/\.github/workflows/release\.yml@refs/tags/' \
+            checksums.txt
+          # Negative control: without it, a verify that accepts anything at all
+          # would pass the step above and prove nothing.
+          printf 'tampered\n' >> checksums.txt
+          if cosign verify-blob \
+               --signature checksums.txt.sig \
+               --certificate checksums.txt.pem \
+               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+               --certificate-identity-regexp \
+                 '^https://github\.com/Blockcast/go-amt/\.github/workflows/release\.yml@refs/tags/' \
+               checksums.txt 2>/dev/null; then
+            echo "::error::cosign accepted a modified checksums.txt — the signature is not binding."
+            exit 1
+          fi

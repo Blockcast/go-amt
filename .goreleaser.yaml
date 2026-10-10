@@ -63,6 +63,39 @@ archives:
 checksum:
   name_template: checksums.txt
 
+# checksums.txt travels over the same channel as the tarball it validates, so on
+# its own it proves integrity against corruption and nothing about authenticity:
+# whoever can serve a bad tarball can serve a matching checksum file. Signing the
+# checksum file covers every artifact transitively — verify the signature, then
+# sha256sum --check — so one signature is enough and there is no per-artifact
+# signature for an operator to forget.
+#
+# Keyless (Fulcio OIDC + Rekor), so there is no private key for anyone to hold or
+# rotate. What an operator verifies is the WORKFLOW IDENTITY that produced the
+# artifact, which means the --certificate-identity-regexp in docs/operations/install.md
+# names this repository's .github/workflows/release.yml at a refs/tags/ ref.
+# Renaming or moving that workflow invalidates every published verify command.
+#
+# Requires `id-token: write` on the signing job; release.yml has it. Nothing in
+# `goreleaser check` or `build --snapshot` exercises this block — signing only
+# runs under `goreleaser release` — so a tag push is the first thing that tries it.
+signs:
+  - cmd: cosign
+    artifacts: checksum
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--yes"
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+
+release:
+  # v0.0.0-rc1 and friends must not become the repository's "Latest release":
+  # auto marks any tag carrying a prerelease segment accordingly, so a release
+  # rehearsal cannot displace the version operators are pointed at.
+  prerelease: auto
+
 snapshot:
   version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
 

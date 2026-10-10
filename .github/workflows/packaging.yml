@@ -59,6 +59,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
+      # On a v* tag the image must report the release version rather than the
+      # commit sha: an operator who pulled :v0.3.0 and runs --version needs back
+      # the string the release is named by, and the broker's version census is
+      # the field-rollback lever (W4 enforces a minimum supported version), so a
+      # released image reporting sha-<40hex> is unrankable against a floor.
+      # Everywhere else the sha is the only stable handle there is.
+      - name: Resolve the version stamp
+        id: stamp
+        run: |
+          case "${GITHUB_REF}" in
+            refs/tags/v*) echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT" ;;
+            *)            echo "version=sha-${GITHUB_SHA}"  >> "$GITHUB_OUTPUT" ;;
+          esac
       - name: Build the image
         uses: docker/build-push-action@v6
         with:
@@ -69,7 +82,7 @@ jobs:
           # Without this the image reports dev-unstamped forever, which is the
           # right default for a hand build and useless for one a cluster pulls:
           # the sha is what lets an operator tie a running pod to a commit.
-          build-args: VERSION=sha-${{ github.sha }}
+          build-args: VERSION=${{ steps.stamp.outputs.version }}
       # An image that builds but cannot execute its entrypoint is not a
       # verified image. selftest exits non-zero on a scoring mismatch, so this
       # also proves the embedded capture survived the build.
@@ -82,11 +95,13 @@ jobs:
       # unattributable. Assert the exact stamp the build was given, before the
       # publish step, so a wrong or missing one never reaches the registry.
       - name: Version stamp survived the image build
+        env:
+          EXPECTED: ${{ steps.stamp.outputs.version }}
         run: |
           reported="$(docker run --rm blockcast-shreds:ci --version)"
           echo "reported version: ${reported}"
-          if [ "${reported}" != "sha-${GITHUB_SHA}" ]; then
-            echo "::error::the image reports '${reported}', expected 'sha-${GITHUB_SHA}'." \
+          if [ "${reported}" != "${EXPECTED}" ]; then
+            echo "::error::the image reports '${reported}', expected '${EXPECTED}'." \
                  "Check build-args in this workflow and ARG VERSION / the -X symbol path in the Dockerfile."
             exit 1
           fi
@@ -97,7 +112,8 @@ jobs:
       # only on a `push` event: a fork cannot raise one, so a pull_request run
       # never holds registry credentials.
       #
-      # Off main this is a credential PROBE, not a publish, and it is
+      # Off a publish ref (main, or a v* tag) this is a credential PROBE, not a
+      # publish, and it is
       # deliberately never red. No agent identity can read Actions secrets (the
       # App token 403s on /actions/secrets for every repo in the org), so
       # "does go-amt see HARBOR_*?" is otherwise unmeasurable until a merge
@@ -112,11 +128,15 @@ jobs:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
         run: |
-          # Red on main, where it blocks a real publish. A warning elsewhere:
-          # a missing or broken org grant is not a defect in whatever branch is
-          # building.
+          # Red on main and on a v* tag, where it blocks a real publish. A
+          # warning elsewhere: a missing or broken org grant is not a defect in
+          # whatever branch is building.
+          case "${GITHUB_REF}" in
+            refs/heads/main|refs/tags/v*) publishing=1 ;;
+            *)                            publishing=0 ;;
+          esac
           refuse() {
-            if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
+            if [ "${publishing}" = 1 ]; then
               echo "::error::$1"
               exit 1
             fi
@@ -136,16 +156,32 @@ jobs:
               | docker login registry.blockcast.net -u "${HARBOR_USERNAME}" --password-stdin; then
             refuse "HARBOR_USERNAME/HARBOR_PASSWORD are visible to this repository but do not authenticate to registry.blockcast.net. See BLO-40067."
           fi
-          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+          if [ "${publishing}" != 1 ]; then
             echo "::notice::Harbor credentials authenticate for this repository." \
-                 "Push rights on ${REPO} are not proven until the first main publish." \
-                 "Not pushing from ${GITHUB_REF} — publish is main-only."
+                 "Not pushing from ${GITHUB_REF} — publish is main- and v*-tag-only."
             exit 0
           fi
-          docker tag blockcast-shreds:ci "${REPO}:main"
-          docker tag blockcast-shreds:ci "${REPO}:sha-${GITHUB_SHA}"
-          docker push "${REPO}:main"
-          docker push "${REPO}:sha-${GITHUB_SHA}"
+          # sha-<40hex> on every publish, so a running container is always
+          # traceable to a commit whatever else it is tagged. main and v* then
+          # add their own floating/immutable handles on top.
+          tags="sha-${GITHUB_SHA}"
+          case "${GITHUB_REF}" in
+            refs/heads/main) tags="${tags} main" ;;
+            refs/tags/v*)
+              tags="${tags} ${GITHUB_REF_NAME}"
+              # :latest moves only for a release with no prerelease segment.
+              # Otherwise a v0.0.0-rc1 rehearsal would silently become what
+              # `docker pull blockcast-shreds` hands an operator.
+              case "${GITHUB_REF_NAME}" in
+                *-*) echo "::notice::${GITHUB_REF_NAME} is a prerelease — not moving :latest." ;;
+                *)   tags="${tags} latest" ;;
+              esac
+              ;;
+          esac
+          for t in ${tags}; do
+            docker tag blockcast-shreds:ci "${REPO}:${t}"
+            docker push "${REPO}:${t}"
+          done
 
   goreleaser:
     runs-on: ubuntu-latest
