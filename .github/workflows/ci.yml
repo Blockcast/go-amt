@@ -917,6 +917,8 @@ jobs:
   # listen_multicast_mobile_ios.go (go-amt#150). `go build` for ios does work
   # under CGO_ENABLED=0, so the second step compiles those. It builds the root
   # package only: ./... includes the cmd/ mains, which need the external link.
+  # Two things stay unchecked, and neither exists today: a test file tagged ios
+  # alone (go build skips tests), and an ios-only file outside the root package.
   mobile-typecheck:
     runs-on: ubuntu-latest
     env:

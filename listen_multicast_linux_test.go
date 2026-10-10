@@ -258,7 +258,7 @@ func TestListenMulticastUDP6ClearsMulticastAll(t *testing.T) {
 		t.Fatal(err)
 	}
 	if errors.Is(getErr, unix.ENOPROTOOPT) {
-		t.Skip("kernel predates IPV6_MULTICAST_ALL (Linux 4.20)")
+		t.Skip("IPV6_MULTICAST_ALL unsupported here (ENOPROTOOPT): a kernel before 4.20, or a sandbox without it")
 	}
 	if getErr != nil {
 		t.Fatal(getErr)
