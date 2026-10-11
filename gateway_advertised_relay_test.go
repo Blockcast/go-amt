@@ -84,12 +84,22 @@ func TestGatewayDestKeepsDiscoveryAddressWhenAdvertisementIsUnusable(t *testing.
 		{"unspecified", net.IPv4zero, discovery.String()},
 		{"private from a global relay", net.IPv4(10, 0, 0, 9), discovery.String()},
 		{"link-local from a global relay", net.IPv4(169, 254, 0, 9), discovery.String()},
+		// Routable and unsendable: the gateway socket is AF_INET, so a 24-byte
+		// advertisement naming a global IPv6 address would steer every
+		// post-discovery message at an address WriteTo cannot reach. Before
+		// this change the advertisement was inert, so the guard is what keeps
+		// the fix from being a regression for that relay.
+		{"global IPv6 from an IPv4 relay", net.ParseIP("2001:db8::9"), discovery.String()},
 		{"global", net.IPv4(203, 0, 113, 9), "203.0.113.9:2268"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			g := &Gateway{RelayAddr: discovery}
-			adv := m.RelayAdvertisementMessage{Nonce: [4]byte{1, 2, 3, 4}, RelayAddr: tc.relayAddr.To4()}
+			relayAddr := tc.relayAddr.To4()
+			if relayAddr == nil {
+				relayAddr = tc.relayAddr.To16()
+			}
+			adv := m.RelayAdvertisementMessage{Nonce: [4]byte{1, 2, 3, 4}, RelayAddr: relayAddr}
 			data, err := adv.MarshalBinary()
 			if err != nil {
 				t.Fatalf("MarshalBinary: %v", err)

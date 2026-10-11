@@ -96,8 +96,20 @@ func withQueryIntervalCode(code byte) fakeRelayOption {
 // carries. It defaults to 127.0.0.1, the address the relay itself listens on,
 // which is the case where sending the Request to the discovery address and to
 // the advertised one are indistinguishable.
+//
+// An IPv6 argument is kept as 16 bytes, so the relay emits the 24-byte
+// advertisement RFC 7450 section 5.1.2.4 defines. Taking To4() unconditionally
+// turned an IPv6 address into nil and the relay then emitted an 8-byte
+// advertisement the decoder rejects for the wrong reason -- which would have
+// made a family-mismatch test pass without the gateway doing anything.
 func withAdvertisedAddress(ip net.IP) fakeRelayOption {
-	return func(fr *fakeRelay) { fr.advertisedAddr = ip.To4() }
+	return func(fr *fakeRelay) {
+		if ip4 := ip.To4(); ip4 != nil {
+			fr.advertisedAddr = ip4
+			return
+		}
+		fr.advertisedAddr = ip.To16()
+	}
 }
 
 // withLostDiscoveries makes the relay ignore the first n Relay Discoveries.

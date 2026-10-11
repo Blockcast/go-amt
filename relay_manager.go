@@ -242,10 +242,10 @@ func DefaultRelayManagerConfig(relayAddr net.UDPAddr) RelayManagerConfig {
 // DefaultRelayManagerConfigWithDRIAD returns a config with DRIAD discovery enabled
 func DefaultRelayManagerConfigWithDRIAD(sourceAddr netip.Addr) RelayManagerConfig {
 	return RelayManagerConfig{
-		EnableDRIAD:       true,
-		SourceAddr:        sourceAddr,
-		DNSTimeout:        DefaultDNSDTimeout,
-		MTU:               1500,
+		EnableDRIAD: true,
+		SourceAddr:  sourceAddr,
+		DNSTimeout:  DefaultDNSDTimeout,
+		MTU:         1500,
 		// Open overwrites RelayAddr with whatever DRIAD discovers, but the rest
 		// of the transport config has to come from somewhere: left zero-valued
 		// a discovered relay got a transport with no read timeout and MTU 0.
@@ -741,6 +741,11 @@ func (rm *RelayManager) performHandshake() error {
 			if err := rm.protocol.HandleAdvertisement(buffer[:n]); err != nil {
 				return fmt.Errorf("failed to handle advertisement: %w", err)
 			}
+			// Only after the protocol has validated the nonce: the
+			// advertisement names the relay that answered, and the Request
+			// below must reach that relay and not the anycast address the
+			// Discovery went to. See advertisedRelayDest.
+			rm.transport.AdoptAdvertisedRelay(buffer[:n])
 
 			// Send request
 			request, err := rm.protocol.CreateRequestMessage(false)
@@ -967,6 +972,7 @@ func (rm *RelayManager) readLoop(ctx context.Context, generation uint64) {
 			if err := rm.protocol.HandleAdvertisement(buffer[:n]); err != nil {
 				continue
 			}
+			rm.transport.AdoptAdvertisedRelay(buffer[:n])
 			request, err := rm.protocol.CreateRequestMessage(false)
 			if err != nil {
 				continue

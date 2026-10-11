@@ -106,35 +106,14 @@ func (g *Gateway) dest() net.Addr {
 }
 
 // adoptAdvertisedRelay points subsequent messages at the relay named in the
-// advertisement. The address arrives off the wire, so it is taken only when it
-// could plausibly be routed to: an unspecified address, or a private or
-// link-local one from a relay we reached at a global address (a relay behind
-// NAT advertising its inside address), would black-hole every message after the
-// discovery. Those keep the discovery address, which is at least known to work.
+// advertisement, when advertisedRelayDest judges it reachable. Everything the
+// address has to survive to be taken is documented there; the same test runs
+// on the RelayManager path.
 func (g *Gateway) adoptAdvertisedRelay(data []byte) {
-	var adv m.RelayAdvertisementMessage
-	if err := adv.UnmarshalBinary(data); err != nil {
-		return
+	discovered, _ := g.RelayAddr.(*net.UDPAddr)
+	if dest := advertisedRelayDest(data, discovered); dest != nil {
+		g.relayDest.Store(dest)
 	}
-	discovered, ok := g.RelayAddr.(*net.UDPAddr)
-	if !ok || len(adv.RelayAddr) == 0 || adv.RelayAddr.IsUnspecified() {
-		return
-	}
-	if !routableBeyondSite(adv.RelayAddr) && routableBeyondSite(discovered.IP) {
-		slog.Warn("amt: ignoring unroutable advertised relay address",
-			"advertised", adv.RelayAddr.String(), "discovery", discovered.String())
-		return
-	}
-	if adv.RelayAddr.Equal(discovered.IP) {
-		return
-	}
-	slog.Debug("amt: using advertised relay address",
-		"advertised", adv.RelayAddr.String(), "discovery", discovered.String())
-	g.relayDest.Store(&net.UDPAddr{IP: adv.RelayAddr, Port: discovered.Port, Zone: discovered.Zone})
-}
-
-func routableBeyondSite(ip net.IP) bool {
-	return !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified()
 }
 
 // Version returns the Rust library version.
