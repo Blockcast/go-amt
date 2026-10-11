@@ -71,6 +71,19 @@ type AMTRelayRecord struct {
 // DiscoverRelay performs DRIAD discovery for the given source address
 // Returns the discovered relay address and port
 func DiscoverRelay(ctx context.Context, config DRIADConfig) (*net.UDPAddr, error) {
+	relays, err := DiscoverRelays(ctx, config)
+	if err != nil {
+		return nil, err
+	}
+	return relays[0], nil
+}
+
+// DiscoverRelays performs DRIAD discovery and returns every relay the source
+// advertises, in the order a gateway should try them (see OrderRelays).
+// DiscoverRelay returns only the first, which leaves a gateway with no answer
+// when that relay is down even though the source listed others; a caller that
+// walks the whole slice gets precedence-respecting failover.
+func DiscoverRelays(ctx context.Context, config DRIADConfig) ([]*net.UDPAddr, error) {
 	if !config.SourceAddr.IsValid() {
 		return nil, fmt.Errorf("invalid source address")
 	}
@@ -91,19 +104,31 @@ func DiscoverRelay(ctx context.Context, config DRIADConfig) (*net.UDPAddr, error
 		return nil, fmt.Errorf("no AMTRELAY records found for %s", config.SourceAddr)
 	}
 
-	// Lowest precedence wins, chosen at random among equal precedence.
-	bestRecord := &OrderRelays(records, rand.Shuffle)[0]
+	// Lowest precedence first, chosen at random among equal precedence.
+	ordered := OrderRelays(records, rand.Shuffle)
 
-	// Resolve relay address if needed
-	relayAddr, err := resolveRelayAddr(ctx, bestRecord, config)
-	if err != nil {
-		return nil, fmt.Errorf("failed to resolve relay address: %w", err)
+	relays := make([]*net.UDPAddr, 0, len(ordered))
+	var resolveErr error
+	for i := range ordered {
+		// A name that does not resolve disqualifies that relay, not the rest of
+		// the RRset.
+		relayAddr, err := resolveRelayAddr(ctx, &ordered[i], config)
+		if err != nil {
+			if resolveErr == nil {
+				resolveErr = err
+			}
+			continue
+		}
+		relays = append(relays, &net.UDPAddr{
+			IP:   relayAddr.AsSlice(),
+			Port: m.DefaultPort,
+		})
+	}
+	if len(relays) == 0 {
+		return nil, fmt.Errorf("failed to resolve relay address: %w", resolveErr)
 	}
 
-	return &net.UDPAddr{
-		IP:   relayAddr.AsSlice(),
-		Port: m.DefaultPort,
-	}, nil
+	return relays, nil
 }
 
 // OrderRelays returns the records in the order a gateway should try them:
@@ -154,6 +179,11 @@ func queryAMTRelayRecords(ctx context.Context, queryName string, config DRIADCon
 	msg := new(dns.Msg)
 	msg.SetQuestion(queryName, DNSTypeAMTRELAY)
 	msg.RecursionDesired = true
+	// An AMTRELAY RRset listing several relays, or one relay by name, outgrows
+	// the 512-byte DNS floor quickly. Without EDNS0 the answer comes back
+	// truncated and the records we would have load balanced across are the ones
+	// that get dropped.
+	msg.SetEdns0(dns.DefaultMsgSize, false)
 
 	// Get DNS server to use
 	dnsServer := getDefaultDNSServer(config.DNSServers)
@@ -393,8 +423,28 @@ func getDefaultDNSServer(configured []string) string {
 		return server
 	}
 
-	// Try to get system DNS server
-	// On most systems, we can use the local resolver
+	return systemDNSServer()
+}
+
+// resolvConfPath is a variable only so a test can point it at a fixture.
+var resolvConfPath = "/etc/resolv.conf"
+
+// systemDNSServer returns the first nameserver the system is configured to use.
+//
+// This used to hardcode 127.0.0.53, systemd-resolved's stub. Anywhere that stub
+// is not listening — a container whose /etc/resolv.conf points at the cluster
+// DNS service, a host running plain resolvconf, macOS — DRIAD discovery could
+// not resolve anything at all, so a correctly published AMTRELAY RRset looked
+// like a source with no relays. The stub stays as the fallback for the case
+// where /etc/resolv.conf is unreadable.
+func systemDNSServer() string {
+	if cfg, err := dns.ClientConfigFromFile(resolvConfPath); err == nil && len(cfg.Servers) > 0 {
+		port := cfg.Port
+		if port == "" {
+			port = "53"
+		}
+		return net.JoinHostPort(cfg.Servers[0], port)
+	}
 	return "127.0.0.53:53" // systemd-resolved default
 }
 

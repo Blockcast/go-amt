@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net"
 	"net/netip"
@@ -214,10 +215,11 @@ type RelayManagerConfig struct {
 	// because Open assigns rm.transport itself and swapping the field afterwards
 	// races the running readLoop.
 	//
-	// Open calls it exactly once. Reconnection reuses that same Transport through
-	// its Close/Open methods rather than building a new one, so a decorator
-	// installed here observes every generation, including the reconnect
-	// handshake.
+	// Open calls it once per relay candidate it tries, so a DRIAD config whose
+	// first relay is unreachable calls it again for the next one. Reconnection
+	// reuses the Transport that succeeded through its Close/Open methods rather
+	// than building a new one, so a decorator installed here observes every
+	// generation, including the reconnect handshake.
 	TransportFactory func(TransportConfig) (Transport, error)
 }
 
@@ -244,6 +246,10 @@ func DefaultRelayManagerConfigWithDRIAD(sourceAddr netip.Addr) RelayManagerConfi
 		SourceAddr:        sourceAddr,
 		DNSTimeout:        DefaultDNSDTimeout,
 		MTU:               1500,
+		// Open overwrites RelayAddr with whatever DRIAD discovers, but the rest
+		// of the transport config has to come from somewhere: left zero-valued
+		// a discovered relay got a transport with no read timeout and MTU 0.
+		TransportConfig:   DefaultTransportConfig(net.UDPAddr{}),
 		InitialBackoff:    1 * time.Second,
 		MaxBackoff:        30 * time.Second,
 		BackoffMultiplier: 2.0,
@@ -316,13 +322,13 @@ func (rm *RelayManager) Open(ctx context.Context) error {
 	rm.ctx, rm.cancel = context.WithCancel(ctx)
 
 	// Perform DRIAD discovery if enabled and no relay address provided
-	relayAddr := rm.config.RelayAddr
-	if len(relayAddr.IP) == 0 && rm.config.EnableDRIAD {
+	candidates := []net.UDPAddr{rm.config.RelayAddr}
+	if len(rm.config.RelayAddr.IP) == 0 && rm.config.EnableDRIAD {
 		if !rm.config.SourceAddr.IsValid() {
 			return fmt.Errorf("DRIAD enabled but no source address provided")
 		}
 
-		discoveredRelay, err := DiscoverRelay(ctx, DRIADConfig{
+		discovered, err := DiscoverRelays(ctx, DRIADConfig{
 			SourceAddr: rm.config.SourceAddr,
 			DNSServers: rm.config.DNSServers,
 			Timeout:    rm.config.DNSTimeout,
@@ -331,14 +337,65 @@ func (rm *RelayManager) Open(ctx context.Context) error {
 			return fmt.Errorf("DRIAD discovery failed: %w", err)
 		}
 
-		relayAddr = *discoveredRelay
-		rm.config.RelayAddr = relayAddr
-		rm.config.TransportConfig.RelayAddr = relayAddr
+		candidates = candidates[:0]
+		for _, relay := range discovered {
+			candidates = append(candidates, *relay)
+		}
 	}
 
-	if len(relayAddr.IP) == 0 {
+	if len(candidates) == 0 || len(candidates[0].IP) == 0 {
 		return fmt.Errorf("no relay address provided and DRIAD discovery not enabled")
 	}
+
+	// Try the relays in order. A source that publishes several AMTRELAY records
+	// expects a gateway to fall through to the next one when a relay is down;
+	// stopping at the first is what turned one unreachable relay into a dead
+	// subscription even though the other relays were answering.
+	var lastErr error
+	for _, relayAddr := range candidates {
+		err := rm.openRelay(relayAddr)
+		if err == nil {
+			rm.state.Store(RelayStateActive)
+			now := time.Now()
+			rm.lastAnyMessage.Store(now)
+			rm.lastDataMessage.Store(now)
+
+			// Start exactly one read/keepalive pair for the initial generation.
+			rm.startLoops()
+
+			return nil
+		}
+		lastErr = fmt.Errorf("relay %s: %w", relayAddr.String(), err)
+		if len(candidates) > 1 {
+			slog.Warn("amt: relay candidate failed, trying next",
+				"relay", relayAddr.String(), "error", err)
+		}
+	}
+
+	return lastErr
+}
+
+// openRelay brings up transport and protocol against one relay and runs the
+// handshake. Everything it allocates is released again on failure so the next
+// candidate starts clean.
+func (rm *RelayManager) openRelay(relayAddr net.UDPAddr) error {
+	rm.config.RelayAddr = relayAddr
+	rm.config.TransportConfig.RelayAddr = relayAddr
+
+	opened := false
+	defer func() {
+		if opened {
+			return
+		}
+		if rm.protocol != nil {
+			rm.protocol.Close()
+			rm.protocol = nil
+		}
+		if rm.transport != nil {
+			rm.transport.Close()
+			rm.transport = nil
+		}
+	}()
 
 	// Create transport
 	newTransport := rm.config.TransportFactory
@@ -373,18 +430,10 @@ func (rm *RelayManager) Open(ctx context.Context) error {
 
 	// Perform discovery handshake
 	if err := rm.performHandshake(); err != nil {
-		rm.transport.Close()
 		return fmt.Errorf("handshake failed: %w", err)
 	}
 
-	rm.state.Store(RelayStateActive)
-	now := time.Now()
-	rm.lastAnyMessage.Store(now)
-	rm.lastDataMessage.Store(now)
-
-	// Start exactly one read/keepalive pair for the initial generation.
-	rm.startLoops()
-
+	opened = true
 	return nil
 }
 

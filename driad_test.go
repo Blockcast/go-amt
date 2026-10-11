@@ -1,10 +1,19 @@
 package amt
 
 import (
-	"github.com/miekg/dns"
+	"context"
 	"math/rand/v2"
+	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
+	"slices"
 	"testing"
+	"time"
+
+	m "github.com/blockcast/go-amt/messages"
+	"github.com/miekg/dns"
+	"go.uber.org/atomic"
 )
 
 func TestBuildDRIADQuery_IPv4(t *testing.T) {
@@ -306,5 +315,147 @@ func TestParseAMTRelayRR_NativeMiekgType(t *testing.T) {
 		if !ok || got != tc.want {
 			t.Fatalf("parseAMTRelayRR(%q) = %+v, %v; want %+v, true", tc.rr, got, ok, tc.want)
 		}
+	}
+}
+
+// driadTestSource is the source whose reverse name the fixtures below answer:
+// BuildDRIADQuery(69.25.95.1) == "1.95.25.69.in-addr.arpa.".
+var driadTestSource = netip.MustParseAddr("69.25.95.1")
+
+// startFakeDRIADResolver answers AMTRELAY queries for driadTestSource with rrs,
+// over UDP on 127.0.0.1, and reports whether the query carried an EDNS0 OPT
+// record. The answer leaves through dns.Msg.Pack and arrives through the normal
+// miekg/dns decode, so a caller exercises the same wire path a real resolver
+// gives it rather than a hand-built RR.
+func startFakeDRIADResolver(t *testing.T, rrs ...string) (addr string, sawEDNS0 *atomic.Bool) {
+	t.Helper()
+
+	answer := make([]dns.RR, 0, len(rrs))
+	for _, text := range rrs {
+		rr, err := dns.NewRR(text)
+		if err != nil {
+			t.Fatalf("NewRR(%q): %v", text, err)
+		}
+		answer = append(answer, rr)
+	}
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen resolver socket: %v", err)
+	}
+
+	sawEDNS0 = atomic.NewBool(false)
+	srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		if req.IsEdns0() != nil {
+			sawEDNS0.Store(true)
+		}
+		resp := new(dns.Msg)
+		resp.SetReply(req)
+		resp.Answer = answer
+		_ = w.WriteMsg(resp)
+	})}
+	go func() { _ = srv.ActivateAndServe() }()
+	t.Cleanup(func() { _ = srv.Shutdown() })
+
+	return pc.LocalAddr().String(), sawEDNS0
+}
+
+func TestParseAMTRelayRR_PackedWireAnswer(t *testing.T) {
+	// The acceptance case: an AMTRELAY RR that has been through dns.Msg.Pack
+	// and back, which is what every real answer is. Before parseAMTRelayRR
+	// learned *dns.AMTRELAY this yielded no records at all, and DiscoverRelay
+	// reported "no AMTRELAY records found" for a source that had published one.
+	rr, err := dns.NewRR("1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 10 0 1 192.0.2.7")
+	if err != nil {
+		t.Fatalf("NewRR: %v", err)
+	}
+	msg := new(dns.Msg)
+	msg.SetQuestion("1.95.25.69.in-addr.arpa.", DNSTypeAMTRELAY)
+	msg.Answer = []dns.RR{rr}
+
+	wire, err := msg.Pack()
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	unpacked := new(dns.Msg)
+	if err := unpacked.Unpack(wire); err != nil {
+		t.Fatalf("Unpack: %v", err)
+	}
+
+	var records []AMTRelayRecord
+	for _, answer := range unpacked.Answer {
+		if record, ok := parseAMTRelayRR(answer); ok {
+			records = append(records, record)
+		}
+	}
+	if len(records) != 1 {
+		t.Fatalf("parsed %d records from a packed AMTRELAY answer, want 1", len(records))
+	}
+	want := AMTRelayRecord{Precedence: 10, RelayType: 1, RelayAddr: "192.0.2.7", ResolvedAddr: netip.MustParseAddr("192.0.2.7")}
+	if records[0] != want {
+		t.Fatalf("record = %+v, want %+v", records[0], want)
+	}
+}
+
+func TestDiscoverRelays_OrdersWireAnswerAndSendsEDNS0(t *testing.T) {
+	resolver, sawEDNS0 := startFakeDRIADResolver(t,
+		"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 30 0 1 192.0.2.30",
+		"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 10 0 1 192.0.2.10",
+		"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 20 0 2 2001:db8::20",
+	)
+
+	relays, err := DiscoverRelays(context.Background(), DRIADConfig{
+		SourceAddr: driadTestSource,
+		DNSServers: []string{resolver},
+		Timeout:    5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("DiscoverRelays: %v", err)
+	}
+
+	// Every advertised relay comes back, not just the winner, so a caller can
+	// fail over; distinct precedences make the order total.
+	got := make([]string, 0, len(relays))
+	for _, relay := range relays {
+		got = append(got, relay.IP.String())
+	}
+	want := []string{"192.0.2.10", "2001:db8::20", "192.0.2.30"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("candidates = %v, want %v", got, want)
+	}
+	for _, relay := range relays {
+		if relay.Port != m.DefaultPort {
+			t.Fatalf("relay %s port = %d, want %d", relay.IP, relay.Port, m.DefaultPort)
+		}
+	}
+
+	// An RRset listing several relays, or a relay named rather than numbered,
+	// outgrows the 512-byte floor; without EDNS0 the answer is truncated and the
+	// extra relays are exactly what gets dropped.
+	if !sawEDNS0.Load() {
+		t.Fatal("DRIAD query carried no EDNS0 OPT record")
+	}
+}
+
+func TestSystemDNSServerReadsResolvConf(t *testing.T) {
+	// Hardcoding systemd-resolved's stub made DRIAD fail outright wherever that
+	// stub is not listening -- a container pointed at a cluster DNS service, a
+	// host on plain resolvconf -- so a published AMTRELAY RRset looked like a
+	// source with no relays.
+	path := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(path, []byte("nameserver 10.96.0.10\nsearch svc.cluster.local\n"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	t.Cleanup(func(old string) func() { return func() { resolvConfPath = old } }(resolvConfPath))
+	resolvConfPath = path
+
+	if got := systemDNSServer(); got != "10.96.0.10:53" {
+		t.Fatalf("systemDNSServer() = %q, want the resolv.conf nameserver 10.96.0.10:53", got)
+	}
+
+	// An unreadable resolv.conf still has to yield something dialable.
+	resolvConfPath = filepath.Join(t.TempDir(), "absent")
+	if _, _, err := net.SplitHostPort(systemDNSServer()); err != nil {
+		t.Fatalf("fallback %q is not host:port: %v", systemDNSServer(), err)
 	}
 }
