@@ -5,7 +5,8 @@
 // more outputs.
 //
 // Ingest A: SSM join (prod-src, group):port. This is the production forwarder's
-// stream.
+// stream. A datagram on the port from any other source is dropped, and counted
+// as foreign.
 // Ingest B: unicast UDP on 127.0.0.1:<local-port>. This is the second
 // listener's stream.
 //
@@ -77,6 +78,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strconv"
@@ -254,20 +256,29 @@ func interfaceWith(ip net.IP) (int, error) {
 	return 0, fmt.Errorf("no interface holds %s", ip)
 }
 
-func reader(c *net.UDPConn, src uint8, out chan<- frame, dropped *atomic.Uint64) {
+// reader passes c's datagrams to out. A valid from admits only datagrams sent
+// from that address and counts the rest in foreign. Ingest A needs it: its
+// socket binds the wildcard on its port, so unicast from any host reaches it,
+// and a forged shred that arrives before the real one wins dedup (BLO-43063).
+func reader(c *net.UDPConn, src uint8, from netip.Addr, out chan<- frame, dropped, foreign *atomic.Uint64) {
+	b := make([]byte, maxDatagram)
 	for {
-		b := make([]byte, maxDatagram)
-		n, _, err := c.ReadFromUDP(b)
+		n, ap, err := c.ReadFromUDPAddrPort(b)
 		if err != nil {
 			// The union needs both ingests: exit so systemd restarts the
 			// merger, rather than run on half of them with healthy stats.
 			log.Fatalf("read error (src=%d): %v", src, err)
+		}
+		if from.IsValid() && ap.Addr().Unmap() != from {
+			foreign.Add(1)
+			continue
 		}
 		if n < hdrLen {
 			continue
 		}
 		select {
 		case out <- frame{buf: b, n: n, src: src}:
+			b = make([]byte, maxDatagram) // out owns the old buffer now
 		default:
 			dropped.Add(1) // the processor is backlogged: count the frame rather than block the reader
 		}
@@ -541,8 +552,8 @@ func parseOutputs(specs []string, defaultPort int, ingests ...*net.UDPAddr) ([]*
 // send queues the frame b on every output that carries it, without waiting:
 // an output whose queue is full loses the frame and counts it in drop. It
 // reports false when a version-3 output needed the frame and b cannot be
-// converted. Queued frames are shared and never written to: each read has its
-// own buffer, and asV3 copies.
+// converted. Queued frames are shared and never written to: each frame a reader
+// passes on has its own buffer, and asV3 copies.
 func send(outs []*output, b []byte) (convertible bool) {
 	var v3 []byte
 	converted := false
@@ -618,7 +629,8 @@ func main() {
 
 	// Ingest A: the production SSM stream. Go binds the wildcard for a multicast
 	// address, so what keeps the socket to this channel's multicast is its own
-	// join, with IP_MULTICAST_ALL cleared. Unicast to the port still reaches it.
+	// join, with IP_MULTICAST_ALL cleared. Unicast to the port still reaches it,
+	// so its reader admits only -prod-src.
 	inA, err := listenUDP4(fmt.Sprintf("%s:%d", *group, *port), *rcvbuf, true)
 	if err != nil {
 		log.Fatalf("bind ingest A: %v", err)
@@ -651,9 +663,9 @@ func main() {
 	}
 
 	ch := make(chan frame, 1<<16)
-	var qdrop atomic.Uint64
-	go reader(inA, 0, ch, &qdrop)
-	go reader(inB, 1, ch, &qdrop)
+	var qdrop, foreign atomic.Uint64
+	go reader(inA, 0, netip.AddrFrom4(mustIP4(*prodSrc)), ch, &qdrop, &foreign)
+	go reader(inB, 1, netip.Addr{}, ch, &qdrop, &foreign) // bound to 127.0.0.1
 
 	seen := newDedup(*keep)
 	var rxA, rxB, emitted, emittedV3, emittedV4, dupA, dupB, firstFromB, v3Unconvertible, skipped uint64
@@ -706,6 +718,8 @@ func main() {
 			// frames as SENT: its socket is unconnected, so it never sees the
 			// ICMP port unreachable. emit_err and out_drop sum ERR and DROP.
 			// queue is the input backlog, which qdrop counts once it is full.
+			// foreign counts datagrams to ingest A from a host other than
+			// -prod-src, dropped unread.
 			var emitErr, outDrop uint64
 			var per strings.Builder
 			for _, o := range outs {
@@ -714,8 +728,8 @@ func main() {
 				outDrop += d
 				fmt.Fprintf(&per, " %s@%s=%d/%d/%d/%d", o.kind, o.dst, sent, e, d, len(o.q))
 			}
-			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d out_drop=%d qdrop=%d queue=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d dedup_ids=%d forgotten=%d%s",
-				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, outDrop, qdrop.Load(), len(ch), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, seen.ids, seen.forgotten, per.String())
+			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d out_drop=%d qdrop=%d foreign=%d queue=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d dedup_ids=%d forgotten=%d%s",
+				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, outDrop, qdrop.Load(), foreign.Load(), len(ch), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, seen.ids, seen.forgotten, per.String())
 
 		case s := <-sig:
 			log.Printf("signal %v; final: rx_prod=%d rx_listener2=%d emitted=%d first_from_listener2=%d", s, rxA, rxB, emitted, firstFromB)

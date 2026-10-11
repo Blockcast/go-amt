@@ -120,7 +120,6 @@ func newOverlapProbedManager(t *testing.T, fr *fakeRelay) (*RelayManager, *recei
 	cfg := DefaultRelayManagerConfig(fr.Addr())
 	cfg.EnableDRIAD = false
 	cfg.TransportConfig.RelayAddr = fr.Addr()
-	cfg.TransportConfig.Timeout = 2 * time.Second
 	cfg.InitialBackoff = 10 * time.Millisecond
 	cfg.MaxBackoff = 100 * time.Millisecond
 
