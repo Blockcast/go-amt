@@ -57,8 +57,8 @@ type Gateway struct {
 	// handleMembershipQuery from renewing the membership to tearing it down.
 	//
 	// Atomic because it is genuinely cross-goroutine in both directions: the
-	// keepalive goroutine started by Open reads it every interval while
-	// stopKeepalive writes it from Open's failure paths, and
+	// keepalive goroutine started once the handshake succeeds reads it every
+	// interval while abortOpen writes it from conn.go's Open failure paths, and
 	// handleMembershipQuery reads it from the read loop while Close writes it.
 	// As a plain bool that was a data race — and worse than the detector
 	// complaining, because the read sits in a bare for loop with no
@@ -275,7 +275,6 @@ func (g *Gateway) Open() (err error) {
 	}
 
 	g.intervalTime.Store(time.Second * 10)
-	g.lastData.Store(time.Now())
 
 	openTimeout := g.Timeout
 	if openTimeout <= 0 {
@@ -296,66 +295,15 @@ func (g *Gateway) Open() (err error) {
 		return err
 	}
 
-	// Start keepalive goroutine. `loopErr` is deliberately local: the outer
-	// `err` is written concurrently by the read loop below, so assigning to it
-	// from here is a data race.
-	go func() {
-		// stalled tracks whether the previous iteration already saw the relay as
-		// silent, so entering and leaving that state logs once each rather than
-		// every interval. A permanently unreachable relay would otherwise emit a
-		// line every intervalTime forever, which is the kind of noise that gets
-		// logging filtered out precisely when it is needed.
-		var stalled bool
-		for {
-			// SLEEP FIRST. This loop used to run its body immediately, before
-			// the handshake it is meant to maintain had any chance to complete.
-			// At that instant the Rust gateway is in Discovering (set by
-			// start_discovery, gateway.rs:155) and request_membership requires
-			// Idle (gateway.rs:195), so the very first keepalive reliably
-			// returned InvalidState and stored it in loopErr — where the next
-			// ReadBatch picks it up via `loopErr.Swap(nil)` (conn.go) and
-			// returns it to the caller. A successful Open was therefore
-			// followed by a spurious error on the first read of the tunnel.
-			//
-			// Sleeping first is also what the loop already means: nothing can
-			// be stale at t=0, because lastData was stored moments earlier, so
-			// the idle branch below could never fire on that first pass either.
-			// Shutdown latency is unchanged — leave is still observed within
-			// one interval, it is just checked after the sleep instead of
-			// before it.
-			time.Sleep(g.intervalTime.Load())
-			if g.leave.Load() {
-				return
-			}
-			var loopErr error
-			if idle := time.Since(g.lastData.Load()); idle > g.intervalTime.Load() {
-				if !stalled {
-					stalled = true
-					slog.Warn("amt: no data from relay, re-sending discovery",
-						"relay", relay, "idle", idle)
-				}
-				// Reset and rediscover
-				C.amt_gateway_reset(g.handle)
-				loopErr = g.sendDiscovery()
-			} else {
-				if stalled {
-					stalled = false
-					slog.Info("amt: relay data resumed", "relay", relay)
-				}
-				loopErr = g.sendRequest()
-			}
-			if loopErr != nil {
-				slog.Warn("amt: keepalive send failed", "relay", relay, "error", loopErr)
-				g.loopErr.Store(loopErr)
-			}
-		}
-	}()
+	// NO KEEPALIVE YET. startKeepalive is called from the success path below,
+	// once the handshake has completed; see its comment for why running it
+	// alongside the handshake tore the handshake down (BLO-43640).
 
 	// Bound the handshake. Without this the read below blocks forever against a
-	// relay that never answers, and the keepalive goroutine spins behind it.
-	// Within the bound, an unanswered Discovery or Request is resent on the same
-	// schedule as RelayManager.performHandshake (handshakeRetransmit). Without
-	// that, one lost datagram among the four failed Open (BLO-43016).
+	// relay that never answers. Within the bound, an unanswered Discovery or
+	// Request is resent on the same schedule as RelayManager.performHandshake
+	// (handshakeRetransmit). Without that, one lost datagram among the four
+	// failed Open (BLO-43016).
 	deadline := time.Now().Add(openTimeout)
 	resendAt := time.Now().Add(handshakeRetransmit)
 	// retries drives the back-off and restarts with the Request leg;
@@ -370,7 +318,6 @@ func (g *Gateway) Open() (err error) {
 	advertised := false
 	for {
 		if err = g.conn.SetReadDeadline(earliest(resendAt, deadline)); err != nil {
-			g.stopKeepalive()
 			return fmt.Errorf("error setting handshake deadline: %w", err)
 		}
 		// SLICE TO WHAT WAS ACTUALLY RECEIVED. This used to discard n and hand
@@ -397,7 +344,6 @@ func (g *Gateway) Open() (err error) {
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) && time.Now().Before(deadline) {
 				if _, err = g.conn.WriteTo(*g.outstanding.Load(), g.cm, g.RelayAddr); err != nil {
-					g.stopKeepalive()
 					return fmt.Errorf("error retransmitting: %w", err)
 				}
 				retries++
@@ -405,7 +351,6 @@ func (g *Gateway) Open() (err error) {
 				resendAt = time.Now().Add(handshakeRetransmit + rand.N(handshakeRetransmit<<retries-handshakeRetransmit+1))
 				continue
 			}
-			g.stopKeepalive()
 			if lastAdvErr != nil && !advertised {
 				return fmt.Errorf(
 					"error reading from connection after %d retransmissions: %w (last advertisement rejected: %v)",
@@ -451,18 +396,19 @@ func (g *Gateway) Open() (err error) {
 			// Handshake done: clear the deadline so steady-state reads are not
 			// bounded by the Open timeout.
 			if deadlineErr := g.conn.SetReadDeadline(time.Time{}); deadlineErr != nil {
-				g.stopKeepalive()
 				return fmt.Errorf("error clearing handshake deadline: %w", deadlineErr)
 			}
 			if queryErr := g.handleMembershipQuery(msg); queryErr != nil {
-				g.stopKeepalive()
 				return queryErr
 			}
+			// Only now. handleMembershipQuery has also had its chance to adopt
+			// the relay's own QQIC into intervalTime, so the first sleep is the
+			// interval the relay asked for rather than the 10s seed.
+			g.startKeepalive(relay)
 			slog.Info("amt: relay handshake complete",
 				"relay", relay, "elapsed", time.Since(started))
 			return nil
 		default:
-			g.stopKeepalive()
 			return fmt.Errorf("invalid response: %d", amtMessageType)
 		}
 	}
@@ -481,9 +427,98 @@ func relayAddrString(a net.Addr) string {
 // DefaultOpenTimeout bounds the relay handshake when Gateway.Timeout is unset.
 const DefaultOpenTimeout = 10 * time.Second
 
-// stopKeepalive signals the keepalive goroutine to exit. Called on every Open
-// failure path so a failed Open does not leak a goroutine that reconnects to a
-// relay nobody is listening to.
+// startKeepalive runs the steady-state keepalive: once per interval it re-sends
+// a Request, or resets and rediscovers when the relay has been silent for longer
+// than one interval.
+//
+// CALLED ONLY FROM OPEN'S SUCCESS PATH, after the handshake has completed. Open
+// used to start it immediately after the first Discovery, where it had no
+// legitimate work to do and one actively destructive branch:
+//
+//   - lastData is written here and by the two steady-state read loops
+//     (conn.go), and neither loop can run while Open is still in its handshake
+//     read, so lastData could not be refreshed during a handshake. The first
+//     iteration therefore woke with idle > intervalTime every single time and
+//     took the stalled branch, calling amt_gateway_reset on a gateway in the
+//     middle of its own handshake and replacing `outstanding` with a Discovery
+//     carrying a NEW nonce — which Open's retransmission then resent as though
+//     it were its own, breaking the same-nonce requirement of RFC 7450 sections
+//     5.2.3.4.5 and 5.2.3.5.6 that the retransmission exists to honour.
+//   - The other branch sends a Request, which request_membership rejects as
+//     InvalidState from Discovering (gateway.rs:195) — see the sleep note below.
+//
+// Both were reachable only above the 10s seed interval, so DefaultOpenTimeout
+// (exactly 10s) hid it and the configurable RelayHandshakeTimeout that BLO-43016
+// made reachable exposed it. Open bounds and retransmits its own handshake, so
+// nothing is lost by waiting: there was never work here the handshake needed.
+// BLO-43640.
+func (g *Gateway) startKeepalive(relay string) {
+	// Date the silence from the completed handshake rather than from Open's
+	// start, so a slow handshake does not spend the first interval's staleness
+	// budget before the tunnel has carried anything.
+	g.lastData.Store(time.Now())
+
+	// `loopErr` is deliberately local: Open's named return is written by the
+	// read loop that called this, so assigning to it from here is a data race.
+	go func() {
+		// stalled tracks whether the previous iteration already saw the relay as
+		// silent, so entering and leaving that state logs once each rather than
+		// every interval. A permanently unreachable relay would otherwise emit a
+		// line every intervalTime forever, which is the kind of noise that gets
+		// logging filtered out precisely when it is needed.
+		var stalled bool
+		for {
+			// SLEEP FIRST. This loop used to run its body immediately on
+			// start. At that instant the Rust gateway was in Discovering (set
+			// by start_discovery, gateway.rs:155) and request_membership
+			// requires Idle (gateway.rs:195), so the very first keepalive
+			// reliably returned InvalidState and stored it in loopErr — where
+			// the next ReadBatch picks it up via `loopErr.Swap(nil)` (conn.go)
+			// and returns it to the caller. A successful Open was therefore
+			// followed by a spurious error on the first read of the tunnel.
+			//
+			// Starting after the handshake now rules that out on its own, but
+			// the sleep stays: an immediate Request on top of the Update that
+			// handleMembershipQuery has just sent is pure duplication, and
+			// shutdown latency is unaffected either way — leave is still
+			// observed within one interval, just after the sleep rather than
+			// before it.
+			time.Sleep(g.intervalTime.Load())
+			if g.leave.Load() {
+				return
+			}
+			var loopErr error
+			if idle := time.Since(g.lastData.Load()); idle > g.intervalTime.Load() {
+				if !stalled {
+					stalled = true
+					slog.Warn("amt: no data from relay, re-sending discovery",
+						"relay", relay, "idle", idle)
+				}
+				// Reset and rediscover
+				C.amt_gateway_reset(g.handle)
+				loopErr = g.sendDiscovery()
+			} else {
+				if stalled {
+					stalled = false
+					slog.Info("amt: relay data resumed", "relay", relay)
+				}
+				loopErr = g.sendRequest()
+			}
+			if loopErr != nil {
+				slog.Warn("amt: keepalive send failed", "relay", relay, "error", loopErr)
+				g.loopErr.Store(loopErr)
+			}
+		}
+	}()
+}
+
+// stopKeepalive signals the keepalive goroutine to exit, so a gateway being torn
+// down does not leave one behind reconnecting to a relay nobody is listening to.
+//
+// Open no longer calls it on its own failure paths: since BLO-43640 the
+// goroutine starts only once the handshake has succeeded, so a failed Open has
+// none to stop. It is still reached through abortOpen, which conn.go runs on
+// exactly those paths, and through Close.
 func (g *Gateway) stopKeepalive() {
 	g.leave.Store(true)
 }

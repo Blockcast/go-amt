@@ -3,6 +3,7 @@
 package amt
 
 import (
+	"math"
 	"net"
 	"strings"
 	"testing"
@@ -81,5 +82,109 @@ func TestGatewayOpenErrorAfterDuplicateAdvertisement(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "after 2 retransmissions") {
 		t.Errorf("Open: %v; want 2 retransmissions, one per leg", err)
+	}
+}
+
+// A Timeout longer than the keepalive's 10s seed interval must not let the
+// keepalive tear down the handshake it exists to maintain.
+//
+// Before BLO-43640, Open started the keepalive goroutine immediately after the
+// first Discovery, and that goroutine's first iteration destroyed the handshake
+// deterministically. lastData is written by gateway.go's seed and by the two
+// steady-state read loops in conn.go, and neither loop can run while Open is
+// still handshaking — so after the goroutine's opening 10s sleep, idle always
+// exceeded intervalTime. It took the stalled branch, called amt_gateway_reset
+// on a gateway in the middle of its own handshake, and sent a second Discovery
+// carrying a FRESH nonce, which Open's retransmission then resent as though it
+// were its own. That breaks the same-nonce requirement of RFC 7450 sections
+// 5.2.3.4.5 and 5.2.3.5.6 that TestGatewayOpenResendsTheSameDiscovery above
+// exists to hold, and it does so only above 10s — which is why the default
+// (DefaultOpenTimeout, exactly 10s) never showed it, and why #159 making
+// RelayHandshakeTimeout reachable is what exposed it.
+//
+// The relay answers nothing, so Open can only end at its deadline. 12s is past
+// the 10s mark where that first keepalive pass would have fired, with margin on
+// both sides. Every Discovery the relay sees must carry one and the same nonce.
+func TestGatewayOpenAboveTheKeepaliveIntervalSendsOneDiscoveryNonce(t *testing.T) {
+	if testing.Short() {
+		t.Skip("must outlast the keepalive's 10s seed interval to prove anything")
+	}
+	// Drop every Discovery: a silent relay, but one that still records what it
+	// was sent. A bare ListenPacket black hole could not report the nonces.
+	fr := newFakeRelay(t, withLostDiscoveries(math.MaxInt64))
+
+	addr := fr.Addr()
+	gw := &Gateway{
+		RelayAddr:  &addr,
+		GroupAddr:  net.ParseIP("232.0.0.1"),
+		SourceAddr: net.ParseIP("192.0.2.1"),
+		MTU:        1500,
+		Timeout:    12 * time.Second,
+	}
+	if err := gw.Open(); err == nil {
+		t.Fatal("Open succeeded against a relay that answered nothing")
+	}
+	gw.abortOpen()
+
+	nonces := fr.seenDiscoveryNonces()
+	// Positive control. With one Discovery and no retransmission the nonce
+	// assertion below is vacuously true, which is also what a regression that
+	// stopped Open retransmitting at all would look like.
+	if len(nonces) < 2 {
+		t.Fatalf("relay saw %d Relay Discoveries; Open did not retransmit, so this test asserts nothing", len(nonces))
+	}
+	distinct := make(map[uint32]struct{}, len(nonces))
+	for _, n := range nonces {
+		distinct[n] = struct{}{}
+	}
+	if len(distinct) != 1 {
+		t.Errorf("distinct Discovery nonces = %d across %d Discoveries (%#x), want 1: "+
+			"something other than Open's own retransmission started a discovery mid-handshake",
+			len(distinct), len(nonces), nonces)
+	}
+}
+
+// The other half of BLO-43640: moving the keepalive out of the handshake must
+// not delete it. A successful Open still owes the tunnel a keepalive goroutine.
+//
+// The relay advertises a 200ms query interval (QQIC 0x02), which
+// handleMembershipQuery adopts, so one keepalive pass costs 200ms rather than
+// the 10s seed. Nothing reads the gateway socket here, so lastData is never
+// refreshed and the pass takes its stalled branch — a reset and a rediscovery,
+// which is the keepalive's own observable signature and the only one available
+// without a MulticastConn read loop.
+func TestGatewayOpenStartsTheKeepaliveOnSuccess(t *testing.T) {
+	fr := newFakeRelay(t, withQueryIntervalCode(0x02))
+
+	addr := fr.Addr()
+	gw := &Gateway{
+		RelayAddr:  &addr,
+		GroupAddr:  net.ParseIP("232.0.0.1"),
+		SourceAddr: net.ParseIP("192.0.2.1"),
+		MTU:        1500,
+		Timeout:    5 * time.Second,
+	}
+	if err := gw.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	atHandshake := fr.discoveries.Load()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for fr.discoveries.Load() == atHandshake && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	got := fr.discoveries.Load()
+
+	// Stop the goroutine and let it observe that before abortOpen frees the
+	// Rust handle it is still calling into. leave is read once per interval,
+	// and an iteration already past that read finishes in microseconds, so one
+	// second covers several intervals of slack.
+	gw.stopKeepalive()
+	time.Sleep(time.Second)
+	gw.abortOpen()
+
+	if got == atHandshake {
+		t.Fatalf("relay saw no Relay Discovery in 2s after a successful Open (still %d): "+
+			"the keepalive goroutine never started", got)
 	}
 }
