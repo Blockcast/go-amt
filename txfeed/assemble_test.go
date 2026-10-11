@@ -494,9 +494,26 @@ func TestAssemblerReverseRunCostsAboutWhatForwardDoes(t *testing.T) {
 		}
 		return time.Since(start)
 	}
-	fwd := run(func(k int) int { return k })
-	rev := run(func(k int) int { return len(frames) - 1 - k })
-	if rev > 4*fwd+50*time.Millisecond {
+	// One run per direction is a single noisy sample, and interference only
+	// ever adds time, so the fastest of a few runs is the least noisy
+	// estimate of each direction's real cost.
+	best := func(order func(int) int) time.Duration {
+		b := run(order)
+		for range 2 {
+			if d := run(order); d < b {
+				b = d
+			}
+		}
+		return b
+	}
+	fwd := best(func(k int) int { return k })
+	rev := best(func(k int) int { return len(frames) - 1 - k })
+	// The reverse overhead is a near-constant 0.2 s of extra scanning, so
+	// the ratio rises on faster hardware rather than falling: 1.5-2.8x on a
+	// dev box, 4.9x on CI under -race, where a 4*fwd+50ms bound fired on
+	// healthy code by 3 ms (BLO-43026, main at 02a2bc64). The shred-by-shred
+	// search this pins out runs 65-100x, so 8x leaves the guard its teeth.
+	if rev > 8*fwd+200*time.Millisecond {
 		t.Errorf("reverse order took %v, forward %v: the search for a batch's ends is no longer cheap", rev, fwd)
 	}
 }
