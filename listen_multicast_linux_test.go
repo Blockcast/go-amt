@@ -32,39 +32,53 @@ func countOpenFDs(t *testing.T) int {
 // return owns that descriptor; a return that skips the close burns one fd per
 // call, which on a gateway retrying a failing join is unbounded.
 //
-// The failure is driven through a non-existent interface, which fails at
-// SetMulticastInterface -- after the raw socket has been wrapped into an
-// ipv4.PacketConn, so it covers the post-wrap paths as well as the raw ones.
+// A filter the kernel rejects fails before the raw socket is wrapped; a
+// non-existent interface fails at SetMulticastInterface, after it. Each case
+// checks it failed at that step, so it cannot pass by failing somewhere that
+// allocates nothing.
 func TestListenMulticastUDP4ClosesFDOnErrorPaths(t *testing.T) {
-	bogus := &net.Interface{Index: 999999, Name: "amt-nonexistent0"}
 	gaddr := &net.UDPAddr{IP: net.IPv4(232, 10, 10, 10), Port: 5555}
 	saddr := netip.MustParseAddr("10.11.12.13")
+	for _, tc := range []struct {
+		name string
+		ifi  *net.Interface
+		f    []bpf.RawInstruction
+		step string
+	}{
+		{"raw socket", nil, []bpf.RawInstruction{{Op: 0xffff}}, "failed to set bpf"},
+		{"wrapped conn", &net.Interface{Index: 999999, Name: "amt-nonexistent0"}, nil, "set multicast interface"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			listen := func() error {
+				c, err := ListenMulticastUDP4("udp4", tc.ifi, saddr, gaddr, tc.f, false, 1, 0, 0, 0)
+				if err == nil {
+					_ = c.Close()
+				}
+				return err
+			}
 
-	// One warm-up call so any lazily-initialised runtime state is already open
-	// and does not count as growth.
-	if conn, err := ListenMulticastUDP4("udp4", bogus, saddr, gaddr, nil, false, 1, 0, 0, 0); err == nil {
-		_ = conn.Close()
-		t.Skip("expected a failure against a non-existent interface; environment permits it")
-	}
+			// The warm-up call also opens any lazily-initialised runtime state.
+			err := listen()
+			switch {
+			case err == nil:
+				t.Skip("expected a failure; environment permits the call")
+			case !strings.Contains(err.Error(), tc.step):
+				t.Fatalf("failed at the wrong step, want %q: %v", tc.step, err)
+			}
 
-	before := countOpenFDs(t)
-
-	const iterations = 50
-	for i := 0; i < iterations; i++ {
-		conn, err := ListenMulticastUDP4("udp4", bogus, saddr, gaddr, nil, false, 1, 0, 0, 0)
-		if err == nil {
-			_ = conn.Close()
-			t.Fatalf("iteration %d unexpectedly succeeded against a non-existent interface", i)
-		}
-	}
-
-	after := countOpenFDs(t)
-
-	// Allow a small slack for unrelated runtime activity; a genuine leak grows
-	// by one descriptor per iteration.
-	if after-before > iterations/10 {
-		t.Errorf("descriptor leak: %d fds before, %d after %d failed calls (grew %d)",
-			before, after, iterations, after-before)
+			before := countOpenFDs(t)
+			const iterations = 50
+			for i := 0; i < iterations; i++ {
+				if listen() == nil {
+					t.Fatalf("iteration %d unexpectedly succeeded", i)
+				}
+			}
+			// Allow a small slack for unrelated runtime activity; a genuine
+			// leak grows by one descriptor per iteration.
+			if grew := countOpenFDs(t) - before; grew > iterations/10 {
+				t.Errorf("descriptor leak: grew %d over %d failed calls", grew, iterations)
+			}
+		})
 	}
 }
 

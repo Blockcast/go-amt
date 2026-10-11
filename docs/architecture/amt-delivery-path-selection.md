@@ -115,6 +115,11 @@ latency AC 2 exists to delete from startup, silently reintroduced and now paid
 — is a single IGMP join and is not urgent, because traffic is already flowing
 over AMT.
 
+The 10s holds unless the operator sets `RelayHandshakeTimeout` (or the legacy
+`Timeout` it falls back to) to at least `MinRelayHandshakeTimeout`, 2s;
+`amtmode.go` says why. A shorter value is treated as unset and gets the 10s
+default, so a setting of 1.5s waits up to 10s against a dead relay, not 1.5s.
+
 So the asymmetry is real, but it is an asymmetry in **what silence means**, not
 in which path is cheap to keep: native-silent is evidence the path is dead, while
 AMT-silent is evidence the tunnel is broken. Neither maps onto "cheap to keep".
