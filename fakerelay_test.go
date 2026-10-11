@@ -327,6 +327,23 @@ func (fr *fakeRelay) encapsulatedIGMPQuery() []byte {
 
 // SendData pushes one Multicast Data message carrying a UDP datagram from
 // (src:sport) to (group:dport).
+//
+// THE CHECK BELOW IS NOT A HANDSHAKE CHECK, whatever its message says. fr.gateway
+// is set the moment the relay sees any datagram from a gateway — leg 1 of 5 — so
+// this passes while Gateway.Open is still parked waiting for the Membership
+// Query. Open's read loop fails on the first unexpected type, and Multicast Data
+// is type 6, so calling this too early kills the tunnel with "invalid response:
+// 6" and the caller then sees a bare net.ErrClosed on its first read. That is
+// BLO-42175, a 1-in-3 flake. Callers must gate themselves: waitTunnelReady for
+// ManagedConn, mc.waitTunnel for MulticastConn.
+//
+// Tightening the check here was considered and not done. A relay-side
+// "handshake complete" flag would key on handleUpdate — leg 5 — and the gateway
+// sends its Membership Update through a 50ms debounced batch
+// (relay_manager.go:714). TestConcurrentSubscribeIsRaceFree
+// (fakerelay_flows_test.go:433) can therefore reach SendData before any update
+// arrives: its wg.Wait() returns when Subscribe returns, not when the batch is
+// promoted. The flag would fail a test that is passing correctly.
 func (fr *fakeRelay) SendData(src, group netip.Addr, sport, dport uint16, payload []byte) {
 	fr.t.Helper()
 
@@ -334,7 +351,8 @@ func (fr *fakeRelay) SendData(src, group netip.Addr, sport, dport uint16, payloa
 	gw := fr.gateway
 	fr.mu.Unlock()
 	if gw == nil {
-		fr.t.Fatal("fake relay: no gateway seen yet; complete the handshake first")
+		fr.t.Fatal("fake relay: no gateway has been seen at all yet; this does not " +
+			"mean the handshake is complete when it passes — see the note above")
 	}
 
 	ip := &layers.IPv4{

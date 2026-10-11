@@ -276,9 +276,68 @@ func TestMulticastConnHandsOverToTheRelayWhenNativeIsSilent(t *testing.T) {
 		t.Fatal("Open succeeded with native silent but the connection does not " +
 			"report tunnelling; the group is on neither path")
 	}
+	// Wait for the handshake to finish before claiming it did, and before
+	// loading the tunnel. Nothing above this line knows its outcome (BLO-42175).
+	//
+	// Two preconditions in this test are both weaker than they read, and the
+	// burst below sits past both of them:
+	//
+	//   - waitForRelayDiscovery returns on leg 2 of a 5-leg handshake. The relay
+	//     has ANSWERED the discovery; the gateway has not yet sent its Request,
+	//     seen the Membership Query, or sent its Update.
+	//   - fakeRelay.SendData's only check is that it has seen some datagram from
+	//     a gateway, which is true from leg 1. Its "complete the handshake first"
+	//     message describes an invariant it does not enforce.
+	//
+	// So the burst used to race Gateway.Open's read loop, which is still parked
+	// waiting for the Membership Query. That loop's `default:` arm (gateway.go)
+	// fails the whole Open on the first unexpected type, and a Multicast Data
+	// message is type 6 — "invalid response: 6". openTunnel then calls
+	// abortOpen, which closes the socket, so mc.amtGw is never published,
+	// waitTunnel returns nil, and SetReadDeadline answers the first read with a
+	// bare net.ErrClosed: "tunnel read 1/8: use of closed network connection".
+	// Measured at 4 failures in 12 runs on main at 241ecdb.
+	//
+	// mc.Open cannot catch this and neither can the err check above. Open
+	// returns nil as soon as the probe goroutine is launched — ten seconds
+	// before the handshake is attempted at all — so both that check and the
+	// COMPLETED log fire whatever the tunnel subsequently does. This is the only
+	// point at which the test can observe the handshake's result, which is why
+	// it is also where the COMPLETED log now sits.
+	//
+	// waitTunnel blocks on tunnelReady, which openTunnel closes on every exit
+	// path it reaches, so this needs no polling. The bound is not just about
+	// slowness: the defer that guarantees that close is not installed until
+	// conn.go:359, after the unbounded `<-decision` at conn.go:345, so a
+	// tunnelDecision that never closes wedges waitTunnel with no deferred close
+	// to rescue it. Unreachable from here — the advertisement observed above
+	// proves sendDiscovery ran, so the decision already resolved — but the bound
+	// covers that gap rather than merely turning a regression into a
+	// package-wide 10-minute timeout. The handshake is itself bounded at
+	// Timeout (2s).
+	gwReady := make(chan *Gateway, 1)
+	go func() { gwReady <- mc.waitTunnel() }()
+	select {
+	case gw := <-gwReady:
+		if gw == nil {
+			t.Fatal("no gateway after the tunnel was selected: Gateway.Open failed " +
+				"and openTunnel aborted it. Nothing returns that error — it is " +
+				"discarded by `go mc.openTunnel()` — so the reason is only in the " +
+				"`amt: relay handshake failed` line logged above. If that line is " +
+				"absent, openTunnel returned before calling Gateway.Open (conn.go:356 " +
+				"or :388), and the preconditions asserted above have moved.")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("openTunnel neither published a gateway nor gave up within 5s; " +
+			"tunnelReady is closed on every exit path, so a wait this long means " +
+			"openTunnel is wedged rather than slow")
+	}
+
 	// The log line the cgo-test lane greps for. A bare --- PASS is not evidence
 	// on its own: that is what the old timeout branch produced too, so CI
-	// asserts on this string specifically.
+	// asserts on this string specifically. It sits below the wait above because
+	// above it the string was not true: it was emitted on every run, including
+	// the ones whose handshake failed two milliseconds later.
 	t.Log("Gateway.Open COMPLETED against fakeRelay")
 
 	const burst = 8
