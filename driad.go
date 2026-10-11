@@ -83,6 +83,12 @@ func DiscoverRelay(ctx context.Context, config DRIADConfig) (*net.UDPAddr, error
 // DiscoverRelay returns only the first, which leaves a gateway with no answer
 // when that relay is down even though the source listed others; a caller that
 // walks the whole slice gets precedence-respecting failover.
+//
+// That failover is connect-time only. RelayManager.Open walks these candidates
+// until one completes a handshake; once a tunnel is up, a relay that dies
+// mid-session is retried by reconnectWithBackoff against the same address
+// rather than falling through to the next candidate. A caller that needs the
+// steady state to move relays has to re-run discovery itself.
 func DiscoverRelays(ctx context.Context, config DRIADConfig) ([]*net.UDPAddr, error) {
 	if !config.SourceAddr.IsValid() {
 		return nil, fmt.Errorf("invalid source address")
@@ -384,6 +390,18 @@ func resolveRelayAddr(ctx context.Context, record *AMTRelayRecord, config DRIADC
 	// Need to resolve domain name
 	if record.RelayType != 3 {
 		return netip.Addr{}, fmt.Errorf("unexpected relay type %d without resolved address", record.RelayType)
+	}
+
+	// Bound each lookup separately. DiscoverRelays resolves host-type records
+	// serially, and RelayManager.Open passes the caller's ctx straight through
+	// while holding rm.mu, so without this a source publishing several
+	// host-type relays behind a black-holing resolver multiplies one stall by
+	// the number of records. config.Timeout bounds the AMTRELAY query; this
+	// gives each name the same budget.
+	if config.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, config.Timeout)
+		defer cancel()
 	}
 
 	// Use standard DNS resolution
