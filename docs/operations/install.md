@@ -466,9 +466,11 @@ Inside `shred_sigverify`, `num_discards_pre` and `num_discards_post` are both
 cumulative counts over the same buffer, sampled before dedup and after
 verification. So rejections attributable to the signature check are
 `num_discards_post − num_discards_pre − num_duplicates`, and survivors are
-`num_packets − num_discards_post`.
+`num_packets − num_discards_post`. That first figure is an upper bound, not a
+signature-failure count: an unknown slot leader is discarded in the same stage
+and is indistinguishable here — see below.
 
-#### Two things will make a healthy feed read as a total failure
+#### What will make a healthy feed read as a total failure
 
 **The deduper runs before signature verification.** We forward the canonical
 shred, byte for byte — which is exactly what turbine delivers. On a validator
@@ -476,9 +478,20 @@ still taking turbine traffic, whichever copy loses the race is discarded into
 `shred_sigverify.num_duplicates` and never reaches sigverify or the blockstore,
 so our delivery can be working perfectly and every downstream counter stays
 flat. To attribute anything, keep turbine off that socket for the window —
-firewall the TVU port to the receiver's source address only. Repair arrives on a
-*separate* socket (`shred_fetch_repair`) and keeps backfilling regardless, which
-is what `blockstore-insert-shreds.num_repair` is for.
+firewall the TVU port to the receiver's source address only.
+
+**Firewalling turbine is necessary but not sufficient: repair poisons the
+deduper too.** Repair shreds arrive on a *separate* socket
+(`shred_fetch_repair`) and are themselves exempt from being discarded by the
+deduper — but they are still *inserted into* it on the way past, deliberately,
+to "filter out duplicates from the turbine path once a shred is repaired"
+([`turbine/src/sigverify_shreds.rs`](https://github.com/anza-xyz/agave/blob/v4.3.0/turbine/src/sigverify_shreds.rs)).
+So any slot the node has already backfilled by repair will silently discard our
+copy of that slot's shreds as duplicates, before sigverify, with the TVU port
+firewalled exactly as prescribed above. Feed slots near the tip that the node
+has not yet obtained by any path, and read
+`blockstore-insert-shreds.num_repair` to confirm repair is not racing you for
+the window you are measuring.
 
 **The slot and version filters run before that.** A shred is dropped at
 `shred_fetch` if its `shred_version` differs from the validator's, or if its slot
@@ -493,6 +506,22 @@ are flat:
 grep -F 'datapoint: shred_fetch ' "$LOG" | tail -1 \
   | grep -oE '(shred_version_mismatch|slot_out_of_range|index_overrun|bad_shred_type)=[0-9]+i'
 ```
+
+**An unknown slot leader is discarded inside sigverify, and the subtraction
+above then blames the signature.** `verify_packets` resolves each shred's leader
+with `leader_schedule_cache.slot_leader_at(slot, working_bank)`; when that
+returns `None` the packet is marked discarded on the spot
+([`turbine/src/sigverify_shreds.rs`](https://github.com/anza-xyz/agave/blob/v4.3.0/turbine/src/sigverify_shreds.rs)),
+so it lands in `num_discards_post` and is counted by the formula above as a
+signature rejection. It is not one — it is a node without a leader schedule
+covering the slot you fed it, which is the expected state of a node that is
+synced but not to *that* epoch. **Do not reach for
+`shred_sigverify.num_unknown_slot_leader` to tell these apart:** that counter is
+incremented in the retransmitter-resign stage, which runs *after*
+`num_discards_post` is sampled, so a shred rejected this way never reaches it
+and it stays at zero throughout. The discriminator is a positive control —
+confirm the node is verifying turbine shreds for the current epoch before you
+believe any zero of ours.
 
 > **Read against Agave `v4.3.0`.** These names have moved before. Check them
 > against the tag your node actually runs (`agave-validator --version`) rather
