@@ -4,6 +4,7 @@ package amt
 
 import (
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,5 +49,37 @@ func TestGatewayOpenResendsTheSameRequest(t *testing.T) {
 	openGateway(t, fr)
 	if n := fr.requests.Load(); n != 2 {
 		t.Errorf("Requests the relay saw = %d, want 2: the first and its retransmission", n)
+	}
+}
+
+// A Request leg that times out reports every retransmission, and doesn't blame
+// the duplicate Advertisement. The relay answers the first Discovery after
+// 1.3s, after the 1s retransmission, and the retransmission after 0.6s. Rust
+// rejects that second answer as InvalidState. Every Request is dropped, so Open
+// resends the Discovery once and the Request once (at 2.3s) before its 3s bound;
+// the next resend is due at 3.3s at the earliest.
+func TestGatewayOpenErrorAfterDuplicateAdvertisement(t *testing.T) {
+	fr := newFakeRelay(t, withAdvertisementDelays(1300*time.Millisecond, 600*time.Millisecond), withLostRequests(1<<30))
+	addr := fr.Addr()
+	gw := &Gateway{
+		RelayAddr:  &addr,
+		GroupAddr:  net.ParseIP("232.0.0.1"),
+		SourceAddr: net.ParseIP("192.0.2.1"),
+		MTU:        1500,
+		Timeout:    3 * time.Second,
+	}
+	err := gw.Open()
+	gw.abortOpen()
+	if err == nil {
+		t.Fatal("Open succeeded against a relay that drops every Request")
+	}
+	if n := fr.advertised.Load(); n != 2 {
+		t.Fatalf("relay advertisements sent = %d, want 2: the late answer and the duplicate", n)
+	}
+	if strings.Contains(err.Error(), "advertisement rejected") {
+		t.Errorf("Open: %v; the rejected duplicate followed an accepted Advertisement, so it isn't why Open failed", err)
+	}
+	if !strings.Contains(err.Error(), "after 2 retransmissions") {
+		t.Errorf("Open: %v; want 2 retransmissions, one per leg", err)
 	}
 }

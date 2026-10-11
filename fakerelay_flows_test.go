@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -150,8 +151,30 @@ func TestHandshakeHonoursTransportTimeout(t *testing.T) {
 	if err := rm.Open(context.Background()); err == nil {
 		t.Fatal("Open succeeded against a relay that drops every Discovery")
 	}
-	if d := time.Since(start); d > 4*time.Second {
+	// The lower bound catches a budget lost on the way: a zero one fails at once.
+	if d := time.Since(start); d < cfg.TransportConfig.Timeout || d > 4*time.Second {
 		t.Errorf("Open failed after %v, want about the 1.5s TransportConfig.Timeout", d.Round(time.Millisecond))
+	}
+}
+
+// TestHandshakeErrorCountsEveryRetransmission: a handshake that dies in the
+// Request leg reports every retransmission, not just that leg's. The relay
+// answers the first Discovery after 1.3s, after the 1s retransmission, and
+// drops every Request. Open resends the Discovery once and the Request once (at
+// 2.3s) before its 3s budget; the next resend is due at 3.3s at the earliest.
+func TestHandshakeErrorCountsEveryRetransmission(t *testing.T) {
+	fr := newFakeRelay(t, withAdvertisementDelays(1300*time.Millisecond, 600*time.Millisecond), withLostRequests(1<<30))
+	cfg := DefaultRelayManagerConfig(fr.Addr())
+	cfg.TransportConfig.Timeout = 3 * time.Second
+	rm := NewRelayManager(cfg)
+	t.Cleanup(func() { _ = rm.Close() })
+
+	err := rm.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open succeeded against a relay that drops every Request")
+	}
+	if !strings.Contains(err.Error(), "after 2 retransmissions") {
+		t.Errorf("Open: %v; want 2 retransmissions, one per leg", err)
 	}
 }
 

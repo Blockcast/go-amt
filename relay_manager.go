@@ -646,7 +646,9 @@ func (rm *RelayManager) performHandshake() error {
 	// its exact bytes, so the relay sees the same nonce (RFC 7450 sections
 	// 5.2.3.4.5 and 5.2.3.5.6).
 	outstanding := discovery
-	retries := 0
+	// retries drives the back-off and restarts with the Request leg;
+	// retransmitted counts every resend, for the error.
+	retries, retransmitted := 0, 0
 	budget := rm.config.TransportConfig.Timeout
 	if budget <= 0 {
 		budget = handshakeTimeout
@@ -670,10 +672,11 @@ func (rm *RelayManager) performHandshake() error {
 					return fmt.Errorf("failed to retransmit: %w", err)
 				}
 				retries++
+				retransmitted++
 				resendAt = time.Now().Add(handshakeRetransmit + rand.N(handshakeRetransmit<<retries-handshakeRetransmit+1))
 				continue
 			}
-			return fmt.Errorf("failed to receive response in %v after %d retransmissions: %w", rm.State(), retries, err)
+			return fmt.Errorf("failed to receive response in %v after %d retransmissions: %w", rm.State(), retransmitted, err)
 		}
 
 		msgType := m.MessageType(buffer[0] & 0x0F)
