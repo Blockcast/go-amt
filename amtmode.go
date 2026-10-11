@@ -64,7 +64,11 @@ const MinUsefulProbeWindow = 10 * time.Second
 // production 50ms therefore did double damage — it destroyed the native join and
 // then gave the relay handshake 50ms to complete a round trip, so the tunnel that
 // replaced native could not come up either.
-const MinRelayHandshakeTimeout = time.Second
+//
+// It is two retransmit intervals, not one. The first resend is due one interval
+// in, and a bound that ends there fails the handshake before it fires, so one
+// lost datagram would fail Open again (BLO-43016).
+const MinRelayHandshakeTimeout = 2 * handshakeRetransmit
 
 // gatewayOpenTimeout adapts the operator's relay timeout for use as the AMT
 // handshake bound. A value too short to complete a round trip to the relay is

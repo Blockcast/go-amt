@@ -206,6 +206,13 @@ func TestGatewayOpenTimeout(t *testing.T) {
 			want:    5 * time.Second,
 		},
 		{
+			// It ends the handshake as the first resend falls due, so a single
+			// lost datagram would fail Open (BLO-43016).
+			name:    "one retransmit interval defers to the gateway default",
+			timeout: handshakeRetransmit,
+			want:    0,
+		},
+		{
 			name:    "the threshold itself is honoured",
 			timeout: MinRelayHandshakeTimeout,
 			want:    MinRelayHandshakeTimeout,

@@ -358,11 +358,16 @@ func (g *Gateway) Open() (err error) {
 	// that, one lost datagram among the four failed Open (BLO-43016).
 	deadline := time.Now().Add(openTimeout)
 	resendAt := time.Now().Add(handshakeRetransmit)
-	retries := 0
+	// retries drives the back-off and restarts with the Request leg;
+	// retransmitted counts every resend, for the error.
+	retries, retransmitted := 0, 0
 
 	// Wait for advertisement and query
 	buffer := make([]byte, g.MTU)
 	var lastAdvErr error
+	// advertised: an Advertisement was accepted. A rejection after that is the
+	// duplicate answer to a retransmitted Discovery, not why Open failed.
+	advertised := false
 	for {
 		if err = g.conn.SetReadDeadline(earliest(resendAt, deadline)); err != nil {
 			g.stopKeepalive()
@@ -396,17 +401,18 @@ func (g *Gateway) Open() (err error) {
 					return fmt.Errorf("error retransmitting: %w", err)
 				}
 				retries++
+				retransmitted++
 				resendAt = time.Now().Add(handshakeRetransmit + rand.N(handshakeRetransmit<<retries-handshakeRetransmit+1))
 				continue
 			}
 			g.stopKeepalive()
-			if lastAdvErr != nil {
+			if lastAdvErr != nil && !advertised {
 				return fmt.Errorf(
 					"error reading from connection after %d retransmissions: %w (last advertisement rejected: %v)",
-					retries, err, lastAdvErr,
+					retransmitted, err, lastAdvErr,
 				)
 			}
-			return fmt.Errorf("error reading from connection after %d retransmissions: %w", retries, err)
+			return fmt.Errorf("error reading from connection after %d retransmissions: %w", retransmitted, err)
 		}
 		// A zero-length UDP datagram is legal and carries no type byte;
 		// determineAMTmessageType would index past the end of it.
@@ -437,6 +443,7 @@ func (g *Gateway) Open() (err error) {
 					"relay", relay, "bytes", n, "error", advErr)
 			} else {
 				// The Request is outstanding now, on a fresh back-off.
+				advertised = true
 				retries = 0
 				resendAt = time.Now().Add(handshakeRetransmit)
 			}
