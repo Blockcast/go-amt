@@ -210,6 +210,7 @@ var allErrorCodes = []ErrorCode{
 	CodeBodyTooLarge,
 	CodePublicationFailed,
 	CodeInternal,
+	CodeServingRelayUnresolved,
 }
 
 func TestErrorTaxonomyIsClosed(t *testing.T) {
@@ -237,13 +238,17 @@ func TestStatusAndRetryForCode(t *testing.T) {
 		{CodeInvalidRequest, http.StatusBadRequest, RetryNever},
 		{CodeEntitlementDenied, http.StatusForbidden, RetryNever},
 		{CodePlaneBindingMismatch, http.StatusForbidden, RetryNever},
-		// 409 rather than 429 is the deliberate one — see CodeConcurrencyCapped.
+		// 409 rather than 429 is a deliberate one — see CodeConcurrencyCapped.
 		{CodeConcurrencyCapped, http.StatusConflict, RetryAfterHeader},
 		{CodeTicketNotRenewable, http.StatusNotFound, RetryNever},
 		{CodeBodyTooLarge, http.StatusRequestEntityTooLarge, RetryNever},
 		{CodePublicationFailed, http.StatusServiceUnavailable, RetryBackoff},
 		// 500 rather than publication_failed's 503 — see CodeInternal.
 		{CodeInternal, http.StatusInternalServerError, RetryBackoff},
+		// Same 500 as CodeInternal, opposite retry class — see
+		// TestOperatorFixableRefusalIsNotRetried for why that split is the
+		// point of this code rather than an inconsistency.
+		{CodeServingRelayUnresolved, http.StatusInternalServerError, RetryNever},
 	} {
 		t.Run(string(tc.code), func(t *testing.T) {
 			status, err := StatusForCode(tc.code)
@@ -318,7 +323,7 @@ func TestUnknownErrorCodeIsNeverRetried(t *testing.T) {
 	}
 }
 
-// TestInternalFaultIsNameableAndRetryable pins the decision BLO-30269 took, and
+// TestBodylessFaultIsTheTrapBothCodesClose pins the decision BLO-30269 took, and
 // pins it next to the trap it closes rather than only as a row in the table
 // above.
 //
@@ -328,11 +333,12 @@ func TestUnknownErrorCodeIsNeverRetried(t *testing.T) {
 // before CodeInternal existed, a conforming gateway stopped permanently on a
 // transient broker fault, with every component behaving exactly as specified.
 //
-// Two mutations this catches that the table does not state the reason for:
-// re-classifying CodeInternal as RetryNever reinstates the permanent stop in a
-// form that now looks deliberate, and answering an internal fault with no body
-// at all reinstates it via the empty-code path below.
-func TestInternalFaultIsNameableAndRetryable(t *testing.T) {
+// The retry and status of each code are pinned exactly by the table above; this
+// test does not restate them. What it adds is the empty-code half, which no
+// other test covers — TestUnknownErrorCodeIsNeverRetried uses a plausible
+// future code, never "" — and which is the mutation "answer a fault with no
+// body at all" reduces to.
+func TestBodylessFaultIsTheTrapBothCodesClose(t *testing.T) {
 	// The bodyless 500 as a client sees it: no body decodes to the zero
 	// ErrorResponse, whose Code is "".
 	const bodyless ErrorCode = ""
@@ -343,24 +349,49 @@ func TestInternalFaultIsNameableAndRetryable(t *testing.T) {
 	if retry != RetryNever {
 		t.Errorf("RetryForCode(%q) = %v, want RetryNever", bodyless, retry)
 	}
+}
 
-	retry, err = RetryForCode(CodeInternal)
+// TestOperatorFixableRefusalIsNotRetried pins the half of BLO-30269 that is not
+// derivable from any single row of the table: that the two 5xx codes sit on
+// *opposite* retry classes, and which way round.
+//
+// Both answer 500 and neither blames the request, so the only thing separating
+// them is whether the condition is transient. CodeInternal's causes — an
+// outage, a recovered panic, a bug — may clear on the next attempt, so backoff
+// is what a client owes. CodeServingRelayUnresolved's do not: the registry
+// returns the same answer every time until an operator edits it, and a gateway
+// backing off against that only adds load. RetryNever is terminal for the
+// request as written, not for the client, and names an operator change as the
+// thing that clears it — which is why CodePlaneBindingMismatch, the same shape,
+// already takes it.
+//
+// The mutation this catches and the table cannot: flipping either code to the
+// other's class still leaves every row internally consistent, because each row
+// is only checked against itself.
+func TestOperatorFixableRefusalIsNotRetried(t *testing.T) {
+	transient, err := RetryForCode(CodeInternal)
 	if err != nil {
 		t.Fatalf("RetryForCode(%q): %v", CodeInternal, err)
 	}
-	if retry != RetryBackoff {
-		t.Errorf("RetryForCode(%q) = %v, want RetryBackoff: an internal fault a client "+
-			"must not retry is indistinguishable from the bodyless 500 this code replaced",
-			CodeInternal, retry)
-	}
-
-	status, err := StatusForCode(CodeInternal)
+	deterministic, err := RetryForCode(CodeServingRelayUnresolved)
 	if err != nil {
-		t.Fatalf("StatusForCode(%q): %v", CodeInternal, err)
+		t.Fatalf("RetryForCode(%q): %v", CodeServingRelayUnresolved, err)
 	}
-	if status < 500 || status > 599 {
-		t.Errorf("StatusForCode(%q) = %d, want a 5xx: an internal fault is not the client's",
-			CodeInternal, status)
+	if transient != RetryBackoff {
+		t.Errorf("RetryForCode(%q) = %v, want RetryBackoff: a transient fault a client never "+
+			"retries is indistinguishable from the bodyless 500 this code replaced",
+			CodeInternal, transient)
+	}
+	if deterministic != RetryNever {
+		t.Errorf("RetryForCode(%q) = %v, want RetryNever: backing off against a registry state "+
+			"only an operator can change adds load without ever succeeding",
+			CodeServingRelayUnresolved, deterministic)
+	}
+	if transient == deterministic {
+		t.Errorf("CodeInternal and CodeServingRelayUnresolved both answer %v; they share a status "+
+			"(500) and neither blames the request, so the retry class is the only thing a client "+
+			"can tell them apart by — collapsing it makes the second code carry no information",
+			transient)
 	}
 }
 
@@ -483,15 +514,15 @@ func TestMintRequestFieldsAreExactlyTheContract(t *testing.T) {
 }
 
 // TestTransportSchemaTracksEnvelopeChanges pins the schema string against the
-// revision that introduced CodeInternal. TransportSchema's own doc requires a
-// new string for any change to the shapes in that file — the error taxonomy
-// included — and the constant is the only thing a broker can assert at build
-// time to prove it compiled against the contract it thinks it did, so leaving
-// it behind after changing the taxonomy is the exact silent edit it exists to
-// prevent.
+// revision that introduced CodeInternal and CodeServingRelayUnresolved.
+// TransportSchema's own doc requires a new string for any change to the shapes
+// in that file — the error taxonomy included — and the constant is the only
+// thing a broker can assert at build time to prove it compiled against the
+// contract it thinks it did, so leaving it behind after changing the taxonomy
+// is the exact silent edit it exists to prevent.
 func TestTransportSchemaTracksEnvelopeChanges(t *testing.T) {
 	if got, want := TransportSchema, "gateway.transport.v3"; got != want {
-		t.Errorf("TransportSchema = %q, want %q: adding CodeInternal is a contract change", got, want)
+		t.Errorf("TransportSchema = %q, want %q: adding an error code is a contract change", got, want)
 	}
 }
 

@@ -63,13 +63,19 @@ const (
 	// A shape change made after a gateway ships is a different decision and
 	// does need the route.
 	//
-	// v3 added CodeInternal (BLO-30269). The routes stay /v1/ for the same
-	// reason, and the degradation for a client compiled against v2 is the one
-	// the closed-taxonomy rule already specifies: an unknown code is RetryNever
-	// plus ErrUnknownErrorCode, which is no worse than the bodyless 500 this
-	// code replaces and is reached by a documented path rather than by a parse
-	// failure. The error taxonomy is part of this file's contract, so it takes
-	// the bump even though no envelope field moved.
+	// v3 added CodeInternal and CodeServingRelayUnresolved (BLO-30269). The
+	// routes stay /v1/, but for a different reason than v2's and a stronger
+	// one: v2's exemption was that no gateway had shipped, and the paragraph
+	// above says in as many words that it expires once one has. This exemption
+	// does not. A client compiled against v2 that meets either new code
+	// degrades through the path the closed-taxonomy rule already specifies —
+	// RetryNever plus ErrUnknownErrorCode — which is no worse than the bodyless
+	// 500 both codes replace, and is reached by a documented route rather than
+	// by a parse failure. That holds whether or not a gateway has shipped, so
+	// it is the reason a v4 author should check against, not v2's.
+	//
+	// The error taxonomy is part of this file's contract, so it takes the bump
+	// even though no envelope field moved.
 	TransportSchema = "gateway.transport.v3"
 
 	// TicketTTL is the maximum lifetime the broker will grant a ticket.
@@ -501,12 +507,14 @@ const (
 
 	// CodeConcurrencyCapped means the account is at its concurrent-session cap.
 	//
-	// This is the one code whose HTTP status is a deliberate choice rather than
-	// the obvious one: it is 409, not 429. A licensing-state conflict that
-	// landed in a client's generic rate-limit backoff would be retried into
-	// silence — backed off, aggregated with unrelated 429s, and never surfaced
-	// to the operator who could raise the cap. It carries Retry-After and must
-	// be honoured on its own path. See RetryAfterHeader and ParseRetryAfter.
+	// Its HTTP status is argued rather than obvious: it is 409, not 429. A
+	// licensing-state conflict that landed in a client's generic rate-limit
+	// backoff would be retried into silence — backed off, aggregated with
+	// unrelated 429s, and never surfaced to the operator who could raise the
+	// cap. It carries Retry-After and must be honoured on its own path. See
+	// RetryAfterHeader and ParseRetryAfter. (CodeInternal's 500 is the other
+	// argued status, though there the obvious choice won and only 503 was
+	// rejected.)
 	//
 	// It must never be returned for a feed the gateway already holds an active
 	// ticket for: the idempotency lookup precedes the cap check, so a retried
@@ -536,6 +544,13 @@ const (
 
 	// CodeInternal is a broker fault with no client-attributable cause: a
 	// datastore outage, a panic recovered at the handler boundary, a bug.
+	//
+	// All three are transient or nondeterministic in origin, which is what
+	// earns the backoff. A broker-side refusal that is *deterministic* — the
+	// same answer on every attempt until an operator changes something — is
+	// not this code however little the client did wrong; see
+	// CodeServingRelayUnresolved, which is the member for that shape and takes
+	// RetryNever like every other operator-fixable condition here.
 	//
 	// It is the taxonomy's deliberately uninformative member and the only one
 	// that names no specific condition. That is its job. Every other code
@@ -570,17 +585,47 @@ const (
 	// the broker is down or that a dependency is unavailable, and a client or
 	// intermediary that treats 503 as "shed load, come back later" would be
 	// acting on a claim this code does not make.
-	CodeInternal ErrorCode = "internal"
+	//
+	// The wire spelling is "internal_error", not "internal": every member of
+	// this set is a two-word phrase that reads as a complete claim, and a bare
+	// adjective in a log line or a metric label (code=internal) reads as a
+	// truncation rather than as the deliberate uninformativeness it is. The
+	// suffix names no more of a condition than the adjective alone, so nothing
+	// is claimed that this code does not mean.
+	CodeInternal ErrorCode = "internal_error"
+
+	// CodeServingRelayUnresolved means the broker could not resolve exactly one
+	// serving relay for this gateway from its registry: none is registered,
+	// more than one is, or the registered id is malformed.
+	//
+	// Not the client's fault — the gateway authenticated and sent a well-formed
+	// request — but not an internal fault either, which is the distinction this
+	// code exists to carry. Every attempt returns this same answer until an
+	// operator edits the registry, so it takes RetryNever, like
+	// CodePlaneBindingMismatch and for the same reason: RetryNever is terminal
+	// for this request as written, not for the client, and it names an operator
+	// fix as the thing that clears it. Backing off against a deterministic
+	// state would only add load until the operator acted.
+	//
+	// 500, not a 4xx: nothing the gateway can change alters the answer, and a
+	// 4xx would send an operator reading access logs to the client first.
+	//
+	// The three conditions share one code because they share one client action
+	// — ask an operator to fix the registry — and Code is a client-branching
+	// discriminator, not an operator-facing one. The broker separates them
+	// where it matters, on its own side: each has its own counter and its own
+	// log line, so an alert can still say which.
+	CodeServingRelayUnresolved ErrorCode = "serving_relay_unresolved"
 )
 
 // ErrorResponse is the body accompanying every 4xx and 5xx from the broker.
 //
 // Every, without exception: there is no status the broker answers with a bare
-// body-less error. CodeInternal exists so that the fault with no
-// client-attributable cause still has a code to carry, which is what keeps that
-// sentence true rather than aspirational. A client may therefore decode this
-// envelope on any non-2xx and treat a failure to do so as a broken peer, not as
-// a case the contract left open.
+// body-less error. CodeInternal and CodeServingRelayUnresolved exist so that
+// the two broker-side refusals that name no client fault still have a code to
+// carry, which is what keeps that sentence true rather than aspirational. A
+// client may therefore decode this envelope on any non-2xx and treat a failure
+// to do so as a broken peer, not as a case the contract left open.
 type ErrorResponse struct {
 	// Code is the closed-taxonomy discriminator clients branch on.
 	Code ErrorCode `json:"code"`
@@ -737,14 +782,15 @@ var statusByCode = map[ErrorCode]struct {
 	status int
 	retry  Retry
 }{
-	CodeInvalidRequest:       {http.StatusBadRequest, RetryNever},
-	CodeEntitlementDenied:    {http.StatusForbidden, RetryNever},
-	CodePlaneBindingMismatch: {http.StatusForbidden, RetryNever},
-	CodeConcurrencyCapped:    {http.StatusConflict, RetryAfterHeader},
-	CodeTicketNotRenewable:   {http.StatusNotFound, RetryNever},
-	CodeBodyTooLarge:         {http.StatusRequestEntityTooLarge, RetryNever},
-	CodePublicationFailed:    {http.StatusServiceUnavailable, RetryBackoff},
-	CodeInternal:             {http.StatusInternalServerError, RetryBackoff},
+	CodeInvalidRequest:         {http.StatusBadRequest, RetryNever},
+	CodeEntitlementDenied:      {http.StatusForbidden, RetryNever},
+	CodePlaneBindingMismatch:   {http.StatusForbidden, RetryNever},
+	CodeConcurrencyCapped:      {http.StatusConflict, RetryAfterHeader},
+	CodeTicketNotRenewable:     {http.StatusNotFound, RetryNever},
+	CodeBodyTooLarge:           {http.StatusRequestEntityTooLarge, RetryNever},
+	CodePublicationFailed:      {http.StatusServiceUnavailable, RetryBackoff},
+	CodeInternal:               {http.StatusInternalServerError, RetryBackoff},
+	CodeServingRelayUnresolved: {http.StatusInternalServerError, RetryNever},
 }
 
 // ErrUnknownErrorCode reports a code outside the closed taxonomy.
