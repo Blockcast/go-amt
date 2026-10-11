@@ -73,6 +73,10 @@ type fakeRelay struct {
 	// withQueryIntervalCode at construction, never afterwards.
 	queryIntervalCode byte
 
+	// advertisedAddr is the relay address put in the Relay Advertisement.
+	// Immutable once serve starts; set it through withAdvertisedAddress.
+	advertisedAddr net.IP
+
 	updateCh chan []byte
 	done     chan struct{}
 	wg       sync.WaitGroup
@@ -86,6 +90,14 @@ type fakeRelayOption func(*fakeRelay)
 // below 0x80 means code*100ms: 0x0a is 1s (the default), 0x7f is 12.7s.
 func withQueryIntervalCode(code byte) fakeRelayOption {
 	return func(fr *fakeRelay) { fr.queryIntervalCode = code }
+}
+
+// withAdvertisedAddress overrides the relay address the Relay Advertisement
+// carries. It defaults to 127.0.0.1, the address the relay itself listens on,
+// which is the case where sending the Request to the discovery address and to
+// the advertised one are indistinguishable.
+func withAdvertisedAddress(ip net.IP) fakeRelayOption {
+	return func(fr *fakeRelay) { fr.advertisedAddr = ip.To4() }
 }
 
 // withLostDiscoveries makes the relay ignore the first n Relay Discoveries.
@@ -141,6 +153,7 @@ func newFakeRelay(t *testing.T, opts ...fakeRelayOption) *fakeRelay {
 		conn:              conn,
 		queryResp:         100 * time.Millisecond,
 		queryIntervalCode: 0x0a,
+		advertisedAddr:    net.IPv4(127, 0, 0, 1).To4(),
 		updateCh:          make(chan []byte, 16),
 		done:              make(chan struct{}),
 	}
@@ -246,7 +259,7 @@ func (fr *fakeRelay) handleDiscovery(msg []byte, addr *net.UDPAddr) {
 	// [0]=V/Type [1..3]=reserved [4..7]=nonce
 	adv := []byte{0x02, 0, 0, 0}
 	adv = append(adv, msg[4:8]...)
-	adv = append(adv, 127, 0, 0, 1) // relay address
+	adv = append(adv, fr.advertisedAddr...) // relay address
 
 	// Counted before the reply is sent, not after. The client observes the
 	// packet, so a counter bumped afterwards can still read stale to a test that
