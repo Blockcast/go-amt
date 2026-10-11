@@ -467,7 +467,6 @@ func newTestManager(t *testing.T, fr *fakeRelay) *RelayManager {
 	cfg := DefaultRelayManagerConfig(fr.Addr())
 	cfg.EnableDRIAD = false
 	cfg.TransportConfig.RelayAddr = fr.Addr()
-	cfg.TransportConfig.Timeout = 2 * time.Second
 
 	rm := NewRelayManager(cfg)
 	t.Cleanup(func() { _ = rm.Close() })

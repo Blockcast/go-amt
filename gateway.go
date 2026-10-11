@@ -12,6 +12,7 @@ package amt
 */
 import "C"
 import (
+	"errors"
 	"fmt"
 	m "github.com/blockcast/go-amt/messages"
 	"github.com/google/gopacket"
@@ -19,6 +20,7 @@ import (
 	"go.uber.org/atomic"
 	"golang.org/x/net/ipv4"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"os"
 	"syscall"
@@ -71,6 +73,11 @@ type Gateway struct {
 	// decide staleness and to size its sleep. As a plain time.Duration that was the
 	// identical race, two lines below the one this change set out to fix.
 	intervalTime atomic.Duration
+	// outstanding is the last Relay Discovery or Request sent. Open's
+	// retransmission resends its exact bytes, so the relay sees the same nonce
+	// (RFC 7450 sections 5.2.3.4.5 and 5.2.3.5.6). Atomic because the keepalive
+	// goroutine sends both kinds too.
+	outstanding  atomic.Pointer[[]byte]
 	responseMac  [6]byte
 	requestNonce uint32
 }
@@ -146,6 +153,7 @@ func (g *Gateway) sendDiscovery() error {
 	defer C.amt_buffer_free(outMsg)
 
 	data := C.GoBytes(unsafe.Pointer(outMsg.data), C.int(outMsg.len))
+	g.outstanding.Store(&data)
 	_, err := g.conn.WriteTo(data, g.cm, g.RelayAddr)
 	return err
 }
@@ -160,6 +168,7 @@ func (g *Gateway) sendRequest() error {
 	defer C.amt_buffer_free(outMsg)
 
 	data := C.GoBytes(unsafe.Pointer(outMsg.data), C.int(outMsg.len))
+	g.outstanding.Store(&data)
 	_, err := g.conn.WriteTo(data, g.cm, g.RelayAddr)
 	return err
 }
@@ -344,15 +353,21 @@ func (g *Gateway) Open() (err error) {
 
 	// Bound the handshake. Without this the read below blocks forever against a
 	// relay that never answers, and the keepalive goroutine spins behind it.
-	if err = g.conn.SetReadDeadline(time.Now().Add(openTimeout)); err != nil {
-		g.stopKeepalive()
-		return fmt.Errorf("error setting handshake deadline: %w", err)
-	}
+	// Within the bound, an unanswered Discovery or Request is resent on the same
+	// schedule as RelayManager.performHandshake (handshakeRetransmit). Without
+	// that, one lost datagram among the four failed Open (BLO-43016).
+	deadline := time.Now().Add(openTimeout)
+	resendAt := time.Now().Add(handshakeRetransmit)
+	retries := 0
 
 	// Wait for advertisement and query
 	buffer := make([]byte, g.MTU)
 	var lastAdvErr error
 	for {
+		if err = g.conn.SetReadDeadline(earliest(resendAt, deadline)); err != nil {
+			g.stopKeepalive()
+			return fmt.Errorf("error setting handshake deadline: %w", err)
+		}
 		// SLICE TO WHAT WAS ACTUALLY RECEIVED. This used to discard n and hand
 		// the decoders `buffer[:]` — the whole MTU-sized array, of which only
 		// the first n bytes were the message and the rest was zero padding.
@@ -375,14 +390,23 @@ func (g *Gateway) Open() (err error) {
 		var n int
 		n, _, _, err = g.conn.ReadFrom(buffer)
 		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) && time.Now().Before(deadline) {
+				if _, err = g.conn.WriteTo(*g.outstanding.Load(), g.cm, g.RelayAddr); err != nil {
+					g.stopKeepalive()
+					return fmt.Errorf("error retransmitting: %w", err)
+				}
+				retries++
+				resendAt = time.Now().Add(handshakeRetransmit + rand.N(handshakeRetransmit<<retries-handshakeRetransmit+1))
+				continue
+			}
 			g.stopKeepalive()
 			if lastAdvErr != nil {
 				return fmt.Errorf(
-					"error reading from connection: %w (last advertisement rejected: %v)",
-					err, lastAdvErr,
+					"error reading from connection after %d retransmissions: %w (last advertisement rejected: %v)",
+					retries, err, lastAdvErr,
 				)
 			}
-			return fmt.Errorf("error reading from connection: %w", err)
+			return fmt.Errorf("error reading from connection after %d retransmissions: %w", retries, err)
 		}
 		// A zero-length UDP datagram is legal and carries no type byte;
 		// determineAMTmessageType would index past the end of it.
@@ -411,6 +435,10 @@ func (g *Gateway) Open() (err error) {
 				lastAdvErr = advErr
 				slog.Warn("amt: relay advertisement rejected",
 					"relay", relay, "bytes", n, "error", advErr)
+			} else {
+				// The Request is outstanding now, on a fresh back-off.
+				retries = 0
+				resendAt = time.Now().Add(handshakeRetransmit)
 			}
 		case m.MembershipQueryType:
 			// Handshake done: clear the deadline so steady-state reads are not

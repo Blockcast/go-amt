@@ -614,7 +614,8 @@ func (rm *RelayManager) Stats() RelayManagerStats {
 	return stats
 }
 
-// Handshake timing. handshakeTimeout bounds the whole exchange. Within it, an
+// Handshake timing. handshakeTimeout bounds the whole exchange, unless
+// TransportConfig.Timeout sets another bound. Within it, an
 // unanswered Relay Discovery or Request is resent after a random timeout in
 // [handshakeRetransmit, handshakeRetransmit*2^retries]: RFC 7450 sections
 // 5.2.3.4.3 and 5.2.3.5.3 recommend a 1s initial timeout with random
@@ -646,7 +647,11 @@ func (rm *RelayManager) performHandshake() error {
 	// 5.2.3.4.5 and 5.2.3.5.6).
 	outstanding := discovery
 	retries := 0
-	deadline := time.Now().Add(handshakeTimeout)
+	budget := rm.config.TransportConfig.Timeout
+	if budget <= 0 {
+		budget = handshakeTimeout
+	}
+	deadline := time.Now().Add(budget)
 	resendAt := time.Now().Add(handshakeRetransmit)
 	advertised := false
 
