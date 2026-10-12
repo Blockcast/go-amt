@@ -2,8 +2,11 @@ package amt
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -363,5 +366,96 @@ func TestPlatformInfo(t *testing.T) {
 	t.Logf("Platform info: %s", info)
 	if info == "" {
 		t.Error("PlatformInfo() returned empty string")
+	}
+}
+
+// TestRelayManagerOpenFallsOverToNextDRIADCandidate drives Open against a real
+// AMTRELAY answer listing an unreachable relay ahead of a working one.
+//
+// Stopping at the first relay is what turned one dead relay into a dead
+// subscription: the source had published a second relay and nothing ever tried
+// it. The transport factory stands in for that relay being unreachable, so the
+// failover is observed in milliseconds rather than after handshakeTimeout.
+func TestRelayManagerOpenFallsOverToNextDRIADCandidate(t *testing.T) {
+	fr := newFakeRelay(t)
+	t.Cleanup(fr.Close)
+
+	const deadRelay = "192.0.2.10"
+	resolver, _ := startFakeDRIADResolver(t,
+		"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 10 0 1 "+deadRelay,
+		fmt.Sprintf("1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 20 0 1 %s", fr.Addr().IP),
+	)
+
+	cfg := DefaultRelayManagerConfigWithDRIAD(driadTestSource)
+	cfg.DNSServers = []string{resolver}
+	cfg.DNSTimeout = 5 * time.Second
+	cfg.TransportConfig.Timeout = 2 * time.Second
+	cfg.InitialBackoff = 10 * time.Millisecond
+	cfg.MaxBackoff = 100 * time.Millisecond
+
+	var tried []string
+	cfg.TransportFactory = func(tc TransportConfig) (Transport, error) {
+		tried = append(tried, tc.RelayAddr.IP.String())
+		if tc.RelayAddr.IP.String() == deadRelay {
+			return nil, fmt.Errorf("simulated unreachable relay %s", tc.RelayAddr.IP)
+		}
+		// DRIAD hands out m.DefaultPort, which is right on the wire and wrong
+		// for a fake relay on an ephemeral port. The IP is what the candidate
+		// list decides, and that is what this test is about.
+		tc.RelayAddr = fr.Addr()
+		return CreatePlatformTransport(tc)
+	}
+
+	rm := NewRelayManager(cfg)
+	t.Cleanup(func() { _ = rm.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	t.Cleanup(cancel)
+	if err := rm.Open(ctx); err != nil {
+		t.Fatalf("Open did not fail over past %s: %v", deadRelay, err)
+	}
+
+	want := []string{deadRelay, fr.Addr().IP.String()}
+	if !slices.Equal(tried, want) {
+		t.Fatalf("relays tried = %v, want %v (lowest precedence first, then the next candidate)", tried, want)
+	}
+	if got := rm.config.RelayAddr.IP.String(); got != fr.Addr().IP.String() {
+		t.Fatalf("manager settled on relay %s, want the reachable one %s", got, fr.Addr().IP)
+	}
+	if rm.State() != RelayStateActive {
+		t.Fatalf("state after failover = %s, want Active", rm.State())
+	}
+}
+
+// TestRelayManagerOpenReportsLastCandidateWhenAllFail keeps the all-dead case
+// an error rather than a silent success on an unopened manager.
+func TestRelayManagerOpenReportsLastCandidateWhenAllFail(t *testing.T) {
+	resolver, _ := startFakeDRIADResolver(t,
+		"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 10 0 1 192.0.2.10",
+		"1.95.25.69.in-addr.arpa. 300 IN AMTRELAY 20 0 1 192.0.2.20",
+	)
+
+	cfg := DefaultRelayManagerConfigWithDRIAD(driadTestSource)
+	cfg.DNSServers = []string{resolver}
+	cfg.DNSTimeout = 5 * time.Second
+
+	var tried []string
+	cfg.TransportFactory = func(tc TransportConfig) (Transport, error) {
+		tried = append(tried, tc.RelayAddr.IP.String())
+		return nil, fmt.Errorf("simulated unreachable relay %s", tc.RelayAddr.IP)
+	}
+
+	rm := NewRelayManager(cfg)
+	t.Cleanup(func() { _ = rm.Close() })
+
+	err := rm.Open(context.Background())
+	if err == nil {
+		t.Fatal("Open succeeded with every relay unreachable")
+	}
+	if !strings.Contains(err.Error(), "192.0.2.20") {
+		t.Fatalf("Open error %q does not name the last relay tried", err)
+	}
+	if want := []string{"192.0.2.10", "192.0.2.20"}; !slices.Equal(tried, want) {
+		t.Fatalf("relays tried = %v, want %v", tried, want)
 	}
 }

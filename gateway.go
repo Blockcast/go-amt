@@ -77,9 +77,43 @@ type Gateway struct {
 	// retransmission resends its exact bytes, so the relay sees the same nonce
 	// (RFC 7450 sections 5.2.3.4.5 and 5.2.3.5.6). Atomic because the keepalive
 	// goroutine sends both kinds too.
-	outstanding  atomic.Pointer[[]byte]
+	outstanding atomic.Pointer[[]byte]
+	// relayDest is the unicast relay address taken from the Relay
+	// Advertisement, nil until one arrives. See dest.
+	//
+	// Atomic for the same reason leave and intervalTime are: the read loop
+	// writes it from handleRelayAdvertisement, while the keepalive goroutine
+	// (sendMembershipUpdate) and Close (sendTeardown) read it.
+	relayDest    atomic.Pointer[net.UDPAddr]
 	responseMac  [6]byte
 	requestNonce uint32
+}
+
+// dest returns the destination for every message sent after the Relay
+// Advertisement. RFC 7450 section 5.1.2.4: the advertisement carries a unicast
+// address of the relay that answered, and the gateway sends the Request and
+// everything after it there. RelayAddr is the *discovery* address, which in an
+// anycast deployment is not that relay — sending the Request back to it can
+// land on a different relay, which then rejects the request because it never
+// issued that nonce. Falls back to RelayAddr before an advertisement arrives,
+// which is also the whole story for a gateway configured with a relay's own
+// unicast address: there the relay advertises what we already had.
+func (g *Gateway) dest() net.Addr {
+	if advertised := g.relayDest.Load(); advertised != nil {
+		return advertised
+	}
+	return g.RelayAddr
+}
+
+// adoptAdvertisedRelay points subsequent messages at the relay named in the
+// advertisement, when advertisedRelayDest judges it reachable. Everything the
+// address has to survive to be taken is documented there; the same test runs
+// on the RelayManager path.
+func (g *Gateway) adoptAdvertisedRelay(data []byte) {
+	discovered, _ := g.RelayAddr.(*net.UDPAddr)
+	if dest := advertisedRelayDest(data, discovered); dest != nil {
+		g.relayDest.Store(dest)
+	}
 }
 
 // Version returns the Rust library version.
@@ -169,7 +203,7 @@ func (g *Gateway) sendRequest() error {
 
 	data := C.GoBytes(unsafe.Pointer(outMsg.data), C.int(outMsg.len))
 	g.outstanding.Store(&data)
-	_, err := g.conn.WriteTo(data, g.cm, g.RelayAddr)
+	_, err := g.conn.WriteTo(data, g.cm, g.dest())
 	return err
 }
 
@@ -220,7 +254,7 @@ func (g *Gateway) sendMembershipUpdate(membershipQuery m.MembershipQueryMessage)
 	defer C.amt_buffer_free(outMsg)
 
 	data := C.GoBytes(unsafe.Pointer(outMsg.data), C.int(outMsg.len))
-	_, err = g.conn.WriteTo(data, g.cm, g.RelayAddr)
+	_, err = g.conn.WriteTo(data, g.cm, g.dest())
 	return err
 }
 
@@ -242,7 +276,7 @@ func (g *Gateway) sendTeardown(membershipQuery m.MembershipQueryMessage) error {
 	defer C.amt_buffer_free(outMsg)
 
 	data := C.GoBytes(unsafe.Pointer(outMsg.data), C.int(outMsg.len))
-	_, err := g.conn.WriteTo(data, g.cm, g.RelayAddr)
+	_, err := g.conn.WriteTo(data, g.cm, g.dest())
 	return err
 }
 
@@ -343,7 +377,13 @@ func (g *Gateway) Open() (err error) {
 		n, _, _, err = g.conn.ReadFrom(buffer)
 		if err != nil {
 			if errors.Is(err, os.ErrDeadlineExceeded) && time.Now().Before(deadline) {
-				if _, err = g.conn.WriteTo(*g.outstanding.Load(), g.cm, g.RelayAddr); err != nil {
+				// The outstanding message is a Discovery until an advertisement is
+				// adopted and a Request after it; resend each where its first copy went.
+				to := g.RelayAddr
+				if advertised {
+					to = g.dest()
+				}
+				if _, err = g.conn.WriteTo(*g.outstanding.Load(), g.cm, to); err != nil {
 					return fmt.Errorf("error retransmitting: %w", err)
 				}
 				retries++
@@ -550,6 +590,10 @@ func (g *Gateway) handleRelayAdvertisement(data []byte) error {
 	if result != C.AMT_RESULT_OK {
 		return fmt.Errorf("failed to handle advertisement: %d", result)
 	}
+
+	// Only after the Rust side has validated the nonce, so an off-path packet
+	// cannot steer us at an attacker's relay.
+	g.adoptAdvertisedRelay(data)
 
 	// Send request after advertisement
 	return g.sendRequest()
