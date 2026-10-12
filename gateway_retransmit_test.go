@@ -55,12 +55,14 @@ func TestGatewayOpenResendsTheSameRequest(t *testing.T) {
 
 // A Request leg that times out reports every retransmission, and doesn't blame
 // the duplicate Advertisement. The relay answers the first Discovery after
-// 1.3s, after the 1s retransmission, and the retransmission after 0.6s. Rust
+// 1.5s, after the 1s retransmission, and the retransmission after 0.8s. Rust
 // rejects that second answer as InvalidState. Every Request is dropped, so Open
-// resends the Discovery once and the Request once (at 2.3s) before its 3s bound;
-// the next resend is due at 3.3s at the earliest.
+// resends the Discovery once and the Request once (at 2.5s) before its 3s bound;
+// the next resend is due at 3.5s at the earliest. Both timer races keep 500ms of
+// slack: the Discovery resend at 1s against the first answer at 1.5s, and the
+// Request resend at 2.5s against the 3s bound.
 func TestGatewayOpenErrorAfterDuplicateAdvertisement(t *testing.T) {
-	fr := newFakeRelay(t, withAdvertisementDelays(1300*time.Millisecond, 600*time.Millisecond), withLostRequests(1<<30))
+	fr := newFakeRelay(t, withAdvertisementDelays(1500*time.Millisecond, 800*time.Millisecond), withLostRequests(1<<30))
 	addr := fr.Addr()
 	gw := &Gateway{
 		RelayAddr:  &addr,
