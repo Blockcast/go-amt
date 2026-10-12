@@ -428,7 +428,10 @@ InfluxDB or Grafana** — the points are already in the validator log at the
 default `RUST_LOG`:
 
 ```sh
-LOG=/path/to/agave-validator.log   # or: journalctl -u <unit> --since '10 min ago'
+LOG=/path/to/agave-validator.log
+# systemd: journalctl -u <unit> --since '10 min ago' > /tmp/agave.log && LOG=/tmp/agave.log
+# The trailing space in "datapoint: $n " is load-bearing: without it `shred_fetch`
+# also matches `shred_fetch_repair`, the repair traffic this page separates below.
 for n in shred_fetch shred_sigverify recv-window-insert-shreds blockstore-insert-shreds; do
   printf '== %s\n' "$n"; grep -F "datapoint: $n " "$LOG" | tail -2
 done
@@ -439,6 +442,7 @@ Every one of these resets itself immediately after it reports — 1 s for
 over your window, never difference the first and last.**
 
 ```sh
+# Same load-bearing trailing space after "$1 " -- see above.
 sum() { grep -F "datapoint: $1 " "$LOG" | grep -oE "$2=[0-9]+" | cut -d= -f2 | awk '{s+=$1} END{print s+0}'; }
 sum shred_fetch                shred_count            # received — see the warning below
 sum recv-window-insert-shreds  num_shreds_received    # passed sigverify
@@ -500,22 +504,28 @@ is past `max_slot` or at/below the validator's root
 A validator that is still catching up therefore rejects *every* shred we send,
 at the first filter, while `shred_count` climbs the whole time. Before believing
 any downstream zero, confirm `shred_version_mismatch` and `slot_out_of_range`
-are flat:
+are zero **summed across your whole window** — these reset every second like the
+rest, so a single interval read after the feed stops is idle and reports zero
+whether or not the filters fired:
 
 ```sh
-grep -F 'datapoint: shred_fetch ' "$LOG" | tail -1 \
-  | grep -oE '(shred_version_mismatch|slot_out_of_range|index_overrun|bad_shred_type)=[0-9]+i'
+for f in shred_version_mismatch slot_out_of_range index_overrun bad_shred_type; do
+  printf '%s=%s\n' "$f" "$(sum shred_fetch "$f")"   # `sum` as defined above
+done
 ```
 
 **An unknown slot leader is discarded inside sigverify, and the subtraction
 above then blames the signature.** `verify_packets` resolves each shred's leader
 with `leader_schedule_cache.slot_leader_at(slot, working_bank)`; when that
-returns `None` the packet is marked discarded on the spot
+returns `None` — or resolves to this node itself, which `get_slot_leaders`
+discards as circular transmission (`leader != self_pubkey`) and which replaying
+your own validator's leader slots will do — the packet is marked discarded on
+the spot
 ([`turbine/src/sigverify_shreds.rs`](https://github.com/anza-xyz/agave/blob/v4.3.0/turbine/src/sigverify_shreds.rs)),
 so it lands in `num_discards_post` and is counted by the formula above as a
-signature rejection. It is not one — it is a node without a leader schedule
-covering the slot you fed it, which is the expected state of a node that is
-synced but not to *that* epoch. **Do not reach for
+signature rejection. It is not one — most often it is a node without a leader
+schedule covering the slot you fed it, which is the expected state of a node
+that is synced but not to *that* epoch. **Do not reach for
 `shred_sigverify.num_unknown_slot_leader` to tell these apart:** that counter is
 incremented in the retransmitter-resign stage, which runs *after*
 `num_discards_post` is sampled, so a shred rejected this way never reaches it
