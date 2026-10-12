@@ -1,21 +1,21 @@
 # Static, pure-Go receiver image for validator operators.
 #
-# The build stage tracks the toolchain floor in go.mod (go 1.24.0) rather than
+# The build stage tracks the toolchain floor in go.mod (go 1.25.0) rather than
 # "latest", so a rebuild cannot silently jump a major Go version. Note what this
-# does NOT buy: `golang:1.24-bookworm` is a floating patch tag, so a rebuild
-# picks up whatever 1.24.x is current and the output is not byte-identical —
+# does NOT buy: `golang:1.25-bookworm` is a floating patch tag, so a rebuild
+# picks up whatever 1.25.x is current and the output is not byte-identical —
 # `-trimpath` removes path nondeterminism, not toolchain nondeterminism. That is
 # the deliberate trade: patch-level Go security fixes on rebuild, in exchange for
 # reproducibility.
 #
 # The whole image reference is one ARG so that a digest is actually passable.
-# Pinning the patch tag alone is not enough — `golang:1.24.0-bookworm` is itself
+# Pinning the patch tag alone is not enough — `golang:1.25.0-bookworm` is itself
 # rebuilt when its base image updates, so only a digest gives a byte-identical
 # rebuild:
 #
 #   docker build --build-arg GO_IMAGE=golang@sha256:<digest> .
 #
-ARG GO_IMAGE=golang:1.24-bookworm
+ARG GO_IMAGE=golang:1.25-bookworm
 
 FROM ${GO_IMAGE} AS build
 WORKDIR /src
