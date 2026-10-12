@@ -195,11 +195,11 @@ jobs:
           cache: true
       - uses: goreleaser/goreleaser-action@v6
         with:
-          version: latest
+          version: v2.18.3
           args: check
       - uses: goreleaser/goreleaser-action@v6
         with:
-          version: latest
+          version: v2.18.3
           args: build --snapshot --clean
       # Guards the deliverable itself: a dynamically linked release binary
       # would still build and still pass tests, and would fail on a customer

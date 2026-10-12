@@ -49,12 +49,10 @@ curl -fsSLO "${BASE}/checksums.txt"
 curl -fsSLO "${BASE}/checksums.txt.sig"
 curl -fsSLO "${BASE}/checksums.txt.pem"
 sha256sum --check --ignore-missing checksums.txt
-tar -xzf "blockcast-shreds_${VERSION}_linux_amd64.tar.gz"
-sudo install -m 0755 blockcast-shreds /usr/local/bin/blockcast-shreds
 ```
 
 The tag carries a leading `v` and the filenames do not — that asymmetry is
-goreleaser's `{{ .Version }}`, and a single `VERSION=v0.3.0` gets you a 404 on
+goreleaser's `{{ .Version }}` in the archive name, and a single `VERSION=v0.3.0` gets you a 404 on
 the tarball while the release URL itself resolves.
 
 ### Verify the download is ours, not just intact
@@ -72,6 +70,13 @@ cosign verify-blob \
   --certificate-identity-regexp \
     '^https://github\.com/Blockcast/go-amt/\.github/workflows/release\.yml@refs/tags/' \
   checksums.txt
+```
+
+Only once that passes, unpack and install:
+
+```sh
+tar -xzf "blockcast-shreds_${VERSION}_linux_amd64.tar.gz"
+sudo install -m 0755 blockcast-shreds /usr/local/bin/blockcast-shreds
 ```
 
 Signing is keyless ([sigstore](https://docs.sigstore.dev/)), so there is no

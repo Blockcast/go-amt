@@ -48,7 +48,7 @@ builds:
     # reports dev-unstamped.
     ldflags:
       - -s -w
-      - -X github.com/blockcast/go-amt/broker.version={{ .Version }}
+      - -X github.com/blockcast/go-amt/broker.version={{ .Tag }}
 
 archives:
   - id: blockcast-shreds
