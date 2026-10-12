@@ -84,9 +84,16 @@ type Gateway struct {
 	// Atomic for the same reason leave and intervalTime are: the read loop
 	// writes it from handleRelayAdvertisement, while the keepalive goroutine
 	// (sendMembershipUpdate) and Close (sendTeardown) read it.
-	relayDest    atomic.Pointer[net.UDPAddr]
-	responseMac  [6]byte
-	requestNonce uint32
+	relayDest atomic.Pointer[net.UDPAddr]
+	// keepaliveStop wakes the keepalive goroutine out of its sleep;
+	// keepaliveDone is closed when it has returned. Both are nil until
+	// startKeepalive runs. stopKeepalive joins on keepaliveDone so the Rust
+	// handle is never freed while the goroutine can still be inside
+	// amt_gateway_reset, sendDiscovery or sendRequest (BLO-44822).
+	keepaliveStop chan struct{}
+	keepaliveDone chan struct{}
+	responseMac   [6]byte
+	requestNonce  uint32
 }
 
 // dest returns the destination for every message sent after the Relay
@@ -497,10 +504,13 @@ func (g *Gateway) startKeepalive(relay string) {
 	// start, so a slow handshake does not spend the first interval's staleness
 	// budget before the tunnel has carried anything.
 	g.lastData.Store(time.Now())
+	stop, done := make(chan struct{}), make(chan struct{})
+	g.keepaliveStop, g.keepaliveDone = stop, done
 
 	// `loopErr` is deliberately local: Open's named return is written by the
 	// read loop that called this, so assigning to it from here is a data race.
 	go func() {
+		defer close(done)
 		// stalled tracks whether the previous iteration already saw the relay as
 		// silent, so entering and leaving that state logs once each rather than
 		// every interval. A permanently unreachable relay would otherwise emit a
@@ -523,7 +533,14 @@ func (g *Gateway) startKeepalive(relay string) {
 			// shutdown latency is unaffected either way — leave is still
 			// observed within one interval, just after the sleep rather than
 			// before it.
-			time.Sleep(g.intervalTime.Load())
+			//
+			// The sleep is interruptible: stopKeepalive waits for this goroutine
+			// to return, and a relay-advertised interval can be minutes long.
+			select {
+			case <-time.After(g.intervalTime.Load()):
+			case <-stop:
+				return
+			}
 			if g.leave.Load() {
 				return
 			}
@@ -559,8 +576,32 @@ func (g *Gateway) startKeepalive(relay string) {
 // goroutine starts only once the handshake has succeeded, so a failed Open has
 // none to stop. It is still reached through abortOpen, which conn.go runs on
 // exactly those paths, and through Close.
+//
+// It returns only once the goroutine has exited, because both callers free the
+// Rust handle next and the goroutine calls into it (BLO-44822).
 func (g *Gateway) stopKeepalive() {
 	g.leave.Store(true)
+	if g.keepaliveStop == nil {
+		return
+	}
+	close(g.keepaliveStop)
+	<-g.keepaliveDone
+	g.keepaliveStop = nil
+}
+
+// beforeHandleFree is a test hook run immediately before the Rust handle is
+// freed; nil outside tests.
+var beforeHandleFree func(*Gateway)
+
+func (g *Gateway) freeHandle() {
+	if g.handle == nil {
+		return
+	}
+	if beforeHandleFree != nil {
+		beforeHandleFree(g)
+	}
+	C.amt_gateway_free(g.handle)
+	g.handle = nil
 }
 
 // abortOpen releases only resources that Open managed to initialize. It is
@@ -569,10 +610,7 @@ func (g *Gateway) stopKeepalive() {
 // messages through a partially initialized gateway.
 func (g *Gateway) abortOpen() {
 	g.stopKeepalive()
-	if g.handle != nil {
-		C.amt_gateway_free(g.handle)
-		g.handle = nil
-	}
+	g.freeHandle()
 	if g.conn != nil {
 		_ = g.conn.Close()
 		g.conn = nil
@@ -653,7 +691,9 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 
 // Close gracefully closes the AMT gateway.
 func (g *Gateway) Close() error {
-	g.leave.Store(true)
+	// Join the keepalive before this goroutine and the one below start calling
+	// into the handle alongside it.
+	g.stopKeepalive()
 	buffer := make([]byte, g.MTU)
 	errc := make(chan error, 1)
 
@@ -680,14 +720,17 @@ func (g *Gateway) Close() error {
 	var err error
 	select {
 	case <-time.After(5 * time.Second):
+		// The goroutine above is still blocked in ReadFrom and will call into
+		// the handle when it returns. Close the socket to unblock it, and wait
+		// for it to finish before freeing.
+		err = g.conn.Close()
+		<-errc
+		g.freeHandle()
+		return err
 	case err = <-errc:
 	}
 
-	// Free Rust handle
-	if g.handle != nil {
-		C.amt_gateway_free(g.handle)
-		g.handle = nil
-	}
+	g.freeHandle()
 
 	errClose := g.conn.Close()
 	if err == nil {
