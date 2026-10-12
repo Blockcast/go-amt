@@ -37,7 +37,9 @@ func countOpenFDs(t *testing.T) int {
 // checks it failed at that step, so it cannot pass by failing somewhere that
 // allocates nothing.
 func TestListenMulticastUDP4ClosesFDOnErrorPaths(t *testing.T) {
-	gaddr := &net.UDPAddr{IP: net.IPv4(232, 10, 10, 10), Port: 5555}
+	// Port 0, so the bind cannot collide with a busy port and the interface
+	// case reaches the wrap.
+	gaddr := &net.UDPAddr{IP: net.IPv4(232, 10, 10, 10)}
 	saddr := netip.MustParseAddr("10.11.12.13")
 	for _, tc := range []struct {
 		name string
@@ -87,7 +89,7 @@ func TestListenMulticastUDP4ClosesFDOnErrorPaths(t *testing.T) {
 func TestListenMulticastUDP4RejectsNonIPv4Group(t *testing.T) {
 	before := countOpenFDs(t)
 
-	gaddr := &net.UDPAddr{IP: net.ParseIP("ff3e::4321:1234"), Port: 5555}
+	gaddr := &net.UDPAddr{IP: net.ParseIP("ff3e::4321:1234")}
 	conn, err := ListenMulticastUDP4("udp4", nil, netip.Addr{}, gaddr, nil, false, 1, ipv4.ControlFlags(0), 0, 0)
 	if err == nil {
 		_ = conn.Close()
