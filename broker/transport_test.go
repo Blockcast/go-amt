@@ -245,9 +245,16 @@ func TestStatusAndRetryForCode(t *testing.T) {
 		{CodePublicationFailed, http.StatusServiceUnavailable, RetryBackoff},
 		// 500 rather than publication_failed's 503 — see CodeInternal.
 		{CodeInternal, http.StatusInternalServerError, RetryBackoff},
-		// Same 500 as CodeInternal, opposite retry class — see
-		// TestOperatorFixableRefusalIsNotRetried for why that split is the
-		// point of this code rather than an inconsistency.
+		// Same 500 as CodeInternal, opposite retry class, and that split is
+		// the point of this code rather than an inconsistency. Both answer 500
+		// and neither blames the request, so the retry class is the only thing
+		// a client can tell them apart by. CodeInternal's causes — an outage, a
+		// recovered panic, a bug — may clear on the next attempt, so backoff is
+		// what a client owes. This code's do not: the registry returns the same
+		// answer every time until an operator edits it, and a gateway backing
+		// off against that only adds load. RetryNever is terminal for the
+		// request as written, not for the client — which is why
+		// CodePlaneBindingMismatch, the same shape, already takes it.
 		{CodeServingRelayUnresolved, http.StatusInternalServerError, RetryNever},
 	} {
 		t.Run(string(tc.code), func(t *testing.T) {
@@ -348,50 +355,6 @@ func TestBodylessFaultIsTheTrapBothCodesClose(t *testing.T) {
 	}
 	if retry != RetryNever {
 		t.Errorf("RetryForCode(%q) = %v, want RetryNever", bodyless, retry)
-	}
-}
-
-// TestOperatorFixableRefusalIsNotRetried pins the half of BLO-30269 that is not
-// derivable from any single row of the table: that the two 5xx codes sit on
-// *opposite* retry classes, and which way round.
-//
-// Both answer 500 and neither blames the request, so the only thing separating
-// them is whether the condition is transient. CodeInternal's causes — an
-// outage, a recovered panic, a bug — may clear on the next attempt, so backoff
-// is what a client owes. CodeServingRelayUnresolved's do not: the registry
-// returns the same answer every time until an operator edits it, and a gateway
-// backing off against that only adds load. RetryNever is terminal for the
-// request as written, not for the client, and names an operator change as the
-// thing that clears it — which is why CodePlaneBindingMismatch, the same shape,
-// already takes it.
-//
-// The mutation this catches and the table cannot: flipping either code to the
-// other's class still leaves every row internally consistent, because each row
-// is only checked against itself.
-func TestOperatorFixableRefusalIsNotRetried(t *testing.T) {
-	transient, err := RetryForCode(CodeInternal)
-	if err != nil {
-		t.Fatalf("RetryForCode(%q): %v", CodeInternal, err)
-	}
-	deterministic, err := RetryForCode(CodeServingRelayUnresolved)
-	if err != nil {
-		t.Fatalf("RetryForCode(%q): %v", CodeServingRelayUnresolved, err)
-	}
-	if transient != RetryBackoff {
-		t.Errorf("RetryForCode(%q) = %v, want RetryBackoff: a transient fault a client never "+
-			"retries is indistinguishable from the bodyless 500 this code replaced",
-			CodeInternal, transient)
-	}
-	if deterministic != RetryNever {
-		t.Errorf("RetryForCode(%q) = %v, want RetryNever: backing off against a registry state "+
-			"only an operator can change adds load without ever succeeding",
-			CodeServingRelayUnresolved, deterministic)
-	}
-	if transient == deterministic {
-		t.Errorf("CodeInternal and CodeServingRelayUnresolved both answer %v; they share a status "+
-			"(500) and neither blames the request, so the retry class is the only thing a client "+
-			"can tell them apart by — collapsing it makes the second code carry no information",
-			transient)
 	}
 }
 

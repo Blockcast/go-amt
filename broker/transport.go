@@ -550,7 +550,7 @@ const (
 	// same answer on every attempt until an operator changes something — is
 	// not this code however little the client did wrong; see
 	// CodeServingRelayUnresolved, which is the member for that shape and takes
-	// RetryNever like every other operator-fixable condition here.
+	// RetryNever like every other condition here that only an operator can clear.
 	//
 	// It is the taxonomy's deliberately uninformative member and the only one
 	// that names no specific condition. That is its job. Every other code
@@ -621,9 +621,12 @@ const (
 // ErrorResponse is the body accompanying every 4xx and 5xx from the broker.
 //
 // Every, without exception: there is no status the broker answers with a bare
-// body-less error. CodeInternal and CodeServingRelayUnresolved exist so that
-// the two broker-side refusals that name no client fault still have a code to
-// carry, which is what keeps that sentence true rather than aspirational. A
+// body-less error. CodeInternal and CodeServingRelayUnresolved, the two codes
+// this schema version adds, exist so that every broker-side failure has a code
+// to carry, which is what makes that sentence satisfiable. Keeping it true is
+// the broker's obligation, discharged at its handler boundary in
+// Network-Operator-Portal (internal/sessionbroker); nothing in this repo can
+// check it, because no broker handler lives here. A
 // client may therefore decode this envelope on any non-2xx and treat a failure
 // to do so as a broken peer, not as a case the contract left open.
 type ErrorResponse struct {
@@ -772,11 +775,14 @@ const RetryTransportFailure = RetryBackoff
 // into disagreeing, which they would if each carried its own switch.
 //
 // Note that it is deliberately not injective: CodeEntitlementDenied and
-// CodePlaneBindingMismatch share 403. There is therefore no inverse
+// CodePlaneBindingMismatch share 403, and CodeInternal and
+// CodeServingRelayUnresolved share 500. The 500 pair is the stronger case: the
+// two sit on opposite retry classes, so a code recovered from the status would
+// carry the wrong RetryForCode answer half the time. There is therefore no inverse
 // CodeForStatus function, and that is the intended shape rather than a missing
 // convenience: the status is a transport-level summary and the body's Code is
 // the discriminator. A client that recovered the code from the status would be
-// unable to tell those two apart, and would branch on a distinction it had
+// unable to tell either pair apart, and would branch on a distinction it had
 // guessed rather than one it had read.
 var statusByCode = map[ErrorCode]struct {
 	status int
