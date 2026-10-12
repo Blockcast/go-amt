@@ -5,11 +5,17 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
-	"sync/atomic"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 var t0 = time.Date(2026, 10, 8, 0, 0, 0, 0, time.UTC)
@@ -487,8 +493,8 @@ func TestReaderDropsDatagramsFromOtherSources(t *testing.T) {
 		t.Fatal(err)
 	}
 	ch := make(chan frame, 2)
-	var dropped, foreign atomic.Uint64
-	go reader(in, 0, netip.MustParseAddr("127.0.0.2"), ch, &dropped, &foreign)
+	var ctr counters
+	go reader(in, 0, netip.MustParseAddr("127.0.0.2"), ch, &ctr)
 
 	sendFrom := func(ip string, slot uint64) {
 		c, err := net.DialUDP("udp4", &net.UDPAddr{IP: net.ParseIP(ip)}, in.LocalAddr().(*net.UDPAddr))
@@ -501,10 +507,10 @@ func TestReaderDropsDatagramsFromOtherSources(t *testing.T) {
 		}
 	}
 	sendFrom("127.0.0.3", 1) // a forger
-	for deadline := time.Now().Add(2 * time.Second); foreign.Load() == 0 && time.Now().Before(deadline); {
+	for deadline := time.Now().Add(2 * time.Second); ctr.foreign[0].Load() == 0 && time.Now().Before(deadline); {
 		time.Sleep(time.Millisecond)
 	}
-	if n := foreign.Load(); n != 1 {
+	if n := ctr.foreign[0].Load(); n != 1 {
 		t.Fatalf("foreign = %d after a datagram from 127.0.0.3, want 1; %d frame(s) passed", n, len(ch))
 	}
 	sendFrom("127.0.0.2", 2) // the production source
@@ -523,15 +529,10 @@ func TestReaderDropsDatagramsFromOtherSources(t *testing.T) {
 // one: otherwise the next read overwrites a frame still queued on an output
 // (BLO-43063).
 func TestReaderGivesEachPassedFrameItsOwnBuffer(t *testing.T) {
-	// reader exits the process on a read error, so this socket and its reader
-	// stay open until the test binary exits.
-	in, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
+	in := loopbackUDP(t)
 	ch := make(chan frame, 2)
-	var dropped, foreign atomic.Uint64
-	go reader(in, 0, netip.Addr{}, ch, &dropped, &foreign) // unfiltered: this is about buffers
+	var ctr counters
+	go reader(in, 0, netip.Addr{}, ch, &ctr) // unfiltered: this is about buffers
 
 	c, err := net.DialUDP("udp4", nil, in.LocalAddr().(*net.UDPAddr))
 	if err != nil {
@@ -562,4 +563,213 @@ func TestReaderGivesEachPassedFrameItsOwnBuffer(t *testing.T) {
 	if slot := binary.LittleEndian.Uint64(first.buf[1:9]); slot != 1 {
 		t.Errorf("the first frame now reads slot %d, want 1: a later read wrote over it", slot)
 	}
+}
+
+// loopbackUDP returns a UDP socket on an ephemeral loopback port. reader exits
+// the process on a read error, so a socket handed to one stays open until the
+// test binary exits and is deliberately not closed.
+func loopbackUDP(t *testing.T) *net.UDPConn {
+	t.Helper()
+	c, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return c
+}
+
+// scrape returns the exposition text of r.
+func scrape(t *testing.T, r *prometheus.Registry) string {
+	t.Helper()
+	srv := httptest.NewServer(promhttp.HandlerFor(r, promhttp.HandlerOpts{}))
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read /metrics: %v", err)
+	}
+	return string(b)
+}
+
+func wantExposition(t *testing.T, out string, lines ...string) {
+	t.Helper()
+	for _, l := range lines {
+		found := false
+		for _, got := range strings.Split(out, "\n") {
+			if strings.TrimRight(got, "\r") == l {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("/metrics missing line %q\n--- exposition ---\n%s", l, out)
+		}
+	}
+}
+
+// The alert BLO-43479 unblocks reads foreign off /metrics rather than off the
+// journal. Ingest A must count a forged datagram; ingest B must publish the 0
+// it can never leave, so "nothing touched ingest B" is a series and not a gap.
+func TestMetricsExportForeignPerIngest(t *testing.T) {
+	inA, inB := loopbackUDP(t), loopbackUDP(t)
+	var c counters
+	ch := make(chan frame, 4)
+	go reader(inA, 0, netip.MustParseAddr("127.0.0.2"), ch, &c)
+	go reader(inB, 1, netip.Addr{}, ch, &c)
+
+	reg := prometheus.NewRegistry()
+	if err := registerMerger(reg, &c, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	sendFrom := func(from string, to *net.UDPConn, slot uint64) {
+		t.Helper()
+		conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: net.ParseIP(from)}, to.LocalAddr().(*net.UDPAddr))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		if _, err := conn.Write(v4Frame(slot, 3, false)[:hdrLen]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sendFrom("127.0.0.3", inA, 1) // a forger
+	sendFrom("127.0.0.2", inA, 2) // the production source
+	sendFrom("127.0.0.1", inB, 3) // the second listener, which admits anyone
+
+	// Both passed datagrams land on ch; the forged one lands on foreign[0].
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		if c.foreign[0].Load() == 1 && len(ch) == 2 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	out := scrape(t, reg)
+	wantExposition(t, out,
+		`# TYPE shred_merger_foreign_datagrams_total counter`,
+		`shred_merger_foreign_datagrams_total{ingest="a"} 1`,
+		`shred_merger_foreign_datagrams_total{ingest="b"} 0`,
+	)
+}
+
+// Each exported series must read the counter the stats line prints under that
+// name, so distinct values rather than a shared 0: reading rx_listener2 off
+// emitted, say, is invisible when every counter is 0.
+func TestMetricsExportReadsEachStatsLineCounter(t *testing.T) {
+	var c counters
+	c.rx[0].Store(11)
+	c.rx[1].Store(22)
+	c.emitted.Store(33)
+	c.qdrop.Store(44)
+	c.foreign[0].Store(55)
+	c.foreign[1].Store(66) // not reachable in production; distinct here to pin the label
+
+	// One output per counter, so a sum that reads the wrong field is visible.
+	outs := []*output{{}, {}}
+	outs[0].err.Store(7)
+	outs[1].err.Store(70)
+	outs[0].drop.Store(5)
+	outs[1].drop.Store(50)
+
+	reg := prometheus.NewRegistry()
+	if err := registerMerger(reg, &c, outs); err != nil {
+		t.Fatal(err)
+	}
+	wantExposition(t, scrape(t, reg),
+		`shred_merger_received_total{ingest="a"} 11`,
+		`shred_merger_received_total{ingest="b"} 22`,
+		`shred_merger_emitted_total 33`,
+		`shred_merger_queue_drops_total 44`,
+		`shred_merger_foreign_datagrams_total{ingest="a"} 55`,
+		`shred_merger_foreign_datagrams_total{ingest="b"} 66`,
+		`shred_merger_emit_errors_total 77`,
+		`shred_merger_output_drops_total 55`,
+	)
+}
+
+// out_drop is summed over every output at scrape time, so a full output has to
+// show up on /metrics without anything republishing it.
+func TestMetricsExportOutputDropsAcrossOutputs(t *testing.T) {
+	// Queues of one with no sender, so both are full after one frame each.
+	stuck := []*output{
+		{dst: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9}, kind: kindAll, q: make(chan []byte, 1)},
+		{dst: &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 10}, kind: kindAll, q: make(chan []byte, 1)},
+	}
+	var c counters
+	reg := prometheus.NewRegistry()
+	if err := registerMerger(reg, &c, stuck); err != nil {
+		t.Fatal(err)
+	}
+	f := v4Frame(1, 3, false)[:hdrLen]
+	for range 4 {
+		send(stuck, f)
+	}
+	// 4 frames to each output, 1 queued, 3 dropped.
+	wantExposition(t, scrape(t, reg), `shred_merger_output_drops_total 6`)
+}
+
+// qdrop counts a datagram the reader could not hand on. Nothing receives on
+// this channel, so the select's default branch takes the first datagram the
+// admitted source sends.
+func TestMetricsExportQueueDrops(t *testing.T) {
+	in := loopbackUDP(t)
+	var c counters
+	go reader(in, 0, netip.MustParseAddr("127.0.0.2"), make(chan frame), &c)
+
+	conn, err := net.DialUDP("udp4", &net.UDPAddr{IP: net.ParseIP("127.0.0.2")}, in.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write(v4Frame(1, 3, false)[:hdrLen]); err != nil {
+		t.Fatal(err)
+	}
+
+	reg := prometheus.NewRegistry()
+	if err := registerMerger(reg, &c, nil); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); c.qdrop.Load() == 0 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	wantExposition(t, scrape(t, reg), `shred_merger_queue_drops_total 1`)
+}
+
+// -metrics-addr is the whole listener: empty opens none, which is the default
+// on a host whose exposed ingest port is this row's subject, and a given
+// address serves the exposition over real HTTP.
+func TestServeMetricsOpensNoListenerByDefault(t *testing.T) {
+	var c counters
+	for _, addr := range []string{"", "  "} {
+		got, err := serveMetrics(addr, &c, nil)
+		if err != nil {
+			t.Fatalf("serveMetrics(%q): %v", addr, err)
+		}
+		if got != nil {
+			t.Errorf("serveMetrics(%q) listened on %s, want no listener", addr, got)
+		}
+	}
+
+	c.foreign[0].Store(3)
+	addr, err := serveMetrics("127.0.0.1:0", &c, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addr == nil {
+		t.Fatal("serveMetrics with an address opened no listener")
+	}
+	resp, err := http.Get("http://" + addr.String() + "/metrics")
+	if err != nil {
+		t.Fatalf("GET /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read /metrics: %v", err)
+	}
+	wantExposition(t, string(body), `shred_merger_foreign_datagrams_total{ingest="a"} 3`)
 }

@@ -70,6 +70,11 @@
 //
 // Deployed on CT 140 (pve1, 69.25.95.57) as shred-merger.service. See that
 // address in onprem-k8s network/registry.yaml.
+//
+// -metrics-addr serves part of the stats line as Prometheus counters, so
+// foreign is watchable by an alert and not only by a human reading ticks
+// (BLO-43479). It opens no listener unless given an address, and that address
+// should be loopback.
 package main
 
 import (
@@ -258,10 +263,11 @@ func interfaceWith(ip net.IP) (int, error) {
 }
 
 // reader passes c's datagrams to out. A valid from admits only datagrams whose
-// claimed source is that address and counts the rest in foreign. Ingest A needs it: its
-// socket binds the wildcard on its port, so unicast from any host reaches it,
-// and a forged shred that arrives before the real one wins dedup (BLO-43063).
-func reader(c *net.UDPConn, src uint8, from netip.Addr, out chan<- frame, dropped, foreign *atomic.Uint64) {
+// claimed source is that address and counts the rest in ctr.foreign[src].
+// Ingest A needs it: its socket binds the wildcard on its port, so unicast from
+// any host reaches it, and a forged shred that arrives before the real one wins
+// dedup (BLO-43063).
+func reader(c *net.UDPConn, src uint8, from netip.Addr, out chan<- frame, ctr *counters) {
 	b := make([]byte, maxDatagram)
 	for {
 		n, ap, err := c.ReadFromUDPAddrPort(b)
@@ -274,7 +280,7 @@ func reader(c *net.UDPConn, src uint8, from netip.Addr, out chan<- frame, droppe
 		// source arrives v4-mapped, and without Unmap every datagram, prod-src's
 		// included, would count as foreign.
 		if from.IsValid() && ap.Addr().Unmap() != from {
-			foreign.Add(1)
+			ctr.foreign[src].Add(1)
 			continue
 		}
 		if n < hdrLen {
@@ -284,7 +290,7 @@ func reader(c *net.UDPConn, src uint8, from netip.Addr, out chan<- frame, droppe
 		case out <- frame{buf: b, n: n, src: src}:
 			b = make([]byte, maxDatagram) // out owns the old buffer now
 		default:
-			dropped.Add(1) // the processor is backlogged: count the frame rather than block the reader
+			ctr.qdrop.Add(1) // the processor is backlogged: count the frame rather than block the reader
 		}
 	}
 }
@@ -606,6 +612,7 @@ func main() {
 		keep      = flag.Duration("dedup-keep", 25*time.Second, "how long a slot's dedup history outlives its latest shred")
 		statsSec  = flag.Int("stats-interval", 10, "seconds between stats lines")
 		rcvbuf    = flag.Int("rcvbuf", 4<<20, "SO_RCVBUF for ingest sockets")
+		metrics   = flag.String("metrics-addr", "", `serve the stats-line counters as Prometheus metrics on this address, e.g. "127.0.0.1:9101"; empty, the default, opens no listener. Bind loopback: the ingest port is already more reachable than it should be`)
 	)
 	flag.Parse()
 
@@ -666,13 +673,17 @@ func main() {
 		log.Printf("out: %s (S=%s, D=%s) ttl=%d", o.kind, from, o.dst, *ttl)
 	}
 
+	var c counters
+	if _, err := serveMetrics(*metrics, &c, outs); err != nil {
+		log.Fatal(err)
+	}
+
 	ch := make(chan frame, 1<<16)
-	var qdrop, foreign atomic.Uint64
-	go reader(inA, 0, netip.AddrFrom4(mustIP4(*prodSrc)), ch, &qdrop, &foreign)
-	go reader(inB, 1, netip.Addr{}, ch, &qdrop, &foreign) // bound to 127.0.0.1
+	go reader(inA, 0, netip.AddrFrom4(mustIP4(*prodSrc)), ch, &c)
+	go reader(inB, 1, netip.Addr{}, ch, &c) // bound to 127.0.0.1
 
 	seen := newDedup(*keep)
-	var rxA, rxB, emitted, emittedV3, emittedV4, dupA, dupB, firstFromB, v3Unconvertible, skipped uint64
+	var emittedV3, emittedV4, dupA, dupB, firstFromB, v3Unconvertible, skipped uint64
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
@@ -683,11 +694,7 @@ func main() {
 		select {
 		case f := <-ch:
 			b := f.buf[:f.n]
-			if f.src == 0 {
-				rxA++
-			} else {
-				rxB++
-			}
+			c.rx[f.src].Add(1)
 			switch seen.observe(time.Now(), binary.LittleEndian.Uint64(b[1:9]), binary.LittleEndian.Uint32(b[9:13]), binary.LittleEndian.Uint32(b[13:17])) {
 			case skip:
 				skipped++
@@ -703,7 +710,7 @@ func main() {
 			if f.src == 1 {
 				firstFromB++ // a marginal shred the second listener contributed
 			}
-			emitted++
+			c.emitted.Add(1)
 			switch b[0] {
 			case 3:
 				emittedV3++
@@ -723,7 +730,10 @@ func main() {
 			// ICMP port unreachable. emit_err and out_drop sum ERR and DROP.
 			// queue is the input backlog, which qdrop counts once it is full.
 			// foreign counts datagrams to ingest A whose claimed source is not
-			// -prod-src: read, then dropped.
+			// -prod-src: read, then dropped. -metrics-addr exports this line's
+			// rx_prod, rx_listener2, emitted, emit_err, out_drop, qdrop and
+			// foreign (that one per ingest) from the same counters; this line
+			// remains the rollback path and carries the rest alone.
 			var emitErr, outDrop uint64
 			var per strings.Builder
 			for _, o := range outs {
@@ -733,10 +743,10 @@ func main() {
 				fmt.Fprintf(&per, " %s@%s=%d/%d/%d/%d", o.kind, o.dst, sent, e, d, len(o.q))
 			}
 			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d out_drop=%d qdrop=%d foreign=%d queue=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d dedup_ids=%d forgotten=%d%s",
-				rxA, rxB, emitted, dupA, dupB, firstFromB, emitErr, outDrop, qdrop.Load(), foreign.Load(), len(ch), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, seen.ids, seen.forgotten, per.String())
+				c.rx[0].Load(), c.rx[1].Load(), c.emitted.Load(), dupA, dupB, firstFromB, emitErr, outDrop, c.qdrop.Load(), c.foreign[0].Load()+c.foreign[1].Load(), len(ch), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, seen.ids, seen.forgotten, per.String())
 
 		case s := <-sig:
-			log.Printf("signal %v; final: rx_prod=%d rx_listener2=%d emitted=%d first_from_listener2=%d", s, rxA, rxB, emitted, firstFromB)
+			log.Printf("signal %v; final: rx_prod=%d rx_listener2=%d emitted=%d first_from_listener2=%d", s, c.rx[0].Load(), c.rx[1].Load(), c.emitted.Load(), firstFromB)
 			return
 		}
 	}
