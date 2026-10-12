@@ -47,6 +47,13 @@ type fakeRelay struct {
 	// requestTimes is when each Request arrived, lost ones included. Guarded
 	// by mu.
 	requestTimes []time.Time
+	// discoveryNonces is the nonce of every Relay Discovery that arrived, lost
+	// ones included. A retransmission repeats its nonce (RFC 7450 section
+	// 5.2.3.4.5), so it is the DISTINCT count that separates "the gateway
+	// resent its own Discovery" from "something started a second discovery
+	// behind it" — which the plain discoveries counter cannot tell apart.
+	// Guarded by mu.
+	discoveryNonces []uint32
 	// dropDiscoveries and dropRequests are how many more of each the relay
 	// ignores, standing in for a datagram lost on the way.
 	dropDiscoveries atomic.Int64
@@ -202,6 +209,15 @@ func (fr *fakeRelay) serve() {
 		switch m.MessageType(msg[0] & 0x0F) {
 		case m.RelayDiscoveryType:
 			fr.discoveries.Add(1)
+			// Recorded before the loss check below, like the counter above it:
+			// a Discovery the relay chose to ignore still reached it, and a
+			// test asserting on nonce identity needs the lost ones too.
+			// [0]=V/Type [1..3]=reserved [4..7]=nonce.
+			if len(msg) >= 8 {
+				fr.mu.Lock()
+				fr.discoveryNonces = append(fr.discoveryNonces, binary.BigEndian.Uint32(msg[4:8]))
+				fr.mu.Unlock()
+			}
 			if fr.dropDiscoveries.Add(-1) >= 0 {
 				continue
 			}
@@ -249,6 +265,14 @@ func (fr *fakeRelay) requestArrivals() []time.Time {
 	fr.mu.Lock()
 	defer fr.mu.Unlock()
 	return append([]time.Time(nil), fr.requestTimes...)
+}
+
+// seenDiscoveryNonces returns the nonce of each Relay Discovery that arrived,
+// in arrival order, lost ones included.
+func (fr *fakeRelay) seenDiscoveryNonces() []uint32 {
+	fr.mu.Lock()
+	defer fr.mu.Unlock()
+	return append([]uint32(nil), fr.discoveryNonces...)
 }
 
 // handleRequest answers a Request with a Membership Query.
