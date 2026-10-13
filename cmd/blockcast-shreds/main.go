@@ -63,10 +63,16 @@ const defaultReportInterval = 30 * time.Second
 // 4.3 MiB.
 const maxReportInterval = 5 * time.Minute
 
+// defaultFeedRcvBuf is the receive buffer each feed socket asks for. On
+// 2026-10-13 a receiver at the ~208 KiB kernel default dropped 1–4% of the union
+// feed's datagrams at the socket, and they scored as erasure (BLO-41705); with
+// 8 MiB the same host dropped 0.083%. It matches shred-txfeed's --rcvbuf.
+const defaultFeedRcvBuf = 8 << 20
+
 const help = `blockcast-shreds demo mode
 
 Usage:
-  blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT|NAME=ssm://SOURCE@GROUP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--json]
+  blockcast-shreds [--mode shred|generic] [--feed NAME=IP:PORT|NAME=ssm://SOURCE@GROUP:PORT]... [--listen IP:PORT] [--dest-ip-ports IP:PORT,...] [--http-addr IP:PORT] [--health-max-age DURATION] [--retain DURATION] [--rcvbuf BYTES] [--json]
    blockcast-shreds [--broker-url URL --gw-uuid UUID --broker-client-cert FILE --broker-client-key FILE]
   blockcast-shreds selftest --fixture [--json]
   blockcast-shreds selftest --generic [--json]
@@ -85,6 +91,13 @@ multicast group natively instead of binding a unicast port. Adding
 ?relay=IP[:PORT] (default port 2268) falls back to an AMT tunnel through that
 relay when no native traffic arrives within the probe window; ?iface=NAME pins
 the join to one interface.
+
+--rcvbuf sets every feed socket's receive buffer (default 8 MiB). With
+CAP_NET_ADMIN the receiver forces it; without, the kernel caps it at
+net.core.rmem_max and a startup warning says so. A receiver left near the
+~208 KiB kernel default drops datagrams at its socket during shred bursts, and
+they score as erasure that is really local. 0 keeps the kernel default, and so
+does a host whose net.core.rmem_default already allocates more.
 
 --dest-ip-ports targets are validator TVU ports and receive canonical Solana
 shreds: a version-4 shred-forwarder frame is delivered with its 28-byte header
@@ -147,6 +160,7 @@ type feeds []string
 type feed struct {
 	name    string
 	address string
+	rcvbuf  int // receive buffer bytes requested for the feed's socket; 0 keeps the kernel default
 }
 
 func (f *feeds) String() string { return strings.Join(*f, ",") }
@@ -203,6 +217,8 @@ func run(args []string) error {
 	reportInterval := flags.Duration("report-interval", defaultReportInterval,
 		"how often the delivery window is drained into /metrics; matches the broker heartbeat cadence")
 	retention := flags.Duration("retain", shred.DefaultRetention, "how far behind the newest arrival to keep per-shred scoring state; see README")
+	rcvbuf := flags.Int("rcvbuf", defaultFeedRcvBuf,
+		"receive buffer bytes for every feed socket: SO_RCVBUFFORCE with CAP_NET_ADMIN, else SO_RCVBUF capped by net.core.rmem_max; 0 keeps the kernel default, as does a larger net.core.rmem_default")
 	deliveryWAL := flags.String("delivery-wal", "",
 		"path to the delivery-session sequence WAL; enables per-destination billing records, requires --delivery-records")
 	deliveryRecords := flags.String("delivery-records", "",
@@ -245,6 +261,9 @@ func run(args []string) error {
 	if *reportInterval > maxReportInterval {
 		return fmt.Errorf("--report-interval must not exceed %s: erasure_fraction is a windowed gauge, so a longer window stops being a signal an operator can alert on, and one score event per completed FEC set is retained until the window drains", maxReportInterval)
 	}
+	if *rcvbuf < 0 {
+		return fmt.Errorf("--rcvbuf must not be negative, got %d", *rcvbuf)
+	}
 	if err := score.validate(); err != nil {
 		return err
 	}
@@ -271,7 +290,7 @@ func run(args []string) error {
 					"scoring, so the grace would be accepted and silently ignored")
 		}
 	}
-	configured := []feed{{name: "default", address: listen}}
+	configured := []feed{{name: "default", address: listen, rcvbuf: *rcvbuf}}
 	if len(configuredFeeds) != 0 {
 		configured = configured[:0]
 		seen := make(map[string]struct{}, len(configuredFeeds))
@@ -284,7 +303,7 @@ func run(args []string) error {
 				return fmt.Errorf("duplicate --feed name %q", name)
 			}
 			seen[name] = struct{}{}
-			configured = append(configured, feed{name: name, address: address})
+			configured = append(configured, feed{name: name, address: address, rcvbuf: *rcvbuf})
 		}
 	}
 	if healthMaxAge <= 0 {
@@ -1188,6 +1207,7 @@ var openFeedFunc = openFeed
 // that relay when no native traffic arrives within the probe window, and
 // ?iface=NAME pins the join to one interface on a multi-homed host.
 func openFeed(f feed) (net.PacketConn, error) {
+	f.rcvbuf = feedRcvBuf(f.rcvbuf)
 	if !strings.HasPrefix(f.address, "ssm://") {
 		udpAddress, err := net.ResolveUDPAddr("udp", f.address)
 		if err != nil {
@@ -1197,9 +1217,13 @@ func openFeed(f feed) (net.PacketConn, error) {
 		if err != nil {
 			return nil, fmt.Errorf("listen feed %q at %q: %w", f.name, f.address, err)
 		}
+		if err := setFeedReceiveBuffer(conn, f); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
 		return conn, nil
 	}
-	conn, err := ssmFeed(f.address)
+	conn, err := ssmFeed(f.address, f.rcvbuf)
 	if err != nil {
 		return nil, fmt.Errorf("feed %q: %w", f.name, err)
 	}
@@ -1210,8 +1234,60 @@ func openFeed(f feed) (net.PacketConn, error) {
 	return conn, nil
 }
 
-// ssmFeed parses an ssm:// feed address into an unopened ManagedConn.
-func ssmFeed(address string) (*amt.ManagedConn, error) {
+// rmemDefaultFile is net.core.rmem_default for this process's network namespace.
+// A variable so a test can point it at a fake.
+var rmemDefaultFile = "/proc/sys/net/core/rmem_default"
+
+// feedRcvBuf returns the receive buffer a feed should request: n, or 0 (keep the
+// kernel default) when net.core.rmem_default already allocates at least what n
+// would. Linux allocates twice a setsockopt request, so n is worth 2n of default.
+// install.md used to have operators raise rmem_default to 128 MiB, and on such a
+// host the 8 MiB request would shrink every feed's buffer eightfold.
+func feedRcvBuf(n int) int {
+	b, err := os.ReadFile(rmemDefaultFile)
+	if err != nil {
+		return n
+	}
+	def, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || def < 2*n {
+		return n
+	}
+	return 0
+}
+
+// setFeedReceiveBuffer gives a unicast feed socket the receive buffer an ssm://
+// feed's ManagedConn requests. A clamp (no CAP_NET_ADMIN and a net.core.rmem_max
+// below the request) is a warning, not an error: the feed still works, it just
+// drops the bursts a bigger buffer would absorb.
+func setFeedReceiveBuffer(conn *net.UDPConn, f feed) error {
+	if f.rcvbuf <= 0 {
+		return nil
+	}
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("feed %q receive buffer: %w", f.name, err)
+	}
+	var setErr error
+	if err := raw.Control(func(fd uintptr) { setErr = amt.SetForcedReceiveBuffer(int(fd), f.rcvbuf) }); err != nil {
+		return fmt.Errorf("feed %q receive buffer: %w", f.name, err)
+	}
+	var clamp *amt.BufferClampedError
+	if errors.As(setErr, &clamp) {
+		fmt.Fprintf(os.Stderr, "blockcast-shreds: warning: feed %q receive buffer clamped to %d of the %d bytes requested; "+
+			"raise net.core.rmem_max or grant CAP_NET_ADMIN, or bursts drop at the socket and score as erasure\n",
+			f.name, clamp.EffectiveCeiling(), clamp.Requested)
+		return nil
+	}
+	if setErr != nil {
+		return fmt.Errorf("feed %q receive buffer: %w", f.name, setErr)
+	}
+	return nil
+}
+
+// ssmFeed parses an ssm:// feed address into an unopened ManagedConn that asks
+// for rcvbuf bytes of receive buffer on whichever socket Open lands on: the
+// native join and the AMT tunnel both apply it and warn on a clamp.
+func ssmFeed(address string, rcvbuf int) (*amt.ManagedConn, error) {
 	u, err := url.Parse(address)
 	if err != nil {
 		return nil, fmt.Errorf("parse %q: %w", address, err)
@@ -1228,7 +1304,7 @@ func ssmFeed(address string) (*amt.ManagedConn, error) {
 	if err != nil || !group.Addr().Is4() || !group.Addr().IsMulticast() || group.Port() == 0 {
 		return nil, usage
 	}
-	conn := &amt.ManagedConn{SrcAddr: source, GroupAddr: group.Addr(), GroupPort: group.Port(), Mode: amt.AMTModeNative}
+	conn := &amt.ManagedConn{SrcAddr: source, GroupAddr: group.Addr(), GroupPort: group.Port(), Mode: amt.AMTModeNative, RcvBufBytes: rcvbuf}
 	// Anything but a well-formed relay/iface query would otherwise parse clean
 	// as a native-only feed: a misspelt key, a bad escape, a ';' separator, a
 	// fragment or an empty ?relay= (an unset ${RELAY}) silently drops the AMT

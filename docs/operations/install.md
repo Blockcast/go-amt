@@ -228,6 +228,7 @@ remaining checks and reports the delivery assertion as `UNVERIFIED`.
 | `--erasure-grace-ms` | `400` | Delay after a slot boundary before a FEC set is scored, in milliseconds. A set still below 32 of 64 shreds at `slot_boundary + grace` scores erased. Raising it waits longer for late shreds before calling a set erased; lowering it reports erasure sooner and will call slow-but-complete sets erased. Published as `bcast_shred_gw_erasure_grace_milliseconds` so a scrape records which grace produced the fraction. **Rejected at startup under `--mode generic`**, which builds no trackers, so the grace would be accepted and silently ignored. **Upgrade note:** this is a breaking startup change. A deployment that templates the flag unconditionally and runs `--mode generic` goes from "starts, flag ignored" to "refuses to start" — grep your unit files and chart values for `--erasure-grace-ms` before rolling out, and drop it from the generic-mode invocations. Only an *explicitly set* flag is rejected (`flags.Visit`), so the default still applies and a plain generic invocation is unaffected. |
 | `--report-interval` | `30s` | How often the delivery window is drained into `/metrics`. Matches the broker heartbeat cadence so the two SLA surfaces publish the same window; the scrape shows the last **drained** window, not a live partial count. Capped at 5m: `erasure_fraction` is a windowed gauge, so an hour-long window averages a bad minute into 59 good ones and stops being alertable. Retention is a secondary concern — one score event per completed FEC set is held until the drain, about 4.3 MiB at 5m and 30k shred/s. |
 | `--retain` | `2s` | How far behind the newest arrival to keep per-shred scoring state. This is what bounds the receiver's memory: duplicate recognition and FEC-set accounting only see arrivals inside the window, so raising it costs memory and lowers it loses duplicate detection across feeds. It does **not** bound completion percentiles: a set is aged on its newest arrival, so one that keeps receiving is never evicted and its first-to-32nd span can exceed the histogram's 4.194304s ceiling at any window, including the default (32 shreds 200ms apart span 6.2s). When that happens the receipt's `completions_above_ceiling` is nonzero and `time_to_32nd_shred` understates — check it rather than the flag. Measured on the arrival clock, not slot distance — a capture's slot numbers jump by hundreds and can arrive below their neighbours, so a slot-distance window reads those as ancient and drops them. Must be positive. |
+| `--rcvbuf` | `8388608` | Receive buffer, in bytes, requested on every feed socket — unicast `--feed`/`--listen` sockets and `ssm://` feeds, native or over AMT. With `CAP_NET_ADMIN` the receiver uses `SO_RCVBUFFORCE` and gets the full size; without it the kernel caps the request at `net.core.rmem_max` and a startup warning names the feed and the cap (see [Receive buffer](#receive-buffer)). `0` keeps the kernel default, and so does a host whose `net.core.rmem_default` already allocates at least what the request would (twice its size, as Linux allocates), so an upgrade never shrinks a tuned host's buffers. Must not be negative. |
 | `--delivery-wal` | *(none)* | Path to the delivery-session sequence WAL. Setting it enables per-destination billing records; requires `--delivery-records` and at least one `--dest-ip-ports` destination. The WAL makes the record `seq` durable across a restart, which is what lets a replayed record be deduplicated by `(session_id, seq)` instead of double-billing. Put it on persistent storage: on tmpfs a restart silently restarts sequences. |
 | `--delivery-records` | *(none)* | Path to the delivery-session record file, one JSON record per line, appended and fsynced. Requires `--delivery-wal`. Created `0600` — records name subscribers and their traffic volumes. `bytes_out`/`packets_out` are **deltas** covering only the interval since the previous record; `duration_ms` is **cumulative** from session open. The rollup is therefore `SUM(bytes_out)` but `MAX(duration_ms)`; swapping them silently mis-bills. |
 | `--delivery-collector` | *(none)* | magma `CDNILogService` `host:port` to ship delivery-session records to, e.g. `blockcastd:50052`. Empty — the default — keeps records local-only in `--delivery-records`, which stays a supported offline/local-ledger mode. **Not** a direct POST to Traffic Ops: the relay namespace is network-isolated from TO by a default-deny netpol, so records reach TO only by this collector forwarding the `DELIVERY_SESSION` tier onward. The local ledger keeps receiving every record alongside the collector; a collector failure retransmits the record verbatim rather than dropping the interval. **That independence is per-record, not per-interval.** `Reporter.Tick` loops targets serially (`reporter.go:113`) and each iteration's first `Ship` is synchronous through the tee, so a collector that accepts TCP and then never answers — a wedged pod, or a netpol that drops after accept — costs the full `defaultCollectorTimeout` (10s) per target per tick. At 55 destinations (`RevisitThresholdDestinations`, the largest fan-out that starts without a capacity warning) that is ~550s per tick against the 30s `--report-interval` default, an ~18x overrun that stalls the **local ledger** too, because the next tick is behind 55 timeouts. Nothing is mis-billed or lost — `drainPending` fails, `Tick` continues, the watermark is not advanced and the delta rolls forward intact — so this is a rate collapse, not a correctness failure. Connection-refused returns fast, so it needs the black-hole mode specifically. Documented rather than fixed: bounding the whole tick, or scaling the timeout by target count, would make this row's promise true instead of qualified. **The requirement set is larger than it looks, and partly transitive — read it before templating this flag.** Directly: `--delivery-wal`, `--delivery-records`, at least one `--dest-ip-ports` destination, `--delivery-content-id`, `--delivery-latency-tier`, `--delivery-transport`, `--delivery-collector-cert` and `--delivery-collector-key`. Then the gateway identity, which is deliberately `--gw-uuid` rather than a second flag that could disagree with the heartbeat's — and `--gw-uuid` in turn requires `--broker-url`, `--broker-client-cert`, `--broker-client-key` and `--mode shred`. **So enabling the collector today also means standing up the gateway-heartbeat stack.** There is no collector-without-broker deployment: ask for one rather than setting `--gw-uuid` alone, which fails at startup with `--gw-uuid requires --broker-url`, an error naming a flag you never set. |
@@ -289,23 +290,29 @@ the fix is a real retention window rather than a blunt cap.
 
 ### Receive buffer
 
-The receiver does not currently set `SO_RCVBUF`. At mainnet shred rates a small
-kernel default is the most likely cause of loss that shows up as erasure but is
-actually local. Size it at the host:
+Every feed socket asks for `--rcvbuf` bytes, 8 MiB by default. At mainnet shred
+rates a small buffer is the most likely cause of loss that shows up as erasure
+but is actually local: on 2026-10-13 a receiver left at the ~208 KiB kernel
+default dropped 1–4% of the union feed's datagrams at the socket, against 0.083%
+with 8 MiB on the same host
+([BLO-41705](https://paperclip.blockcast.net/BLO/issues/BLO-41705)).
+
+With `CAP_NET_ADMIN` the request is forced past `net.core.rmem_max`. Without it
+the kernel caps the request there and the receiver warns at startup —
+`receive buffer clamped`, naming the feed — so raise the cap at the host:
 
 ```sh
 sudo sysctl -w net.core.rmem_max=134217728
-sudo sysctl -w net.core.rmem_default=134217728
 ```
 
-Losses inside the receiver — as opposed to before it — appear as
-`fanout_dropped_packets_total`, never as silent gaps.
+A host that raised `net.core.rmem_default` instead, as this page used to advise,
+keeps that default: the receiver skips a request that would allocate less than
+it. For more than 8 MiB per feed, raise `--rcvbuf`.
 
-Sizing it at the host is the only lever today. A per-socket setter exists and is
-tested (`receiver.OpenUDPFlow`, `RcvBufBytes`), but the shipped binary opens its
-ingress socket with bare `net.ListenUDP` and never calls it — the same
-built-but-unwired shape the erasure metrics had before
-[BLO-28442](https://paperclip.blockcast.net/BLO/issues/BLO-28442) wired them.
+Losses inside the receiver — as opposed to before it — appear as
+`fanout_dropped_packets_total`, never as silent gaps. Losses at the socket appear
+in the host's `UdpRcvbufErrors` (`nstat`) and in the `d` field of
+`ss -uamn` for the feed's port.
 
 ## What the score actually means
 

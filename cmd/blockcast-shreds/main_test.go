@@ -861,7 +861,7 @@ func TestScoringValidate(t *testing.T) {
 }
 
 func TestSSMFeedAddress(t *testing.T) {
-	conn, err := ssmFeed("ssm://69.25.95.102@232.0.0.1:5001")
+	conn, err := ssmFeed("ssm://69.25.95.102@232.0.0.1:5001", 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -873,8 +873,13 @@ func TestSSMFeedAddress(t *testing.T) {
 	if conn.Mode != amt.AMTModeNative || len(conn.RelayAddr.IP) != 0 {
 		t.Fatalf("no-relay feed: mode %v relay %v, want native with no relay", conn.Mode, conn.RelayAddr)
 	}
+	// --rcvbuf reaches whichever socket Open lands on through RcvBufBytes; the
+	// amt package applies it on the native join and on the AMT tunnel alike.
+	if conn.RcvBufBytes != 1<<20 {
+		t.Fatalf("RcvBufBytes = %d, want the requested %d", conn.RcvBufBytes, 1<<20)
+	}
 
-	conn, err = ssmFeed("ssm://69.25.95.102@232.0.0.1:5001?relay=69.25.95.128")
+	conn, err = ssmFeed("ssm://69.25.95.102@232.0.0.1:5001?relay=69.25.95.128", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -898,7 +903,7 @@ func TestSSMFeedAddress(t *testing.T) {
 		"ssm://69.25.95.102@232.0.0.1:5001?relay=69.25.95.128:",         // empty relay port
 		"ssm://69.25.95.102@232.0.0.1:5001?relay=1.1.1.1&relay=2.2.2.2", // two relays
 	} {
-		if _, err := ssmFeed(bad); err == nil {
+		if _, err := ssmFeed(bad, 0); err == nil {
 			t.Errorf("ssmFeed(%q) accepted", bad)
 		}
 	}

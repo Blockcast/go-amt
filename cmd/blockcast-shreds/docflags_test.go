@@ -159,6 +159,7 @@ func TestDocumentedFlagsAreAccepted(t *testing.T) {
 		"rights-basis":   {"--rights-basis"},
 		"health-max-age": {"--health-max-age"},
 		"retain":         {"--retain"},
+		"rcvbuf":         {"--rcvbuf"},
 		// Probed with no value, like the other value-taking flags. A probe that
 		// supplied a real path would parse, fall through to listenAndScore and
 		// hang the package on the test timeout -- the trap TestUndefinedFlagIsRejected
