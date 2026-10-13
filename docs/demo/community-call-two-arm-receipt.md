@@ -11,10 +11,13 @@ complete alone but the union could.
 
 ## The claim
 
-One client, two feeds, first-arrival-wins. The baseline arm is the raw turbine
-path; the second arm carries the additional ingest paths. The receipt reports
+One client, two feeds, first-arrival-wins. The baseline arm is the production
+forwarder path (`prod`); the second arm carries the additional ingest paths. The receipt reports
 each arm's own erasure fraction, the union's, and the sets the extra arm
 rescued. That last number is the claim, and it is a measurement of this run.
+
+The `prod` arm's loss is ours: our own forwarder and receive-socket drops. Say
+so when it is on screen, and never narrate it as Turbine loss.
 
 ## What to run
 
@@ -70,13 +73,22 @@ two-arm) read prod **51.5%** (`9898/19234`), union arm **3.2%** (`618/19234`,
 time to 32nd shred p50 **25ms**. The rescue headline held; the union figure
 did not. Restore the feed or re-measure on the day before recording.
 
-| Measure | prod / raw turbine | union | Notes |
+The re-rehearsal the same night (same receiver, four runs, receipts archived
+on BLO-27267) moved the union arm to **0.28–2.38%**, and to **0.28–1.47%**
+once the receiver's sockets got 8 MiB buffers. The prod arm stayed at
+**32.8–33.8%**. Raising the buffer is what fixes the two-arm receiver: host
+`UdpRcvbufErrors` fell from +54,026 to +1,331 across 150 s. The union-only
+residual of ~0.9–1.5% looks like the feed, not the receiver: a short run with
+its buffer clamped to the kernel default read 0.87%, inside the raised runs'
+range. That run covered only 2,410 sets, so treat it as a hint, not a result.
+
+| Measure | prod arm | union | Notes |
 |---|---:|---:|---|
 | Unrecoverable FEC sets | 3–17% observed | ~0.06–0.3% observed | Show the run's own numerator and denominator. |
 | `rescued_sets` | — | record live | Sets erased on prod alone, complete in the union. The headline. |
 | `gap_closed_fraction` | — | record live | `rescued_sets` over total sets. |
 | Time to 32nd shred, p50 | record live | ~21ms reference | Time to the 32nd shred. **Not** leader-to-receiver latency. |
-| Turbine burst | 54% burst | near 0% same window | Keep the burst on the chart; do not smooth it. |
+| Prod-arm burst | 54% burst | near 0% same window | Keep the burst on the chart; do not smooth it. |
 | At-source union control | n/a | 0.063% (`38/60,597`) | 2026-08-14 control, **not** a receiver result. |
 | Receiver headroom | ≥~80 Mbit/s | same | A residential receiver read 33% erasure at ~23 Mbit/s effective against a ~70 Mbit/s feed. That is the receiver, not the feed. |
 
@@ -86,8 +98,8 @@ Two numbers on screen will be questioned, so state them before they are:
   means: a set still under 32 of 64 shreds at the slot boundary plus this grace.
   It is on `/metrics`, so point at it rather than asserting it.
 - **The fixture's own 28.57%.** It is a property of the bundled capture — a
-  determinism control, not a quality result. Shown 30 seconds before "union is
-  ~0.06%" it invites exactly the wrong inference, so name it as a replay
+  determinism control, not a quality result. Shown 30 seconds before the union's
+  own figure it invites exactly the wrong inference, so name it as a replay
   artifact when it appears.
 
 ## Reading the word "union" on screen
