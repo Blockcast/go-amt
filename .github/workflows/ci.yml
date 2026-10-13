@@ -950,8 +950,8 @@ jobs:
   # of the cmd/ mains, blockcast-shreds included, for macOS. The ios step in
   # mobile-typecheck reaches sockbuf_darwin.go but swaps the listeners for the
   # mobile ones and builds the root package only. Unlike ios, darwin links
-  # under CGO_ENABLED=0, so ./... works. Darwin's ENOBUFS-to-clamp logic is
-  # tested on linux through retryAtMaxsockbuf (sockbuf_test.go); no job here
+  # under CGO_ENABLED=0, so ./... works. Darwin's buffer-clamp logic is
+  # tested on linux through setXNUBufferAtLeast (sockbuf_test.go); no job here
   # runs a test on macOS.
   cross-build:
     runs-on: ubuntu-latest

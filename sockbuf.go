@@ -19,11 +19,12 @@ import (
 // and still be a clamp. EffectiveCeiling unhalves it into the same units as
 // Requested, which is the number an operator compares against rmem_max.
 //
-// Darwin does not clamp silently: it has no FORCE variant, and a
-// SO_RCVBUF/SO_SNDBUF above kern.ipc.maxsockbuf*2048/2304 fails with ENOBUFS.
-// retryAtMaxsockbuf then retries at that ceiling and returns this error with
-// Got set to the accepted size. Darwin's getsockopt does not double, so there
-// EffectiveCeiling is Got itself.
+// Darwin has no FORCE variant. Its kernel clamps an oversized
+// SO_RCVBUF/SO_SNDBUF to kern.ipc.maxsockbuf without an error on macOS 14.4
+// and later, and refuses it with ENOBUFS on earlier releases.
+// setXNUBufferAtLeast handles both and reads the size back, and returns this
+// error with Got set to that readback. Darwin's getsockopt does not double, so
+// there EffectiveCeiling is Got itself.
 type BufferClampedError struct {
 	Requested int
 	Got       int
