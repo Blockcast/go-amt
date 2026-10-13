@@ -4,6 +4,9 @@ package main
 
 import (
 	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -62,6 +65,55 @@ func TestUnicastFeedGetsReceiveBuffer(t *testing.T) {
 	defer unset.Close()
 	if got := rcvBuf(t, unset.(*net.UDPConn)); got != kernelDefault {
 		t.Fatalf("--rcvbuf 0 feed SO_RCVBUF = %d, want the kernel default %d", got, kernelDefault)
+	}
+}
+
+// TestRaisedHostDefaultIsNotShrunk: install.md used to have operators raise
+// net.core.rmem_default to 128 MiB. Linux allocates twice a setsockopt request,
+// so on such a host the 8 MiB request would shrink every feed socket. openFeed
+// must leave a default that already covers the request alone.
+func TestRaisedHostDefaultIsNotShrunk(t *testing.T) {
+	const want = 1 << 20
+	fake := filepath.Join(t.TempDir(), "rmem_default")
+	defer func(old string) { rmemDefaultFile = old }(rmemDefaultFile)
+	rmemDefaultFile = fake
+	setDefault := func(v string) {
+		t.Helper()
+		if err := os.WriteFile(fake, []byte(v), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setDefault("134217728\n")
+	control, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer control.Close()
+	kernelDefault := rcvBuf(t, control)
+	conn, err := openFeed(feed{name: "tap", address: "127.0.0.1:0", rcvbuf: want})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if got := rcvBuf(t, conn.(*net.UDPConn)); got != kernelDefault {
+		t.Fatalf("feed SO_RCVBUF = %d under a raised rmem_default, want the default %d left alone", got, kernelDefault)
+	}
+
+	// The threshold is what the request would allocate, twice its size.
+	for v, wantReq := range map[string]int{
+		strconv.Itoa(2 * want):   0,
+		strconv.Itoa(2*want - 1): want,
+		"not a number":           want,
+	} {
+		setDefault(v)
+		if got := feedRcvBuf(want); got != wantReq {
+			t.Errorf("rmem_default %q: feedRcvBuf(%d) = %d, want %d", v, want, got, wantReq)
+		}
+	}
+	rmemDefaultFile = filepath.Join(t.TempDir(), "absent")
+	if got := feedRcvBuf(want); got != want {
+		t.Errorf("no rmem_default file: feedRcvBuf(%d) = %d, want the request sent", want, got)
 	}
 }
 

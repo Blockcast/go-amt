@@ -96,7 +96,8 @@ the join to one interface.
 CAP_NET_ADMIN the receiver forces it; without, the kernel caps it at
 net.core.rmem_max and a startup warning says so. A receiver left near the
 ~208 KiB kernel default drops datagrams at its socket during shred bursts, and
-they score as erasure that is really local. 0 keeps the kernel default.
+they score as erasure that is really local. 0 keeps the kernel default, and so
+does a host whose net.core.rmem_default already allocates more.
 
 --dest-ip-ports targets are validator TVU ports and receive canonical Solana
 shreds: a version-4 shred-forwarder frame is delivered with its 28-byte header
@@ -217,7 +218,7 @@ func run(args []string) error {
 		"how often the delivery window is drained into /metrics; matches the broker heartbeat cadence")
 	retention := flags.Duration("retain", shred.DefaultRetention, "how far behind the newest arrival to keep per-shred scoring state; see README")
 	rcvbuf := flags.Int("rcvbuf", defaultFeedRcvBuf,
-		"receive buffer bytes for every feed socket: SO_RCVBUFFORCE with CAP_NET_ADMIN, else SO_RCVBUF capped by net.core.rmem_max; 0 keeps the kernel default")
+		"receive buffer bytes for every feed socket: SO_RCVBUFFORCE with CAP_NET_ADMIN, else SO_RCVBUF capped by net.core.rmem_max; 0 keeps the kernel default, as does a larger net.core.rmem_default")
 	deliveryWAL := flags.String("delivery-wal", "",
 		"path to the delivery-session sequence WAL; enables per-destination billing records, requires --delivery-records")
 	deliveryRecords := flags.String("delivery-records", "",
@@ -1206,6 +1207,7 @@ var openFeedFunc = openFeed
 // that relay when no native traffic arrives within the probe window, and
 // ?iface=NAME pins the join to one interface on a multi-homed host.
 func openFeed(f feed) (net.PacketConn, error) {
+	f.rcvbuf = feedRcvBuf(f.rcvbuf)
 	if !strings.HasPrefix(f.address, "ssm://") {
 		udpAddress, err := net.ResolveUDPAddr("udp", f.address)
 		if err != nil {
@@ -1230,6 +1232,27 @@ func openFeed(f feed) (net.PacketConn, error) {
 		return nil, fmt.Errorf("join feed %q at %q: %w", f.name, f.address, err)
 	}
 	return conn, nil
+}
+
+// rmemDefaultFile is net.core.rmem_default for this process's network namespace.
+// A variable so a test can point it at a fake.
+var rmemDefaultFile = "/proc/sys/net/core/rmem_default"
+
+// feedRcvBuf returns the receive buffer a feed should request: n, or 0 (keep the
+// kernel default) when net.core.rmem_default already allocates at least what n
+// would. Linux allocates twice a setsockopt request, so n is worth 2n of default.
+// install.md used to have operators raise rmem_default to 128 MiB, and on such a
+// host the 8 MiB request would shrink every feed's buffer eightfold.
+func feedRcvBuf(n int) int {
+	b, err := os.ReadFile(rmemDefaultFile)
+	if err != nil {
+		return n
+	}
+	def, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || def < 2*n {
+		return n
+	}
+	return 0
 }
 
 // setFeedReceiveBuffer gives a unicast feed socket the receive buffer an ssm://
