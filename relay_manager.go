@@ -14,8 +14,6 @@ import (
 
 	m "github.com/blockcast/go-amt/messages"
 	"github.com/cenkalti/backoff/v4"
-	"github.com/google/gopacket"
-	"github.com/google/gopacket/layers"
 	"github.com/puzpuzpuz/xsync/v3"
 	"go.uber.org/atomic"
 )
@@ -225,7 +223,9 @@ type RelayManagerConfig struct {
 	// DNSTimeout is the timeout for DRIAD DNS queries
 	DNSTimeout time.Duration
 
-	// MTU is the maximum transmission unit
+	// MTU is the maximum transmission unit. It sizes the handshake's read
+	// buffer; the data read loop uses tunnelReadBuffer, since the relay's
+	// fragmented data messages reach it reassembled past any MTU.
 	MTU int
 
 	// TransportConfig for transport layer
@@ -301,6 +301,7 @@ type RelayManagerStats struct {
 	LastReconnectTime time.Time
 	TransportType     TransportType
 	ProtocolType      ProtocolType
+	Decap             DecapStats
 }
 
 // RelayManager manages a shared AMT relay connection for multiple subscriptions
@@ -341,6 +342,10 @@ type RelayManager struct {
 	// reportRetransmitDelay picks the delay before a state-change report is
 	// sent again (RFC 3376 §5.1). A test replaces it before Open.
 	reportRetransmitDelay func() time.Duration
+
+	// decap parses the inner packet of each data message, reassembling IPv4
+	// fragments.
+	decap decapsulator
 }
 
 // NewRelayManager creates a new RelayManager
@@ -777,6 +782,7 @@ func (rm *RelayManager) Stats() RelayManagerStats {
 		TotalPackets:      totalPackets,
 		TotalBytes:        totalBytes,
 		ReconnectCount:    rm.reconnectCount.Load(),
+		Decap:             rm.decap.stats(),
 	}
 
 	if rm.transport != nil {
@@ -1064,7 +1070,7 @@ func (rm *RelayManager) generationActive(generation uint64) bool {
 // readLoop continuously reads from the transport
 func (rm *RelayManager) readLoop(ctx context.Context, generation uint64) {
 	defer rm.loopsWG.Done()
-	buffer := make([]byte, rm.config.MTU)
+	buffer := make([]byte, tunnelReadBuffer)
 
 	for {
 		if !rm.generationActive(generation) {
@@ -1123,28 +1129,14 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 	if len(data) < m.DataMsgHdrLen {
 		return
 	}
-
-	// Parse IP/UDP headers to extract (S,G,Port)
-	pkt := gopacket.NewPacket(data[m.DataMsgHdrLen:], layers.LayerTypeIPv4, gopacket.NoCopy)
-	ipLayer := pkt.Layer(layers.LayerTypeIPv4)
-	if ipLayer == nil {
+	d, ok := rm.decap.decap(data[m.DataMsgHdrLen:], time.Now())
+	if !ok {
 		return
 	}
-	ip := ipLayer.(*layers.IPv4)
-
-	udpLayer := pkt.Layer(layers.LayerTypeUDP)
-	if udpLayer == nil {
-		return
-	}
-	udp := udpLayer.(*layers.UDP)
-
-	srcAddr, _ := netip.AddrFromSlice(ip.SrcIP)
-	dstAddr, _ := netip.AddrFromSlice(ip.DstIP)
-
 	key := SubscriptionKey{
-		Source: srcAddr,
-		Group:  dstAddr,
-		Port:   uint16(udp.DstPort),
+		Source: d.src,
+		Group:  d.dst,
+		Port:   d.dport,
 	}
 
 	sub, ok := rm.subscriptions.Load(key)
@@ -1161,17 +1153,10 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 		return
 	}
 
-	// Extract and own the payload before the read loop reuses its receive buffer.
-	payload := pkt.ApplicationLayer()
-	if payload == nil {
-		return
-	}
-	payloadData := append([]byte(nil), payload.Payload()...)
-
-	// ip.SrcIP aliases the read buffer too (gopacket.NoCopy), and the address we
-	// hand out outlives this iteration via dataChan. Own those bytes as well.
-	srcIP := append(net.IP(nil), ip.SrcIP...)
-	srcPort := int(udp.SrcPort)
+	// Own the payload before the read loop reuses its receive buffer.
+	payloadData := append([]byte(nil), d.payload...)
+	srcIP := net.IP(d.src.AsSlice())
+	srcPort := int(d.sport)
 
 	// Update stats
 	sub.packetsReceived.Add(1)

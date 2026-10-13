@@ -711,6 +711,7 @@ func (mc *ManagedConn) Stats() *ManagedConnStats {
 		stats.RelayState = rmStats.State.String()
 		stats.ReconnectCount = rmStats.ReconnectCount
 		stats.TransportType = string(rmStats.TransportType)
+		stats.Decap = rmStats.Decap
 	}
 
 	return stats
@@ -725,6 +726,8 @@ type ManagedConnStats struct {
 	RelayState      string
 	ReconnectCount  uint64
 	TransportType   string
+	// Decap is the relay's data path, shared by every ManagedConn to it.
+	Decap DecapStats
 }
 
 // RelayManager returns the underlying RelayManager (for advanced use)
