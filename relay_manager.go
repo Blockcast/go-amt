@@ -124,9 +124,17 @@ type Subscription struct {
 	state     atomic.Value // SubscriptionState
 	callbacks SubscriptionCallbacks
 	dataChan  chan *DataPacket
-	ctx       context.Context
-	cancel    context.CancelFunc
-	manager   *RelayManager
+	// dataMu orders sends on dataChan against its close. The read loop sends
+	// under the read lock and skips once dataClosed is set; Unsubscribe and
+	// Close close the channel once, under the write lock. Without it a teardown
+	// could close the channel between the read loop's Active check and its
+	// send, and a send on a closed channel panics even in a select with a
+	// default case (BLO-45585).
+	dataMu     sync.RWMutex
+	dataClosed bool
+	ctx        context.Context
+	cancel     context.CancelFunc
+	manager    *RelayManager
 
 	// Statistics
 	packetsReceived atomic.Uint64
@@ -165,6 +173,31 @@ type SubscriptionStats struct {
 // DataChan returns the channel for receiving data packets
 func (s *Subscription) DataChan() <-chan *DataPacket {
 	return s.dataChan
+}
+
+// deliver queues p without blocking. It drops p when the channel is full or the
+// subscription has been torn down.
+func (s *Subscription) deliver(p *DataPacket) {
+	s.dataMu.RLock()
+	defer s.dataMu.RUnlock()
+	if s.dataClosed {
+		return
+	}
+	select {
+	case s.dataChan <- p:
+	default:
+		// Channel full, drop packet
+	}
+}
+
+// closeData closes dataChan once, after any in-flight deliver has returned.
+func (s *Subscription) closeData() {
+	s.dataMu.Lock()
+	defer s.dataMu.Unlock()
+	if !s.dataClosed {
+		s.dataClosed = true
+		close(s.dataChan)
+	}
 }
 
 func (s *Subscription) setState(state SubscriptionState) {
@@ -455,7 +488,7 @@ func (rm *RelayManager) Close() error {
 		if sub.cancel != nil {
 			sub.cancel()
 		}
-		close(sub.dataChan)
+		sub.closeData()
 		return true
 	})
 	rm.subscriptions.Clear()
@@ -561,7 +594,7 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	if sub.cancel != nil {
 		sub.cancel()
 	}
-	close(sub.dataChan)
+	sub.closeData()
 
 	// A relay keeps the previous membership until it receives a leave report.
 	// Preserve other sources in the same group with a source-specific leave.
@@ -1056,15 +1089,11 @@ func (rm *RelayManager) routeDataToSubscription(data []byte) {
 	}
 
 	// Also send to channel (non-blocking)
-	select {
-	case sub.dataChan <- &DataPacket{
+	sub.deliver(&DataPacket{
 		Data:      payloadData,
 		Source:    &net.UDPAddr{IP: srcIP, Port: srcPort},
 		Timestamp: time.Now(),
-	}:
-	default:
-		// Channel full, drop packet
-	}
+	})
 }
 
 // keepaliveLoop sends periodic keepalive requests
