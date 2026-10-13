@@ -1124,6 +1124,13 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 			_ = conn.Close()
 		}
 		mu.Unlock()
+		// Closing an AMT feed sends its leave and schedules the RFC 3376
+		// retransmission, which this process would otherwise exit before
+		// sending. A lost leave keeps the relay streaming here for minutes
+		// (BLO-45585).
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = amt.WaitRelayLeaves(ctx)
 	}
 	// Feeds open concurrently. An ssm:// feed with ?relay= can take a whole
 	// probe window to open, so opening in turn would stagger the joins by a
