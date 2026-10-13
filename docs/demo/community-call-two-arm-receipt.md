@@ -61,7 +61,14 @@ narrative; the JSON reports percentiles in nanoseconds (`completion_p50_ns:
 ## Expected numbers
 
 Guardrails for the recording, not pass criteria. Live values come from the
-rehearsal.
+rehearsal. **Narrate the rehearsal's numbers, never this table's**: the
+"observed" figures below are from August 2026 and the feed has since moved.
+
+The 2026-10-13 dry run (devbox `69.25.95.32`, sfo12, go-amt `cbffbe5`, 150 s
+two-arm) read prod **51.5%** (`9898/19234`), union arm **3.2%** (`618/19234`,
+1.2% on a 60 s union-only run with 0.023% host drops), `rescued_sets=9441`,
+time to 32nd shred p50 **25ms**. The rescue headline held; the union figure
+did not. Restore the feed or re-measure on the day before recording.
 
 | Measure | prod / raw turbine | union | Notes |
 |---|---:|---:|---|
