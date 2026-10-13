@@ -337,6 +337,10 @@ type RelayManager struct {
 	leavesMu      sync.Mutex
 	leavesPending int
 	leavesIdle    chan struct{}
+
+	// reportRetransmitDelay picks the delay before a state-change report is
+	// sent again (RFC 3376 §5.1). A test replaces it before Open.
+	reportRetransmitDelay func() time.Duration
 }
 
 // NewRelayManager creates a new RelayManager
@@ -346,6 +350,9 @@ func NewRelayManager(config RelayManagerConfig) *RelayManager {
 		subscriptions: xsync.NewMapOf[SubscriptionKey, *Subscription](),
 		pendingJoins:  xsync.NewMapOf[SubscriptionKey, *Subscription](),
 		intervalTime:  config.KeepaliveInterval,
+		reportRetransmitDelay: func() time.Duration {
+			return rand.N(unsolicitedReportInterval)
+		},
 	}
 	rm.state.Store(RelayStateIdle)
 	return rm
@@ -683,16 +690,13 @@ func (rm *RelayManager) sourceGroupSubscribed(key SubscriptionKey) bool {
 // retransmission. The relay's QRV is not read.
 const unsolicitedReportInterval = time.Second
 
-// leaveRetransmitDelay picks the retransmission's delay. A test replaces it.
-var leaveRetransmitDelay = func() time.Duration { return rand.N(unsolicitedReportInterval) }
-
-// retransmitLeave sends report once more, after leaveRetransmitDelay. One leave
-// is one datagram: if it is lost, the relay keeps streaming to this gateway
-// until the membership times out, minutes later (BLO-45585). The retransmission
-// is dropped if key's (S,G) has been subscribed again, since it would undo that
-// join, or if the tunnel is no longer active.
+// retransmitLeave sends report once more, after reportRetransmitDelay. One
+// leave is one datagram: if it is lost, the relay keeps streaming to this
+// gateway until the membership times out, minutes later (BLO-45585). The
+// retransmission is dropped if key's (S,G) has been subscribed again, since it
+// would undo that join, or if the tunnel is no longer active.
 func (rm *RelayManager) retransmitLeave(key SubscriptionKey, report []byte) {
-	delay := leaveRetransmitDelay()
+	delay := rm.reportRetransmitDelay()
 	rm.leavesMu.Lock()
 	if rm.leavesPending == 0 {
 		rm.leavesIdle = make(chan struct{})
@@ -941,9 +945,22 @@ func (rm *RelayManager) scheduleBatchedJoin() {
 		// Debounce joins by 50ms to batch multiple subscriptions
 		rm.joinTimer = time.AfterFunc(50*time.Millisecond, func() {
 			rm.joinPending.Store(false)
+			joining := rm.pendingJoins.Size() > 0
 			if err := rm.sendBatchedMembershipUpdate(); err != nil {
 				// Log error but don't fail
 				_ = err
+				return
+			}
+			// A join is a state-change report too (RFC 3376 §5.1). A lost
+			// one left the gateway without data until the next keepalive
+			// refresh, 12.5 s later against the production relay
+			// (BLO-45585). The retransmission is rebuilt from the
+			// subscriptions current when it fires, so it cannot rejoin
+			// a group left in the meantime.
+			if joining {
+				time.AfterFunc(rm.reportRetransmitDelay(), func() {
+					_ = rm.sendBatchedMembershipUpdate()
+				})
 			}
 		})
 	}

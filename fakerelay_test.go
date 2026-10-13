@@ -490,6 +490,26 @@ func (fr *fakeRelay) WaitForLeaveRecord(timeout time.Duration) (byte, error) {
 	}
 }
 
+// firstRecord returns the record type and source count of an Update's first
+// IGMPv3 group record, or false for a report that carries none, such as the
+// empty current-state report of the handshake. The layout is
+// WaitForLeaveRecord's; the source count follows the type and aux length.
+func firstRecord(u []byte) (recordType byte, sources int, ok bool) {
+	const recordTypeOffset = 12 + igmpIPHeaderLen + 8
+	if len(u) < recordTypeOffset+4 {
+		return 0, 0, false
+	}
+	return u[recordTypeOffset], int(binary.BigEndian.Uint16(u[recordTypeOffset+2:])), true
+}
+
+// isJoinRecord reports whether an Update's first record joins a source. The
+// implementations spell an SSM join differently (pure Go as ALLOW_NEW_SOURCES),
+// so any record naming a source counts, except BLOCK_OLD_SOURCES.
+func isJoinRecord(u []byte) bool {
+	rt, n, ok := firstRecord(u)
+	return ok && n > 0 && rt != m.IGMPv3BlockOldSources
+}
+
 func onesComplementChecksum(b []byte) uint16 {
 	var sum uint32
 	for i := 0; i+1 < len(b); i += 2 {
