@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,6 +145,58 @@ func TestRouteDataToSubscriptionCopiesPayload(t *testing.T) {
 	}
 	if !bytes.Equal(got.Data, want) {
 		t.Fatalf("queued payload changed after receive buffer reuse: got %q, want %q", got.Data, want)
+	}
+}
+
+// TestTeardownRacingDeliveryDoesNotPanic: on 2026-10-13 a blockcast-shreds
+// receiver stopped with SIGTERM while an AMT stream was flowing died with "send
+// on closed channel" in routeDataToSubscription, and its receipt was never
+// printed (BLO-45585). Unsubscribe and Close closed sub.dataChan while the read
+// loop, having already seen the subscription Active, was about to send on it;
+// a send on a closed channel panics even inside a select with a default case.
+func TestTeardownRacingDeliveryDoesNotPanic(t *testing.T) {
+	key := SubscriptionKey{
+		Source: netip.MustParseAddr("192.0.2.1"),
+		Group:  netip.MustParseAddr("239.0.0.1"),
+		Port:   5000,
+	}
+	packet := multicastDataPacket(t, []byte("shred"))
+	for name, teardown := range map[string]func(*RelayManager) error{
+		"Unsubscribe": func(rm *RelayManager) error { return rm.Unsubscribe(key) },
+		"Close":       func(rm *RelayManager) error { return rm.Close() },
+	} {
+		t.Run(name, func(t *testing.T) {
+			const senders = 4
+			for range 500 {
+				rm := NewRelayManager(DefaultRelayManagerConfig(net.UDPAddr{}))
+				sub := &Subscription{key: key, dataChan: make(chan *DataPacket, 1)}
+				sub.state.Store(SubscriptionStateActive)
+				rm.subscriptions.Store(key, sub)
+
+				// Every sender is mid-stream, as the read loop is under a live feed,
+				// before the teardown starts.
+				var stop atomic.Bool
+				panics := make(chan any, senders)
+				for range senders {
+					go func() {
+						defer func() { panics <- recover() }()
+						for !stop.Load() {
+							rm.routeDataToSubscription(packet)
+						}
+					}()
+				}
+				for sub.packetsReceived.Load() < senders {
+					runtime.Gosched()
+				}
+				_ = teardown(rm)
+				stop.Store(true)
+				for range senders {
+					if p := <-panics; p != nil {
+						t.Fatalf("delivery racing %s panicked: %v", name, p)
+					}
+				}
+			}
+		})
 	}
 }
 
