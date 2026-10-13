@@ -329,6 +329,14 @@ type RelayManager struct {
 	// For batched IGMP
 	joinPending atomic.Bool
 	joinTimer   *time.Timer
+
+	// leavesPending counts the leave retransmissions Unsubscribe scheduled
+	// and has not yet sent or abandoned. leavesIdle is closed whenever it
+	// drops to zero. Not a WaitGroup: an Unsubscribe may schedule one while
+	// WaitLeaves is waiting, which a WaitGroup forbids.
+	leavesMu      sync.Mutex
+	leavesPending int
+	leavesIdle    chan struct{}
 }
 
 // NewRelayManager creates a new RelayManager
@@ -600,30 +608,7 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	// Preserve other sources in the same group with a source-specific leave.
 	var leaveErr error
 	if rm.State() == RelayStateActive || rm.State() == RelayStateQuerying {
-		stillSubscribed := false
-
-		// Both maps must be consulted. Subscribe parks a new subscription in
-		// pendingJoins until the debounced batch promotes it, so scanning only
-		// subscriptions misses a same-(S,G) subscription made within that
-		// window and leaves the membership it still needs.
-		scan := func(otherKey SubscriptionKey, _ *Subscription) bool {
-			if otherKey.Source == key.Source && otherKey.Group == key.Group {
-				stillSubscribed = true
-			}
-			return true
-		}
-		// Scan order is load-bearing, not stylistic. Promotion in
-		// sendBatchedMembershipUpdate stores into subscriptions before it
-		// clears pendingJoins, so scanning in the opposite direction to that
-		// transfer observes a concurrently-promoted entry in at least one
-		// map: absence from pendingJoins implies the clear already ran, which
-		// implies the store landed, and subscriptions is scanned strictly
-		// later. Scanning subscriptions first leaves the entry invisible to
-		// both ranges and sends a leave for a membership still in use.
-		rm.pendingJoins.Range(scan)
-		rm.subscriptions.Range(scan)
-
-		if !stillSubscribed {
+		if !rm.sourceGroupSubscribed(key) {
 			var report []byte
 			var err error
 			// An SSM membership is INCLUDE({S}), and RFC 3376 §5.1 reports
@@ -652,6 +637,8 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 					leaveErr = fmt.Errorf("failed to build membership update for %s: %w", key.String(), uerr)
 				} else if serr := rm.transport.Send(update); serr != nil {
 					leaveErr = fmt.Errorf("failed to send leave for %s: %w", key.String(), serr)
+				} else {
+					rm.retransmitLeave(key, report)
 				}
 			}
 		}
@@ -661,6 +648,106 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	rm.scheduleBatchedJoin()
 
 	return leaveErr
+}
+
+// sourceGroupSubscribed reports whether any subscription, promoted or still
+// pending, wants key's (S,G), whatever its port.
+func (rm *RelayManager) sourceGroupSubscribed(key SubscriptionKey) bool {
+	subscribed := false
+	// Both maps must be consulted. Subscribe parks a new subscription in
+	// pendingJoins until the debounced batch promotes it, so scanning only
+	// subscriptions misses a same-(S,G) subscription made within that
+	// window and leaves the membership it still needs.
+	scan := func(otherKey SubscriptionKey, _ *Subscription) bool {
+		if otherKey.Source == key.Source && otherKey.Group == key.Group {
+			subscribed = true
+		}
+		return true
+	}
+	// Scan order is load-bearing, not stylistic. Promotion in
+	// sendBatchedMembershipUpdate stores into subscriptions before it
+	// clears pendingJoins, so scanning in the opposite direction to that
+	// transfer observes a concurrently-promoted entry in at least one
+	// map: absence from pendingJoins implies the clear already ran, which
+	// implies the store landed, and subscriptions is scanned strictly
+	// later. Scanning subscriptions first leaves the entry invisible to
+	// both ranges and sends a leave for a membership still in use.
+	rm.pendingJoins.Range(scan)
+	rm.subscriptions.Range(scan)
+	return subscribed
+}
+
+// RFC 3376 §5.1 sends a state-change report [Robustness Variable] - 1 more
+// times, each after a random delay within the [Unsolicited Report Interval]
+// (§8.11, default 1 s). With the default Robustness Variable of 2 that is one
+// retransmission. The relay's QRV is not read.
+const unsolicitedReportInterval = time.Second
+
+// leaveRetransmitDelay picks the retransmission's delay. A test replaces it.
+var leaveRetransmitDelay = func() time.Duration { return rand.N(unsolicitedReportInterval) }
+
+// retransmitLeave sends report once more, after leaveRetransmitDelay. One leave
+// is one datagram: if it is lost, the relay keeps streaming to this gateway
+// until the membership times out, minutes later (BLO-45585). The retransmission
+// is dropped if key's (S,G) has been subscribed again, since it would undo that
+// join, or if the tunnel is no longer active.
+func (rm *RelayManager) retransmitLeave(key SubscriptionKey, report []byte) {
+	delay := leaveRetransmitDelay()
+	rm.leavesMu.Lock()
+	if rm.leavesPending == 0 {
+		rm.leavesIdle = make(chan struct{})
+	}
+	rm.leavesPending++
+	rm.leavesMu.Unlock()
+	go func() {
+		defer func() {
+			rm.leavesMu.Lock()
+			rm.leavesPending--
+			if rm.leavesPending == 0 {
+				close(rm.leavesIdle)
+			}
+			rm.leavesMu.Unlock()
+		}()
+		timer := time.NewTimer(delay)
+		select {
+		case <-rm.ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if state := rm.State(); state != RelayStateActive && state != RelayStateQuerying {
+			return
+		}
+		if rm.sourceGroupSubscribed(key) {
+			return
+		}
+		// Wrapped again rather than resent as-is: a keepalive may have renewed
+		// the response MAC since the first send.
+		update, err := rm.protocol.CreateMembershipUpdate(report)
+		if err != nil {
+			return
+		}
+		_ = rm.transport.Send(update)
+	}()
+}
+
+// WaitLeaves blocks until every leave retransmission Unsubscribe scheduled has
+// been sent or abandoned, or ctx is done. A process that exits right after
+// unsubscribing calls it, or its retransmissions die with it.
+func (rm *RelayManager) WaitLeaves(ctx context.Context) error {
+	rm.leavesMu.Lock()
+	if rm.leavesPending == 0 {
+		rm.leavesMu.Unlock()
+		return nil
+	}
+	idle := rm.leavesIdle
+	rm.leavesMu.Unlock()
+	select {
+	case <-idle:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 // State returns the current relay state
@@ -1255,6 +1342,16 @@ func GetOrCreateRelayManager(relayAddr net.UDPAddr, config *RelayManagerConfig) 
 
 	relayManagerRegistry.Store(key, rm)
 	return rm, nil
+}
+
+// WaitRelayLeaves runs WaitLeaves on every registered RelayManager.
+func WaitRelayLeaves(ctx context.Context) error {
+	var err error
+	relayManagerRegistry.Range(func(_ string, rm *RelayManager) bool {
+		err = rm.WaitLeaves(ctx)
+		return err == nil
+	})
+	return err
 }
 
 // CloseRelayManager closes and removes a RelayManager from the registry

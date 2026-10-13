@@ -654,6 +654,88 @@ func TestUnsubscribeLastSourceSendsSourceSpecificLeave(t *testing.T) {
 	}
 }
 
+// TestUnsubscribeRetransmitsLeave pins RFC 3376 §5.1 for the leave: it goes out
+// again within the Unsolicited Report Interval, and WaitLeaves returns only once
+// it has. A leave sent once was lost in transit 1 time in 6 from an off-site
+// gateway, and the production relay then kept streaming to the exited gateway
+// for minutes (BLO-45585).
+func TestUnsubscribeRetransmitsLeave(t *testing.T) {
+	// Fixed, and longer than the 100 ms the assertions wait, so a WaitLeaves
+	// that returned early would fail here rather than pass on a short draw.
+	defaultDelay := leaveRetransmitDelay
+	leaveRetransmitDelay = func() time.Duration { return 300 * time.Millisecond }
+	t.Cleanup(func() { leaveRetransmitDelay = defaultDelay })
+
+	fr := newFakeRelay(t)
+	rm := newTestManager(t, fr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := rm.Open(ctx); err != nil {
+		t.Fatalf("Open against fake relay: %v", err)
+	}
+
+	key := SubscriptionKey{Source: netip.MustParseAddr("10.7.7.1"), Group: testHarnessGroup, Port: testHarnessPort}
+	subscribeActive(t, rm, key)
+	fr.DrainUpdates()
+
+	if err := rm.Unsubscribe(key); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+	if err := rm.WaitLeaves(ctx); err != nil {
+		t.Fatalf("WaitLeaves: %v", err)
+	}
+	for i := 1; i <= 2; i++ {
+		rt, err := fr.WaitForLeaveRecord(100 * time.Millisecond)
+		if err != nil {
+			t.Fatalf("leave %d of 2 once WaitLeaves returned: %v", i, err)
+		}
+		if rt != m.IGMPv3BlockOldSources {
+			t.Fatalf("leave %d record type = %d, want BLOCK_OLD_SOURCES (%d)", i, rt, m.IGMPv3BlockOldSources)
+		}
+	}
+}
+
+// TestResubscribeCancelsLeaveRetransmission: a retransmission that comes due
+// after the same (S,G) was joined again would undo that join, so it is dropped.
+func TestResubscribeCancelsLeaveRetransmission(t *testing.T) {
+	const delay = 400 * time.Millisecond
+	defaultDelay := leaveRetransmitDelay
+	leaveRetransmitDelay = func() time.Duration { return delay }
+	t.Cleanup(func() { leaveRetransmitDelay = defaultDelay })
+
+	fr := newFakeRelay(t)
+	rm := newTestManager(t, fr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := rm.Open(ctx); err != nil {
+		t.Fatalf("Open against fake relay: %v", err)
+	}
+
+	key := SubscriptionKey{Source: netip.MustParseAddr("10.7.7.1"), Group: testHarnessGroup, Port: testHarnessPort}
+	subscribeActive(t, rm, key)
+	fr.DrainUpdates()
+
+	if err := rm.Unsubscribe(key); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+	if _, err := fr.WaitForLeaveRecord(3 * time.Second); err != nil {
+		t.Fatalf("first leave: %v", err)
+	}
+	start := time.Now()
+	subscribeActive(t, rm, key)
+	if took := time.Since(start); took >= delay {
+		t.Fatalf("the join took %s, past the %s retransmission delay this test needs it to beat", took, delay)
+	}
+	if err := rm.WaitLeaves(ctx); err != nil {
+		t.Fatalf("WaitLeaves: %v", err)
+	}
+	if rt, err := fr.WaitForLeaveRecord(100 * time.Millisecond); err == nil {
+		t.Fatalf("a leave (record type %d) went out after the (S,G) was joined again", rt)
+	}
+}
+
 // TestV4MappedSubscriptionCompletesFullLifecycle covers the boundary the
 // Subscribe guard actually draws (Ally, PR #33, head 937c12a, Important #2).
 //
