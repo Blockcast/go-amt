@@ -5,8 +5,8 @@
 // The pipeline: reduce each union frame to its erasure shard, assemble FEC
 // sets (recovering missing data shards with Reed-Solomon), deshred complete
 // entry batches, parse each transaction (legacy, v0 or SIMD-0385 v1),
-// classify it, and frame it one per datagram for every partition group it
-// belongs to.
+// classify it, and frame it for every partition group it belongs to: one per
+// datagram, or in chunks when it would not fit in MaxDatagram (frame.go).
 //
 // Nothing here authenticates shreds: a wire version 3 frame carries no
 // signature to check. A transaction's own signatures prove who signed it,

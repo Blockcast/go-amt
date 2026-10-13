@@ -1,13 +1,15 @@
 //go:build linux
 
 // shred-txfeed decodes the shred union into Solana transactions and emits
-// them, one per datagram, on partition groups (BLO-41705).
+// them on partition groups (BLO-41705), one per datagram, or in chunks when a
+// transaction would not fit in txfeed.MaxDatagram, so that no datagram is
+// IP-fragmented.
 //
 // Ingest is union frames, forwarder wire version 3 or 4: unicast on -listen,
 // such as the merger's -out 127.0.0.1:5003=all, or an SSM join with -ssm.
 // txfeed.Assembler assembles FEC sets, recovers missing data shreds with
 // Reed-Solomon and deshreds complete entry batches. Each transaction is
-// parsed, classified, and sent as a txframe (txfeed/frame.go) to every
+// parsed, classified, and sent as txframes (txfeed/frame.go) to every
 // partition group it belongs to, at these offsets from the group base:
 //
 //	1          non-vote transactions
@@ -49,8 +51,34 @@ const (
 
 // output is one address family's partition groups.
 type output struct {
-	conn *net.UDPConn
-	dst  []netip.AddrPort // by partition
+	conn interface { // a *net.UDPConn; tests record the datagrams
+		WriteToUDPAddrPort([]byte, netip.AddrPort) (int, error)
+	}
+	dst []netip.AddrPort // by partition
+}
+
+// publish sends tx, transaction i of batch, to each of its partition groups
+// on every output: as one txframe, or as its chunks when it would not fit in
+// txfeed.MaxDatagram. Each group gets every datagram of tx in order before
+// the next group gets any. It returns the datagrams sent, the sends that
+// failed, and the datagrams tx took.
+func publish(outs []*output, ids []txfeed.Pubkey, batch txfeed.Batch, i int, tx txfeed.Tx) (sent, failed uint64, n int) {
+	dgs := txfeed.Datagrams(txfeed.Frame{
+		Vote: tx.Vote, Slot: batch.Slot, BatchStart: batch.StartIndex,
+		Index: uint16(i), ShredTs: batch.ShredTs, Tx: tx.Raw,
+	})
+	for _, p := range txfeed.Partitions(tx, ids) {
+		for _, o := range outs {
+			for _, d := range dgs {
+				if _, err := o.conn.WriteToUDPAddrPort(d, o.dst[p]); err != nil {
+					failed++
+				} else {
+					sent++
+				}
+			}
+		}
+	}
+	return sent, failed, len(dgs)
 }
 
 func newOutput(base string, src netip.Addr, port, ttl int, loop bool) (*output, error) {
@@ -219,11 +247,11 @@ func main() {
 	go reader(in, ch, &qdrop)
 
 	asm := txfeed.NewAssembler(*keep)
-	var batchErr, txs, votes, oversize, overflow, sent, sendErr uint64
+	var batchErr, txs, votes, oversize, overflow, chunked, sent, sendErr uint64
 	stats := func() string {
 		s := asm.Stats()
-		return fmt.Sprintf("frames=%d dups=%d bad=%d sets_recovered=%d shards_recovered=%d recovered_bad=%d parity_checked=%d parity_mismatch=%d batches=%d batch_err=%d txs=%d votes=%d oversize=%d index_overflow=%d sent=%d send_err=%d queue=%d qdrop=%d slots=%d held=%d evicted=%d max_slot=%d",
-			s.Frames, s.Dups, s.Bad, s.SetsRecovered, s.ShardsRecovered, s.RecoveredBad, s.ParityChecked, s.ParityMismatch, s.Batches, batchErr, txs, votes, oversize, overflow, sent, sendErr, len(ch), qdrop.Load(), s.Slots, s.Held, s.Evicted, s.MaxSlot)
+		return fmt.Sprintf("frames=%d dups=%d bad=%d sets_recovered=%d shards_recovered=%d recovered_bad=%d parity_checked=%d parity_mismatch=%d batches=%d batch_err=%d txs=%d votes=%d oversize=%d index_overflow=%d chunked=%d sent=%d send_err=%d queue=%d qdrop=%d slots=%d held=%d evicted=%d max_slot=%d",
+			s.Frames, s.Dups, s.Bad, s.SetsRecovered, s.ShardsRecovered, s.RecoveredBad, s.ParityChecked, s.ParityMismatch, s.Batches, batchErr, txs, votes, oversize, overflow, chunked, sent, sendErr, len(ch), qdrop.Load(), s.Slots, s.Held, s.Evicted, s.MaxSlot)
 	}
 
 	sig := make(chan os.Signal, 1)
@@ -231,7 +259,6 @@ func main() {
 	tick := time.NewTicker(time.Duration(*statsSec) * time.Second)
 	defer tick.Stop()
 
-	var buf []byte
 	for {
 		select {
 		case b := <-ch:
@@ -257,18 +284,10 @@ func main() {
 					if tx.Vote {
 						votes++
 					}
-					buf = txfeed.AppendFrame(buf[:0], txfeed.Frame{
-						Vote: tx.Vote, Slot: batch.Slot, BatchStart: batch.StartIndex,
-						Index: uint16(i), ShredTs: batch.ShredTs, Tx: tx.Raw,
-					})
-					for _, p := range txfeed.Partitions(tx, ids) {
-						for _, o := range outs {
-							if _, err := o.conn.WriteToUDPAddrPort(buf, o.dst[p]); err != nil {
-								sendErr++
-							} else {
-								sent++
-							}
-						}
+					s, e, n := publish(outs, ids, batch, i, tx)
+					sent, sendErr = sent+s, sendErr+e
+					if n > 1 {
+						chunked++
 					}
 				}
 			}
