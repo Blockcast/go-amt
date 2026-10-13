@@ -59,6 +59,12 @@ const (
 	// History goes by arrival time, as in txfeed.Assembler: a slot number from
 	// the wire cannot measure age.
 	dedupKeep = 10 * time.Second
+	// A transaction too large for one datagram arrives as chunks sent back to
+	// back; one still incomplete after chunkTimeout lost a chunk.
+	chunkTimeout = time.Second
+	// maxChunked caps the chunked transactions held at once. The non-vote
+	// group carried 245 a second on 2026-10-13, each held up to 1.5 s.
+	maxChunked = 4096
 )
 
 // sub is one joined group.
@@ -354,6 +360,7 @@ func main() {
 		keys map[uint64]bool // batch start<<16 | index
 	}
 	seen := map[uint64]*slotSeen{}
+	chunks := txfeed.NewReassembler(chunkTimeout, maxChunked)
 	var sweep time.Time // when the next eviction pass runs
 	enc := json.NewEncoder(os.Stdout)
 
@@ -371,6 +378,9 @@ func main() {
 		}
 		log.Printf("printed=%d dups=%d filtered=%d bad=%d verify_ok=%d verify_bad=%d latency_ms p50=%.1f p90=%.1f p99=%.1f",
 			printed, dups, filtered, bad, verOK, verBad, percentile(lat, 50), percentile(lat, 90), percentile(lat, 99))
+		c := chunks.Stats()
+		log.Printf("chunks=%d reassembled=%d chunk_dups=%d inconsistent=%d timeouts=%d overflow=%d",
+			c.Chunks, c.Txs, c.Dups, c.Inconsistent, c.Timeouts, c.Overflow)
 	}()
 	for cfg.limit == 0 || printed < cfg.limit {
 		var p packet
@@ -386,6 +396,10 @@ func main() {
 		if err != nil {
 			bad++
 			continue
+		}
+		f, whole := chunks.Add(f, p.at)
+		if !whole {
+			continue // a chunk of a transaction not yet complete
 		}
 		tx, _, err := txfeed.ParseTx(f.Tx)
 		if err != nil || tx.NumSigs == 0 {
