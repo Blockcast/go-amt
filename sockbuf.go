@@ -19,21 +19,33 @@ import (
 // and still be a clamp. EffectiveCeiling unhalves it into the same units as
 // Requested, which is the number an operator compares against rmem_max.
 //
-// On Darwin this type exists but is never returned, since Darwin has no
-// FORCE variant — SO_RCVBUF/SO_SNDBUF is the only mechanism and any clamp
-// is invisible to userspace.
+// Darwin does not clamp silently: it has no FORCE variant, and a
+// SO_RCVBUF/SO_SNDBUF above kern.ipc.maxsockbuf*2048/2304 fails with ENOBUFS.
+// retryAtMaxsockbuf then retries at that ceiling and returns this error with
+// Got set to the accepted size. Darwin's getsockopt does not double, so there
+// EffectiveCeiling is Got itself.
 type BufferClampedError struct {
 	Requested int
 	Got       int
+
+	// ceiling, when non-zero, is the accepted setsockopt input, for errors
+	// whose Got is not a doubled Linux readback (Darwin).
+	ceiling int
 }
 
 // EffectiveCeiling is the accepted setsockopt input implied by the readback —
-// i.e. the net.core.{r,w}mem_max the kernel clamped to — in the same units as
+// i.e. the net.core.{r,w}mem_max (Linux) or kern.ipc.maxsockbuf-derived
+// (Darwin) limit the kernel held the request to — in the same units as
 // Requested.
-func (e *BufferClampedError) EffectiveCeiling() int { return e.Got / 2 }
+func (e *BufferClampedError) EffectiveCeiling() int {
+	if e.ceiling != 0 {
+		return e.ceiling
+	}
+	return e.Got / 2
+}
 
 func (e *BufferClampedError) Error() string {
-	return fmt.Sprintf("socket buffer clamped: requested %d bytes, kernel allocated %d (effective ceiling %d; raise net.core.rmem_max/wmem_max or grant CAP_NET_ADMIN)",
+	return fmt.Sprintf("socket buffer clamped: requested %d bytes, kernel allocated %d (effective ceiling %d; raise net.core.rmem_max/wmem_max or grant CAP_NET_ADMIN on Linux, kern.ipc.maxsockbuf on macOS)",
 		e.Requested, e.Got, e.EffectiveCeiling())
 }
 

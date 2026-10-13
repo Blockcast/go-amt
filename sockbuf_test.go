@@ -4,6 +4,7 @@ package amt
 
 import (
 	"errors"
+	"slices"
 	"syscall"
 	"testing"
 )
@@ -130,5 +131,91 @@ func TestSetForcedSendBufferDoesNotShrink(t *testing.T) {
 	after, _ := syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_SNDBUF)
 	if after < before {
 		t.Errorf("send buffer was shrunk: before=%d after=%d", before, after)
+	}
+}
+
+// TestRetryAtMaxsockbuf drives Darwin's ENOBUFS path with a fake setsockopt
+// that, like XNU's sbreserve under the default 8 MiB kern.ipc.maxsockbuf,
+// refuses anything above floor(8388608*2048/2304) = 7456540. The exact quotient
+// is 7456540.44, so a wrong ratio or rounding lands on a size the fake refuses
+// or on the wrong Got.
+func TestRetryAtMaxsockbuf(t *testing.T) {
+	const (
+		defaultMaxsockbuf = 8 << 20 // macOS default kern.ipc.maxsockbuf
+		ceiling           = 7456540 // largest size sbreserve accepts under it
+		shredsRcvbuf      = 8 << 20 // blockcast-shreds' default --rcvbuf
+	)
+	for _, tc := range []struct {
+		name       string
+		want       int
+		maxsockbuf uint32
+		sysctlErr  error
+		setErr     error // returned for every call instead of the sbreserve check
+		wantCalls  []int
+		wantGot    int   // non-zero: expect *BufferClampedError with this Got
+		wantErr    error // otherwise: expect errors.Is(err, wantErr), or nil
+	}{
+		{
+			name: "default rcvbuf on stock macOS clamps to the ceiling",
+			want: shredsRcvbuf, maxsockbuf: defaultMaxsockbuf,
+			wantCalls: []int{shredsRcvbuf, ceiling}, wantGot: ceiling,
+		},
+		{
+			name: "request at the ceiling is accepted as is",
+			want: ceiling, maxsockbuf: defaultMaxsockbuf,
+			wantCalls: []int{ceiling},
+		},
+		{
+			name: "other setsockopt errors pass through without a retry",
+			want: shredsRcvbuf, maxsockbuf: defaultMaxsockbuf, setErr: syscall.EBADF,
+			wantCalls: []int{shredsRcvbuf}, wantErr: syscall.EBADF,
+		},
+		{
+			name: "unreadable maxsockbuf keeps the ENOBUFS",
+			want: shredsRcvbuf, sysctlErr: syscall.ENOENT,
+			wantCalls: []int{shredsRcvbuf}, wantErr: syscall.ENOBUFS,
+		},
+		{
+			name: "ENOBUFS under a higher maxsockbuf is not a clamp",
+			want: shredsRcvbuf, maxsockbuf: 2 * defaultMaxsockbuf,
+			wantCalls: []int{shredsRcvbuf}, wantErr: syscall.ENOBUFS,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var calls []int
+			set := func(n int) error {
+				calls = append(calls, n)
+				if tc.setErr != nil {
+					return tc.setErr
+				}
+				if n > ceiling {
+					return syscall.ENOBUFS
+				}
+				return nil
+			}
+			err := retryAtMaxsockbuf(tc.want, set,
+				func() (uint32, error) { return tc.maxsockbuf, tc.sysctlErr })
+
+			if !slices.Equal(calls, tc.wantCalls) {
+				t.Errorf("setsockopt calls = %v, want %v", calls, tc.wantCalls)
+			}
+			var clamp *BufferClampedError
+			if tc.wantGot != 0 {
+				if !errors.As(err, &clamp) {
+					t.Fatalf("want *BufferClampedError, got %v", err)
+				}
+				if clamp.Requested != tc.want || clamp.Got != tc.wantGot || clamp.EffectiveCeiling() != tc.wantGot {
+					t.Errorf("clamp = {Requested %d, Got %d, EffectiveCeiling %d}, want {%d, %d, %d}",
+						clamp.Requested, clamp.Got, clamp.EffectiveCeiling(), tc.want, tc.wantGot, tc.wantGot)
+				}
+				return
+			}
+			if errors.As(err, &clamp) {
+				t.Fatalf("unexpected *BufferClampedError: %v", err)
+			}
+			if !errors.Is(err, tc.wantErr) { // errors.Is(err, nil) is err == nil
+				t.Errorf("err = %v, want %v", err, tc.wantErr)
+			}
+		})
 	}
 }

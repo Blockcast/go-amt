@@ -1264,8 +1264,9 @@ func feedRcvBuf(n int) int {
 
 // setFeedReceiveBuffer gives a unicast feed socket the receive buffer an ssm://
 // feed's ManagedConn requests. A clamp (no CAP_NET_ADMIN and a net.core.rmem_max
-// below the request) is a warning, not an error: the feed still works, it just
-// drops the bursts a bigger buffer would absorb.
+// below the request on Linux; a request above the kern.ipc.maxsockbuf ceiling on
+// macOS) is a warning, not an error: the feed still works, it just drops the
+// bursts a bigger buffer would absorb.
 func setFeedReceiveBuffer(conn *net.UDPConn, f feed) error {
 	if f.rcvbuf <= 0 {
 		return nil
@@ -1281,7 +1282,7 @@ func setFeedReceiveBuffer(conn *net.UDPConn, f feed) error {
 	var clamp *amt.BufferClampedError
 	if errors.As(setErr, &clamp) {
 		fmt.Fprintf(os.Stderr, "blockcast-shreds: warning: feed %q receive buffer clamped to %d of the %d bytes requested; "+
-			"raise net.core.rmem_max or grant CAP_NET_ADMIN, or bursts drop at the socket and score as erasure\n",
+			"raise net.core.rmem_max or grant CAP_NET_ADMIN (Linux) or raise kern.ipc.maxsockbuf (macOS), or bursts drop at the socket and score as erasure\n",
 			f.name, clamp.EffectiveCeiling(), clamp.Requested)
 		return nil
 	}
