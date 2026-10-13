@@ -116,6 +116,11 @@ Requires the DC host, CTO-side:
 
 - [ ] Receiver is DC-hosted with ≥~80 Mbit/s downlink headroom, and is **not**
       the union source host. Measured interface recorded.
+- [ ] The run starts with no `receive buffer clamped` warning: the receiver has
+      `CAP_NET_ADMIN`, or `net.core.rmem_max` covers the 8 MiB each feed asks
+      for (`--rcvbuf`). A clamped receiver drops bursts at its own socket and
+      scores them as erasure. Bracket the run with `nstat -saz UdpRcvbufErrors`
+      and quote the host's drop count beside the erasure numbers.
 - [ ] Tap allowlist approved for both forward destinations.
 - [ ] The two `--feed` values are **distinct** local bind ports, both taps
       confirmed forwarding into them.
