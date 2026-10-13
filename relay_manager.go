@@ -568,45 +568,44 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 	var leaveErr error
 	if rm.State() == RelayStateActive || rm.State() == RelayStateQuerying {
 		stillSubscribed := false
-		otherGroupSource := false
 
 		// Both maps must be consulted. Subscribe parks a new subscription in
 		// pendingJoins until the debounced batch promotes it, so scanning only
-		// subscriptions misses a sibling source joined within that window and
-		// emits a group-wide leave that withdraws its membership too.
+		// subscriptions misses a same-(S,G) subscription made within that
+		// window and leaves the membership it still needs.
 		scan := func(otherKey SubscriptionKey, _ *Subscription) bool {
 			if otherKey.Source == key.Source && otherKey.Group == key.Group {
 				stillSubscribed = true
-			}
-			if otherKey.Group == key.Group {
-				otherGroupSource = true
 			}
 			return true
 		}
 		// Scan order is load-bearing, not stylistic. Promotion in
 		// sendBatchedMembershipUpdate stores into subscriptions before it
 		// clears pendingJoins, so scanning in the opposite direction to that
-		// transfer observes a concurrently-promoted sibling in at least one
+		// transfer observes a concurrently-promoted entry in at least one
 		// map: absence from pendingJoins implies the clear already ran, which
 		// implies the store landed, and subscriptions is scanned strictly
 		// later. Scanning subscriptions first leaves the entry invisible to
-		// both ranges and emits a group-wide leave.
+		// both ranges and sends a leave for a membership still in use.
 		rm.pendingJoins.Range(scan)
 		rm.subscriptions.Range(scan)
 
 		if !stillSubscribed {
 			var report []byte
 			var err error
-			if otherGroupSource {
-				sourceLeaver, ok := rm.protocol.(SourceSpecificLeaveReporter)
-				if !ok {
-					// A group-wide leave is safer than reporting an error after
-					// teardown: the removed source must not remain subscribed.
-					report, err = rm.protocol.CreateIGMPLeaveReport(key.Source, key.Group)
-				} else {
-					report, err = sourceLeaver.CreateIGMPSourceLeaveReport(key.Source, key.Group)
-				}
+			// An SSM membership is INCLUDE({S}), and RFC 3376 §5.1 reports
+			// leaving it as BLOCK_OLD_SOURCES({S}), which also keeps any other
+			// source in the group joined. The empty CHANGE_TO_INCLUDE_MODE form
+			// is only a fallback. The production relay's forwarding table
+			// (linux-amt amt-astats, mrouteSyncer.OnMembership) keys on (S,G)
+			// and discards a record with no source, so that form left it
+			// streaming to an exited gateway until its 3-minute liveness sweep
+			// (BLO-45606).
+			if sourceLeaver, ok := rm.protocol.(SourceSpecificLeaveReporter); ok {
+				report, err = sourceLeaver.CreateIGMPSourceLeaveReport(key.Source, key.Group)
 			} else {
+				// A group-wide leave is safer than reporting an error after
+				// teardown: the removed source must not remain subscribed.
 				report, err = rm.protocol.CreateIGMPLeaveReport(key.Source, key.Group)
 			}
 			// Do not swallow this. A leave that is never sent leaves the relay

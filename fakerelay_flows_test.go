@@ -563,12 +563,15 @@ func TestConcurrentSubscribeIsRaceFree(t *testing.T) {
 // TestUnsubscribeDuringPendingJoinPreservesOtherSource covers the review finding
 // on relay_manager.go:479 (Ally, PR #33, head 36ce988).
 //
-// Unsubscribe decides between a group-wide CHANGE_TO_INCLUDE_MODE leave and a
-// source-specific BLOCK_OLD_SOURCES leave by scanning for other subscribers of
-// the same group -- but it scans only rm.subscriptions. Subscribe parks a new
-// subscription in rm.pendingJoins, where it stays until the 50ms debounced batch
-// promotes it. Unsubscribing (S1,G) inside that window therefore cannot see
-// (S2,G), emits the group-wide leave, and withdraws S2's membership for G.
+// Unsubscribe used to choose between a group-wide CHANGE_TO_INCLUDE_MODE leave
+// and a source-specific BLOCK_OLD_SOURCES leave by scanning for other
+// subscribers of the same group, and it scanned only rm.subscriptions. Subscribe
+// parks a new subscription in rm.pendingJoins, where it stays until the 50ms
+// debounced batch promotes it. Unsubscribing (S1,G) inside that window could not
+// see (S2,G), emitted the group-wide leave, and withdrew S2's membership for G.
+// Every leave is now source-specific
+// (TestUnsubscribeLastSourceSendsSourceSpecificLeave); this test keeps it so
+// while a sibling is pending.
 //
 // The window is real but narrow, so this test deliberately does NOT let the
 // debounce drain after subscribing S2.
@@ -613,6 +616,41 @@ func TestUnsubscribeDuringPendingJoinPreservesOtherSource(t *testing.T) {
 	}
 	if rt != m.IGMPv3BlockOldSources {
 		t.Fatalf("leave record type = %d, want BLOCK_OLD_SOURCES (%d)", rt, m.IGMPv3BlockOldSources)
+	}
+}
+
+// TestUnsubscribeLastSourceSendsSourceSpecificLeave pins the leave form the
+// production relay acts on (BLO-45606). Unsubscribing a group's only source used
+// to send the group-wide CHANGE_TO_INCLUDE_MODE form, a record with no source.
+// The relay's forwarding table keys on (S,G) and discards such a record, so it
+// kept streaming to the exited gateway until its 3-minute liveness sweep.
+// BLOCK_OLD_SOURCES({S}) names the (S,G) being left.
+func TestUnsubscribeLastSourceSendsSourceSpecificLeave(t *testing.T) {
+	fr := newFakeRelay(t)
+	rm := newTestManager(t, fr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := rm.Open(ctx); err != nil {
+		t.Fatalf("Open against fake relay: %v", err)
+	}
+
+	key := SubscriptionKey{Source: netip.MustParseAddr("10.7.7.1"), Group: testHarnessGroup, Port: testHarnessPort}
+	subscribeActive(t, rm, key)
+	fr.DrainUpdates()
+
+	if err := rm.Unsubscribe(key); err != nil {
+		t.Fatalf("Unsubscribe: %v", err)
+	}
+
+	rt, err := fr.WaitForLeaveRecord(3 * time.Second)
+	if err != nil {
+		t.Fatalf("leave record: %v", err)
+	}
+	if rt != m.IGMPv3BlockOldSources {
+		t.Fatalf("leave record type = %d, want BLOCK_OLD_SOURCES (%d): a leave with no source "+
+			"leaves the production relay streaming to this gateway (BLO-45606)",
+			rt, m.IGMPv3BlockOldSources)
 	}
 }
 
