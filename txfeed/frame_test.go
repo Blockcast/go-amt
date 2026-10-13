@@ -144,6 +144,10 @@ func TestDatagramsBoundary(t *testing.T) {
 			t.Errorf("Datagrams(%d bytes): %d datagrams, the first %d bytes; want %d, none over %d", n, len(dgs), len(dgs[0]), want, MaxDatagram)
 		}
 	}
+	// The chunk count is one byte: more than 255 chunks would wrap it.
+	if dgs := Datagrams(Frame{Tx: make([]byte, 255*maxChunk+1)}); dgs != nil {
+		t.Errorf("Datagrams over 255 chunks: %d datagrams, want none", len(dgs))
+	}
 }
 
 // parseFrameV1 is ParseFrame as it was before version 2 (go-amt 4714f61), the

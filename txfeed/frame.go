@@ -112,12 +112,16 @@ func AppendFrame(dst []byte, f Frame) []byte {
 
 // Datagrams returns the datagrams carrying f, whose Tx is a whole transaction
 // of at most MaxTxSize bytes: one version-1 frame when it fits in
-// MaxDatagram, else version-2 chunks, none longer than MaxDatagram.
+// MaxDatagram, else version-2 chunks, none longer than MaxDatagram. It returns
+// nil for a Tx needing more than 255 chunks.
 func Datagrams(f Frame) [][]byte {
 	if frameHeaderSize+len(f.Tx) <= MaxDatagram {
 		return [][]byte{AppendFrame(nil, f)}
 	}
 	tx, n := f.Tx, (len(f.Tx)+maxChunk-1)/maxChunk
+	if n > 255 {
+		return nil // the chunk count is a byte; callers cap f.Tx at MaxTxSize (3 chunks) first
+	}
 	dgs := make([][]byte, n)
 	f.Chunks = uint8(n)
 	for i := range dgs {

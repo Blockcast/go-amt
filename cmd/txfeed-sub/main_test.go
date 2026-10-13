@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	amt "github.com/blockcast/go-amt"
 	"github.com/blockcast/go-amt/txfeed"
@@ -165,6 +166,36 @@ func TestJoinFiltersOnlyProgramBuckets(t *testing.T) {
 	// A raw join of the same channel takes every frame of it.
 	if subs = join(subs, "ssm", src, bucket, nil); len(subs) != 2 || !subs[0].keeps(txfeed.Tx{Programs: []txfeed.Pubkey{token}}) {
 		t.Error("joining a filtered group unfiltered must widen it, not join it twice")
+	}
+}
+
+// A chunked transaction reaches every group that carries it, each with its own
+// filter: completing it on one group must not mark it done for another
+// (Ally on go-amt#179).
+func TestGroupsReassembleIndependently(t *testing.T) {
+	src := netip.MustParseAddr("69.25.95.57")
+	jup := txfeed.DefaultPrograms[5].ID
+	subs := join(nil, "nonvote", src, netip.MustParseAddrPort("232.0.3.1:5003"), &jup)
+	subs = join(subs, "jupiter", src, netip.MustParseAddrPort("232.0.3.21:5003"), nil)
+	f := txfeed.Frame{Slot: 456620543, BatchStart: 7, Index: 3, Tx: make([]byte, 3000)}
+	at := time.Unix(1785000000, 0)
+	for _, s := range subs { // publish sends every chunk to the non-vote group first
+		var got int
+		for _, d := range txfeed.Datagrams(f) {
+			g, whole, err := s.frame(d, at)
+			if err != nil {
+				t.Fatalf("%s: %v", s.label, err)
+			}
+			if whole {
+				got++
+				if len(g.Tx) != len(f.Tx) {
+					t.Errorf("%s: reassembled %d bytes, want %d", s.label, len(g.Tx), len(f.Tx))
+				}
+			}
+		}
+		if got != 1 {
+			t.Errorf("%s: %d whole transactions, want 1", s.label, got)
+		}
 	}
 }
 

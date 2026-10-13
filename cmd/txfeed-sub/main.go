@@ -62,7 +62,7 @@ const (
 	// A transaction too large for one datagram arrives as chunks sent back to
 	// back; one still incomplete after chunkTimeout lost a chunk.
 	chunkTimeout = time.Second
-	// maxChunked caps the chunked transactions held at once. The non-vote
+	// maxChunked caps the chunked transactions each group holds at once. The non-vote
 	// group carried 245 a second on 2026-10-13, each held up to 1.5 s.
 	maxChunked = 4096
 )
@@ -75,6 +75,20 @@ type sub struct {
 	all    bool            // some selector takes every frame of the group
 	filter []txfeed.Pubkey // otherwise, keep transactions invoking one of these
 	frames uint64
+	// chunks is this group's own: a reassembler shared across groups would
+	// complete a transaction on one group, filter it out there, and then
+	// discard its chunks from a group whose filter keeps it.
+	chunks *txfeed.Reassembler
+}
+
+// frame parses one datagram from s. whole is false for a chunk of a
+// transaction not yet complete.
+func (s *sub) frame(b []byte, at time.Time) (f txfeed.Frame, whole bool, err error) {
+	if f, err = txfeed.ParseFrame(b); err != nil {
+		return f, false, err
+	}
+	f, whole = s.chunks.Add(f, at)
+	return f, whole, nil
 }
 
 func (s *sub) keeps(tx txfeed.Tx) bool {
@@ -87,7 +101,7 @@ func join(subs []*sub, label string, source netip.Addr, group netip.AddrPort, pr
 	i := slices.IndexFunc(subs, func(s *sub) bool { return s.source == source && s.group == group })
 	if i < 0 {
 		i = len(subs)
-		subs = append(subs, &sub{label: label, source: source, group: group})
+		subs = append(subs, &sub{label: label, source: source, group: group, chunks: txfeed.NewReassembler(chunkTimeout, maxChunked)})
 	}
 	if prog == nil {
 		subs[i].all = true
@@ -360,7 +374,6 @@ func main() {
 		keys map[uint64]bool // batch start<<16 | index
 	}
 	seen := map[uint64]*slotSeen{}
-	chunks := txfeed.NewReassembler(chunkTimeout, maxChunked)
 	var sweep time.Time // when the next eviction pass runs
 	enc := json.NewEncoder(os.Stdout)
 
@@ -378,7 +391,16 @@ func main() {
 		}
 		log.Printf("printed=%d dups=%d filtered=%d bad=%d verify_ok=%d verify_bad=%d latency_ms p50=%.1f p90=%.1f p99=%.1f",
 			printed, dups, filtered, bad, verOK, verBad, percentile(lat, 50), percentile(lat, 90), percentile(lat, 99))
-		c := chunks.Stats()
+		var c txfeed.ReassemblyStats
+		for _, s := range cfg.subs {
+			g := s.chunks.Stats()
+			c.Chunks += g.Chunks
+			c.Txs += g.Txs
+			c.Dups += g.Dups
+			c.Inconsistent += g.Inconsistent
+			c.Timeouts += g.Timeouts
+			c.Overflow += g.Overflow
+		}
 		log.Printf("chunks=%d reassembled=%d chunk_dups=%d inconsistent=%d timeouts=%d overflow=%d",
 			c.Chunks, c.Txs, c.Dups, c.Inconsistent, c.Timeouts, c.Overflow)
 	}()
@@ -392,12 +414,11 @@ func main() {
 			return
 		}
 		p.s.frames++
-		f, err := txfeed.ParseFrame(p.b)
+		f, whole, err := p.s.frame(p.b, p.at)
 		if err != nil {
 			bad++
 			continue
 		}
-		f, whole := chunks.Add(f, p.at)
 		if !whole {
 			continue // a chunk of a transaction not yet complete
 		}
