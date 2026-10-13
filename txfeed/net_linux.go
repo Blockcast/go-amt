@@ -22,7 +22,7 @@ import (
 // joined on the port, whatever the socket joined itself. Unicast to the port
 // still reaches it.
 func ListenSSM(source, group netip.Addr, port int, ifaceIP netip.Addr, rcvbuf int) (*net.UDPConn, error) {
-	ifi, err := interfaceWith(ifaceIP)
+	ifi, err := InterfaceWith(ifaceIP)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +77,7 @@ func EmitSocket(src netip.Addr, ttl int, loop bool) (*net.UDPConn, error) {
 	if loop {
 		lp = 1
 	}
-	ifi, err := interfaceWith(src)
+	ifi, err := InterfaceWith(src)
 	if err != nil {
 		return nil, err
 	}
@@ -117,26 +117,4 @@ func EmitSocket(src netip.Addr, ttl int, loop bool) (*net.UDPConn, error) {
 		return nil, serr
 	}
 	return uc, nil
-}
-
-// interfaceWith returns the interface that holds ip.
-func interfaceWith(ip netip.Addr) (*net.Interface, error) {
-	ifs, err := net.Interfaces()
-	if err != nil {
-		return nil, err
-	}
-	for i := range ifs {
-		addrs, err := ifs[i].Addrs()
-		if err != nil {
-			continue
-		}
-		for _, a := range addrs {
-			if n, ok := a.(*net.IPNet); ok {
-				if have, ok := netip.AddrFromSlice(n.IP); ok && have.Unmap() == ip.Unmap() {
-					return &ifs[i], nil
-				}
-			}
-		}
-	}
-	return nil, fmt.Errorf("no interface holds %s", ip)
 }
