@@ -134,70 +134,147 @@ func TestSetForcedSendBufferDoesNotShrink(t *testing.T) {
 	}
 }
 
-// TestRetryAtMaxsockbuf drives Darwin's ENOBUFS path with a fake setsockopt
-// that, like XNU's sbreserve under the default 8 MiB kern.ipc.maxsockbuf,
-// refuses anything above floor(8388608*2048/2304) = 7456540. The exact quotient
-// is 7456540.44, so a wrong ratio or rounding lands on a size the fake refuses
-// or on the wrong Got.
-func TestRetryAtMaxsockbuf(t *testing.T) {
+// fakeXNU is the sbreserve that setsockopt(SO_RCVBUF/SO_SNDBUF) calls, in
+// both of its shapes:
+//   - legacy (xnu-10002.81.5, macOS 14.3, and earlier) refuses any size above
+//     sb_max*MCLBYTES/(MSIZE+MCLBYTES) = maxsockbuf*2048/2304;
+//   - modern (xnu-10063.101.15, macOS 14.4, through xnu-12377) clamps a size
+//     above sb_max to sb_max, and refuses only if the buffer is already there.
+//
+// Both refuse growth on an SB_LIMITED buffer. A refusal is ENOBUFS and leaves
+// hiwat alone. getsockopt returns hiwat undoubled.
+type fakeXNU struct {
+	legacy  bool
+	limited bool
+	sbMax   int
+	hiwat   int
+	calls   []int
+}
+
+func (k *fakeXNU) set(cc int) error {
+	k.calls = append(k.calls, cc)
+	if k.legacy {
+		if cc > k.sbMax*2048/2304 {
+			return syscall.ENOBUFS
+		}
+	} else if cc > k.sbMax {
+		if k.hiwat == k.sbMax {
+			return syscall.ENOBUFS
+		}
+		cc = k.sbMax
+	}
+	if k.limited && cc > k.hiwat {
+		return syscall.ENOBUFS
+	}
+	k.hiwat = cc
+	return nil
+}
+
+// TestSetXNUBufferAtLeast drives Darwin's buffer set against both kernels. The
+// legacy ceiling under the default 8 MiB maxsockbuf is
+// floor(8388608*2048/2304) = 7456540; the exact quotient is 7456540.44, so a
+// wrong ratio or rounding lands on a size the fake refuses or on the wrong Got.
+func TestSetXNUBufferAtLeast(t *testing.T) {
 	const (
 		defaultMaxsockbuf = 8 << 20 // macOS default kern.ipc.maxsockbuf
-		ceiling           = 7456540 // largest size sbreserve accepts under it
+		legacyCeiling     = 7456540 // largest size legacy sbreserve accepts under it
+		udpRecvspace      = 786896  // macOS default UDP receive buffer
 		shredsRcvbuf      = 8 << 20 // blockcast-shreds' default --rcvbuf
 	)
 	for _, tc := range []struct {
-		name       string
-		want       int
-		maxsockbuf uint32
-		sysctlErr  error
-		setErr     error // returned for every call instead of the sbreserve check
-		wantCalls  []int
-		wantGot    int   // non-zero: expect *BufferClampedError with this Got
-		wantErr    error // otherwise: expect errors.Is(err, wantErr), or nil
+		name      string
+		kernel    fakeXNU
+		want      int
+		sysctlErr error
+		setErr    error // returned for every setsockopt instead of the fake
+		getErr    error // returned for every getsockopt
+		wantCalls []int
+		wantGot   int   // non-zero: expect *BufferClampedError with this Got
+		wantErr   error // otherwise: expect errors.Is(err, wantErr), or nil
+		wantHiwat int   // the buffer size left behind
 	}{
 		{
-			name: "default rcvbuf on stock macOS clamps to the ceiling",
-			want: shredsRcvbuf, maxsockbuf: defaultMaxsockbuf,
-			wantCalls: []int{shredsRcvbuf, ceiling}, wantGot: ceiling,
+			name:   "legacy: default rcvbuf retries at the ceiling and reports the clamp",
+			kernel: fakeXNU{legacy: true, sbMax: defaultMaxsockbuf, hiwat: udpRecvspace},
+			want:   shredsRcvbuf, wantCalls: []int{shredsRcvbuf, legacyCeiling},
+			wantGot: legacyCeiling, wantHiwat: legacyCeiling,
 		},
 		{
-			name: "request at the ceiling is accepted as is",
-			want: ceiling, maxsockbuf: defaultMaxsockbuf,
-			wantCalls: []int{ceiling},
+			name:   "legacy: a request at the ceiling is accepted as is",
+			kernel: fakeXNU{legacy: true, sbMax: defaultMaxsockbuf, hiwat: udpRecvspace},
+			want:   legacyCeiling, wantCalls: []int{legacyCeiling}, wantHiwat: legacyCeiling,
 		},
 		{
-			name: "other setsockopt errors pass through without a retry",
-			want: shredsRcvbuf, maxsockbuf: defaultMaxsockbuf, setErr: syscall.EBADF,
-			wantCalls: []int{shredsRcvbuf}, wantErr: syscall.EBADF,
+			name:   "legacy: unreadable maxsockbuf reports the unchanged buffer as the clamp",
+			kernel: fakeXNU{legacy: true, sbMax: defaultMaxsockbuf, hiwat: udpRecvspace},
+			want:   shredsRcvbuf, sysctlErr: syscall.ENOENT,
+			wantCalls: []int{shredsRcvbuf}, wantGot: udpRecvspace, wantHiwat: udpRecvspace,
 		},
 		{
-			name: "unreadable maxsockbuf keeps the ENOBUFS",
-			want: shredsRcvbuf, sysctlErr: syscall.ENOENT,
-			wantCalls: []int{shredsRcvbuf}, wantErr: syscall.ENOBUFS,
+			name:   "legacy: a refused retry reports the unchanged buffer as the clamp",
+			kernel: fakeXNU{legacy: true, limited: true, sbMax: defaultMaxsockbuf, hiwat: udpRecvspace},
+			want:   shredsRcvbuf, wantCalls: []int{shredsRcvbuf, legacyCeiling},
+			wantGot: udpRecvspace, wantHiwat: udpRecvspace,
 		},
 		{
-			name: "ENOBUFS under a higher maxsockbuf is not a clamp",
-			want: shredsRcvbuf, maxsockbuf: 2 * defaultMaxsockbuf,
-			wantCalls: []int{shredsRcvbuf}, wantErr: syscall.ENOBUFS,
+			name:   "ENOBUFS with the ceiling at or above the request is not retried",
+			kernel: fakeXNU{legacy: true, limited: true, sbMax: 2 * defaultMaxsockbuf, hiwat: udpRecvspace},
+			want:   shredsRcvbuf, wantCalls: []int{shredsRcvbuf},
+			wantGot: udpRecvspace, wantHiwat: udpRecvspace,
+		},
+		{
+			name:   "modern: default rcvbuf equals maxsockbuf and is accepted in full",
+			kernel: fakeXNU{sbMax: defaultMaxsockbuf, hiwat: udpRecvspace},
+			want:   shredsRcvbuf, wantCalls: []int{shredsRcvbuf}, wantHiwat: shredsRcvbuf,
+		},
+		{
+			name:   "modern: the silent clamp above maxsockbuf is reported",
+			kernel: fakeXNU{sbMax: defaultMaxsockbuf, hiwat: udpRecvspace},
+			want:   2 * shredsRcvbuf, wantCalls: []int{2 * shredsRcvbuf},
+			wantGot: defaultMaxsockbuf, wantHiwat: defaultMaxsockbuf,
+		},
+		{
+			name:   "modern: ENOBUFS at maxsockbuf does not shrink the buffer to the legacy ceiling",
+			kernel: fakeXNU{sbMax: defaultMaxsockbuf, hiwat: defaultMaxsockbuf},
+			want:   2 * shredsRcvbuf, wantCalls: []int{2 * shredsRcvbuf},
+			wantGot: defaultMaxsockbuf, wantHiwat: defaultMaxsockbuf,
+		},
+		{
+			name:   "a buffer already at least the request is left alone",
+			kernel: fakeXNU{sbMax: 4 * defaultMaxsockbuf, hiwat: 2 * shredsRcvbuf},
+			want:   shredsRcvbuf, wantHiwat: 2 * shredsRcvbuf,
+		},
+		{
+			name:   "other setsockopt errors pass through without a retry",
+			kernel: fakeXNU{legacy: true, sbMax: defaultMaxsockbuf, hiwat: udpRecvspace},
+			want:   shredsRcvbuf, setErr: syscall.EBADF,
+			wantCalls: []int{shredsRcvbuf}, wantErr: syscall.EBADF, wantHiwat: udpRecvspace,
+		},
+		{
+			name:   "an unreadable size after the set is an error, not success",
+			kernel: fakeXNU{sbMax: defaultMaxsockbuf, hiwat: udpRecvspace},
+			want:   shredsRcvbuf, getErr: syscall.EBADF,
+			wantCalls: []int{shredsRcvbuf}, wantErr: syscall.EBADF, wantHiwat: shredsRcvbuf,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var calls []int
+			k := tc.kernel
 			set := func(n int) error {
-				calls = append(calls, n)
 				if tc.setErr != nil {
+					k.calls = append(k.calls, n)
 					return tc.setErr
 				}
-				if n > ceiling {
-					return syscall.ENOBUFS
-				}
-				return nil
+				return k.set(n)
 			}
-			err := retryAtMaxsockbuf(tc.want, set,
-				func() (uint32, error) { return tc.maxsockbuf, tc.sysctlErr })
+			get := func() (int, error) { return k.hiwat, tc.getErr }
+			err := setXNUBufferAtLeast(tc.want, get, set,
+				func() (uint32, error) { return uint32(k.sbMax), tc.sysctlErr })
 
-			if !slices.Equal(calls, tc.wantCalls) {
-				t.Errorf("setsockopt calls = %v, want %v", calls, tc.wantCalls)
+			if !slices.Equal(k.calls, tc.wantCalls) {
+				t.Errorf("setsockopt calls = %v, want %v", k.calls, tc.wantCalls)
+			}
+			if k.hiwat != tc.wantHiwat {
+				t.Errorf("buffer left at %d, want %d", k.hiwat, tc.wantHiwat)
 			}
 			var clamp *BufferClampedError
 			if tc.wantGot != 0 {
