@@ -26,7 +26,7 @@ import (
 	"github.com/blockcast/go-amt/broker"
 	"github.com/blockcast/go-amt/broker/gwclient"
 	"github.com/blockcast/go-amt/erasure"
-	"github.com/blockcast/go-amt/messages"
+	"github.com/blockcast/go-amt/internal/amtrelay"
 	"github.com/blockcast/go-amt/receiver"
 	"github.com/blockcast/go-amt/receiver/config"
 	"github.com/blockcast/go-amt/receiver/delivery"
@@ -1330,18 +1330,14 @@ func ssmFeed(address string, rcvbuf int) (*amt.ManagedConn, error) {
 		}
 	}
 	if relay := query.Get("relay"); relay != "" {
-		if _, _, err := net.SplitHostPort(relay); err != nil {
-			relay = net.JoinHostPort(relay, strconv.Itoa(messages.DefaultPort))
+		relayAddress, err := amtrelay.Parse(relay)
+		if errors.Is(err, amtrelay.ErrPortZero) {
+			return nil, fmt.Errorf("%w: relay port 0", usage)
 		}
-		relayAddress, err := net.ResolveUDPAddr("udp4", relay)
 		if err != nil {
 			return nil, fmt.Errorf("%q relay: %w", address, err)
 		}
-		if relayAddress.Port == 0 {
-			// ?relay=IP: splits cleanly with an empty port, skipping the default.
-			return nil, fmt.Errorf("%w: relay port 0", usage)
-		}
-		conn.RelayAddr, conn.Mode = *relayAddress, amt.AMTModeAuto
+		conn.RelayAddr, conn.Mode = relayAddress, amt.AMTModeAuto
 	}
 	if name := query.Get("iface"); name != "" {
 		if conn.IFace, err = net.InterfaceByName(name); err != nil {
