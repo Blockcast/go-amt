@@ -35,6 +35,13 @@
 // channels are sent, at most -channel-max of them, and never one on the vote
 // or compute budget program, which nearly every transaction carries.
 //
+// -registry-rpc adds the channels of the W9 channel registry (BLO-46422,
+// registry.go): every -registry-poll it asks the -registry-program for the
+// -registry-publisher's active channels, and sends them besides the -channel6
+// ones, within -channel-max. It starts at most -registry-add new channels per
+// poll and stops a channel as soon as a poll no longer returns it. If no poll
+// has succeeded for -registry-stale, it stops every registry channel.
+//
 // -ttl 0 with -loop keeps the feed on this host, for a subscriber on it.
 package main
 
@@ -200,7 +207,7 @@ func source6(src6, base6 string, channels int) (netip.Addr, error) {
 	}
 	src, err := netip.ParseAddr(src6)
 	if err != nil || src.Is4() {
-		return netip.Addr{}, fmt.Errorf("-group-base6 and -channel6 need -src6, a local IPv6 address; got %q", src6)
+		return netip.Addr{}, fmt.Errorf("-group-base6, -channel6 and -registry-rpc need -src6, a local IPv6 address; got %q", src6)
 	}
 	return src, nil
 }
@@ -243,6 +250,12 @@ func main() {
 		keep       = flag.Duration("keep", 10*time.Second, "how long a slot's FEC-set and batch state outlives its latest frame")
 		statsSec   = flag.Int("stats-interval", 10, "seconds between stats lines")
 		rcvbuf     = flag.Int("rcvbuf", 8<<20, "SO_RCVBUF for the ingest socket")
+		regRPC     = flag.String("registry-rpc", "", "Solana JSON-RPC URL of the W9 channel registry; empty sends the -channel6 channels alone")
+		regProgram = flag.String("registry-program", "", "BASE58 channel registry program id")
+		regPub     = flag.String("registry-publisher", "", "BASE58 publisher whose registry channels this sends")
+		regPoll    = flag.Duration("registry-poll", 30*time.Second, "time between registry polls")
+		regAdd     = flag.Int("registry-add", 4, "most new registry channels started per poll")
+		regStale   = flag.Duration("registry-stale", 2*time.Minute, "stop every registry channel when no poll has succeeded for this long")
 	)
 	flag.Parse()
 
@@ -266,7 +279,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	source, err := source6(*src6, *base6, len(chans))
+	reg, err := newRegistry(*regRPC, *regProgram, *regPub, *port, *regPoll, *regAdd, *regStale)
+	if err != nil {
+		log.Fatal(err)
+	}
+	nchan := len(chans)
+	if reg != nil {
+		nchan = max(nchan, 1) // registry channels need -src6 too
+	}
+	source, err := source6(*src6, *base6, nchan)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -278,6 +299,7 @@ func main() {
 	}
 
 	var outs []*output
+	var out6 *output // the IPv6 output, which sends the filter channels
 	if *base4 != "" {
 		o, err := newOutput(*base4, iface, *port, *ttl, *loop)
 		if err != nil {
@@ -300,6 +322,7 @@ func main() {
 			log.Printf("channel %s: (S=%s, G=%s) hops=%d loop=%t", c, source, o.chans[c], *ttl, *loop)
 		}
 		outs = append(outs, o)
+		out6 = o
 	}
 	if len(outs) == 0 {
 		log.Fatal("no output: give -group-base, -group-base6 or -channel6")
@@ -345,6 +368,14 @@ func main() {
 			s.Frames, s.Dups, s.Bad, s.SetsRecovered, s.ShardsRecovered, s.RecoveredBad, s.ParityChecked, s.ParityMismatch, s.Batches, batchErr, txs, votes, oversize, overflow, chunked, sent, sendErr, len(ch), qdrop.Load(), s.Slots, s.Held, s.Evicted, s.MaxSlot)
 	}
 
+	polls := make(chan registryPoll, 1)
+	var regChans []txfeed.Channel // the registry channels being sent
+	lastPoll := time.Now()        // a failing registry at start goes stale -registry-stale later
+	if reg != nil {
+		log.Printf("registry: %s program %s publisher %s, every %v, at most %d new per poll", reg.url, reg.program, reg.publisher, *regPoll, *regAdd)
+		go reg.run(*regPoll, polls)
+	}
+
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	tick := time.NewTicker(time.Duration(*statsSec) * time.Second)
@@ -382,6 +413,35 @@ func main() {
 					}
 				}
 			}
+
+		case p := <-polls:
+			if p.err != nil {
+				log.Printf("registry poll: %v", p.err)
+				if time.Since(lastPoll) < *regStale || len(regChans) == 0 {
+					continue
+				}
+				log.Printf("registry: no poll has succeeded for %v; stopping every registry channel", *regStale)
+				p.chans = nil
+			} else {
+				lastPoll = time.Now()
+			}
+			if p.skipped > 0 {
+				log.Printf("registry: skipped %d accounts that are not channels this publisher may send", p.skipped)
+			}
+			next, added, dropped := nextChannels(chans, regChans, p.chans, *regAdd, *channelMax)
+			if len(added)+len(dropped) == 0 {
+				continue
+			}
+			for _, c := range dropped {
+				delete(out6.chans, c)
+				log.Printf("registry: stop channel %s", c)
+			}
+			for _, c := range added {
+				out6.chans[c] = netip.AddrPortFrom(txfeed.ChannelGroup(c.Kind, c.Key), uint16(*port))
+				log.Printf("registry: start channel %s: (S=%s, G=%s)", c, source, out6.chans[c])
+			}
+			regChans = next[len(chans):]
+			log.Printf("registry: sending %d channels, %d of them from the registry", len(out6.chans), len(regChans))
 
 		case <-tick.C:
 			log.Print(stats())
