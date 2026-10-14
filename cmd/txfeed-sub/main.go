@@ -25,6 +25,17 @@
 // well. Off Blockcast's network:
 //
 //	txfeed-sub -relay 69.25.95.128 -named jupiter-v6 -json
+//
+// -listen ADDR:PORT joins nothing: it reads frames from a loopback socket, the
+// hand-off from amt-verify --forward (amt-protocol), which receives an IPv6
+// filter channel (W9, txfeed.ChannelGroup) through the IPv6 AMT relay.
+// -channel KIND:BASE58 checks that every transaction matches that channel. One
+// that does not is counted as nonmatching, not printed, and makes the exit
+// status 1. For the Jupiter v6 program channel:
+//
+//	txfeed-sub -listen 127.0.0.1:15003 -channel program:JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4 -json &
+//	amt-verify --family v6 --relay 2602:f74d:1::128 --source 2602:f74d:1:5::57 \
+//		--group ff3e:0:5931:b9e6:ea21:cfec:b94a:e197 --forward 127.0.0.1:15003
 package main
 
 import (
@@ -145,9 +156,11 @@ func (f *multiFlag) Set(s string) error { *f = append(*f, s); return nil }
 // config is a parsed command line.
 type config struct {
 	subs           []*sub
-	iface          netip.Addr     // -iface-ip; unset with -relay and no -iface-ip
-	ifi            *net.Interface // the interface holding iface, for a relayed join
-	relay          *net.UDPAddr   // -relay; nil for native joins only
+	iface          netip.Addr              // -iface-ip; unset with -relay and no -iface-ip
+	ifi            *net.Interface          // the interface holding iface, for a relayed join
+	relay          *net.UDPAddr            // -relay; nil for native joins only
+	listen         netip.AddrPort          // -listen; unset when joining groups
+	channel        map[txfeed.Channel]bool // -channel, the one channel every transaction must match; nil for no check
 	verify, asJSON bool
 	limit          uint64
 	duration       time.Duration
@@ -175,6 +188,31 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 		c.relay = &a
 		return nil
 	})
+	fs.Func("listen", "loopback ADDR:PORT to read frames from instead of joining any group: the hand-off from amt-verify --forward", func(s string) error {
+		ap, err := netip.ParseAddrPort(s)
+		if err != nil {
+			return err
+		}
+		// Loopback only, like --forward: the socket is a hand-off on this host,
+		// not a port open to the network.
+		if !ap.Addr().IsLoopback() {
+			return fmt.Errorf("%s is not a loopback address", ap.Addr())
+		}
+		c.listen = ap
+		return nil
+	})
+	fs.Func("channel", "KIND:BASE58 channel, KIND program or account, that every transaction must match; one that does not is "+
+		"counted as nonmatching, not printed, and makes the exit status 1", func(s string) error {
+		if c.channel != nil {
+			return errors.New("given twice")
+		}
+		ch, err := txfeed.ParseChannel(s)
+		if err != nil {
+			return err
+		}
+		c.channel = map[txfeed.Channel]bool{ch: true}
+		return nil
+	})
 	var (
 		source   = fs.String("source", "69.25.95.57", "source of the partition groups: the shred-txfeed host")
 		base     = fs.String("group-base", "232.0.3.0", "partition group base")
@@ -192,6 +230,7 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 
   txfeed-sub -iface-ip 10.0.0.5 -nonvote                  native joins: Linux, on a network carrying the feed
   txfeed-sub -relay 69.25.95.128 -named jupiter-v6 -json  anywhere: native first, else through the AMT relay
+  txfeed-sub -listen 127.0.0.1:15003 -channel program:B58  frames handed off by amt-verify --forward 127.0.0.1:15003
 
 `)
 		fs.PrintDefaults()
@@ -200,6 +239,14 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 		return nil, err
 	}
 	c.verify, c.asJSON, c.limit, c.duration = *verify, *asJSON, *limit, *duration
+
+	if c.listen.IsValid() {
+		if c.relay != nil || *ifaceIP != "" || *vote || *nonvote || len(named)+len(programs)+len(raw) > 0 {
+			return nil, errors.New("-listen joins nothing: give no -relay, -iface-ip or group selector with it")
+		}
+		c.subs = []*sub{{label: "listen", group: c.listen, all: true, chunks: txfeed.NewReassembler(chunkTimeout, maxChunked)}}
+		return c, nil
+	}
 
 	if c.relay == nil && runtime.GOOS != "linux" {
 		return nil, errors.New("give -relay: a native join needs Linux")
@@ -264,9 +311,15 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 		c.subs = join(c.subs, "ssm", rs, rg, nil)
 	}
 	if len(c.subs) == 0 {
-		return nil, errors.New("nothing to subscribe to: give -vote, -nonvote, -named, -program or -ssm")
+		return nil, errors.New("nothing to subscribe to: give -vote, -nonvote, -named, -program, -ssm or -listen")
 	}
 	return c, nil
+}
+
+// matches reports whether tx passes the -channel check: it matches the channel,
+// or no -channel was given.
+func (c *config) matches(tx txfeed.Tx) bool {
+	return c.channel == nil || len(txfeed.MatchChannels(tx, c.channel)) > 0
 }
 
 // openRelayed opens a relayed join. It and listenNative, the native join, are
@@ -274,11 +327,20 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 var openRelayed = (*amt.ManagedConn).Open
 
 // open joins s and returns a function that reads its next datagram, and how it
-// joined. Without -relay it is the native txfeed.ListenSSM join. With -relay it
+// joined. With -listen it reads the loopback socket and joins nothing. Without
+// -relay it is the native txfeed.ListenSSM join. With -relay it
 // is an amt.ManagedConn, the opener behind blockcast-shreds' ssm:// feeds.
 // ManagedConns to one relay share its RelayManager, so every group rides one
 // AMT tunnel.
 func (c *config) open(s *sub) (read func([]byte) (int, error), via string, err error) {
+	if c.listen.IsValid() {
+		uc, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(c.listen))
+		if err != nil {
+			return nil, "", err
+		}
+		_ = uc.SetReadBuffer(rcvbuf)
+		return func(b []byte) (int, error) { n, _, err := uc.ReadFromUDPAddrPort(b); return n, err }, "on " + uc.LocalAddr().String(), nil
+	}
 	if c.relay == nil {
 		uc, err := listenNative(s.source, s.group.Addr(), int(s.group.Port()), c.iface, rcvbuf)
 		if err != nil {
@@ -341,7 +403,11 @@ func main() {
 		if err != nil {
 			log.Fatalf("%s: %v", s.label, err)
 		}
-		log.Printf("joined %s: (S=%s, G=%s) %s", s.label, s.source, s.group, via)
+		if cfg.listen.IsValid() {
+			log.Printf("listening %s", via)
+		} else {
+			log.Printf("joined %s: (S=%s, G=%s) %s", s.label, s.source, s.group, via)
+		}
 		go func() {
 			buf := make([]byte, maxDatagram)
 			for {
@@ -355,6 +421,15 @@ func main() {
 				ch <- packet{s: s, b: bytes.Clone(buf[:n]), at: time.Now()}
 			}
 		}()
+	}
+	var nonmatching uint64 // transactions failing the -channel check
+	defer func() {
+		if nonmatching > 0 {
+			os.Exit(1) // last, after the summary and the leaves
+		}
+	}()
+	for ch := range cfg.channel {
+		log.Printf("checking every transaction against channel %s, group %s", ch, txfeed.ChannelGroup(ch.Kind, ch.Key))
 	}
 	defer cfg.leave() // after the summary below: it can wait 2s on the relay
 	for _, s := range cfg.subs {
@@ -391,6 +466,9 @@ func main() {
 		}
 		log.Printf("printed=%d dups=%d filtered=%d bad=%d verify_ok=%d verify_bad=%d latency_ms p50=%.1f p90=%.1f p99=%.1f",
 			printed, dups, filtered, bad, verOK, verBad, percentile(lat, 50), percentile(lat, 90), percentile(lat, 99))
+		if cfg.channel != nil {
+			log.Printf("channel check: matched=%d nonmatching=%d", printed, nonmatching)
+		}
 		var c txfeed.ReassemblyStats
 		for _, s := range cfg.subs {
 			g := s.chunks.Stats()
@@ -455,6 +533,12 @@ func main() {
 			continue
 		}
 		ss.keys[k] = true
+		if !cfg.matches(tx) {
+			if nonmatching++; nonmatching == 1 { // the first only: a wrong channel would flood the log
+				log.Printf("nonmatching transaction: slot=%d sig=%s", f.Slot, txfeed.Base58Encode(tx.Sig))
+			}
+			continue
+		}
 
 		l := line{Slot: f.Slot, Batch: f.BatchStart, Index: f.Index, Vote: f.Vote, Sig: txfeed.Base58Encode(tx.Sig),
 			LatencyMs: float64(p.at.UnixMicro()-int64(f.ShredTs)) / 1000}
