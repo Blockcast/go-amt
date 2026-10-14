@@ -1,0 +1,32 @@
+{
+  "accounts": [
+    {
+      "address": "9xVg4xQPYeQPRZ9pqWxJbSiNvpUfq5qEgeCWNBFvajMf",
+      "data_hex": "020301010479d55bf231c06eee74c56ece681507fdb1b2dea3f48e5102b1cda256bc138f630404ac7a2ad2fe27803a80913812117c077ecd60576459cfa3f0b36dc03652d6fad9b7039acaae246bf4dc28bd5f684f1401f7677cc7d2452919fba5905ab0ff3e00005931b9e6ea21cfecb94ae1978b13e803000000000000ffffffffffffffffffe8030000000000000000000000000000",
+      "name": "channel-program-jupiter-active"
+    },
+    {
+      "address": "98CvJKxSN6EbTUWtZ7X5qnqMog6Te2oTVakdBg6dqyGd",
+      "data_hex": "02030200c6fa7af3bedbad3a3d65f36aabc97431b1bbe4c2d2f6e0e47ca60203452f5d61630404ac7a2ad2fe27803a80913812117c077ecd60576459cfa3f0b36dc03652d6fad9b7039acaae246bf4dc28bd5f684f1401f7677cc7d2452919fba5905ab0ff3e000085500b182c471bcf99d764098b13e803000000000000feffffffffffffffffe8030000000000000000000000000000",
+      "name": "channel-account-usdc-pending"
+    },
+    {
+      "address": "2bBJtAKoVumsbQmJYDuRJ9d3cBB76q4RLHKxryxGeZCN",
+      "data_hex": "0203010206ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9630404ac7a2ad2fe27803a80913812117c077ecd60576459cfa3f0b36dc03652d6fad9b7039acaae246bf4dc28bd5f684f1401f7677cc7d2452919fba5905ab0ff3e000006c51ce001cf7ee7834a80758b13e803000000000000ffffffffffffffffffe803000000000000e803000000000000",
+      "name": "channel-program-token-revoked"
+    },
+    {
+      "address": "DCXveX4qQULAXjLiayUCgPLvqXUHNksRuXwnyK3dQWr8",
+      "data_hex": "0303ff01d6fad9b7039acaae246bf4dc28bd5f684f1401f7677cc7d2452919fba5905ab0630404ac7a2ad2fe27803a80913812117c077ecd60576459cfa3f0b36dc03652ff3e0000000000000000000002320201e803000000000000ffffffffffffffffe8030000000000000000000000000000",
+      "name": "subscription-shreds-active"
+    },
+    {
+      "address": "9ioWVzh2Ansr6mRp7BD3Dmj5XEmvqY4dMzdYecwCXygs",
+      "data_hex": "0103630404ac7a2ad2fe27803a80913812117c077ecd60576459cfa3f0b36dc036520001010000fc477d5d3c76baeacbd157ab80283532c2315ddad4e1985dbd0b2b7c55c87cc02b0a0000000000000040420f000000000080841e0000000000c0c62d000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "name": "config"
+    }
+  ],
+  "note": "account bytes written by channel-registry main 4d693c4 (layout version 3) in LiteSVM; deposits are test values",
+  "payer": "FUC6qrY1nVbuuHwg28gM9VeQXAMxDtWu7sz5Xb6jTE7q",
+  "publisher": "7fWv7uMkcPdDwbj2XX9gPk8YWYJMTPFMXqL7ys6ACc3B"
+}
