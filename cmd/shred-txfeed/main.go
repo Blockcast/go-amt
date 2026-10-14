@@ -34,6 +34,9 @@
 // 1280-byte IPv6 path whole through the IPv6 AMT relay. Only configured
 // channels are sent, at most -channel-max of them, and never one on the vote
 // or compute budget program, which nearly every transaction carries.
+// -channel-cap caps what each channel sends, and -channel-total-cap all of
+// them together (caps.go): a transaction over a cap is not sent on that
+// channel, and is counted in chan_capped.
 //
 // -registry-rpc adds the channels of the W9 channel registry (BLO-46422,
 // registry.go): every -registry-poll it asks the -registry-program for the
@@ -76,6 +79,7 @@ type output struct {
 	}
 	dst   []netip.AddrPort                  // by partition; nil for -channel6 without -group-base6
 	chans map[txfeed.Channel]netip.AddrPort // each -channel6 channel's group
+	caps  *channelCaps                      // the channels' byte caps; nil for none
 }
 
 // publish sends tx, transaction i of batch, to each of its partition groups
@@ -112,10 +116,17 @@ func publish(outs []*output, ids []txfeed.Pubkey, batch txfeed.Batch, i int, tx 
 	// it punt a resolve to its routing engine, so a group per key seen would
 	// be a self-inflicted control-plane DoS; -channel-max caps the set.
 	var chanDgs [][]byte // cut at the first match: most transactions match none
+	var chanBytes int
 	for _, o := range outs {
 		for _, c := range txfeed.MatchChannels(tx, o.chans) {
 			if chanDgs == nil {
 				chanDgs = txfeed.DatagramsWithin(f, txfeed.MaxChannelDatagram)
+				for _, d := range chanDgs {
+					chanBytes += len(d)
+				}
+			}
+			if o.caps != nil && !o.caps.take(c, chanBytes) {
+				continue // over a cap: the whole transaction stays off this channel
 			}
 			send(o, o.chans[c], chanDgs)
 		}
@@ -256,6 +267,11 @@ func main() {
 		regPoll    = flag.Duration("registry-poll", 30*time.Second, "time between registry polls")
 		regAdd     = flag.Int("registry-add", 4, "most new registry channels started per poll")
 		regStale   = flag.Duration("registry-stale", 2*time.Minute, "stop every registry channel when no poll has succeeded for this long")
+		// The cap defaults come from the 2026-10-13 native bitrates (W5.6):
+		// 8 is half the 15.8 Mbit/s non-vote feed and 5x Jupiter v6's
+		// busiest second (1.67 Mbit/s); 64 is 4x the non-vote feed.
+		chanCap   = flag.Float64("channel-cap", 8, "Mbit/s of UDP payload each filter channel may send, in bursts of up to 1 s; 0 is no cap")
+		chanTotal = flag.Float64("channel-total-cap", 64, "Mbit/s of UDP payload all filter channels together may send, in bursts of up to 1 s; 0 is no cap")
 	)
 	flag.Parse()
 
@@ -266,6 +282,9 @@ func main() {
 	}
 	if *statsSec <= 0 {
 		log.Fatalf("-stats-interval %d: want a positive number of seconds", *statsSec)
+	}
+	if *chanCap < 0 || *chanTotal < 0 {
+		log.Fatalf("-channel-cap %v, -channel-total-cap %v: want 0 (no cap) or more", *chanCap, *chanTotal)
 	}
 	named, err := parsePrograms(programs)
 	if err != nil {
@@ -321,6 +340,10 @@ func main() {
 			o.chans[c] = netip.AddrPortFrom(txfeed.ChannelGroup(c.Kind, c.Key), uint16(*port))
 			log.Printf("channel %s: (S=%s, G=%s) hops=%d loop=%t", c, source, o.chans[c], *ttl, *loop)
 		}
+		if *chanCap > 0 || *chanTotal > 0 {
+			o.caps = newChannelCaps(*chanCap, *chanTotal)
+			log.Printf("channel caps: %v Mbit/s each, %v Mbit/s in all (0 is no cap)", *chanCap, *chanTotal)
+		}
 		outs = append(outs, o)
 		out6 = o
 	}
@@ -364,8 +387,12 @@ func main() {
 	var batchErr, txs, votes, oversize, overflow, chunked, sent, sendErr uint64
 	stats := func() string {
 		s := asm.Stats()
-		return fmt.Sprintf("frames=%d dups=%d bad=%d sets_recovered=%d shards_recovered=%d recovered_bad=%d parity_checked=%d parity_mismatch=%d batches=%d batch_err=%d txs=%d votes=%d oversize=%d index_overflow=%d chunked=%d sent=%d send_err=%d queue=%d qdrop=%d slots=%d held=%d evicted=%d max_slot=%d",
-			s.Frames, s.Dups, s.Bad, s.SetsRecovered, s.ShardsRecovered, s.RecoveredBad, s.ParityChecked, s.ParityMismatch, s.Batches, batchErr, txs, votes, oversize, overflow, chunked, sent, sendErr, len(ch), qdrop.Load(), s.Slots, s.Held, s.Evicted, s.MaxSlot)
+		var capped uint64
+		if out6 != nil && out6.caps != nil {
+			capped = out6.caps.capped
+		}
+		return fmt.Sprintf("frames=%d dups=%d bad=%d sets_recovered=%d shards_recovered=%d recovered_bad=%d parity_checked=%d parity_mismatch=%d batches=%d batch_err=%d txs=%d votes=%d oversize=%d index_overflow=%d chunked=%d sent=%d send_err=%d queue=%d qdrop=%d slots=%d held=%d evicted=%d max_slot=%d chan_capped=%d",
+			s.Frames, s.Dups, s.Bad, s.SetsRecovered, s.ShardsRecovered, s.RecoveredBad, s.ParityChecked, s.ParityMismatch, s.Batches, batchErr, txs, votes, oversize, overflow, chunked, sent, sendErr, len(ch), qdrop.Load(), s.Slots, s.Held, s.Evicted, s.MaxSlot, capped)
 	}
 
 	polls := make(chan registryPoll, 1)
@@ -434,6 +461,9 @@ func main() {
 			}
 			for _, c := range dropped {
 				delete(out6.chans, c)
+				if out6.caps != nil {
+					out6.caps.forget(c)
+				}
 				log.Printf("registry: stop channel %s", c)
 			}
 			for _, c := range added {
