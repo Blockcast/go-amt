@@ -1,0 +1,82 @@
+{
+  "spec": [
+    "Test vectors for Blockcast txfeed filter channel addresses, spec v1 (go-amt txfeed/channel.go). channel-vectors.py, which uses only Python's standard library, writes this file. Implementations in other languages assert it.",
+    "A channel is a kind and a 32-byte key. Kind program (1) carries the transactions that invoke the program in a top-level instruction; a program called by CPI is not visible in shreds. Kind account (2) carries the transactions that list the account among their message's static account keys; accounts reached through address lookup tables are not matched.",
+    "The channel's IPv6 SSM group is ff3e:0000: followed by the first 12 bytes of SHA-256(domain || kind || key). domain is the 27 ASCII bytes below, with no length prefix or terminator; kind is one byte; key is the 32 bytes that the base58 key decodes to.",
+    "group is the RFC 5952 text form: lowercase, no leading zeros, the longest run of two or more zero 16-bit words as ::, and a single zero word as 0. Go's net/netip, Rust's std::net::Ipv6Addr and the WHATWG URL serializer print it so. Subscriptions are keyed by this text, so print it exactly. group_hex is the same group's 16 bytes.",
+    "refused lists the keys that can have no channel, of either kind: nearly every transaction carries them, so the channel would be the whole feed."
+  ],
+  "domain": "blockcast/txfeed/channel/v1",
+  "kinds": {
+    "program": 1,
+    "account": 2
+  },
+  "refused": [
+    {
+      "name": "vote",
+      "key": "Vote111111111111111111111111111111111111111"
+    },
+    {
+      "name": "compute-budget",
+      "key": "ComputeBudget111111111111111111111111111111"
+    }
+  ],
+  "vectors": [
+    {
+      "name": "System program, as a program",
+      "kind": "program",
+      "key": "11111111111111111111111111111111",
+      "group": "ff3e:0:8320:2ab9:355f:c7a4:d5ff:7856",
+      "group_hex": "ff3e000083202ab9355fc7a4d5ff7856"
+    },
+    {
+      "name": "System program, as an account: the same key under the other kind is another channel",
+      "kind": "account",
+      "key": "11111111111111111111111111111111",
+      "group": "ff3e:0:ef61:7664:b042:a64e:2ce7:a5e5",
+      "group_hex": "ff3e0000ef617664b042a64e2ce7a5e5"
+    },
+    {
+      "name": "Token program, as a program",
+      "kind": "program",
+      "key": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "group": "ff3e:0:6c5:1ce0:1cf:7ee7:834a:8075",
+      "group_hex": "ff3e000006c51ce001cf7ee7834a8075"
+    },
+    {
+      "name": "Token program, as an account",
+      "kind": "account",
+      "key": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+      "group": "ff3e:0:a2d7:254b:f0ad:362e:77f0:e5a9",
+      "group_hex": "ff3e0000a2d7254bf0ad362e77f0e5a9"
+    },
+    {
+      "name": "Jupiter v6, as a program",
+      "kind": "program",
+      "key": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+      "group": "ff3e:0:5931:b9e6:ea21:cfec:b94a:e197",
+      "group_hex": "ff3e00005931b9e6ea21cfecb94ae197"
+    },
+    {
+      "name": "Jupiter v6, as an account",
+      "kind": "account",
+      "key": "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4",
+      "group": "ff3e:0:edf0:e663:7044:b12a:bff0:718a",
+      "group_hex": "ff3e0000edf0e6637044b12abff0718a"
+    },
+    {
+      "name": "USDC mint, an account that is not a program",
+      "kind": "account",
+      "key": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "group": "ff3e:0:8550:b18:2c47:1bcf:99d7:6409",
+      "group_hex": "ff3e000085500b182c471bcf99d76409"
+    },
+    {
+      "name": "A key whose hash starts with two zero bytes: with the prefix's zero word that makes two zero 16-bit words, which RFC 5952 compresses to ff3e::",
+      "kind": "account",
+      "key": "EmAUFcWNCxmaCSA4gintqezZGKV69PSYCx2wirujEZW",
+      "group": "ff3e::689c:9698:281c:efa1:eab4",
+      "group_hex": "ff3e00000000689c9698281cefa1eab4"
+    }
+  ]
+}

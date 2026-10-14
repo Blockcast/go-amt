@@ -46,6 +46,11 @@ type Tx struct {
 	NumSigs  int
 	Sig      []byte   // the first signature, the transaction's id (sub-slice of Raw)
 	Programs []Pubkey // distinct top-level program ids, first-use order
+	// Keys are the message's static account keys, 32 bytes each (sub-slice of
+	// Raw). The accounts a version-0 message loads from address lookup tables
+	// are not among them, since only on-chain state resolves them, and nor are
+	// the tables' own addresses.
+	Keys []byte
 	// Vote marks a simple vote as Agave's is_simple_vote_transaction defines
 	// it: a legacy message, one or two signatures, and exactly one
 	// instruction, to VoteProgram.
@@ -192,6 +197,7 @@ func parseTx(b []byte) (Tx, message, error) {
 		NumSigs:  numSigs,
 		Sig:      firstSig(sigs),
 		Programs: programs,
+		Keys:     slices.Clip(m.keys),
 		Vote:     !v0 && numSigs < 3 && n == 1 && programs[0] == VoteProgram,
 	}, m, nil
 }
@@ -267,6 +273,7 @@ func parseTxV1(b []byte) (Tx, message, error) {
 		NumSigs:  m.required,
 		Sig:      firstSig(m.sigs),
 		Programs: programs, // never a simple vote: Agave requires a legacy message
+		Keys:     slices.Clip(m.keys),
 	}, m, nil
 }
 

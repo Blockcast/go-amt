@@ -51,12 +51,7 @@ func (tt testTx) build() []byte {
 	}
 	msg = append(msg, byte(len(tt.signers)), 0, byte(len(tt.extra)))
 	msg = appendShortVec(msg, len(tt.signers)+len(tt.extra))
-	for _, k := range tt.signers {
-		msg = append(msg, k.Public().(ed25519.PublicKey)...)
-	}
-	for _, k := range tt.extra {
-		msg = append(msg, k[:]...)
-	}
+	msg = append(msg, tt.keys()...)
 	msg = append(msg, bytes.Repeat([]byte{0xbb}, 32)...) // recent_blockhash
 	msg = appendShortVec(msg, len(tt.ixs))
 	for _, in := range tt.ixs {
@@ -80,12 +75,7 @@ func (tt testTx) buildV1() []byte {
 	msg = binary.LittleEndian.AppendUint32(msg, tt.mask)
 	msg = append(msg, bytes.Repeat([]byte{0xbb}, 32)...) // lifetime specifier
 	msg = append(msg, byte(len(tt.ixs)), byte(len(tt.signers)+len(tt.extra)))
-	for _, k := range tt.signers {
-		msg = append(msg, k.Public().(ed25519.PublicKey)...)
-	}
-	for _, k := range tt.extra {
-		msg = append(msg, k[:]...)
-	}
+	msg = append(msg, tt.keys()...)
 	for i := 0; i < 32; i++ {
 		if tt.mask&(1<<i) != 0 {
 			msg = append(msg, 0xc0, 0xff, 0xee, byte(i)) // one config value slot
@@ -102,6 +92,19 @@ func (tt testTx) buildV1() []byte {
 		tx = append(tx, ed25519.Sign(k, msg)...)
 	}
 	return tx
+}
+
+// keys returns the static account keys build writes: the signers', then
+// extra.
+func (tt testTx) keys() []byte {
+	var b []byte
+	for _, k := range tt.signers {
+		b = append(b, k.Public().(ed25519.PublicKey)...)
+	}
+	for _, k := range tt.extra {
+		b = append(b, k[:]...)
+	}
+	return b
 }
 
 func key(seed byte) ed25519.PrivateKey {
@@ -203,6 +206,14 @@ func TestParseTx(t *testing.T) {
 			t.Errorf("%s: ParseTx = %d bytes, %d sigs, programs %v, vote %t; want %d, %d, %v, %t",
 				c.name, n, tx.NumSigs, tx.Programs, tx.Vote, len(raw), len(c.tx.signers), c.programs, c.vote)
 		}
+		// The static keys only: v0Tx's lookup table and what it loads are not.
+		if !bytes.Equal(tx.Keys, c.tx.keys()) {
+			t.Errorf("%s: Keys = %x, want the %d static keys %x", c.name, tx.Keys, len(c.tx.keys())/32, c.tx.keys())
+		}
+		// A sub-slice of Raw, not a copy, with no room to append into the batch.
+		if off := bytes.Index(tx.Raw, tx.Keys); off < 0 || &tx.Raw[off] != &tx.Keys[0] || cap(tx.Keys) != len(tx.Keys) {
+			t.Errorf("%s: Keys is not a clipped sub-slice of Raw", c.name)
+		}
 	}
 }
 
@@ -260,6 +271,11 @@ func TestParseEntries(t *testing.T) {
 	if !txs[0].Vote || txs[1].Vote || txs[2].Vote || txs[3].Vote {
 		t.Error("only the first transaction is a vote")
 	}
+	for i, tt := range []testTx{voteTx, v0Tx, legacyTx, v1Tx} {
+		if !bytes.Equal(txs[i].Keys, tt.keys()) {
+			t.Errorf("transaction %d: Keys are not its static keys", i)
+		}
+	}
 
 	// Agave's bincode::deserialize ignores bytes after the entries; so does
 	// ParseEntries.
@@ -296,7 +312,7 @@ func FuzzParseEntries(f *testing.F) {
 		}
 		for _, tx := range txs {
 			again, n, err := ParseTx(tx.Raw)
-			if err != nil || n != len(tx.Raw) || !slices.Equal(again.Programs, tx.Programs) || again.Vote != tx.Vote {
+			if err != nil || n != len(tx.Raw) || !slices.Equal(again.Programs, tx.Programs) || !bytes.Equal(again.Keys, tx.Keys) || again.Vote != tx.Vote {
 				t.Fatalf("a parsed transaction does not parse alone: %d of %d bytes, %v", n, len(tx.Raw), err)
 			}
 			VerifyTx(tx.Raw) // must not panic, whatever the bytes
