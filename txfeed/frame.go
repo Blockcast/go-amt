@@ -20,14 +20,15 @@ import (
 //	[24:]    the exact VersionedTransaction bytes
 //
 // Version 2, one chunk of a transaction too large for a version-1 frame of
-// at most MaxDatagram bytes:
+// at most MaxDatagram bytes, or MaxChannelDatagram on a filter channel:
 //
 //	[0]      version      u8       2
 //	[1:24]   as version 1
 //	[24]     chunk index  u8       0..chunk count-1
 //	[25]     chunk count  u8       at least 1
-//	[26:]    the chunk, a slice of the transaction. shred-txfeed cuts at
-//	         MaxDatagram-26 = 1376 bytes, the last chunk shorter.
+//	[26:]    the chunk, a slice of the transaction. shred-txfeed cuts every
+//	         chunk at MaxChannelDatagram-26 = 1156 bytes, the last shorter,
+//	         on every group, so a transaction's chunks are the same on all.
 //
 // (slot, batch start, tx index) names the transaction, so it is the
 // reassembly key. Every chunk carries the same header, and concatenating the
@@ -45,10 +46,13 @@ import (
 // parse the result as the transaction of a version-1 frame with the same
 // header: bytes 1..23 mean what they mean in version 1. A subscriber joined
 // to several groups receives each chunk once per group, so ignore a chunk
-// index already held. Drop the transaction when its chunks disagree on the
+// index already held: the copies are identical. A transaction can also arrive
+// whole on one group and in chunks on a filter channel, whose version-1 frames
+// are smaller; both give the same transaction, so dedupe whole transactions
+// by the same key. Drop the transaction when its chunks disagree on the
 // vote flag, shred_ts_us or chunk count, when the whole would exceed MaxTxSize,
-// or when it is still incomplete after a second (Reassembler does all of
-// this).
+// or when it is still incomplete after a second. Reassembler does all of this
+// but the whole-transaction dedupe, which txfeed-sub keeps per slot.
 const (
 	frameHeaderSize = 24
 	chunkHeaderSize = frameHeaderSize + 2
@@ -63,9 +67,20 @@ const (
 // 1500 with two.
 const MaxDatagram = 1500 - (40 + 8 + 2) - (40 + 8) // 1402
 
+// MaxChannelDatagram is the largest txframe shred-txfeed sends to a filter
+// channel (channel.go), which is IPv6 only: the 1280-byte IPv6 minimum MTU
+// minus IPv6-in-IPv6 AMT, outer 40 + 8 + 2 and inner 40 + 8. The IPv6 AMT
+// relay cannot fragment (linux-amt's amt_send_multicast_data_v6 never sets
+// ignore_df), and a MaxDatagram datagram fills a 1500-byte path exactly, so a
+// channel datagram is cut to cross any IPv6 path whole.
+const MaxChannelDatagram = 1280 - (40 + 8 + 2) - (40 + 8) // 1182
+
 // maxChunk is the transaction bytes a version-2 frame carries, all but the
-// last chunk of a transaction.
-const maxChunk = MaxDatagram - chunkHeaderSize // 1376
+// last chunk of a transaction: one size for every group, the filter channels'
+// (MaxChannelDatagram), so that a transaction's chunks from two groups can
+// share a Reassembler. Chunks cut at two sizes under one key would splice
+// into a wrong transaction that no check catches.
+const maxChunk = MaxChannelDatagram - chunkHeaderSize // 1156
 
 // MaxTxSize is the largest transaction: SIMD-0296 lets a version-1
 // transaction be 4096 bytes. shred-txfeed drops anything larger.
@@ -112,20 +127,27 @@ func AppendFrame(dst []byte, f Frame) []byte {
 
 // Datagrams returns the datagrams carrying f, whose Tx is a whole transaction
 // of at most MaxTxSize bytes: one version-1 frame when it fits in
-// MaxDatagram, else version-2 chunks, none longer than MaxDatagram. It returns
+// MaxDatagram, else version-2 chunks of at most MaxChannelDatagram. It returns
 // nil for a Tx needing more than 255 chunks.
-func Datagrams(f Frame) [][]byte {
-	if frameHeaderSize+len(f.Tx) <= MaxDatagram {
+func Datagrams(f Frame) [][]byte { return DatagramsWithin(f, MaxDatagram) }
+
+// DatagramsWithin is Datagrams with a version-1 frame of at most limit bytes,
+// such as MaxChannelDatagram on a filter channel. The chunks are the same
+// whatever the limit (maxChunk), unless a limit under MaxChannelDatagram,
+// which must still exceed the 26-byte version-2 header, needs them smaller.
+func DatagramsWithin(f Frame, limit int) [][]byte {
+	if frameHeaderSize+len(f.Tx) <= limit {
 		return [][]byte{AppendFrame(nil, f)}
 	}
-	tx, n := f.Tx, (len(f.Tx)+maxChunk-1)/maxChunk
+	size := min(limit, MaxChannelDatagram) - chunkHeaderSize
+	tx, n := f.Tx, (len(f.Tx)+size-1)/size
 	if n > 255 {
-		return nil // the chunk count is a byte; callers cap f.Tx at MaxTxSize (3 chunks) first
+		return nil // the chunk count is a byte; callers cap f.Tx at MaxTxSize (4 chunks) first
 	}
 	dgs := make([][]byte, n)
 	f.Chunks = uint8(n)
 	for i := range dgs {
-		f.Chunk, f.Tx = uint8(i), tx[i*maxChunk:min((i+1)*maxChunk, len(tx))]
+		f.Chunk, f.Tx = uint8(i), tx[i*size:min((i+1)*size, len(tx))]
 		dgs[i] = AppendFrame(nil, f)
 	}
 	return dgs

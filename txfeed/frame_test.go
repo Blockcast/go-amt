@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -86,8 +87,8 @@ func fixtureFrames(t testing.TB) [][]byte {
 
 // TestDatagramsSplitsTheLiveFeed splits every captured transaction as
 // shred-txfeed now does. One that fits leaves as the identical version-1
-// frame; one that does not leaves as version-2 chunks, none over
-// MaxDatagram, that reassemble into exactly the captured frame.
+// frame; one that does not leaves as version-2 chunks of MaxChannelDatagram,
+// the last shorter, that reassemble into exactly the captured frame.
 func TestDatagramsSplitsTheLiveFeed(t *testing.T) {
 	t0 := time.Unix(1792000000, 0)
 	var fragmented, split int
@@ -111,9 +112,9 @@ func TestDatagramsSplitsTheLiveFeed(t *testing.T) {
 		var whole Frame
 		var ok bool
 		for j, d := range dgs {
-			if len(d) > MaxDatagram || d[0] != 2 || (j < len(dgs)-1 && len(d) != MaxDatagram) {
+			if len(d) > MaxChannelDatagram || d[0] != 2 || (j < len(dgs)-1 && len(d) != MaxChannelDatagram) {
 				t.Fatalf("frame %d, %d bytes: datagram %d of %d is %d bytes, version %d; want version 2, all but the last %d bytes",
-					i, len(b), j, len(dgs), len(d), d[0], MaxDatagram)
+					i, len(b), j, len(dgs), len(d), d[0], MaxChannelDatagram)
 			}
 			c, err := ParseFrame(d)
 			if err != nil {
@@ -137,7 +138,7 @@ func TestDatagramsSplitsTheLiveFeed(t *testing.T) {
 func TestDatagramsBoundary(t *testing.T) {
 	for n, want := range map[int]int{
 		0: 1, MaxDatagram - frameHeaderSize: 1, // fits: one version-1 frame of exactly MaxDatagram
-		MaxDatagram - frameHeaderSize + 1: 2, 2 * maxChunk: 2, 2*maxChunk + 1: 3, MaxTxSize: 3,
+		MaxDatagram - frameHeaderSize + 1: 2, 2 * maxChunk: 2, 2*maxChunk + 1: 3, MaxTxSize: 4,
 	} {
 		dgs := Datagrams(Frame{Tx: make([]byte, n)})
 		if len(dgs) != want || len(dgs[0]) > MaxDatagram {
@@ -147,6 +148,44 @@ func TestDatagramsBoundary(t *testing.T) {
 	// The chunk count is one byte: more than 255 chunks would wrap it.
 	if dgs := Datagrams(Frame{Tx: make([]byte, 255*maxChunk+1)}); dgs != nil {
 		t.Errorf("Datagrams over 255 chunks: %d datagrams, want none", len(dgs))
+	}
+}
+
+// A filter channel's datagrams fit a 1280-byte IPv6 path through IPv6-in-IPv6
+// AMT: every one is at most MaxChannelDatagram, every chunk but the last
+// exactly that.
+func TestDatagramsWithinAChannelDatagram(t *testing.T) {
+	if MaxChannelDatagram+(40+8+2)+(40+8) != 1280 {
+		t.Fatalf("MaxChannelDatagram %d does not fill a 1280-byte path", MaxChannelDatagram)
+	}
+	for n, want := range map[int]int{
+		MaxChannelDatagram - frameHeaderSize:     1, // one version-1 frame of exactly MaxChannelDatagram
+		MaxChannelDatagram - frameHeaderSize + 1: 2,
+		1232:                                     2, // the largest legacy or version-0 transaction
+		MaxTxSize:                                4,
+	} {
+		dgs := DatagramsWithin(Frame{Tx: make([]byte, n)}, MaxChannelDatagram)
+		if len(dgs) != want {
+			t.Errorf("DatagramsWithin(%d bytes): %d datagrams, want %d", n, len(dgs), want)
+		}
+		for j, d := range dgs {
+			if len(d) > MaxChannelDatagram || j < len(dgs)-1 && len(d) != MaxChannelDatagram {
+				t.Errorf("DatagramsWithin(%d bytes): datagram %d of %d is %d bytes; want all but the last %d", n, j, len(dgs), len(d), MaxChannelDatagram)
+			}
+		}
+	}
+}
+
+// A transaction chunked for a partition group and for a filter channel is cut
+// into the same chunks, so one Reassembler can hold them across groups. Cut at
+// two sizes, a partition's chunk 0 and a channel's chunk 1 would splice into a
+// transaction of the wrong length, which no check catches.
+func TestChunksAreTheSameOnEveryGroup(t *testing.T) {
+	for n := MaxDatagram - frameHeaderSize + 1; n <= MaxTxSize; n++ { // both chunk it
+		f := Frame{Slot: 1, Tx: make([]byte, n)}
+		if !slices.EqualFunc(Datagrams(f), DatagramsWithin(f, MaxChannelDatagram), bytes.Equal) {
+			t.Fatalf("a %d-byte transaction: a partition's chunks differ from a channel's", n)
+		}
 	}
 }
 
@@ -222,18 +261,18 @@ func TestReassemblerOrderDuplicatesAndLoss(t *testing.T) {
 		t.Fatal("a version-1 frame must pass through untouched")
 	}
 
-	a := chunksOf(t, 1, MaxTxSize) // 3 chunks
-	if len(a) != 3 {
-		t.Fatalf("%d chunks of a %d-byte transaction; want 3", len(a), MaxTxSize)
+	a := chunksOf(t, 1, MaxTxSize) // 4 chunks
+	if len(a) != 4 {
+		t.Fatalf("%d chunks of a %d-byte transaction; want 4", len(a), MaxTxSize)
 	}
-	for _, c := range []Frame{a[2], a[0], a[0], a[2]} { // out of order, then each again from another group
+	for _, c := range []Frame{a[3], a[2], a[0], a[0], a[2]} { // out of order, then two again from another group
 		if _, ok := r.Add(c, t0); ok {
 			t.Fatal("emitted before every chunk arrived")
 		}
 	}
 	f, ok := r.Add(a[1], t0)
 	if want := chunksOf(t, 1, MaxTxSize); !ok || f.Chunks != 0 || len(f.Tx) != MaxTxSize ||
-		!bytes.Equal(f.Tx, bytes.Join([][]byte{want[0].Tx, want[1].Tx, want[2].Tx}, nil)) {
+		!bytes.Equal(f.Tx, bytes.Join([][]byte{want[0].Tx, want[1].Tx, want[2].Tx, want[3].Tx}, nil)) {
 		t.Fatalf("Add(the last chunk) = %d bytes, %d chunks, %t; want the whole transaction as a version-1 frame", len(f.Tx), f.Chunks, ok)
 	}
 	if _, ok := r.Add(a[1], t0); ok { // the same chunk from another group, after reassembly
@@ -254,8 +293,8 @@ func TestReassemblerOrderDuplicatesAndLoss(t *testing.T) {
 	if _, ok := r.Add(b[0], t0); ok {
 		t.Fatal("emitted half a transaction")
 	}
-	if s := r.Stats(); s.Chunks != 9 || s.Txs != 2 || s.Dups != 3 || s.Timeouts != 0 || s.Inconsistent != 0 {
-		t.Fatalf("stats %+v; want 9 chunks, 2 transactions, 3 dups", s)
+	if s := r.Stats(); s.Chunks != 10 || s.Txs != 2 || s.Dups != 3 || s.Timeouts != 0 || s.Inconsistent != 0 {
+		t.Fatalf("stats %+v; want 10 chunks, 2 transactions, 3 dups", s)
 	}
 	// Past the timeout, the next chunk to arrive expires both: the
 	// incomplete one as a timeout, the reassembled one quietly.
@@ -273,12 +312,12 @@ func TestReassemblerDropsInconsistentChunks(t *testing.T) {
 	with := func(f Frame, edit func(*Frame)) Frame { edit(&f); return f }
 	for name, seq := range map[string][]Frame{
 		"chunk count":      {a[0], with(a[1], func(f *Frame) { f.Chunks = 2 }), a[1], a[2]},
-		"larger count":     {a[0], with(a[1], func(f *Frame) { f.Chunk, f.Chunks = 3, 4 }), a[1], a[2]},
+		"larger count":     {a[0], with(a[1], func(f *Frame) { f.Chunk, f.Chunks = 4, 5 }), a[1], a[2]},
 		"vote flag":        {a[0], with(a[1], func(f *Frame) { f.Vote = true }), a[1], a[2]},
 		"shred_ts":         {a[0], with(a[1], func(f *Frame) { f.ShredTs++ }), a[1], a[2]},
 		"repeat differs":   {a[0], with(a[0], func(f *Frame) { f.Tx = f.Tx[1:] }), a[1], a[2]},
-		"over MaxTxSize":   {a[0], a[1], with(a[2], func(f *Frame) { f.Tx = make([]byte, maxChunk) })},
-		"chunk past count": {with(a[0], func(f *Frame) { f.Chunk = 3 }), a[0], a[1], a[2]},
+		"over MaxTxSize":   {a[0], a[1], a[2], with(a[3], func(f *Frame) { f.Tx = make([]byte, maxChunk) })},
+		"chunk past count": {with(a[0], func(f *Frame) { f.Chunk = 4 }), a[0], a[1], a[2]},
 	} {
 		r := NewReassembler(time.Second, 8)
 		for _, c := range seq {
