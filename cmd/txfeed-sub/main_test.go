@@ -16,8 +16,9 @@ import (
 	"github.com/blockcast/go-amt/txfeed"
 )
 
-// No test here opens a socket: listenNative and openRelayed are swapped for
-// fakes, so nothing joins multicast or contacts a relay.
+// No test here joins multicast or contacts a relay: listenNative and
+// openRelayed are swapped for fakes. TestListenReadsLoopback binds a loopback
+// socket, as -listen does.
 
 func parseArgs(args ...string) (*config, error) {
 	fs := flag.NewFlagSet("txfeed-sub", flag.ContinueOnError)
@@ -208,5 +209,90 @@ func TestPercentile(t *testing.T) {
 	}
 	if percentile(nil, 50) != 0 {
 		t.Error("the percentile of nothing is 0")
+	}
+}
+
+func TestListenFlag(t *testing.T) {
+	jup := txfeed.DefaultPrograms[5].ID
+	c, err := parseArgs("-listen", "127.0.0.1:15003", "-channel", "program:"+jup.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.listen.String() != "127.0.0.1:15003" || len(c.subs) != 1 || !c.subs[0].all || !c.channel[txfeed.Channel{Kind: txfeed.ChannelProgram, Key: jup}] {
+		t.Errorf("parse: listen %v, %d subs, channel %v; want one unfiltered sub on 127.0.0.1:15003 checked against Jupiter v6", c.listen, len(c.subs), c.channel)
+	}
+	// -listen alone needs no -iface-ip, which a native join does, and no -relay.
+	if _, err := parseArgs("-listen", "[::1]:15003"); err != nil {
+		t.Errorf("-listen [::1]:15003: %v", err)
+	}
+
+	for _, args := range [][]string{
+		{"-listen", "10.0.0.5:15003"},              // not loopback: the hand-off never leaves the host
+		{"-listen", "127.0.0.1"},                   // no port
+		{"-listen", "127.0.0.1:15003", "-nonvote"}, // -listen joins nothing
+		{"-listen", "127.0.0.1:15003", "-relay", "69.25.95.128"},
+		{"-listen", "127.0.0.1:15003", "-iface-ip", "127.0.0.1"},
+		{"-listen", "127.0.0.1:15003", "-channel", "vote:" + jup.String()}, // not a kind
+		{"-listen", "127.0.0.1:15003", "-channel", "program:x"},            // not a key
+		{"-listen", "127.0.0.1:15003", "-channel", "program:" + jup.String(), "-channel", "account:" + jup.String()},
+	} {
+		if c, err := parseArgs(args...); err == nil {
+			t.Errorf("parse(%q) accepted, listen %v", args, c.listen)
+		}
+	}
+}
+
+func TestListenReadsLoopback(t *testing.T) {
+	c, err := parseArgs("-listen", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	swapOpeners(t, func(netip.Addr, netip.Addr, int, netip.Addr, int) (*net.UDPConn, error) {
+		t.Error("-listen joined a group natively")
+		return nil, errors.New("native")
+	}, func(*amt.ManagedConn) error {
+		t.Error("-listen joined a group through a relay")
+		return nil
+	})
+	read, via, err := c.open(c.subs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	to, err := netip.ParseAddrPort(strings.TrimPrefix(via, "on "))
+	if err != nil {
+		t.Fatalf("via %q: %v", via, err)
+	}
+	uc, err := net.DialUDP("udp", nil, net.UDPAddrFromAddrPort(to))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer uc.Close()
+	if _, err := uc.Write([]byte("frame")); err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, maxDatagram)
+	if n, err := read(b); err != nil || string(b[:n]) != "frame" {
+		t.Errorf("read %q, %v; want the datagram sent to %s", b[:n], err, to)
+	}
+}
+
+// The -channel check passes only transactions matching the channel; without
+// -channel it passes all.
+func TestChannelCheck(t *testing.T) {
+	jup, token := txfeed.DefaultPrograms[5].ID, txfeed.DefaultPrograms[0].ID
+	c, err := parseArgs("-listen", "127.0.0.1:15003", "-channel", "program:"+jup.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.matches(txfeed.Tx{Programs: []txfeed.Pubkey{token, jup}}) || c.matches(txfeed.Tx{Programs: []txfeed.Pubkey{token}}) {
+		t.Error("a program channel must pass exactly the transactions invoking the program")
+	}
+	// Jupiter's key as a static account, not an invoked program, is an account
+	// channel's match, never a program channel's.
+	if c.matches(txfeed.Tx{Programs: []txfeed.Pubkey{token}, Keys: jup[:]}) {
+		t.Error("a program channel passed a transaction that only lists the program as an account")
+	}
+	if c.channel = nil; !c.matches(txfeed.Tx{}) {
+		t.Error("without -channel every transaction must pass")
 	}
 }
