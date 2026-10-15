@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"time"
 
+	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
 )
 
@@ -33,6 +34,8 @@ type MulticastConn struct {
 	// Mode mirrors the cgo build's field so callers can set it under any build
 	// configuration without tag-specific code.
 	Mode AMTMode
+	// Filter mirrors the cgo build\'s field; this build does not apply it.
+	Filter []bpf.RawInstruction
 }
 
 var errNoCGO = fmt.Errorf("multicast connections require CGO; rebuild with CGO_ENABLED=1")

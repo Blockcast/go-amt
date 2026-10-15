@@ -56,6 +56,15 @@ type MulticastConn struct {
 	// by configuration clone from deciding the delivery path (BLO-28640).
 	Mode AMTMode
 
+	// Filter, if non-empty, is attached to the native socket with
+	// SO_ATTACH_FILTER before the group join, so it governs every datagram the
+	// socket sees, including the one the native probe waits for. A filter that
+	// drops all traffic for the probe window therefore reads as "native not
+	// deliverable"; callers sharding one group across several sockets should
+	// set Mode to AMTModeNative on the shards that may see nothing. Not applied
+	// on the AMT tunnel path, which reads one unicast socket (BLO-40191).
+	Filter []bpf.RawInstruction
+
 	conn4 *ipv4.PacketConn
 	conn6 *ipv6.PacketConn
 	amtGw *Gateway
@@ -89,7 +98,7 @@ func (mc *MulticastConn) activeConn() nativeConn {
 }
 
 func (mc *MulticastConn) Open() error {
-	var prog []bpf.RawInstruction
+	prog := mc.Filter
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
 	probeWindow, _ := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)

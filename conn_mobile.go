@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"time"
 
+	"golang.org/x/net/bpf"
 	"golang.org/x/net/ipv4"
 )
 
@@ -35,6 +36,8 @@ type MulticastConn struct {
 	// configuration without tag-specific code. It is forwarded to ManagedConn
 	// below, which is where this build makes the native-vs-tunnel decision.
 	Mode AMTMode
+	// Filter mirrors the cgo build\'s field; this build does not apply it.
+	Filter []bpf.RawInstruction
 
 	managed *ManagedConn
 }
