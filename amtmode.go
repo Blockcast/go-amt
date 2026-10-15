@@ -1,6 +1,14 @@
 package amt
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+// errFilterNeedsNative is returned by Open when a MulticastConn.Filter is set
+// on a configuration that could deliver over the AMT tunnel, which cannot
+// apply it: a shard socket would silently receive the whole flow (BLO-40191).
+var errFilterNeedsNative = errors.New("Filter requires AMTModeNative or no relay: the AMT tunnel path cannot apply it")
 
 // resolveTimeouts keeps the legacy Timeout field working while allowing the
 // two delivery-path bounds to be configured independently. An explicit zero

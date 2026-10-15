@@ -61,8 +61,9 @@ type MulticastConn struct {
 	// socket sees, including the one the native probe waits for. A filter that
 	// drops all traffic for the probe window therefore reads as "native not
 	// deliverable"; callers sharding one group across several sockets should
-	// set Mode to AMTModeNative on the shards that may see nothing. Not applied
-	// on the AMT tunnel path, which reads one unicast socket (BLO-40191).
+	// set Mode to AMTModeNative on the shards that may see nothing. The AMT
+	// tunnel reads one unicast socket and cannot apply it, so Open rejects a
+	// Filter whenever the plan could fall back to the tunnel (BLO-40191).
 	Filter []bpf.RawInstruction
 
 	conn4 *ipv4.PacketConn
@@ -102,6 +103,9 @@ func (mc *MulticastConn) Open() error {
 	addr := netip.AddrPortFrom(mc.GroupAddr, mc.GroupPort)
 	dstAddr := net.UDPAddrFromAddrPort(addr)
 	probeWindow, _ := resolveTimeouts(mc.Timeout, mc.ProbeWindow, mc.RelayHandshakeTimeout)
+	if len(prog) > 0 && planProbe(mc.Mode, len(mc.RelayAddr.IP) > 0, probeWindow).TunnelOnFailure {
+		return errFilterNeedsNative
+	}
 
 	if mc.GroupAddr.Is6() {
 		// The plan is consulted BEFORE the socket is bound. Binding first made

@@ -36,13 +36,17 @@ type MulticastConn struct {
 	// configuration without tag-specific code. It is forwarded to ManagedConn
 	// below, which is where this build makes the native-vs-tunnel decision.
 	Mode AMTMode
-	// Filter mirrors the cgo build\'s field; this build does not apply it.
+	// Filter mirrors the cgo build's field. ManagedConn cannot apply it, so
+	// Open rejects a non-empty Filter rather than deliver the whole flow.
 	Filter []bpf.RawInstruction
 
 	managed *ManagedConn
 }
 
 func (mc *MulticastConn) Open() error {
+	if len(mc.Filter) > 0 {
+		return fmt.Errorf("Filter is not supported on android/ios: ManagedConn cannot apply it")
+	}
 	managed := &ManagedConn{
 		RelayAddr:             mc.RelayAddr,
 		SrcAddr:               mc.SrcAddr,

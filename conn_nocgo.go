@@ -34,7 +34,7 @@ type MulticastConn struct {
 	// Mode mirrors the cgo build's field so callers can set it under any build
 	// configuration without tag-specific code.
 	Mode AMTMode
-	// Filter mirrors the cgo build\'s field; this build does not apply it.
+	// Filter mirrors the cgo build's field; this build's Open always fails.
 	Filter []bpf.RawInstruction
 }
 
