@@ -1,0 +1,6 @@
+time_to_32nd_shred union p50=21.375ms p95=110.079ms p99=135.167ms
+union erasure sets=14260 erased=134 fraction=0.009397 mean_shreds_per_set=51.48
+gap_ms union <1=695545 1-2.4=22046 2.4-7=7116 7-32=1554 >=32=39 reordered=7827
+feed name=prod erasure sets=14260 erased=4675 fraction=0.327840 mean_shreds_per_set=33.49 unique_first=227995 first_arrival_fraction=0.310566
+feed name=union erasure sets=14260 erased=339 fraction=0.023773 mean_shreds_per_set=50.86 unique_first=506133 first_arrival_fraction=0.689434
+second_feed_measured_worth baseline=prod rescued_sets=4541 gap_closed_fraction=0.318443

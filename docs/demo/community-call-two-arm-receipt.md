@@ -29,11 +29,12 @@ flag that were never registered, and would have exited 1 on camera.
 # 1. Offline control. Deterministic, no network, nothing to trust.
 blockcast-shreds selftest --fixture
 
-# 2. Live two-arm run. Order matters: prod first makes prod the baseline.
-#    Both values are LOCAL bind addresses the taps forward into, not sources.
-timeout -s TERM 300 blockcast-shreds \
-  --feed prod=<receiver-bind-ip>:20001 \
-  --feed union=<receiver-bind-ip>:20002 \
+# 2. Live two-arm run, as the stage runs it (docs/demo/receipts/2026-10-13/rehearse2.sh).
+#    Order matters: prod first makes prod the baseline. Native SSM joins on an
+#    on-net receiver; quote the values, the ? would otherwise glob.
+timeout -s TERM 150 blockcast-shreds \
+  --feed 'prod=ssm://69.25.95.197@232.0.0.1:5001?iface=eth0' \
+  --feed 'union=ssm://69.25.95.57@232.0.0.2:5001?iface=eth0' \
   --report-interval 5s \
   --http-addr 127.0.0.1:8080 \
   > receipt.txt
@@ -42,19 +43,37 @@ timeout -s TERM 300 blockcast-shreds \
 watch -n2 "curl -s http://127.0.0.1:8080/metrics | grep erasure_fraction"
 ```
 
+### Off-site variant: AMT through the relay
+
+A receiver that is not on-net cannot join natively. Point the union arm at the
+relay and let it fall back to an AMT tunnel:
+
+```sh
+timeout -s TERM 150 blockcast-shreds \
+  --feed 'union=ssm://69.25.95.57@232.0.0.2:5001?relay=69.25.95.128' \
+  --report-interval 5s \
+  --http-addr 127.0.0.1:8080 \
+  > receipt.txt
+```
+
+- The first ~10 s is the native probe. Nothing arrives until it times out and
+  the tunnel comes up, so the gauges sit at `0`; do not narrate over that gap.
+- Restart at most once per 13 minutes for this source and group, counted across
+  every host, until the relay runs build #248. A faster re-join is not served.
+
 ### Why there is a third command
 
 The receipt prints **once**, on the SIGINT/SIGTERM path. Nothing reaches stdout
-before that. Verified: the redirect target is 0 bytes for the entire run and
-2144 bytes after the signal. So a narration that says "watch the receipts
+before that. Verified: the redirect target is empty for the entire run and holds
+the full receipt only after the signal. So a narration that says "watch the receipts
 update" over command 2 alone is describing a blank screen for five minutes.
 The live surface is `/metrics`; the receipt is the closing artifact.
 
 `--report-interval` is why command 3 shows anything at all. It defaults to 30s,
-and the erasure gauges read exactly `0` until the first window drains — at 5s
-into a run with 401 payloads already ingested, every gauge was still `0`.
-At `5s` the same run showed `prod 0.5` against `union 0`, which is the contrast
-the demo exists to show. It also keeps a burst legible instead of averaging it
+and the erasure gauges read exactly `0` until the first window drains, however
+many payloads have already arrived. At `5s` the first window shows the prod arm
+above zero and the union arm at zero, which is the contrast the demo exists to
+show. It also keeps a burst legible instead of averaging it
 into a 30s window. The maximum accepted is 5m.
 
 Prefer the human table over `--json` on camera. It is six lines and reads as the
@@ -63,34 +82,40 @@ narrative; the JSON reports percentiles in nanoseconds (`completion_p50_ns:
 
 ## Expected numbers
 
-Guardrails for the recording, not pass criteria. Live values come from the
-rehearsal. **Narrate the rehearsal's numbers, never this table's**: the
-"observed" figures below are from August 2026 and the feed has since moved.
+Guardrails for the recording, not pass criteria. **Narrate the rehearsal's own
+receipt, never this section's**: every figure here is dated, and each one links
+the committed receipt it came from.
 
-The 2026-10-13 dry run (devbox `69.25.95.32`, sfo12, go-amt `cbffbe5`, 150 s
-two-arm) read prod **51.5%** (`9898/19234`), union arm **3.2%** (`618/19234`,
-1.2% on a 60 s union-only run with 0.023% host drops), `rescued_sets=9441`,
-time to 32nd shred p50 **25ms**. The rescue headline held; the union figure
-did not. Restore the feed or re-measure on the day before recording.
+**Post-G2, 2026-10-16** ([receipt](receipts/2026-10-16/w75-rebaseline.md),
+devbox `69.25.95.32` in sfo12, 180 s, native joins, after the G2 roll at
+12:06:50Z). The prod-source arm erased **310/16,469 = 1.88%**, the union-source
+arm **18/16,469 = 0.11%**, and the two together **17/16,469 = 0.10%**.
+`rescued_sets` was **293** (1.78% of sets). Host drops were 70 of 2,018,370
+packets (0.003%), with no clamp warning. That run named its arms `listener` and
+`merged`; the sources are the `prod` and `union` sources above.
 
-The re-rehearsal the same night (same receiver, four runs, receipts archived
-on BLO-27267) moved the union arm to **0.28–2.38%**, and to **0.28–1.47%**
-once the receiver's sockets got 8 MiB buffers. The prod arm stayed at
-**32.8–33.8%**. Raising the buffer is what fixes the two-arm receiver: host
-`UdpRcvbufErrors` fell from +54,026 to +1,331 across 150 s. The union-only
-residual of ~0.9–1.5% looks like the feed, not the receiver: a short run with
-its buffer clamped to the kernel default read 0.87%, inside the raised runs'
-range. That run covered only 2,410 sets, so treat it as a hint, not a result.
+**Pre-G2, 2026-10-13** ([all four runs](receipts/2026-10-13/README.md), same
+receiver and sources). The prod arm erased **4,675/14,260 = 32.8%** and
+**5,359/15,842 = 33.8%** on the two 150 s two-arm runs. Raising the receive
+buffer is what fixed the two-arm receiver: the union arm went from
+**339/14,260 = 2.38%** at the kernel default buffer to **45/15,842 = 0.28%** with
+8 MiB, and host `UdpRcvbufErrors` fell from +54,026 to +1,331. The union-only
+residual looked like the feed, not the receiver: **96/6,536 = 1.47%** with the
+raised buffer, and **21/2,410 = 0.87%** clamped to the kernel default. That last
+run covered only 2,410 sets, so treat it as a hint. These numbers describe the
+feed before G2; do not narrate them as current.
+
+So the contrast to expect is roughly 1.9% against 0.1%, not the pre-G2 33%
+against under 1%.
 
 | Measure | prod arm | union | Notes |
 |---|---:|---:|---|
-| Unrecoverable FEC sets | 3–17% observed | ~0.06–0.3% observed | Show the run's own numerator and denominator. |
+| Unrecoverable FEC sets | record live | record live | Show the run's own numerator and denominator. |
 | `rescued_sets` | — | record live | Sets erased on prod alone, complete in the union. The headline. |
 | `gap_closed_fraction` | — | record live | `rescued_sets` over total sets. |
-| Time to 32nd shred, p50 | record live | ~21ms reference | Time to the 32nd shred. **Not** leader-to-receiver latency. |
-| Prod-arm burst | 54% burst | near 0% same window | Keep the burst on the chart; do not smooth it. |
-| At-source union control | n/a | 0.063% (`38/60,597`) | 2026-08-14 control, **not** a receiver result. |
-| Receiver headroom | ≥~80 Mbit/s | same | A residential receiver read 33% erasure at ~23 Mbit/s effective against a ~70 Mbit/s feed. That is the receiver, not the feed. |
+| Time to 32nd shred, p50 | record live | record live | Time to the 32nd shred. **Not** leader-to-receiver latency. |
+| Prod-arm burst | record live | record live, same window | Keep the burst on the chart; do not smooth it. |
+| Receiver headroom | ≥~80 Mbit/s | same | A receiver below the feed rate scores its own drops as erasure. That is the receiver, not the feed. |
 
 Two numbers on screen will be questioned, so state them before they are:
 
@@ -140,9 +165,8 @@ Requires the DC host, CTO-side:
       for (`--rcvbuf`). A clamped receiver drops bursts at its own socket and
       scores them as erasure. Bracket the run with `nstat -saz UdpRcvbufErrors`
       and quote the host's drop count beside the erasure numbers.
-- [ ] Tap allowlist approved for both forward destinations.
-- [ ] The two `--feed` values are **distinct** local bind ports, both taps
-      confirmed forwarding into them.
+- [ ] Receiver is on-net for the native `ssm://` joins, or uses the off-site
+      AMT variant above. The two `--feed` values name **distinct** sources.
 - [ ] `prod` is listed first, and the receipt confirms `baseline=prod`.
 - [ ] First received payload parses as a valid forwarder header with no offset
       adjustment or re-framing.
