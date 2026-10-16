@@ -164,7 +164,7 @@ Offline, no tap required:
 
 Requires the DC host, CTO-side:
 
-- [ ] Receiver is DC-hosted with ≥~80 Mbit/s downlink headroom, and is **not**
+- [ ] Receiver is DC-hosted with downlink headroom above the feed rate, and is **not**
       the union source host. Measured interface recorded.
 - [ ] The run starts with no `receive buffer clamped` warning: the receiver has
       `CAP_NET_ADMIN`, or `net.core.rmem_max` covers the 8 MiB each feed asks

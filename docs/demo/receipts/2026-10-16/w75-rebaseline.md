@@ -28,3 +28,20 @@ verbatim `receipt.txt` when it is copied off the devbox.
   `completions_above_ceiling` 0, exit 0.
 - Devbox 1-min load was 58.9 at start and 31.1 at end, from other tooling on
   the host.
+
+## Union-only 60 s runs, 2026-10-16 (W7.5 step 4)
+
+Transcribed from Omar's comment on BLO-45889 (2026-10-16 14:16:32Z), not the
+verbatim files. Devbox native SSM on `eth0`, receive-only, receiver
+blockcast-shreds `1b36ebd`, script `union60.sh`. Receipts on the devbox under
+`receipts/2026-10-16/w75-rebaseline/union60-20261016T141315Z/` and
+`union60-20261016T141452Z-unplanned/`, each with `SHA256SUMS`.
+
+| run (start) | union erased | host tap drops | own-socket drops |
+|---|---:|---:|---:|
+| 14:13:15Z (planned) | 25/7,362 = 0.340% | 0 of 900,268 | 0 of 404,510 |
+| 14:14:52Z (unplanned re-run) | 12/7,012 = 0.171% | 0 of 854,715 | 0 |
+
+Both: clamp warnings 0, frontier resyncs 0, completions above ceiling 0, exit 0.
+Short runs weigh sets in flight at start and stop more heavily than the 180 s
+take above (union 17/16,469).
