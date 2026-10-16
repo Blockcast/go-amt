@@ -29,7 +29,9 @@ flag that were never registered, and would have exited 1 on camera.
 # 1. Offline control. Deterministic, no network, nothing to trust.
 blockcast-shreds selftest --fixture
 
-# 2. Live two-arm run, as the stage runs it (docs/demo/receipts/2026-10-13/rehearse2.sh).
+# 2. Live two-arm run, derived from docs/demo/receipts/2026-10-13/rehearse2.sh
+#    (that script forced 8 MiB via sock-rcvbuf.py and used :18080; this relies
+#    on the built-in --rcvbuf default, also 8 MiB).
 #    Order matters: prod first makes prod the baseline. Native SSM joins on an
 #    on-net receiver; quote the values, the ? would otherwise glob.
 timeout -s TERM 150 blockcast-shreds \
@@ -56,6 +58,9 @@ timeout -s TERM 150 blockcast-shreds \
   > receipt.txt
 ```
 
+Operational guidance, not measurements (from the BLO-45838 build plan, as of
+2026-10-16; no committed receipt backs these):
+
 - The first ~10 s is the native probe. Nothing arrives until it times out and
   the tunnel comes up, so the gauges sit at `0`; do not narrate over that gap.
 - Restart at most once per 13 minutes for this source and group, counted across
@@ -66,7 +71,7 @@ timeout -s TERM 150 blockcast-shreds \
 The receipt prints **once**, on the SIGINT/SIGTERM path. Nothing reaches stdout
 before that. Verified: the redirect target is empty for the entire run and holds
 the full receipt only after the signal. So a narration that says "watch the receipts
-update" over command 2 alone is describing a blank screen for five minutes.
+update" over command 2 alone is describing a blank screen for the whole 150 s run.
 The live surface is `/metrics`; the receipt is the closing artifact.
 
 `--report-interval` is why command 3 shows anything at all. It defaults to 30s,
@@ -84,7 +89,8 @@ narrative; the JSON reports percentiles in nanoseconds (`completion_p50_ns:
 
 Guardrails for the recording, not pass criteria. **Narrate the rehearsal's own
 receipt, never this section's**: every figure here is dated, and each one links
-the committed receipt it came from.
+the committed receipt it came from, or for 2026-10-16 a labelled transcription
+of it until the verbatim `receipt.txt` lands.
 
 **Post-G2, 2026-10-16** ([receipt](receipts/2026-10-16/w75-rebaseline.md),
 devbox `69.25.95.32` in sfo12, 180 s, native joins, after the G2 roll at
@@ -115,7 +121,7 @@ against under 1%.
 | `gap_closed_fraction` | — | record live | `rescued_sets` over total sets. |
 | Time to 32nd shred, p50 | record live | record live | Time to the 32nd shred. **Not** leader-to-receiver latency. |
 | Prod-arm burst | record live | record live, same window | Keep the burst on the chart; do not smooth it. |
-| Receiver headroom | ≥~80 Mbit/s | same | A receiver below the feed rate scores its own drops as erasure. That is the receiver, not the feed. |
+| Receiver headroom | above the feed rate | same | A receiver below the feed rate scores its own drops as erasure. That is the receiver, not the feed. |
 
 Two numbers on screen will be questioned, so state them before they are:
 
