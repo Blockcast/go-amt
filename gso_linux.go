@@ -3,10 +3,13 @@
 package amt
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"sync"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/net/ipv4"
@@ -31,13 +34,21 @@ func appendUDPSegmentCmsg(oob []byte, segmentSize uint16) []byte {
 	// is exactly the sort of per-packet allocation one-syscall sends exist to
 	// remove -- would otherwise have it scribble the UDP cmsg into a buffer
 	// the caller reuses.
-	oob = append(oob[:off:off], make([]byte, unix.CmsgSpace(2))...)
-	h := (*unix.Cmsghdr)(unsafe.Pointer(&oob[off]))
+	return putUDPSegmentCmsg(oob[:off:off], segmentSize)
+}
+
+// putUDPSegmentCmsg is appendUDPSegmentCmsg for a caller that owns dst's spare
+// capacity: it appends in place, so a reused scratch costs no allocation once
+// it has grown. segSend is that caller (BLO-47267).
+func putUDPSegmentCmsg(dst []byte, segmentSize uint16) []byte {
+	off := len(dst)
+	dst = append(dst, make([]byte, unix.CmsgSpace(2))...)
+	h := (*unix.Cmsghdr)(unsafe.Pointer(&dst[off]))
 	h.Level = unix.IPPROTO_UDP
 	h.Type = unix.UDP_SEGMENT
 	h.SetLen(unix.CmsgLen(2))
-	binary.NativeEndian.PutUint16(oob[off+unix.CmsgLen(0):], segmentSize)
-	return oob
+	binary.NativeEndian.PutUint16(dst[off+unix.CmsgLen(0):], segmentSize)
+	return dst
 }
 
 // writeSegments performs the segmented sendmsg(2) on pc's underlying socket.
@@ -47,6 +58,22 @@ func appendUDPSegmentCmsg(oob []byte, segmentSize uint16) []byte {
 // unix.SendmsgN so it keeps the runtime's poller semantics: write deadlines are
 // honoured and EAGAIN blocks for writability instead of surfacing as an error.
 func writeSegments(pc *ipv4.PacketConn, b []byte, segmentSize int, oob []byte, dst *net.UDPAddr) (int, error) {
+	return sendSegments(pc, b, segmentSize, oob, nil, dst)
+}
+
+// writeSegmentsCM is writeSegments with the IP-level control message given
+// unmarshalled. Its marshalled bytes are cached on the pooled segSend and
+// reused while cm's fields are unchanged, which is every send of a channel's
+// hoisted control message: cm.Marshal allocated a fresh buffer per call
+// (BLO-47267).
+func writeSegmentsCM(pc *ipv4.PacketConn, b []byte, segmentSize int, cm *ipv4.ControlMessage, dst *net.UDPAddr) (int, error) {
+	return sendSegments(pc, b, segmentSize, nil, cm, dst)
+}
+
+// sendSegments is the shared body. oob, if any, is the caller's marshalled
+// IP-level control message; cm, if non-nil, is marshalled through the cache
+// instead. At most one of them is set.
+func sendSegments(pc *ipv4.PacketConn, b []byte, segmentSize int, oob []byte, cm *ipv4.ControlMessage, dst *net.UDPAddr) (int, error) {
 	udp, ok := pc.PacketConn.(*net.UDPConn)
 	if !ok {
 		return 0, fmt.Errorf("%w: underlying conn is %T, not *net.UDPConn", ErrSegmentsUnsupported, pc.PacketConn)
@@ -55,25 +82,92 @@ func writeSegments(pc *ipv4.PacketConn, b []byte, segmentSize int, oob []byte, d
 	if ip == nil {
 		return 0, fmt.Errorf("%w: destination %s is not IPv4", ErrSegmentsUnsupported, dst.IP)
 	}
-	sa := &unix.SockaddrInet4{Port: dst.Port}
-	copy(sa.Addr[:], ip)
-
-	rc, err := udp.SyscallConn()
-	if err != nil {
+	s := takeSegSend()
+	defer s.put()
+	if s.udp != udp {
+		rc, err := udp.SyscallConn()
+		if err != nil {
+			return 0, err
+		}
+		s.udp, s.rc = udp, rc
+	}
+	s.sa = unix.SockaddrInet4{Port: dst.Port}
+	copy(s.sa.Addr[:], ip)
+	if cm != nil {
+		oob = s.marshalCM(cm)
+	}
+	s.oob = putUDPSegmentCmsg(append(s.oob[:0], oob...), uint16(segmentSize))
+	s.b = b
+	if err := s.rc.Write(s.fn); err != nil {
 		return 0, err
 	}
-	oob = appendUDPSegmentCmsg(oob, uint16(segmentSize))
+	return classifySendResult(s.n, len(b), s.opErr)
+}
 
-	var n int
-	var opErr error
-	if err := rc.Write(func(fd uintptr) bool {
-		n, opErr = unix.SendmsgN(int(fd), b, oob, sa, 0)
-		// false parks until the socket is writable and calls back.
-		return !retrySegmentedSend(opErr)
-	}); err != nil {
-		return 0, err
+// segSend is one segmented send's state, pooled (BLO-47267). Built per call,
+// the destination sockaddr, the cmsg buffer, the RawConn and the write
+// closure with its two captured results were nine allocations per DS 74 block
+// on the sender's hottest loop. Pooled, they are none once warm: fn is bound
+// to its segSend once, at construction, and every other field is overwritten
+// before the send reads it.
+//
+// rc is cached against the *net.UDPConn it came from. SyscallConn returns an
+// immutable wrapper of that conn's fd, so reusing it for the same conn is the
+// same call; a different conn takes a new one.
+type segSend struct {
+	udp   *net.UDPConn
+	rc    syscall.RawConn
+	sa    unix.SockaddrInet4
+	oob   []byte
+	b     []byte
+	n     int
+	opErr error
+	fn    func(fd uintptr) bool
+
+	// The last control message marshalled, and the fields it was marshalled
+	// from. Compared byte for byte, so a changed source or interface is
+	// re-marshalled rather than sent stale.
+	cmOOB        []byte
+	cmTTL, cmIf  int
+	cmSrc, cmDst []byte
+	cmValid      bool
+}
+
+func (s *segSend) marshalCM(cm *ipv4.ControlMessage) []byte {
+	if !s.cmValid || cm.TTL != s.cmTTL || cm.IfIndex != s.cmIf ||
+		!bytes.Equal(cm.Src, s.cmSrc) || !bytes.Equal(cm.Dst, s.cmDst) {
+		s.cmOOB = append(s.cmOOB[:0], cm.Marshal()...)
+		s.cmTTL, s.cmIf = cm.TTL, cm.IfIndex
+		s.cmSrc = append(s.cmSrc[:0], cm.Src...)
+		s.cmDst = append(s.cmDst[:0], cm.Dst...)
+		s.cmValid = true
 	}
-	return classifySendResult(n, len(b), opErr)
+	return s.cmOOB
+}
+
+var segSends sync.Pool
+
+func takeSegSend() *segSend {
+	if s, _ := segSends.Get().(*segSend); s != nil {
+		return s
+	}
+	s := new(segSend)
+	s.fn = s.write
+	return s
+}
+
+// write is the RawConn.Write callback. false parks until the socket is
+// writable and calls back.
+func (s *segSend) write(fd uintptr) bool {
+	s.n, s.opErr = unix.SendmsgN(int(fd), s.b, s.oob, &s.sa, 0)
+	return !retrySegmentedSend(s.opErr)
+}
+
+// put drops the payload and the result before pooling, so a pooled segSend
+// pins neither the caller's buffer nor an error.
+func (s *segSend) put() {
+	s.b, s.n, s.opErr = nil, 0, nil
+	segSends.Put(s)
 }
 
 // retrySegmentedSend reports whether a sendmsg outcome should be reissued
