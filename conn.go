@@ -3,6 +3,7 @@
 package amt
 
 import (
+	"errors"
 	"fmt"
 	m "github.com/blockcast/go-amt/messages"
 	"github.com/google/gopacket"
@@ -837,6 +838,34 @@ func (mc *MulticastConn) EnableGRO() error {
 		return fmt.Errorf("%w: connection is not open", ErrGROUnsupported)
 	}
 	return enableGRO(mc.conn4.PacketConn)
+}
+
+// SetMulticastLoopback sets IP_MULTICAST_LOOP (IPV6_MULTICAST_LOOP on a v6
+// group) on the native socket. Open turns it on, which a receiver needs and a
+// sender pays for: every datagram the socket sends is also copied back into
+// this host's stack and delivered to every local socket joined to the group,
+// the sender's own socket included, which nothing reads, so each copy is
+// queued and then dropped as RcvbufErrors inside the sender's own sendmsg
+// (BLO-47236). A send-only caller turns it off after Open.
+//
+// Off affects only sends from this socket, and only the copy into this host:
+// datagrams still leave on the interface, and a socket on the loopback device
+// still receives them, because there the device itself delivers them. A
+// receiver on the same host but a real interface stops hearing this socket.
+//
+// Call it once Open has returned, as EnableGRO. An AMT tunnel has no native
+// socket to set it on and reports an error.
+func (mc *MulticastConn) SetMulticastLoopback(on bool) error {
+	if mc.IsUsingTunnel() {
+		return errors.New("amt: amt tunnel has no native socket to set multicast loopback on")
+	}
+	if mc.conn6 != nil {
+		return mc.conn6.SetMulticastLoopback(on)
+	}
+	if mc.conn4 == nil {
+		return errors.New("amt: connection is not open")
+	}
+	return mc.conn4.SetMulticastLoopback(on)
 }
 
 func (mc *MulticastConn) WriteBatch(msg []ipv4.Message, i int) (int, error) {

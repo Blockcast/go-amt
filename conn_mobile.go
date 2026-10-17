@@ -145,6 +145,12 @@ func (mc *MulticastConn) EnableGRO() error {
 	return fmt.Errorf("%w: managed mobile connection", ErrGROUnsupported)
 }
 
+// SetMulticastLoopback is not offered on mobile: ManagedConn exposes no socket
+// to set the option on, as for EnableGRO.
+func (mc *MulticastConn) SetMulticastLoopback(on bool) error {
+	return fmt.Errorf("amt: multicast loopback is not settable on a managed mobile connection")
+}
+
 func (mc *MulticastConn) Close() error {
 	if mc.managed == nil {
 		return nil

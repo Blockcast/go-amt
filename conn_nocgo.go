@@ -80,6 +80,8 @@ func (mc *MulticastConn) EnableGRO() error {
 	return fmt.Errorf("%w: %v", ErrGROUnsupported, errNoCGO)
 }
 
+func (mc *MulticastConn) SetMulticastLoopback(on bool) error { return errNoCGO }
+
 func (mc *MulticastConn) WriteSegments(b []byte, segmentSize int, cm *ipv4.ControlMessage, dst net.Addr) (int, error) {
 	// Wrapped, unlike the other stubs in this file: WriteSegments publishes
 	// ErrSegmentsUnsupported as the way a caller detects "no segmented write
