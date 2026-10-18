@@ -71,16 +71,26 @@ func TestListenMulticastUDP4SharedPortOverVeth(t *testing.T) {
 	// The pre-fix shape as a control, logged rather than asserted, since its
 	// outcome is the kernel's: bound to 0.0.0.0, a 6.9+ kernel hands group 0
 	// to one hash-picked socket with IP_MULTICAST_ALL=0, and clones it to all
-	// five with IP_MULTICAST_ALL=1. Before 6.9 both deliver to socket 0 only
-	// or to all five, respectively.
+	// five with IP_MULTICAST_ALL=1. Before 6.9, or with udp_early_demux=0,
+	// IP_MULTICAST_ALL=0 delivers to socket 0 only.
 	var uts unix.Utsname
 	_ = unix.Uname(&uts)
-	for _, all := range []int{0, 1} {
+	for c, all := range []int{0, 1, 0} {
+		demux := "on"
+		if c == 2 {
+			// The same as case 0 with UDP early demux off. A sandbox with a
+			// read-only /proc/sys cannot run it; it says so.
+			if err := os.WriteFile("/proc/sys/net/ipv4/udp_early_demux", []byte("0"), 0); err != nil {
+				t.Logf("control, udp_early_demux=0: not run: %v", err)
+				break
+			}
+			demux = "off"
+		}
 		var fds []int
 		for i := range 5 {
-			fds = append(fds, anyAddrListener(t, peer, net.IPv4(239, 255, 47, byte(10+i)), port+1+all, all))
+			fds = append(fds, anyAddrListener(t, peer, net.IPv4(239, 255, 47, byte(10+i)), port+1+c, all))
 		}
-		sendRawUDP4(t, "veth0", net.IPv4(239, 255, 47, 10), port+1+all, sent)
+		sendRawUDP4(t, "veth0", net.IPv4(239, 255, 47, 10), port+1+c, sent)
 		time.Sleep(300 * time.Millisecond)
 		var got []int
 		for _, fd := range fds {
@@ -93,8 +103,8 @@ func TestListenMulticastUDP4SharedPortOverVeth(t *testing.T) {
 			got = append(got, n)
 			unix.Close(fd)
 		}
-		t.Logf("control, kernel %s, bound 0.0.0.0, IP_MULTICAST_ALL=%d: per-socket packets %v (socket 0 joined the group)",
-			unix.ByteSliceToString(uts.Release[:]), all, got)
+		t.Logf("control, kernel %s, bound 0.0.0.0, IP_MULTICAST_ALL=%d, udp_early_demux %s: per-socket packets %v (socket 0 joined the group)",
+			unix.ByteSliceToString(uts.Release[:]), all, demux, got)
 	}
 }
 
