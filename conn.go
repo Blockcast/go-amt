@@ -919,11 +919,9 @@ func (mc *MulticastConn) WriteSegments(b []byte, segmentSize int, cm *ipv4.Contr
 	if err := checkSegmentBatch(len(b), segmentSize, mtu); err != nil {
 		return 0, err
 	}
-	var oob []byte
-	if cm != nil {
-		// Marshal allocates a fresh buffer per call, so appending the UDP cmsg
-		// to it cannot disturb a caller-held one.
-		oob = cm.Marshal()
-	}
-	return writeSegments(mc.conn4, b, segmentSize, oob, udpDst)
+	// cm is marshalled through writeSegmentsCM's cache rather than here: a
+	// fresh Marshal per call was an allocation per send (BLO-47267). The UDP
+	// cmsg is appended into the pooled send's own buffer, so a caller-held cm
+	// is never written.
+	return writeSegmentsCM(mc.conn4, b, segmentSize, cm, udpDst)
 }

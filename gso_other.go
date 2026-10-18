@@ -17,3 +17,7 @@ import (
 func writeSegments(pc *ipv4.PacketConn, b []byte, segmentSize int, oob []byte, dst *net.UDPAddr) (int, error) {
 	return 0, fmt.Errorf("%w: UDP_SEGMENT is not available on %s", ErrSegmentsUnsupported, runtime.GOOS)
 }
+
+func writeSegmentsCM(pc *ipv4.PacketConn, b []byte, segmentSize int, cm *ipv4.ControlMessage, dst *net.UDPAddr) (int, error) {
+	return writeSegments(pc, b, segmentSize, nil, dst)
+}
