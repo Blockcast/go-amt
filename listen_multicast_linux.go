@@ -17,8 +17,8 @@ import (
 )
 
 // ListenMulticastUDP4 listens for multicast UDP packets sent to gaddr. It binds
-// 0.0.0.0 on gaddr's port and receives only the group it joins (see
-// IP_MULTICAST_ALL below).
+// gaddr itself, not 0.0.0.0, and receives only the group it joins (see
+// IP_MULTICAST_ALL and the bind below).
 func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, gaddr *net.UDPAddr, f []bpf.RawInstruction, timestamp bool, ttl int, flags4 ipv4.ControlFlags, rcvBufBytes int, sndBufBytes int) (*ipv4.PacketConn, error) {
 
 	if gaddr == nil || gaddr.IP.To4() == nil {
@@ -88,8 +88,18 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 		}
 	}
 
+	// Bind the group, not 0.0.0.0. With IP_MULTICAST_ALL cleared, UDP early
+	// demux finds the one socket whose filter admits the group, and since
+	// Linux 6.9 marks it prefetched (sock_pfree), so inet_steal_sock re-picks
+	// by hash from that socket's SO_REUSEPORT group. Every socket bound to
+	// 0.0.0.0 on the port shares that group, so one hash-picked socket, usually
+	// another group's, got every packet: DS 74 lost its group to the four
+	// live-service sockets on :1024 (BLO-47285). Sockets bound to different
+	// addresses never share a reuseport group, so the re-pick stays among
+	// sockets joined to this group, e.g. one receiver's SO_REUSEPORT shards.
+	// IPv6 early demux skips multicast, so ListenMulticastUDP6 keeps ::.
 	lsa := syscall.SockaddrInet4{Port: gaddr.Port}
-	copy(lsa.Addr[:], net.IPv4zero.To4()) // Bind to 0.0.0.0
+	copy(lsa.Addr[:], gaddr.IP.To4())
 	if err := syscall.Bind(sock, &lsa); err != nil {
 		_ = syscall.Close(sock)
 		return nil, fmt.Errorf("could not bind socket: %w", err)
