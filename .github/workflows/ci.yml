@@ -294,6 +294,27 @@ jobs:
           done
           exit $rc
 
+      # BLO-47285: sockets sharing a port must each get only their own group
+      # over a real link. It needs a veth pair, so it runs in its own user and
+      # network namespace, and as root because Ubuntu's AppArmor withholds
+      # capabilities in an unprivileged one; without them it skips, which goes
+      # red here. It discriminates only on Linux 6.9+, where UDP early demux
+      # marks its socket prefetched; the log's control line names the kernel
+      # and shows the pre-fix misdelivery.
+      - name: Prove the shared-port veth guard ran
+        run: |
+          set -euo pipefail
+          uname -r
+          t=TestListenMulticastUDP4SharedPortOverVeth
+          go test -c -o /tmp/amt.test .
+          rc=0
+          sudo /tmp/amt.test -test.v -test.count=1 -test.run "^$t\$" 2>&1 | tee /tmp/sharedport.log || rc=$?
+          grep -qF -- "--- PASS: $t " /tmp/sharedport.log || {
+            echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
+            rc=1
+          }
+          exit $rc
+
   race:
     runs-on: ubuntu-latest
     env:
