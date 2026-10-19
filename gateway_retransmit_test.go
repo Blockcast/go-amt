@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -191,13 +192,13 @@ func TestGatewayOpenStartsTheKeepaliveOnSuccess(t *testing.T) {
 	}
 }
 
-// An active gateway already has the nonce and response MAC needed for a
-// Membership Update. Refreshing that report keeps the relay membership alive
-// without opening another Request/Query round, which can race the read loop
-// while the Rust gateway is in Querying (BLO-47396).
-func TestGatewayKeepaliveSendsMembershipUpdate(t *testing.T) {
+// A keepalive Request that lands while handleMembershipQuery is between
+// handle_query (Active to Querying) and send_update used to find the Rust
+// gateway in Querying and fail with InvalidState, which the next read returned
+// as "failed to request membership: 2" (BLO-47396). handleMu makes it wait for
+// the Update, after which the Request goes out from Active.
+func TestGatewayKeepaliveRequestWaitsForQueryHandling(t *testing.T) {
 	fr := newFakeRelay(t, withQueryIntervalCode(0x01))
-
 	addr := fr.Addr()
 	gw := &Gateway{
 		RelayAddr:  &addr,
@@ -206,30 +207,29 @@ func TestGatewayKeepaliveSendsMembershipUpdate(t *testing.T) {
 		MTU:        1500,
 		Timeout:    5 * time.Second,
 	}
+	refreshed := make(chan error, 1)
+	var once sync.Once
+	betweenQueryAndUpdate = func(g *Gateway) {
+		once.Do(func() {
+			go func() { refreshed <- g.refreshMembership() }()
+			// Give an unserialized Request ample time to reach the Rust
+			// gateway while it is still in Querying.
+			time.Sleep(50 * time.Millisecond)
+		})
+	}
+	t.Cleanup(func() { betweenQueryAndUpdate = nil })
+
 	if err := gw.Open(); err != nil {
 		t.Fatalf("Open: %v", err)
 	}
 	defer gw.abortOpen()
 
-	// Consume the handshake's Update before observing the keepalive refresh.
-	if _, err := fr.WaitForUpdate(time.Second); err != nil {
-		t.Fatalf("handshake membership update: %v", err)
-	}
-	requestsAtHandshake := fr.requests.Load()
-
-	// Keep the gateway on the refresh branch for the first short tick. A real
-	// read loop updates lastData when it receives a multicast packet; this test
-	// only needs to isolate the control message selected by that branch.
-	gw.intervalTime.Store(20 * time.Millisecond)
-	gw.lastData.Store(time.Now().Add(time.Hour))
-	if _, err := fr.WaitForUpdate(time.Second); err != nil {
-		t.Fatalf("keepalive membership update: %v", err)
-	}
-
-	if got := fr.requests.Load(); got != requestsAtHandshake {
-		t.Fatalf("relay Requests = %d, want %d: active keepalive reopened a Request/Query round", got, requestsAtHandshake)
-	}
-	if err := gw.loopErr.Load(); err != nil {
-		t.Fatalf("keepalive loop error = %v", err)
+	select {
+	case err := <-refreshed:
+		if err != nil {
+			t.Fatalf("keepalive Request during Query handling: %v; want it to wait for the Update and succeed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("keepalive Request never completed")
 	}
 }
