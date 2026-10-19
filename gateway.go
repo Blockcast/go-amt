@@ -84,7 +84,7 @@ type Gateway struct {
 	//
 	// Atomic for the same reason leave and intervalTime are: the read loop
 	// writes it from handleRelayAdvertisement, while the keepalive goroutine
-	// (sendMembershipUpdate) and Close (sendTeardown) read it.
+	// (sendRequest) and Close (sendRequest and sendTeardown) read it.
 	relayDest atomic.Pointer[net.UDPAddr]
 	// keepaliveStop wakes the keepalive goroutine out of its sleep;
 	// keepaliveDone is closed when it has returned. Both are nil until
