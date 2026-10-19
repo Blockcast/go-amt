@@ -40,6 +40,17 @@ jobs:
           cache: true
       - uses: sigstore/cosign-installer@v3
 
+      # goreleaser's default previous tag is the nearest tag of any kind, so
+      # v0.3.0 diffed against prerelease v0.0.0-rc2 and its changelog listed one
+      # PR out of 210 (BLO-45892). Diff against the last stable tag instead.
+      - name: Previous stable tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          prev="$(git describe --tags --abbrev=0 --exclude='*-*' "${GITHUB_REF_NAME}^" 2>/dev/null || true)"
+          echo "previous stable tag: ${prev:-<none>}"
+          [ -n "${prev}" ] && echo "GORELEASER_PREVIOUS_TAG=${prev}" >> "${GITHUB_ENV}"
+          true
+
       - name: Publish the release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: goreleaser/goreleaser-action@v6

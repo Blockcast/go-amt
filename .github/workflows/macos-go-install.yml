@@ -1,0 +1,25 @@
+# Proves the documented Mac install path on a real macOS runner (BLO-45892 AC 5).
+# The module is fetched from the proxy at the tag, so the result does not
+# depend on the PR diff. Tag pushes check the tag just cut.
+name: macos go install
+on:
+  pull_request:
+    paths: [.github/workflows/macos-go-install.yml]
+  push:
+    tags: ['v*']
+jobs:
+  go-install:
+    runs-on: macos-latest
+    env:
+      # ponytail: PRs pin the current release; bump when a newer one ships.
+      TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.3.0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: {go-version-file: go.mod, cache: false}
+      - run: uname -sm
+      - run: CGO_ENABLED=0 go install "github.com/blockcast/go-amt/cmd/blockcast-shreds@${TAG}"
+      # Recorded, not asserted: go install applies no ldflags, so this prints
+      # broker.version's default "dev-unstamped". Release binaries are stamped
+      # by goreleaser and checked in packaging.yml.
+      - run: '"$(go env GOPATH)/bin/blockcast-shreds" --version'
