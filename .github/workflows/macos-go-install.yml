@@ -19,7 +19,7 @@ jobs:
         with: {go-version-file: go.mod, cache: false}
       - run: uname -sm
       - run: CGO_ENABLED=0 go install "github.com/blockcast/go-amt/cmd/blockcast-shreds@${TAG}"
-      - run: |
-          out="$("$(go env GOPATH)/bin/blockcast-shreds" --version)"
-          echo "${out}"
-          grep -qF "${TAG}" <<<"${out}"
+      # Recorded, not asserted: go install applies no ldflags, so this prints
+      # broker.version's default "dev-unstamped". Release binaries are stamped
+      # by goreleaser and checked in packaging.yml.
+      - run: '"$(go env GOPATH)/bin/blockcast-shreds" --version'
