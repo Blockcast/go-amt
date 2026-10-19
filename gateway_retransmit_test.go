@@ -190,3 +190,46 @@ func TestGatewayOpenStartsTheKeepaliveOnSuccess(t *testing.T) {
 			"the keepalive goroutine never started", got)
 	}
 }
+
+// An active gateway already has the nonce and response MAC needed for a
+// Membership Update. Refreshing that report keeps the relay membership alive
+// without opening another Request/Query round, which can race the read loop
+// while the Rust gateway is in Querying (BLO-47396).
+func TestGatewayKeepaliveSendsMembershipUpdate(t *testing.T) {
+	fr := newFakeRelay(t, withQueryIntervalCode(0x01))
+
+	addr := fr.Addr()
+	gw := &Gateway{
+		RelayAddr:  &addr,
+		GroupAddr:  net.ParseIP("232.0.0.1"),
+		SourceAddr: net.ParseIP("192.0.2.1"),
+		MTU:        1500,
+		Timeout:    5 * time.Second,
+	}
+	if err := gw.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer gw.abortOpen()
+
+	// Consume the handshake's Update before observing the keepalive refresh.
+	if _, err := fr.WaitForUpdate(time.Second); err != nil {
+		t.Fatalf("handshake membership update: %v", err)
+	}
+	requestsAtHandshake := fr.requests.Load()
+
+	// Keep the gateway on the refresh branch for the first short tick. A real
+	// read loop updates lastData when it receives a multicast packet; this test
+	// only needs to isolate the control message selected by that branch.
+	gw.intervalTime.Store(20 * time.Millisecond)
+	gw.lastData.Store(time.Now().Add(time.Hour))
+	if _, err := fr.WaitForUpdate(time.Second); err != nil {
+		t.Fatalf("keepalive membership update: %v", err)
+	}
+
+	if got := fr.requests.Load(); got != requestsAtHandshake {
+		t.Fatalf("relay Requests = %d, want %d: active keepalive reopened a Request/Query round", got, requestsAtHandshake)
+	}
+	if err := gw.loopErr.Load(); err != nil {
+		t.Fatalf("keepalive loop error = %v", err)
+	}
+}

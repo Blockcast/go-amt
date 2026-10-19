@@ -475,8 +475,8 @@ func relayAddrString(a net.Addr) string {
 const DefaultOpenTimeout = 10 * time.Second
 
 // startKeepalive runs the steady-state keepalive: once per interval it re-sends
-// a Request, or resets and rediscovers when the relay has been silent for longer
-// than one interval.
+// the current Membership Update, or resets and rediscovers when the relay has
+// been silent for longer than one interval.
 //
 // CALLED ONLY FROM OPEN'S SUCCESS PATH, after the handshake has completed. Open
 // used to start it immediately after the first Discovery, where it had no
@@ -491,8 +491,11 @@ const DefaultOpenTimeout = 10 * time.Second
 //     carrying a NEW nonce — which Open's retransmission then resent as though
 //     it were its own, breaking the same-nonce requirement of RFC 7450 sections
 //     5.2.3.4.5 and 5.2.3.5.6 that the retransmission exists to honour.
-//   - The other branch sends a Request, which request_membership rejects as
-//     InvalidState from Discovering (gateway.rs:195) — see the sleep note below.
+//   - The other branch used to send a Request. That races the read loop when a
+//     Query is being handled (the Rust gateway is briefly Querying), and the
+//     request is rejected as InvalidState. An active tunnel already has the
+//     response MAC and nonce needed for a Membership Update, so refreshing the
+//     current report keeps the relay alive without opening another Query round.
 //
 // Both were reachable only above the 10s seed interval, so DefaultOpenTimeout
 // (exactly 10s) hid it and the configurable RelayHandshakeTimeout that BLO-43016
@@ -559,7 +562,13 @@ func (g *Gateway) startKeepalive(relay string) {
 					stalled = false
 					slog.Info("amt: relay data resumed", "relay", relay)
 				}
-				loopErr = g.sendRequest()
+				// RFC 7450 §4.2.1.2 permits an active gateway to refresh its
+				// membership with an Update. Re-sending a Request here used to
+				// race handleMembershipQuery's Querying state and surface the
+				// spurious "failed to request membership: 2" error to readers.
+				// The Membership Update uses the last Query's nonce and response
+				// MAC, and keeps the existing (S,G) subscribed at the relay.
+				loopErr = g.sendMembershipUpdate(m.MembershipQueryMessage{})
 			}
 			if loopErr != nil {
 				slog.Warn("amt: keepalive send failed", "relay", relay, "error", loopErr)
