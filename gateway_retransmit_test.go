@@ -6,6 +6,7 @@ import (
 	"math"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -188,5 +189,47 @@ func TestGatewayOpenStartsTheKeepaliveOnSuccess(t *testing.T) {
 	if got == atHandshake {
 		t.Fatalf("relay saw no Relay Discovery in 2s after a successful Open (still %d): "+
 			"the keepalive goroutine never started", got)
+	}
+}
+
+// A keepalive Request that lands while handleMembershipQuery is between
+// handle_query (Active to Querying) and send_update used to find the Rust
+// gateway in Querying and fail with InvalidState, which the next read returned
+// as "failed to request membership: 2" (BLO-47396). handleMu makes it wait for
+// the Update, after which the Request goes out from Active.
+func TestGatewayKeepaliveRequestWaitsForQueryHandling(t *testing.T) {
+	fr := newFakeRelay(t, withQueryIntervalCode(0x01))
+	addr := fr.Addr()
+	gw := &Gateway{
+		RelayAddr:  &addr,
+		GroupAddr:  net.ParseIP("232.0.0.1"),
+		SourceAddr: net.ParseIP("192.0.2.1"),
+		MTU:        1500,
+		Timeout:    5 * time.Second,
+	}
+	refreshed := make(chan error, 1)
+	var once sync.Once
+	betweenQueryAndUpdate = func(g *Gateway) {
+		once.Do(func() {
+			go func() { refreshed <- g.refreshMembership() }()
+			// Give an unserialized Request ample time to reach the Rust
+			// gateway while it is still in Querying.
+			time.Sleep(50 * time.Millisecond)
+		})
+	}
+	t.Cleanup(func() { betweenQueryAndUpdate = nil })
+
+	if err := gw.Open(); err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer gw.abortOpen()
+
+	select {
+	case err := <-refreshed:
+		if err != nil {
+			t.Fatalf("keepalive Request during Query handling: %v; want it to wait for the Update and succeed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("keepalive Request never completed")
 	}
 }

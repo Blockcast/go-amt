@@ -23,6 +23,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -83,7 +84,7 @@ type Gateway struct {
 	//
 	// Atomic for the same reason leave and intervalTime are: the read loop
 	// writes it from handleRelayAdvertisement, while the keepalive goroutine
-	// (sendMembershipUpdate) and Close (sendTeardown) read it.
+	// (sendRequest) and Close (sendRequest and sendTeardown) read it.
 	relayDest atomic.Pointer[net.UDPAddr]
 	// keepaliveStop wakes the keepalive goroutine out of its sleep;
 	// keepaliveDone is closed when it has returned. Both are nil until
@@ -92,8 +93,14 @@ type Gateway struct {
 	// amt_gateway_reset, sendDiscovery or sendRequest (BLO-44822).
 	keepaliveStop chan struct{}
 	keepaliveDone chan struct{}
-	responseMac   [6]byte
-	requestNonce  uint32
+	// handleMu serializes the read loop's and the keepalive goroutine's calls
+	// into the Rust handle. handleMembershipQuery holds it from handle_query
+	// (Active to Querying) through send_update (back to Active), so a
+	// keepalive Request can no longer land in between and fail with
+	// InvalidState ("failed to request membership: 2", BLO-47396).
+	handleMu     sync.Mutex
+	responseMac  [6]byte
+	requestNonce uint32
 }
 
 // dest returns the destination for every message sent after the Relay
@@ -552,14 +559,16 @@ func (g *Gateway) startKeepalive(relay string) {
 						"relay", relay, "idle", idle)
 				}
 				// Reset and rediscover
+				g.handleMu.Lock()
 				C.amt_gateway_reset(g.handle)
 				loopErr = g.sendDiscovery()
+				g.handleMu.Unlock()
 			} else {
 				if stalled {
 					stalled = false
 					slog.Info("amt: relay data resumed", "relay", relay)
 				}
-				loopErr = g.sendRequest()
+				loopErr = g.refreshMembership()
 			}
 			if loopErr != nil {
 				slog.Warn("amt: keepalive send failed", "relay", relay, "error", loopErr)
@@ -567,6 +576,17 @@ func (g *Gateway) startKeepalive(relay string) {
 			}
 		}
 	}()
+}
+
+// refreshMembership re-sends the tunnel's Request from Active: RFC 7450
+// section 4.2.1.2's periodic Request/Query cycle (step 12), which is also how
+// the gateway picks up a fresh response MAC. It takes handleMu, so it waits for
+// a Query the read loop is still answering instead of finding the Rust gateway
+// in Querying.
+func (g *Gateway) refreshMembership() error {
+	g.handleMu.Lock()
+	defer g.handleMu.Unlock()
+	return g.sendRequest()
 }
 
 // stopKeepalive signals the keepalive goroutine to exit, so a gateway being torn
@@ -619,6 +639,8 @@ func (g *Gateway) abortOpen() {
 
 // handleRelayAdvertisement processes AMT Relay Advertisement.
 func (g *Gateway) handleRelayAdvertisement(data []byte) error {
+	g.handleMu.Lock()
+	defer g.handleMu.Unlock()
 	// Pass to Rust library
 	result := C.amt_gateway_handle_advertisement(
 		g.handle,
@@ -637,8 +659,15 @@ func (g *Gateway) handleRelayAdvertisement(data []byte) error {
 	return g.sendRequest()
 }
 
+// betweenQueryAndUpdate is a test hook run after handle_query has moved the
+// Rust gateway to Querying and before send_update moves it back; nil outside
+// tests.
+var betweenQueryAndUpdate func(*Gateway)
+
 // handleMembershipQuery processes AMT Membership Query.
 func (g *Gateway) handleMembershipQuery(data []byte) error {
+	g.handleMu.Lock()
+	defer g.handleMu.Unlock()
 	// Pass to Rust library to extract query data
 	var outQueryData C.amt_buffer_t
 	result := C.amt_gateway_handle_query(
@@ -651,6 +680,9 @@ func (g *Gateway) handleMembershipQuery(data []byte) error {
 		return fmt.Errorf("failed to handle query: %d", result)
 	}
 	defer C.amt_buffer_free(outQueryData)
+	if betweenQueryAndUpdate != nil {
+		betweenQueryAndUpdate(g)
+	}
 
 	queryData := C.GoBytes(unsafe.Pointer(outQueryData.data), C.int(outQueryData.len))
 
@@ -700,7 +732,10 @@ func (g *Gateway) Close() error {
 	go func() {
 		defer close(errc)
 		for {
-			if err := g.sendRequest(); err != nil {
+			g.handleMu.Lock()
+			err := g.sendRequest()
+			g.handleMu.Unlock()
+			if err != nil {
 				errc <- fmt.Errorf("failed to send request: %w", err)
 				return
 			}
