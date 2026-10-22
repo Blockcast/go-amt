@@ -387,6 +387,7 @@ func TestParseMarker(t *testing.T) {
 		{"UpdateParent", marker(MarkerUpdateParent, parent), Marker{Variant: MarkerUpdateParent, Slot: 460_180_511, Hash: [32]byte(id)}},
 		{"footer", marker(MarkerFooter, footer), Marker{Variant: MarkerFooter, Hash: [32]byte(id), ProducerTimeNanos: 1_792_700_000_123_456_789, UserAgent: "agave/4.3.2"}},
 		{"abandon", make([]byte, 8), Marker{Variant: MarkerAbandon}},
+		{"abandon, zero-filled", make([]byte, 963), Marker{Variant: MarkerAbandon}}, // a Firedancer leader's full-size shred
 	} {
 		m, ok, err := ParseMarker(tc.batch)
 		if err != nil || !ok || m != tc.want {
@@ -396,7 +397,7 @@ func TestParseMarker(t *testing.T) {
 			t.Errorf("%s: ParseEntries = %d transactions, %v; want none", tc.name, len(txs), err)
 		}
 		// Truncation anywhere past the entry count is an error, never a panic.
-		for n := 9; n < len(tc.batch); n++ {
+		for n := 9; n < len(tc.batch) && tc.want.Variant != MarkerAbandon; n++ {
 			if _, ok, err := ParseMarker(tc.batch[:n]); !ok || err == nil {
 				t.Fatalf("%s: ParseMarker accepted the first %d of %d bytes", tc.name, n, len(tc.batch))
 			}

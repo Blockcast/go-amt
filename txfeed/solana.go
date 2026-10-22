@@ -351,7 +351,10 @@ func ParseMarker(batch []byte) (m Marker, ok bool, err error) {
 	if n := r.u64(); n != 0 || r.err != nil {
 		return Marker{}, false, r.err
 	}
-	if len(batch) == 8 {
+	// Agave sends exactly these eight bytes; a Firedancer leader zero-fills
+	// every data shred to full size, so a zero tail is the same batch. No
+	// marker is all zeros: its version is 1.
+	if !slices.ContainsFunc(batch[8:], func(b byte) bool { return b != 0 }) {
 		return Marker{Variant: MarkerAbandon}, true, nil
 	}
 	if v := r.u16(); v != 1 && r.err == nil {

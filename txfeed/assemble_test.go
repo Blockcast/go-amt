@@ -2,10 +2,14 @@ package txfeed
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/binary"
+	"io"
 	"math/rand/v2"
+	"os"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -577,5 +581,102 @@ func TestAssemblerBoundsWhatOneSlotHolds(t *testing.T) {
 	sets := uint64(maxSlotIndexes / numData)
 	if s := a.Stats(); s.Held != sets || s.Bad != maxSlotIndexes-sets {
 		t.Errorf("%+v; want the %d sets starting at a multiple of %d held, the rest refused", s, sets, numData)
+	}
+}
+
+// TestAlpenglowLiveSets decodes the three marker-and-tick sets of two mainnet
+// blocks, from a passive capture of the v3 union (232.0.0.2:5001) on
+// 2026-10-22 between 21:41:01Z and 21:41:16Z. Slot 460191482 had an Agave
+// 4.3.2 (Jito) leader. Slot 460191528 had a Firedancer 26.10.4 leader, which
+// zero-fills every data shred. Each block's sets are the header (fec 0), the
+// footer and the final one-tick batch. The fixture is the 327 frames, each u16
+// LE length then the frame, and Reed-Solomon recovers the data shreds the
+// capture missed.
+func TestAlpenglowLiveSets(t *testing.T) {
+	f, err := os.Open("testdata/alpenglow-sets-2026-10-22.bin.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type set struct {
+		slot uint64
+		fec  uint32
+	}
+	// One assembler per set: a set's batch starts just past the previous
+	// set's DATA_COMPLETE shred, which the capture does not hold for every
+	// set, so a set that emits no batch is read from its recovered shards.
+	asm := map[set]*Assembler{}
+	emitted := map[set][]byte{}
+	for frames := 0; len(b) >= 2; frames++ {
+		n := 2 + int(binary.LittleEndian.Uint16(b))
+		fr := b[2:n]
+		b = b[n:]
+		k := set{binary.LittleEndian.Uint64(fr[1:9]), binary.LittleEndian.Uint32(fr[9:13])}
+		if asm[k] == nil {
+			asm[k] = NewAssembler(time.Hour)
+		}
+		for _, batch := range asm[k].Add(fr) {
+			emitted[k] = batch.Payload
+		}
+		if len(b) == 0 && frames != 326 {
+			t.Fatalf("fixture: %d frames, want 327", frames+1)
+		}
+	}
+	payload := func(k set) []byte {
+		if p, ok := emitted[k]; ok {
+			return p
+		}
+		ss := asm[k].slots[k.slot]
+		var p []byte
+		for i := k.fec; i < k.fec+numData; i++ {
+			if ss == nil || !ss.data.has(i) {
+				t.Fatalf("slot %d set %d: data shred %d was not recovered", k.slot, k.fec, i)
+			}
+			p = append(p, ss.payload[i]...)
+		}
+		return p
+	}
+
+	for _, blk := range []struct {
+		slot             uint64
+		footer, tick     uint32
+		agent            string // the footer's client prefix
+		firedancerPadded bool
+	}{
+		{460191482, 480, 512, "agave/4.3.2", false},
+		{460191528, 576, 608, "", true},
+	} {
+		h, ok, err := ParseMarker(payload(set{blk.slot, 0}))
+		if err != nil || !ok || h.Variant != MarkerHeader || h.Slot != blk.slot-1 || h.Hash == [32]byte{} {
+			t.Errorf("slot %d header: %+v, %v, %v; want parent slot %d and a block id", blk.slot, h, ok, err, blk.slot-1)
+		}
+		ft, ok, err := ParseMarker(payload(set{blk.slot, blk.footer}))
+		if err != nil || !ok || ft.Variant != MarkerFooter || ft.Hash == [32]byte{} || !strings.HasPrefix(ft.UserAgent, blk.agent) ||
+			(blk.agent == "") != (ft.UserAgent == "") {
+			t.Errorf("slot %d footer: %+v, %v, %v; want a bank hash and client %q", blk.slot, ft, ok, err, blk.agent)
+		}
+		// The producer clock reads 2026-10-22 between 21:40 and 21:42Z.
+		if at := time.Unix(0, int64(ft.ProducerTimeNanos)).UTC(); at.Before(time.Date(2026, 10, 22, 21, 40, 0, 0, time.UTC)) ||
+			at.After(time.Date(2026, 10, 22, 21, 42, 0, 0, time.UTC)) {
+			t.Errorf("slot %d footer: producer time %v", blk.slot, at)
+		}
+		tick := payload(set{blk.slot, blk.tick})
+		if _, ok, err := ParseMarker(tick); ok || err != nil {
+			t.Errorf("slot %d final tick: ParseMarker ok %v, %v; want an entry batch", blk.slot, ok, err)
+		}
+		if txs, err := ParseEntries(tick); err != nil || len(txs) != 0 {
+			t.Errorf("slot %d final tick: %d transactions, %v; want none", blk.slot, len(txs), err)
+		}
+		if padded := len(payload(set{blk.slot, 0})) > 54; padded != blk.firedancerPadded {
+			t.Errorf("slot %d header set: %d bytes; zero-filled = %v, want %v", blk.slot, len(payload(set{blk.slot, 0})), padded, blk.firedancerPadded)
+		}
 	}
 }
