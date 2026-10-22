@@ -306,6 +306,7 @@ func FuzzParseEntries(f *testing.F) {
 	f.Add([]byte{})
 	f.Add(binary.LittleEndian.AppendUint64(nil, 1<<62)) // a huge entry count
 	f.Fuzz(func(t *testing.T, b []byte) {
+		ParseMarker(b) // must not panic, whatever the bytes
 		txs, err := ParseEntries(b)
 		if err != nil {
 			return
@@ -350,5 +351,69 @@ func TestVerifyTx(t *testing.T) {
 	}
 	if _, err := VerifyTx(append(raw, 0)); err == nil {
 		t.Error("VerifyTx accepted a trailing byte")
+	}
+}
+
+// marker builds an Alpenglow block marker: a zero entry count, the u16
+// version 1, the variant and the u16-length-prefixed body.
+func marker(variant byte, body []byte) []byte {
+	b := binary.LittleEndian.AppendUint64(nil, 0)
+	b = binary.LittleEndian.AppendUint16(b, 1)
+	b = append(b, variant)
+	b = binary.LittleEndian.AppendUint16(b, uint16(len(body)))
+	return append(b, body...)
+}
+
+func TestParseMarker(t *testing.T) {
+	id := bytes.Repeat([]byte{7}, 32)
+	parent := append(binary.LittleEndian.AppendUint64([]byte{1}, 460_180_511), id...) // version 1, slot, block id
+	header := marker(MarkerHeader, parent)
+	// Agave v4.3.2 (entry/src/block_component.rs) opens every block with this
+	// 54-byte component.
+	if len(header) != 54 || !bytes.HasPrefix(header, []byte{0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0x29, 0, 1}) {
+		t.Fatalf("header marker is %d bytes, %x; want 54 bytes from 00x8 01 00 01 29 00 01", len(header), header[:14])
+	}
+	footer := append([]byte{1}, id...) // version 1, bank hash
+	footer = binary.LittleEndian.AppendUint64(footer, 1_792_700_000_123_456_789)
+	footer = append(append(footer, byte(len("agave/4.3.2"))), "agave/4.3.2"...)
+	footer = append(footer, 0, 0, 0) // no finalization, skip-reward or notar-reward certificate
+
+	for _, tc := range []struct {
+		name  string
+		batch []byte
+		want  Marker
+	}{
+		{"header", header, Marker{Variant: MarkerHeader, Slot: 460_180_511, Hash: [32]byte(id)}},
+		{"UpdateParent", marker(MarkerUpdateParent, parent), Marker{Variant: MarkerUpdateParent, Slot: 460_180_511, Hash: [32]byte(id)}},
+		{"footer", marker(MarkerFooter, footer), Marker{Variant: MarkerFooter, Hash: [32]byte(id), ProducerTimeNanos: 1_792_700_000_123_456_789, UserAgent: "agave/4.3.2"}},
+		{"abandon", make([]byte, 8), Marker{Variant: MarkerAbandon}},
+		{"abandon, zero-filled", make([]byte, 963), Marker{Variant: MarkerAbandon}}, // a Firedancer leader's full-size shred
+	} {
+		m, ok, err := ParseMarker(tc.batch)
+		if err != nil || !ok || m != tc.want {
+			t.Errorf("%s: ParseMarker = %+v, %v, %v; want %+v", tc.name, m, ok, err, tc.want)
+		}
+		if txs, err := ParseEntries(tc.batch); err != nil || len(txs) != 0 {
+			t.Errorf("%s: ParseEntries = %d transactions, %v; want none", tc.name, len(txs), err)
+		}
+		// Truncation anywhere past the entry count is an error, never a panic.
+		for n := 9; n < len(tc.batch) && tc.want.Variant != MarkerAbandon; n++ {
+			if _, ok, err := ParseMarker(tc.batch[:n]); !ok || err == nil {
+				t.Fatalf("%s: ParseMarker accepted the first %d of %d bytes", tc.name, n, len(tc.batch))
+			}
+		}
+	}
+
+	if _, ok, err := ParseMarker(entries([][]byte{legacyTx.build()})); ok || err != nil {
+		t.Errorf("an entry batch: ParseMarker = ok %v, %v; want no marker", ok, err)
+	}
+	for name, b := range map[string][]byte{
+		"unknown variant": marker(4, parent),
+		"marker version":  binary.LittleEndian.AppendUint16(header[:8:8], 2),
+		"body version":    marker(MarkerHeader, append([]byte{2}, parent[1:]...)),
+	} {
+		if _, ok, err := ParseMarker(b); !ok || err == nil {
+			t.Errorf("%s: ParseMarker = ok %v, %v; want an error", name, ok, err)
+		}
 	}
 }

@@ -87,6 +87,13 @@ func (r *reader) u8() byte {
 	return 0
 }
 
+func (r *reader) u16() uint16 {
+	if b := r.bytes(2); b != nil {
+		return binary.LittleEndian.Uint16(b)
+	}
+	return 0
+}
+
 func (r *reader) u64() uint64 {
 	if b := r.bytes(8); b != nil {
 		return binary.LittleEndian.Uint64(b)
@@ -307,6 +314,78 @@ func ParseEntries(batch []byte) ([]Tx, error) {
 		return nil, r.err
 	}
 	return txs, nil
+}
+
+// Alpenglow block markers (SIMD-0307, -0337 and -0384; Agave's
+// entry/src/block_component.rs). Since the mainnet migration at slot
+// 459,653,000 a block is a header marker, entry batches, a footer marker and a
+// final one-tick batch, each a DATA_COMPLETE run of its own. A marker opens
+// with a zero entry count, so ParseEntries returns no transactions for one.
+const (
+	MarkerFooter       = 0 // the leader's bank hash, clock and certificates
+	MarkerHeader       = 1 // the block's parent
+	MarkerUpdateParent = 2 // fast leader handover moved the parent: the slot's earlier batches are void
+	MarkerGenesisCert  = 3 // only in the first Alpenglow block
+	// MarkerAbandon is no wire variant: a leader abandons its block with an
+	// empty entry batch, eight zero bytes. The slot's earlier batches are void.
+	MarkerAbandon = 0xff
+)
+
+// Marker is one decoded block marker.
+type Marker struct {
+	Variant uint8
+	// Slot and Hash are the parent slot and block id of a header or an
+	// UpdateParent, the certified slot and block id of a genesis certificate,
+	// and zero and the bank hash of a footer.
+	Slot uint64
+	Hash [32]byte
+	// A footer's producer clock and client, such as "agave/4.3.2".
+	ProducerTimeNanos uint64
+	UserAgent         string
+}
+
+// ParseMarker decodes batch as a block marker. ok is false, with no error, for
+// an entry batch, whose entry count is not zero.
+func ParseMarker(batch []byte) (m Marker, ok bool, err error) {
+	r := &reader{b: batch}
+	if n := r.u64(); n != 0 || r.err != nil {
+		return Marker{}, false, r.err
+	}
+	// Agave sends exactly these eight bytes; a Firedancer leader zero-fills
+	// every data shred to full size, so a zero tail is the same batch. No
+	// marker is all zeros: its version is 1.
+	if !slices.ContainsFunc(batch[8:], func(b byte) bool { return b != 0 }) {
+		return Marker{Variant: MarkerAbandon}, true, nil
+	}
+	if v := r.u16(); v != 1 && r.err == nil {
+		return Marker{}, true, fmt.Errorf("block marker version %d, want 1", v)
+	}
+	m.Variant = r.u8()
+	body := r.bytes(int(r.u16()))
+	if r.err != nil {
+		return Marker{}, true, r.err
+	}
+	r = &reader{b: body}
+	if m.Variant != MarkerGenesisCert { // the one marker without a version byte
+		if v := r.u8(); v != 1 && r.err == nil {
+			return Marker{}, true, fmt.Errorf("block marker %d: version %d, want 1", m.Variant, v)
+		}
+	}
+	switch m.Variant {
+	case MarkerHeader, MarkerUpdateParent, MarkerGenesisCert:
+		m.Slot = r.u64()
+		copy(m.Hash[:], r.bytes(32))
+	case MarkerFooter:
+		copy(m.Hash[:], r.bytes(32))
+		m.ProducerTimeNanos = r.u64()
+		m.UserAgent = string(r.bytes(int(r.u8())))
+	default:
+		return Marker{}, true, fmt.Errorf("unknown block marker variant %d", m.Variant)
+	}
+	if r.err != nil {
+		return Marker{}, true, fmt.Errorf("block marker %d: %w", m.Variant, r.err)
+	}
+	return m, true, nil
 }
 
 // VerifyTx checks every signature of the transaction raw: signature i signs
