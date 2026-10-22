@@ -13,7 +13,8 @@
 // partition group it belongs to, at these offsets from the group base:
 //
 //	1          non-vote transactions
-//	2          simple votes
+//	2          simple votes: none since Alpenglow (mainnet slot 459,653,000),
+//	           whose votes are BLS messages between validators, not transactions
 //	16+i       transactions invoking named program i: -program, or
 //	           txfeed.DefaultPrograms
 //	64+b       transactions invoking a program in bucket b (txfeed.Bucket),
@@ -385,14 +386,16 @@ func main() {
 
 	asm := txfeed.NewAssembler(*keep)
 	var batchErr, txs, votes, oversize, overflow, chunked, sent, sendErr uint64
+	var markers [4]uint64 // Alpenglow block markers by variant: footer, header, UpdateParent, genesis
+	var abandoned, markerErr uint64
 	stats := func() string {
 		s := asm.Stats()
 		var capped uint64
 		if out6 != nil && out6.caps != nil {
 			capped = out6.caps.capped
 		}
-		return fmt.Sprintf("frames=%d dups=%d bad=%d sets_recovered=%d shards_recovered=%d recovered_bad=%d parity_checked=%d parity_mismatch=%d batches=%d batch_err=%d txs=%d votes=%d oversize=%d index_overflow=%d chunked=%d sent=%d send_err=%d queue=%d qdrop=%d slots=%d held=%d evicted=%d max_slot=%d chan_capped=%d",
-			s.Frames, s.Dups, s.Bad, s.SetsRecovered, s.ShardsRecovered, s.RecoveredBad, s.ParityChecked, s.ParityMismatch, s.Batches, batchErr, txs, votes, oversize, overflow, chunked, sent, sendErr, len(ch), qdrop.Load(), s.Slots, s.Held, s.Evicted, s.MaxSlot, capped)
+		return fmt.Sprintf("frames=%d dups=%d bad=%d sets_recovered=%d shards_recovered=%d recovered_bad=%d parity_checked=%d parity_mismatch=%d batches=%d batch_err=%d headers=%d footers=%d update_parents=%d abandoned=%d marker_err=%d txs=%d votes=%d oversize=%d index_overflow=%d chunked=%d sent=%d send_err=%d queue=%d qdrop=%d slots=%d held=%d evicted=%d max_slot=%d chan_capped=%d",
+			s.Frames, s.Dups, s.Bad, s.SetsRecovered, s.ShardsRecovered, s.RecoveredBad, s.ParityChecked, s.ParityMismatch, s.Batches, batchErr, markers[txfeed.MarkerHeader], markers[txfeed.MarkerFooter], markers[txfeed.MarkerUpdateParent], abandoned, markerErr, txs, votes, oversize, overflow, chunked, sent, sendErr, len(ch), qdrop.Load(), s.Slots, s.Held, s.Evicted, s.MaxSlot, capped)
 	}
 
 	polls := make(chan registryPoll, 1)
@@ -419,6 +422,29 @@ func main() {
 							batch.Slot, batch.StartIndex, len(batch.Payload), err, batch.Payload[:min(64, len(batch.Payload))])
 					}
 					continue
+				}
+				if len(parsed) == 0 {
+					// Every Alpenglow block opens with a header and closes with a
+					// footer. After an UpdateParent (SIMD-0337) or an abandoned block,
+					// the slot's earlier transactions, which this feed has already
+					// sent, never take effect.
+					switch m, ok, err := txfeed.ParseMarker(batch.Payload); {
+					case err != nil:
+						if markerErr++; markerErr == 1 {
+							log.Printf("block marker error: slot=%d start=%d: %v; first bytes %x",
+								batch.Slot, batch.StartIndex, err, batch.Payload[:min(64, len(batch.Payload))])
+						}
+					case !ok:
+					case m.Variant == txfeed.MarkerAbandon:
+						abandoned++
+						log.Printf("slot %d: the leader abandoned its block; transactions sent from it will not land", batch.Slot)
+					default:
+						markers[m.Variant]++
+						if m.Variant == txfeed.MarkerUpdateParent {
+							log.Printf("slot %d: UpdateParent to slot %d; the cluster discards the effects of the transactions sent from this slot before index %d",
+								batch.Slot, m.Slot, batch.StartIndex)
+						}
+					}
 				}
 				for i, tx := range parsed {
 					txs++
