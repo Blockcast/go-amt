@@ -30,14 +30,14 @@ import (
 // uint64s local to the processor loop: they are stats-line only. Moving one
 // here is what exporting it costs.
 //
-// ponytail: rx and emitted are incremented inside main's processor loop, which
-// no test can drive without extracting that loop — a change to the emit path
-// this row is scoped not to make. Both increments survived mutation testing
-// (BLO-43479); every other guard here failed under one. The gap is bounded by
-// this struct being the single source of truth: the stats line reads the same
-// fields, so a dropped increment prints rx_prod=0 in the journal rather than
-// disagreeing with /metrics. Close it by extracting the loop body when that
-// path needs changing for its own reasons.
+// ponytail: rx, emitted and otherVersions are incremented inside main's
+// processor loop, which no test can drive without extracting that loop — a
+// change to the emit path this row is scoped not to make. rx and emitted
+// survived mutation testing (BLO-43479); every other guard here failed under
+// one. The gap is bounded by this struct being the single source of truth: the
+// stats line reads the same fields, so a dropped increment prints rx_prod=0 in
+// the journal rather than disagreeing with /metrics. Close it by extracting
+// the loop body when that path needs changing for its own reasons.
 type counters struct {
 	// Indexed by frame.src: 0 is ingest A, the production SSM channel; 1 is
 	// ingest B, the second listener. foreign[1] can never move, because reader
@@ -47,8 +47,9 @@ type counters struct {
 	rx      [2]atomic.Uint64
 	foreign [2]atomic.Uint64
 
-	emitted atomic.Uint64
-	qdrop   atomic.Uint64
+	emitted       atomic.Uint64
+	otherVersions atomic.Uint64 // emitted frames that are a later version of a shred
+	qdrop         atomic.Uint64
 }
 
 // ingestLabels names each frame.src on /metrics.
@@ -70,6 +71,7 @@ func counterFunc(name, help string, labels prometheus.Labels, f func() uint64) p
 func registerMerger(r prometheus.Registerer, c *counters, outs []*output) error {
 	cs := []prometheus.Collector{
 		counterFunc("emitted_total", "Shreds the union has emitted (stats-line emitted).", nil, c.emitted.Load),
+		counterFunc("other_versions_total", "Emitted shreds that are a later version of one the union carries: same slot, FEC set and index, another leader signature (stats-line other_versions).", nil, c.otherVersions.Load),
 		counterFunc("queue_drops_total", "Frames dropped with the processor queue full (stats-line qdrop).", nil, c.qdrop.Load),
 		counterFunc("emit_errors_total", "Output writes that failed, summed over every output (stats-line emit_err).", nil, func() uint64 {
 			var n uint64
