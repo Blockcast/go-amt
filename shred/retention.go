@@ -13,7 +13,9 @@ import (
 // erasure.Tracker bounds the same kind of state by slot distance: it reclaims
 // slots more than two behind its frontier (erasure/tracker.go, reclaimOldSlots).
 // That works there because the tracker scores a dense live feed, where slot
-// numbers advance one at a time and "two slots back" really is ~800ms back.
+// numbers advance one at a time and "two slots back" really is ~424ms back:
+// two ~212 ms slots, since SIMD-0525's 200 ms step took effect from epoch 1053
+// (slot 454,896,000, 2026-10-09 14:40Z).
 //
 // It does not survive contact with a capture. In the bundled fixture the
 // observed slots are 438757867, 438758026, 438758296, 438758365, 438758729 and
@@ -25,7 +27,7 @@ import (
 // proxy fails because a slot number is a property of the shred and the question
 // being asked — how long ago did this arrive — is a property of the arrival.
 //
-// So the bound here is the arrival clock directly. Two seconds is about five
+// So the bound here is the arrival clock directly. Two seconds is about nine
 // Solana slots: far wider than any inter-feed skew a duplicate can survive (the
 // duplicates this recognises come from a second feed milliseconds behind the
 // first), and still only a few thousand shreds at mainnet rates.

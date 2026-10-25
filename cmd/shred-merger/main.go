@@ -23,7 +23,8 @@
 //	             datagram budget fits a version-3 frame and not a full shred.
 //	             Version-4 frames are reduced to the erasure shard the forwarder
 //	             sends as version 3 (shred.FrameV3); version-3 frames pass
-//	             through unchanged.
+//	             through unchanged. Of a shred in two versions it carries the
+//	             first only (see the dedup key).
 //	data         data shreds only, verbatim
 //	coding-even  coding shreds at an even FEC-set position, verbatim
 //	coding-odd   coding shreds at an odd FEC-set position, verbatim
@@ -42,10 +43,10 @@
 // that binds the wildcard address gets every group the host has joined on its
 // port: Linux defaults IP_MULTICAST_ALL to 1. The layers are disjoint, so one
 // such socket can take several layers, but it must not also take the v3
-// output, or it gets most shreds twice in two versions. Bind each group
+// output, or it gets most shreds twice in two wire versions. Bind each group
 // address, or clear IP_MULTICAST_ALL as listenUDP4 does.
 //
-// The dedup key is (slot, fec_set_index, local_index). local_index is a
+// The dedup key is (slot, fec_set_index, local_index, ver). local_index is a
 // UNIFIED data||coding coordinate produced by shred-forwarder's parse_shred:
 //
 //	data   shreds -> index - fec_set_index        (0 .. num_data-1)
@@ -54,8 +55,29 @@
 // so data and coding never collide and no is_coding component is required.
 // Keying on (slot, local_index) alone would be WRONG: local_index is local to
 // the FEC set (0..63), so it would collapse distinct shreds across FEC sets in
-// the slot. The key ignores the wire version, so a shred both inputs deliver
-// is emitted once even while the inputs are on different versions.
+// the slot.
+//
+// ver tells versions of a shred apart. It is the first 8 bytes of a
+// wire-version-4 frame's body: the leader's signature over the FEC set's Merkle
+// root, which every shred of the set carries. Not a hash of the whole shred:
+// the last set of a slot is resigned, and its retransmitter signature differs
+// per retransmitter. A slot can come in two versions. At the Alpenglow switch,
+// 2026-10-21 13:54Z, SIMD-0384 rolled back the slots after genesis block
+// 459,652,999, and the production forwarder saw FEC sets with two Merkle
+// roots. Keyed on position alone, the union kept whichever version reached it
+// first at each index, so a set could mix the two and leave a TVU fed from the
+// union, as the RPC node's is from 232.0.2.1-3 (BLO-46795), short of both. Now
+// each version of a shred is emitted once, and other_versions in the stats
+// line counts all but the first. Only a consumer that checks signatures, such
+// as that TVU, gains. A v3 output frame has no signature to tell versions
+// apart by, so that output carries the first version of each shred and no
+// other, and a first-wins assembler, such as txfeed's, takes a later version
+// for a duplicate: either can still build a set from two versions.
+//
+// A wire-version-3 frame has no signature, so its ver is 0, which matches
+// every ver: a shred both inputs deliver is emitted once even while the inputs
+// are on different wire versions. Versions are told apart only while both
+// inputs are on wire version 4.
 // History of a slot lasts -dedup-keep past its latest shred: an arrival
 // clock, not a slot window, because the forwarders do not authenticate slots
 // (see dedup).
@@ -301,6 +323,7 @@ const (
 	emit      verdict = iota // first sighting: forward it
 	duplicate                // the union already carries this shred
 	skip                     // slot 0: no real shred has it
+	emitOther                // another version of a shred the union carries: forward it to every output but v3
 )
 
 // dedup remembers, per slot, which shreds the union has already emitted. It
@@ -317,14 +340,15 @@ type dedup struct {
 	keep      time.Duration
 	maxSlot   uint64 // the highest slot seen, for the stats line only
 	seen      map[uint64]*slotSeen
-	ids       int       // shreds remembered across every slot
+	ids       int       // shreds remembered across every slot, each version of one counted
 	forgotten uint64    // slots forgotten or reset at a cap rather than for idling
 	sweep     time.Time // when the next eviction pass runs
 }
 
 type slotSeen struct {
-	last time.Time           // arrival of its latest shred
-	ids  map[uint64]struct{} // fec_set_index<<32 | local_index
+	last time.Time              // arrival of its latest shred
+	ids  map[uint64]uint64      // fec_set_index<<32 | local_index -> ver of the first version emitted
+	alt  map[[2]uint64]struct{} // {id, ver} of each later version emitted; nil until one is
 }
 
 // maxDedupSlots bounds history under a flood of distinct forged slots. Real
@@ -335,9 +359,11 @@ const maxDedupSlots = 256
 
 // maxSlotIDs bounds one slot's history. A flood of distinct (fec_set_index,
 // local_index) pairs on one slot number keeps that slot fresh, so neither the
-// sweep nor maxDedupSlots ever forgets it. A real slot carries at most 32768
-// data shreds and as many coding. A new id past the cap starts the slot over;
-// a duplicate never does, so a full real slot is not reset by a repeat.
+// sweep nor maxDedupSlots ever forgets it. So does a flood of versions of one
+// shred, which a forged signature makes as cheaply, so the cap counts each
+// version as an id. A real slot carries at most 32768 data shreds and as many
+// coding. A new id past the cap starts the slot over; a duplicate never does,
+// so a full real slot is not reset by a repeat.
 const maxSlotIDs = 1 << 16
 
 // maxDedupIDs bounds history across slots. The two caps above allow 16.8M ids,
@@ -347,18 +373,21 @@ const maxSlotIDs = 1 << 16
 // idlest other slot. That bounds memory, not the hold: a flood can still hold
 // up to the cap, and one that refreshes its slots faster than live slots go
 // idle makes the live slots the idlest, so their history shortens instead.
-// 2M ids is about 72 MiB, ten times the 130k-190k ids live traffic holds across
-// 100-140 slots (CT 140, 2026-10-09). A dedup_ids pinned near it is a flood of
-// full slots, and slots pinned at 256 one of distinct slots. A one-slot flood
-// leaves both at live levels and shows only as forgotten climbing, one per
-// 65536 new ids.
+// Measured with go1.25 (runtime.MemStats over slots of 1,300 to 65,536 ids), an
+// id costs 24-38 B in a slot's ids and 35-56 B as a later version in its alt.
+// So 2M ids is up to about 75 MiB, ten times the 130k-190k ids live traffic
+// holds across 100-140 slots (CT 140, 2026-10-09), and up to about 112 MiB
+// (56.0 B x 2^21) for a flood of versions. A dedup_ids pinned near it is a
+// flood of full slots, and slots pinned at 256 one of distinct slots. A
+// one-slot flood, of ids or of versions of one shred, leaves both at live
+// levels and shows only as forgotten climbing, one per 65536 new ids.
 const maxDedupIDs = 1 << 21
 
 func newDedup(keep time.Duration) *dedup {
 	return &dedup{keep: keep, seen: map[uint64]*slotSeen{}}
 }
 
-func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
+func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32, ver uint64) verdict {
 	if slot == 0 {
 		return skip
 	}
@@ -378,7 +407,7 @@ func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
 		if len(d.seen) >= maxDedupSlots {
 			d.forgetIdlest(slot)
 		}
-		ss = &slotSeen{ids: map[uint64]struct{}{}}
+		ss = &slotSeen{ids: map[uint64]uint64{}}
 		d.seen[slot] = ss
 	}
 	ss.last = now
@@ -386,26 +415,43 @@ func (d *dedup) observe(now time.Time, slot uint64, fec, idx uint32) verdict {
 	// no shred of its slot, a repeat is rarer than the harm of refusing a
 	// slot on its number alone.
 	k := uint64(fec)<<32 | uint64(idx)
-	if _, dup := ss.ids[k]; dup {
-		return duplicate
+	first, known := ss.ids[k]
+	if known {
+		if first == ver || first == 0 || ver == 0 {
+			return duplicate // a version-3 frame has no signature: it matches any version
+		}
+		if _, dup := ss.alt[[2]uint64{k, ver}]; dup {
+			return duplicate
+		}
 	}
-	if len(ss.ids) >= maxSlotIDs {
+	// Both caps count later versions, or a flood of forged versions of one
+	// shred would pass the slot's cap and then the global one.
+	if len(ss.ids)+len(ss.alt) >= maxSlotIDs {
 		// More shreds than a real slot has: start it over.
-		d.ids -= len(ss.ids)
-		ss.ids = map[uint64]struct{}{}
+		d.ids -= len(ss.ids) + len(ss.alt)
+		ss.ids, ss.alt = map[uint64]uint64{}, nil
 		d.forgotten++
+		known = false
 	}
 	for d.ids >= maxDedupIDs && len(d.seen) > 1 {
 		d.forgetIdlest(slot)
 	}
-	ss.ids[k] = struct{}{}
 	d.ids++
-	return emit
+	if !known {
+		ss.ids[k] = ver
+		return emit
+	}
+	if ss.alt == nil {
+		ss.alt = map[[2]uint64]struct{}{}
+	}
+	ss.alt[[2]uint64{k, ver}] = struct{}{}
+	return emitOther
 }
 
 // drop forgets slot s.
 func (d *dedup) drop(s uint64) {
-	d.ids -= len(d.seen[s].ids)
+	ss := d.seen[s]
+	d.ids -= len(ss.ids) + len(ss.alt)
 	delete(d.seen, s)
 }
 
@@ -421,6 +467,16 @@ func (d *dedup) forgetIdlest(except uint64) {
 	}
 	d.drop(idlest)
 	d.forgotten++
+}
+
+// frameVersion returns the ver observe keys a frame on: for a version-4 frame,
+// the first 8 bytes of the leader's signature over its FEC set's Merkle root.
+// Any other frame gives 0, which matches every ver.
+func frameVersion(b []byte) uint64 {
+	if b[0] == 4 && len(b) >= hdrLen+8 {
+		return binary.LittleEndian.Uint64(b[hdrLen:])
+	}
+	return 0
 }
 
 // asV3 returns b as a forwarder wire-version-3 frame.
@@ -563,13 +619,15 @@ func parseOutputs(specs []string, defaultPort int, ingests ...*net.UDPAddr) ([]*
 // an output whose queue is full loses the frame and counts it in drop. It
 // reports false when a version-3 output needed the frame and b cannot be
 // converted. Queued frames are shared and never written to: each frame a reader
-// passes on has its own buffer, and asV3 copies.
-func send(outs []*output, b []byte) (convertible bool) {
+// passes on has its own buffer, and asV3 copies. later marks a later version of
+// a shred the union carries, which a version-3 output never takes: it has no
+// signature to tell versions apart by, so it keeps the first.
+func send(outs []*output, b []byte, later bool) (convertible bool) {
 	var v3 []byte
 	converted := false
 	convertible = true
 	for _, o := range outs {
-		if !o.kind.carries(b) {
+		if !o.kind.carries(b) || later && o.kind == kindV3 {
 			continue
 		}
 		p := b
@@ -695,7 +753,8 @@ func main() {
 		case f := <-ch:
 			b := f.buf[:f.n]
 			c.rx[f.src].Add(1)
-			switch seen.observe(time.Now(), binary.LittleEndian.Uint64(b[1:9]), binary.LittleEndian.Uint32(b[9:13]), binary.LittleEndian.Uint32(b[13:17])) {
+			later := false
+			switch seen.observe(time.Now(), binary.LittleEndian.Uint64(b[1:9]), binary.LittleEndian.Uint32(b[9:13]), binary.LittleEndian.Uint32(b[13:17]), frameVersion(b)) {
 			case skip:
 				skipped++
 				continue
@@ -706,6 +765,9 @@ func main() {
 					dupB++
 				}
 				continue
+			case emitOther:
+				c.otherVersions.Add(1)
+				later = true
 			}
 			if f.src == 1 {
 				firstFromB++ // a marginal shred the second listener contributed
@@ -717,23 +779,29 @@ func main() {
 			case 4:
 				emittedV4++
 			}
-			if !send(outs, b) {
+			if !send(outs, b, later) {
 				v3Unconvertible++
 			}
 
 		case <-tick.C:
-			// emitted counts the shreds the union carries. Each output follows
-			// as KIND@DST=SENT/ERR/DROP/QUEUED: frames written, failed, dropped
-			// with its queue full, and still queued; for an all output they add
-			// up to emitted. A unicast output with no listener still counts its
-			// frames as SENT: its socket is unconnected, so it never sees the
-			// ICMP port unreachable. emit_err and out_drop sum ERR and DROP.
-			// queue is the input backlog, which qdrop counts once it is full.
-			// foreign counts datagrams to ingest A whose claimed source is not
-			// -prod-src: read, then dropped. -metrics-addr exports this line's
-			// rx_prod, rx_listener2, emitted, emit_err, out_drop, qdrop and
-			// foreign (that one per ingest) from the same counters; this line
-			// remains the rollback path and carries the rest alone.
+			// emitted counts the shreds the union carries, and other_versions
+			// those of them that are a later version of a shred it carries.
+			// first_from_listener2 includes the later versions listener2
+			// contributes, and dup_prod and dup_listener2 no longer count them,
+			// only their repeats.
+			// Each output follows as KIND@DST=SENT/ERR/DROP/QUEUED: frames
+			// written, failed, dropped with its queue full, and still queued; for
+			// an all output they add up to emitted, and for a v3 output to emitted
+			// less other_versions and v3_unconvertible. A unicast output with no
+			// listener still counts its frames as SENT: its socket is unconnected,
+			// so it never sees the ICMP port unreachable. emit_err and out_drop
+			// sum ERR and DROP. queue is the input backlog, which qdrop counts once
+			// it is full. foreign counts datagrams to ingest A whose claimed source
+			// is not -prod-src: read, then dropped. -metrics-addr exports this
+			// line's rx_prod, rx_listener2, emitted, other_versions, emit_err,
+			// out_drop, qdrop and foreign (that one per ingest) from the same
+			// counters; this line remains the rollback path and carries the rest
+			// alone.
 			var emitErr, outDrop uint64
 			var per strings.Builder
 			for _, o := range outs {
@@ -742,8 +810,8 @@ func main() {
 				outDrop += d
 				fmt.Fprintf(&per, " %s@%s=%d/%d/%d/%d", o.kind, o.dst, sent, e, d, len(o.q))
 			}
-			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d out_drop=%d qdrop=%d foreign=%d queue=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d dedup_ids=%d forgotten=%d%s",
-				c.rx[0].Load(), c.rx[1].Load(), c.emitted.Load(), dupA, dupB, firstFromB, emitErr, outDrop, c.qdrop.Load(), c.foreign[0].Load()+c.foreign[1].Load(), len(ch), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, seen.ids, seen.forgotten, per.String())
+			log.Printf("rx_prod=%d rx_listener2=%d emitted=%d other_versions=%d dup_prod=%d dup_listener2=%d first_from_listener2=%d emit_err=%d out_drop=%d qdrop=%d foreign=%d queue=%d slots=%d max_slot=%d emitted_v3=%d emitted_v4=%d v3_unconvertible=%d skipped=%d dedup_ids=%d forgotten=%d%s",
+				c.rx[0].Load(), c.rx[1].Load(), c.emitted.Load(), c.otherVersions.Load(), dupA, dupB, firstFromB, emitErr, outDrop, c.qdrop.Load(), c.foreign[0].Load()+c.foreign[1].Load(), len(ch), len(seen.seen), seen.maxSlot, emittedV3, emittedV4, v3Unconvertible, skipped, seen.ids, seen.forgotten, per.String())
 
 		case s := <-sig:
 			log.Printf("signal %v; final: rx_prod=%d rx_listener2=%d emitted=%d first_from_listener2=%d", s, c.rx[0].Load(), c.rx[1].Load(), c.emitted.Load(), firstFromB)

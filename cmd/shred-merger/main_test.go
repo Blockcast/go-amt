@@ -34,7 +34,7 @@ func TestDedupKeysOnFECSetAndLocalIndex(t *testing.T) {
 		{"same coordinates, next slot: a different shred", 101, 0, 5, emit},
 		{"slot 0 is never emitted", 0, 0, 5, skip},
 	} {
-		if got := d.observe(t0, step.slot, step.fec, step.idx); got != step.want {
+		if got := d.observe(t0, step.slot, step.fec, step.idx, 0); got != step.want {
 			t.Errorf("%s: observe = %d, want %d", step.name, got, step.want)
 		}
 	}
@@ -43,37 +43,140 @@ func TestDedupKeysOnFECSetAndLocalIndex(t *testing.T) {
 func TestDedupForgetsASlotIdleForKeep(t *testing.T) {
 	d := newDedup(25 * time.Second)
 	at := func(sec int) time.Time { return t0.Add(time.Duration(sec) * time.Second) }
-	d.observe(at(0), 100, 0, 1)
-	if got := d.observe(at(20), 100, 0, 1); got != duplicate {
+	d.observe(at(0), 100, 0, 1, 0)
+	if got := d.observe(at(20), 100, 0, 1, 0); got != duplicate {
 		t.Fatalf("slot 100 inside keep: observe = %d, want duplicate", got)
 	}
 	// History runs from a slot's latest shred, not its first: 24s after the
 	// latest, a sweep keeps it.
-	d.observe(at(44), 300, 0, 1)
+	d.observe(at(44), 300, 0, 1, 0)
 	if _, kept := d.seen[100]; !kept {
 		t.Fatal("slot 100 was swept 24s after its latest shred, inside keep")
 	}
 	// Sweeps run every keep/2. The next one, 37s after the latest shred,
 	// forgets the slot, and its shreds are emitted again.
-	d.observe(at(57), 300, 0, 2)
+	d.observe(at(57), 300, 0, 2, 0)
 	if _, kept := d.seen[100]; kept {
 		t.Error("slot 100 sat idle past keep but its history was not swept")
 	}
-	if got := d.observe(at(57), 100, 0, 1); got != emit {
+	if got := d.observe(at(57), 100, 0, 1, 0); got != emit {
 		t.Errorf("slot 100 after its history was swept: observe = %d, want emit", got)
 	}
 	checkIDs(t, d)
 }
 
-// checkIDs checks the stats line's dedup_ids against the history held.
+// checkIDs checks the stats line's dedup_ids against the history held, each
+// version of a shred counted.
 func checkIDs(t *testing.T, d *dedup) {
 	t.Helper()
 	n := 0
 	for _, ss := range d.seen {
-		n += len(ss.ids)
+		n += len(ss.ids) + len(ss.alt)
 	}
 	if d.ids != n {
 		t.Errorf("dedup_ids = %d, but the slots hold %d", d.ids, n)
+	}
+}
+
+// A slot can come in two versions, as at the Alpenglow switch. Each version of
+// a shred is emitted once, so the union carries every shred of each version it
+// received, and a TVU fed from it is not left with a set mixing the two.
+func TestDedupKeepsEachVersionOfAShred(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	for _, step := range []struct {
+		name string
+		ver  uint64
+		want verdict
+	}{
+		{"first version", 0xa, emit},
+		{"the first version from the other listener", 0xa, duplicate},
+		{"a second version", 0xb, emitOther},
+		{"the second version again", 0xb, duplicate},
+		{"a third version", 0xc, emitOther},
+		{"a version-3 frame, which has no signature", 0, duplicate},
+	} {
+		if got := d.observe(t0, 100, 0, 5, step.ver); got != step.want {
+			t.Errorf("%s: observe = %d, want %d", step.name, got, step.want)
+		}
+	}
+	checkIDs(t, d)
+}
+
+// A version-3 frame has no signature, so it matches every version: a shred is
+// emitted once while one input is on wire version 3 and the other on 4.
+func TestDedupV3FrameMatchesAnyVersion(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	if got := d.observe(t0, 100, 0, 5, 0); got != emit {
+		t.Errorf("version-3 frame first: observe = %d, want emit", got)
+	}
+	for _, ver := range []uint64{0, 0xa, 0xb} {
+		if got := d.observe(t0, 100, 0, 5, ver); got != duplicate {
+			t.Errorf("version %#x after a version-3 frame: observe = %d, want duplicate", ver, got)
+		}
+	}
+	checkIDs(t, d)
+}
+
+// The forwarders check no signature, so forged versions of one shred cost
+// nothing and keep its slot fresh. Unless the slot's cap counts them, they pass
+// it, and past maxDedupIDs every new id forgets a real slot instead.
+func TestDedupBoundsVersionsOfOneShred(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	for v := range uint64(maxSlotIDs + 10) {
+		d.observe(t0, 100, 0, 0, v+1)
+	}
+	if ss := d.seen[100]; len(ss.ids)+len(ss.alt) > maxSlotIDs || d.ids > maxSlotIDs {
+		t.Errorf("slot 100 holds %d ids, %d in all; want at most %d", len(ss.ids)+len(ss.alt), d.ids, maxSlotIDs)
+	}
+	if d.forgotten != 1 {
+		t.Errorf("forgotten = %d, want 1: the slot started over once", d.forgotten)
+	}
+	checkIDs(t, d)
+}
+
+// A later version that starts its slot over becomes that shred's first
+// version, since the reset forgot the version it followed. Its copy from the
+// other listener is then a duplicate, not a second emit of the same version.
+func TestDedupSlotResetByALaterVersion(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	for v := uint64(1); v <= maxSlotIDs; v++ {
+		d.observe(t0, 100, 0, 0, v)
+	}
+	if v := d.observe(t0, 100, 0, 0, maxSlotIDs+1); v != emit || d.forgotten != 1 {
+		t.Errorf("version past the cap: %v, forgotten=%d; want emit, 1", v, d.forgotten)
+	}
+	if v := d.observe(t0, 100, 0, 0, maxSlotIDs+1); v != duplicate {
+		t.Errorf("that version again: %v; want duplicate", v)
+	}
+	checkIDs(t, d)
+}
+
+// A slot forgotten for idling gives back its later versions too, or dedup_ids
+// climbs with every slot that had one.
+func TestDedupDropCountsLaterVersions(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	d.observe(t0, 100, 0, 5, 0xa)
+	d.observe(t0, 100, 0, 5, 0xb)
+	d.observe(t0.Add(time.Minute), 101, 0, 5, 0xa) // sweeps slot 100, idle past keep
+	if _, kept := d.seen[100]; kept || d.ids != 1 {
+		t.Errorf("after slot 100 was swept: kept=%v, dedup_ids=%d; want false, 1", kept, d.ids)
+	}
+	checkIDs(t, d)
+}
+
+func TestFrameVersionReadsTheLeaderSignature(t *testing.T) {
+	f := v4Frame(7, 3, false)
+	binary.LittleEndian.PutUint64(f[hdrLen:], 0x0123456789abcdef) // the signature's first 8 bytes
+	for name, b := range map[string][]byte{"a version-4 frame": f, "a version-4 frame cut after those 8 bytes": f[:hdrLen+8]} {
+		if got := frameVersion(b); got != 0x0123456789abcdef {
+			t.Errorf("frameVersion(%s) = %#x, want 0x0123456789abcdef", name, got)
+		}
+	}
+	v3, _ := asV3(f) // its body starts with the variant byte, not 0
+	for name, b := range map[string][]byte{"a version-3 frame": v3, "a bodyless version-4 frame": f[:hdrLen]} {
+		if got := frameVersion(b); got != 0 {
+			t.Errorf("frameVersion(%s) = %#x, want 0", name, got)
+		}
 	}
 }
 
@@ -82,18 +185,18 @@ func checkIDs(t *testing.T, d *dedup) {
 // by arrival time has no window to move.
 func TestDedupIgnoresTheSlotNumberOfAForgedShred(t *testing.T) {
 	d := newDedup(25 * time.Second)
-	d.observe(t0, 100, 0, 1)
+	d.observe(t0, 100, 0, 1, 0)
 	for _, forged := range []uint64{1 << 62, 1<<64 - 1, 1} {
-		if got := d.observe(t0, forged, 0, 1); got != emit {
+		if got := d.observe(t0, forged, 0, 1, 0); got != emit {
 			t.Errorf("forged slot %d: observe = %d, want emit (the merger does not authenticate)", forged, got)
 		}
 	}
 	for i := uint32(2); i < 52; i++ {
-		if got := d.observe(t0.Add(time.Duration(i)*time.Millisecond), 100, 0, i); got != emit {
+		if got := d.observe(t0.Add(time.Duration(i)*time.Millisecond), 100, 0, i, 0); got != emit {
 			t.Fatalf("real shred %d after forged slots: observe = %d, want emit", i, got)
 		}
 	}
-	if got := d.observe(t0.Add(time.Second), 100, 0, 1); got != duplicate {
+	if got := d.observe(t0.Add(time.Second), 100, 0, 1, 0); got != duplicate {
 		t.Errorf("real slot's history after forged slots: observe = %d, want duplicate", got)
 	}
 }
@@ -101,16 +204,16 @@ func TestDedupIgnoresTheSlotNumberOfAForgedShred(t *testing.T) {
 func TestDedupBoundsHistoryUnderAFloodOfSlots(t *testing.T) {
 	d := newDedup(25 * time.Second)
 	at := t0
-	d.observe(at, 100, 0, 1)
+	d.observe(at, 100, 0, 1, 0)
 	for s := uint64(1 << 40); s < 1<<40+3*maxDedupSlots; s++ {
 		at = at.Add(time.Microsecond)
-		d.observe(at, s, 0, 1)
-		d.observe(at, 100, 0, uint32(s)) // the real slot keeps receiving
+		d.observe(at, s, 0, 1, 0)
+		d.observe(at, 100, 0, uint32(s), 0) // the real slot keeps receiving
 	}
 	if len(d.seen) > maxDedupSlots {
 		t.Errorf("dedup holds %d slots, want at most %d", len(d.seen), maxDedupSlots)
 	}
-	if got := d.observe(at, 100, 0, 1); got != duplicate {
+	if got := d.observe(at, 100, 0, 1, 0); got != duplicate {
 		t.Errorf("the slot being received lost its history in the flood: observe = %d, want duplicate", got)
 	}
 	// Slot 100 and the first 255 forged slots fill the cap; each later forged
@@ -127,7 +230,7 @@ func TestDedupBoundsHistoryUnderAFloodOfSlots(t *testing.T) {
 func TestDedupBoundsTheHistoryOfOneSlot(t *testing.T) {
 	d := newDedup(25 * time.Second)
 	for i := range uint64(maxSlotIDs + 10) {
-		d.observe(t0, 100, uint32(i>>6), uint32(i&63))
+		d.observe(t0, 100, uint32(i>>6), uint32(i&63), 0)
 	}
 	if n := len(d.seen[100].ids); n > maxSlotIDs || d.ids > maxSlotIDs {
 		t.Errorf("slot 100 holds %d ids, %d in all; want at most %d", n, d.ids, maxSlotIDs)
@@ -144,12 +247,12 @@ func TestDedupBoundsTheHistoryOfOneSlot(t *testing.T) {
 func TestDedupDoesNotResetAFullSlotOnADuplicate(t *testing.T) {
 	d := newDedup(25 * time.Second)
 	for i := range uint64(maxSlotIDs) {
-		d.observe(t0, 100, uint32(i>>6), uint32(i&63))
+		d.observe(t0, 100, uint32(i>>6), uint32(i&63), 0)
 	}
-	if v := d.observe(t0, 100, 0, 0); v != duplicate || d.forgotten != 0 || d.ids != maxSlotIDs {
+	if v := d.observe(t0, 100, 0, 0, 0); v != duplicate || d.forgotten != 0 || d.ids != maxSlotIDs {
 		t.Errorf("repeat into a full slot: %v, forgotten=%d ids=%d; want duplicate, 0, %d", v, d.forgotten, d.ids, maxSlotIDs)
 	}
-	if v := d.observe(t0, 100, 1<<20, 0); v != emit || d.forgotten != 1 || d.ids != 1 {
+	if v := d.observe(t0, 100, 1<<20, 0, 0); v != emit || d.forgotten != 1 || d.ids != 1 {
 		t.Errorf("new id past the cap: %v, forgotten=%d ids=%d; want emit, 1, 1", v, d.forgotten, d.ids)
 	}
 	checkIDs(t, d)
@@ -165,11 +268,11 @@ func TestDedupBoundsIDsAcrossSlots(t *testing.T) {
 	for s := uint64(1); s <= full; s++ {
 		for r := uint64(1); r < s; r++ { // one duplicate keeps each earlier slot fresh
 			at = at.Add(time.Nanosecond)
-			d.observe(at, r, 0, 0)
+			d.observe(at, r, 0, 0, 0)
 		}
 		for i := range uint64(maxSlotIDs) {
 			at = at.Add(time.Nanosecond)
-			d.observe(at, s, uint32(i>>6), uint32(i&63))
+			d.observe(at, s, uint32(i>>6), uint32(i&63), 0)
 			if d.ids > maxDedupIDs {
 				t.Fatalf("dedup holds %d ids filling slot %d, want at most %d", d.ids, s, maxDedupIDs)
 			}
@@ -180,8 +283,30 @@ func TestDedupBoundsIDsAcrossSlots(t *testing.T) {
 			full, ss != nil, d.forgotten, d.seen[1] != nil, maxSlotIDs)
 	}
 	// A slot is not forgotten for its own new id, even stamped earliest of all.
-	if v := d.observe(t0, full+1, 0, 0); v != emit || d.seen[full+1] == nil {
+	if v := d.observe(t0, full+1, 0, 0, 0); v != emit || d.seen[full+1] == nil {
 		t.Errorf("new slot at the cap: %v, kept=%v; want emit, true", v, d.seen[full+1] != nil)
+	}
+	checkIDs(t, d)
+}
+
+// The cap across slots counts later versions too. Here later versions alone
+// take the total to it: each slot's first version came while the total was low.
+func TestDedupBoundsVersionsAcrossSlots(t *testing.T) {
+	d := newDedup(25 * time.Second)
+	at := t0
+	const slots, per = 2 * maxDedupIDs / maxSlotIDs, maxSlotIDs / 2 // half-full slots, the cap between them
+	for s := uint64(1); s <= slots; s++ {
+		d.observe(at, s, 0, 0, 1)
+	}
+	for s := uint64(1); s <= slots; s++ {
+		for v := uint64(2); v <= per; v++ {
+			at = at.Add(time.Nanosecond)
+			d.observe(at, s, 0, 0, v)
+		}
+	}
+	if v := d.observe(at.Add(time.Nanosecond), 1, 0, 0, per+1); v != emitOther || d.ids > maxDedupIDs || d.seen[2] != nil {
+		t.Errorf("a later version past the cap: %v, dedup_ids=%d, slot 2 kept=%v; want emitOther, at most %d, false: the idlest other slot gives way",
+			v, d.ids, d.seen[2] != nil, maxDedupIDs)
 	}
 	checkIDs(t, d)
 }
@@ -347,11 +472,11 @@ func TestSendRoutesEachFrameToItsOutputs(t *testing.T) {
 	data, even, odd := v4Frame(7, 3, false), v4Frame(7, 32+4, true), v4Frame(7, 32+5, true)
 	unknown := append([]byte{5}, data[1:]...)
 	for _, f := range [][]byte{data, even, odd} {
-		if !send(outs, f) {
+		if !send(outs, f, false) {
 			t.Fatalf("send reported a well-formed version-4 frame unconvertible")
 		}
 	}
-	if send(outs, unknown) {
+	if send(outs, unknown, false) {
 		t.Error("send must report a frame the version-3 output cannot take")
 	}
 
@@ -439,12 +564,12 @@ func TestSendDoesNotWaitForAFullOutput(t *testing.T) {
 	go func() {
 		start := time.Now()
 		for _, f := range frames {
-			send([]*output{stuck, live}, f)
+			send([]*output{stuck, live}, f, false)
 		}
 		// Then many to the full output alone: waiting even 0.1 ms a frame
 		// would take a second.
 		for range more {
-			send([]*output{stuck}, frames[0])
+			send([]*output{stuck}, frames[0], false)
 		}
 		took <- time.Since(start)
 	}()
@@ -479,6 +604,26 @@ func TestSendDoesNotWaitForAFullOutput(t *testing.T) {
 	}
 	if d := live.drop.Load(); d != 0 {
 		t.Errorf("the live output counted %d drops, want 0", d)
+	}
+}
+
+// A later version of a shred goes to every verbatim output and not to v3, whose
+// frames have no signature to tell versions apart by: that output keeps one
+// version of each shred, the first.
+func TestSendKeepsLaterVersionsOffTheV3Output(t *testing.T) {
+	var outs []*output
+	for _, k := range []kind{kindAll, kindV3, kindData, kindCodingEven, kindCodingOdd} {
+		outs = append(outs, &output{kind: k, q: make(chan []byte, 4)}) // no sender: the queue keeps what send gave it
+	}
+	for _, f := range [][]byte{v4Frame(7, 3, false), v4Frame(7, 32+4, true)} {
+		if !send(outs, f, true) {
+			t.Error("send counted a later version as v3_unconvertible")
+		}
+	}
+	for _, o := range outs {
+		if want := map[kind]int{kindAll: 2, kindData: 1, kindCodingEven: 1}[o.kind]; len(o.q) != want {
+			t.Errorf("%s output queued %d later versions, want %d", o.kind, len(o.q), want)
+		}
 	}
 }
 
@@ -664,6 +809,7 @@ func TestMetricsExportReadsEachStatsLineCounter(t *testing.T) {
 	c.rx[0].Store(11)
 	c.rx[1].Store(22)
 	c.emitted.Store(33)
+	c.otherVersions.Store(88)
 	c.qdrop.Store(44)
 	c.foreign[0].Store(55)
 	c.foreign[1].Store(66) // not reachable in production; distinct here to pin the label
@@ -683,6 +829,7 @@ func TestMetricsExportReadsEachStatsLineCounter(t *testing.T) {
 		`shred_merger_received_total{ingest="a"} 11`,
 		`shred_merger_received_total{ingest="b"} 22`,
 		`shred_merger_emitted_total 33`,
+		`shred_merger_other_versions_total 88`,
 		`shred_merger_queue_drops_total 44`,
 		`shred_merger_foreign_datagrams_total{ingest="a"} 55`,
 		`shred_merger_foreign_datagrams_total{ingest="b"} 66`,
@@ -706,7 +853,7 @@ func TestMetricsExportOutputDropsAcrossOutputs(t *testing.T) {
 	}
 	f := v4Frame(1, 3, false)[:hdrLen]
 	for range 4 {
-		send(stuck, f)
+		send(stuck, f, false)
 	}
 	// 4 frames to each output, 1 queued, 3 dropped.
 	wantExposition(t, scrape(t, reg), `shred_merger_output_drops_total 6`)
