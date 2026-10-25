@@ -1,6 +1,6 @@
 // Package txfeed turns the shred union into a feed of decoded Solana
-// transactions, partitioned onto multicast groups by vote/non-vote and by
-// program (BLO-41705).
+// transactions, partitioned onto multicast groups: non-vote, and by program
+// (BLO-41705). The vote group is retired (BLO-22812).
 //
 // The pipeline: reduce each union frame to its erasure shard, assemble FEC
 // sets (recovering missing data shards with Reed-Solomon), deshred complete

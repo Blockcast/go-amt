@@ -59,7 +59,7 @@ func TestPartitions(t *testing.T) {
 		tx   Tx
 		want []int
 	}{
-		{"a vote goes to the vote group only", Tx{Vote: true, Programs: []Pubkey{VoteProgram, token}}, []int{PartVote}},
+		{"a vote goes to no group: PartVote is retired", Tx{Vote: true, Programs: []Pubkey{VoteProgram, token}}, nil},
 		// token is named 0, jupiter named 5; their buckets are 20 and 8.
 		// The compute budget program gets no bucket.
 		{"a swap", Tx{Programs: []Pubkey{ComputeBudgetProgram, jupiter, token}}, []int{PartNonVote, 16, 21, 64 + 8, 64 + 20}},

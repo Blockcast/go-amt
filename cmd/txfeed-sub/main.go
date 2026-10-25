@@ -3,8 +3,7 @@
 //
 // Selectors join groups under -group-base, from -source, and combine:
 //
-//	-vote          simple votes
-//	-nonvote       every other transaction
+//	-nonvote       every transaction but a simple vote
 //	-named NAME    transactions invoking a txfeed.DefaultPrograms program
 //	-program B58   transactions invoking that program. Its bucket group is
 //	               shared with other programs, so frames from it are
@@ -218,7 +217,6 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 		base     = fs.String("group-base", "232.0.3.0", "partition group base")
 		port     = fs.Int("port", 5003, "partition group port")
 		ifaceIP  = fs.String("iface-ip", "", "local IP address on the interface to join on; optional with -relay")
-		vote     = fs.Bool("vote", false, "subscribe to simple votes")
 		nonvote  = fs.Bool("nonvote", false, "subscribe to non-vote transactions")
 		verify   = fs.Bool("verify", false, "verify each transaction's ed25519 signatures")
 		asJSON   = fs.Bool("json", false, "print JSON lines")
@@ -241,7 +239,7 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 	c.verify, c.asJSON, c.limit, c.duration = *verify, *asJSON, *limit, *duration
 
 	if c.listen.IsValid() {
-		if c.relay != nil || *ifaceIP != "" || *vote || *nonvote || len(named)+len(programs)+len(raw) > 0 {
+		if c.relay != nil || *ifaceIP != "" || *nonvote || len(named)+len(programs)+len(raw) > 0 {
 			return nil, errors.New("-listen joins nothing: give no -relay, -iface-ip or group selector with it")
 		}
 		c.subs = []*sub{{label: "listen", group: c.listen, all: true, chunks: txfeed.NewReassembler(chunkTimeout, maxChunked)}}
@@ -274,7 +272,7 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 		return nil, fmt.Errorf("-group-base: %v", err)
 	}
 	// Every partition offset is in range, so a group fails only on its base.
-	if _, err := txfeed.Group(b, 0); err != nil && (*vote || *nonvote || len(named) > 0 || len(programs) > 0) {
+	if _, err := txfeed.Group(b, 0); err != nil && (*nonvote || len(named) > 0 || len(programs) > 0) {
 		return nil, fmt.Errorf("-group-base: %v", err)
 	}
 	group := func(off int) netip.AddrPort {
@@ -282,9 +280,6 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 		return netip.AddrPortFrom(g, uint16(*port))
 	}
 
-	if *vote {
-		c.subs = join(c.subs, "vote", src, group(txfeed.PartVote), nil)
-	}
 	if *nonvote {
 		c.subs = join(c.subs, "nonvote", src, group(txfeed.PartNonVote), nil)
 	}
@@ -311,7 +306,7 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 		c.subs = join(c.subs, "ssm", rs, rg, nil)
 	}
 	if len(c.subs) == 0 {
-		return nil, errors.New("nothing to subscribe to: give -vote, -nonvote, -named, -program, -ssm or -listen")
+		return nil, errors.New("nothing to subscribe to: give -nonvote, -named, -program, -ssm or -listen")
 	}
 	return c, nil
 }

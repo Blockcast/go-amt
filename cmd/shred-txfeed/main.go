@@ -13,8 +13,11 @@
 // partition group it belongs to, at these offsets from the group base:
 //
 //	1          non-vote transactions
-//	2          simple votes: none since Alpenglow (mainnet slot 459,653,000),
-//	           whose votes are BLS messages between validators, not transactions
+//	2          retired and reserved (BLO-22812). Consensus votes left blocks
+//	           at Alpenglow (mainnet slot 459,653,000); the simple-vote test
+//	           still matches rare one-instruction vote-account transactions,
+//	           such as Withdraw. These are counted in votes and sent on no
+//	           partition group.
 //	16+i       transactions invoking named program i: -program, or
 //	           txfeed.DefaultPrograms
 //	64+b       transactions invoking a program in bucket b (txfeed.Bucket),

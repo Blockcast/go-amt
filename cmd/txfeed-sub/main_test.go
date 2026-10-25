@@ -35,8 +35,8 @@ func swapOpeners(t *testing.T, native func(netip.Addr, netip.Addr, int, netip.Ad
 
 func TestRelayFlag(t *testing.T) {
 	for args, want := range map[string]string{
-		"-relay 69.25.95.128 -vote":      "69.25.95.128:2268",
-		"-relay 69.25.95.128:4000 -vote": "69.25.95.128:4000",
+		"-relay 69.25.95.128 -nonvote":      "69.25.95.128:2268",
+		"-relay 69.25.95.128:4000 -nonvote": "69.25.95.128:4000",
 	} {
 		c, err := parseArgs(strings.Fields(args)...)
 		if err != nil || c.relay == nil || c.relay.String() != want {
@@ -47,20 +47,20 @@ func TestRelayFlag(t *testing.T) {
 			t.Errorf("parse(%q): -relay without -iface-ip must join on the default interface", args)
 		}
 	}
-	if c, err := parseArgs("-relay", "69.25.95.128", "-iface-ip", "127.0.0.1", "-vote"); err != nil || c.ifi == nil {
+	if c, err := parseArgs("-relay", "69.25.95.128", "-iface-ip", "127.0.0.1", "-nonvote"); err != nil || c.ifi == nil {
 		t.Errorf("-relay with -iface-ip must join on the interface holding it: %v", err)
 	}
 
 	// Each must fail loudly, not quietly drop the AMT fallback.
 	for _, args := range [][]string{
-		{"-vote", "-relay"},                                 // no value
-		{"-relay=", "-vote"},                                // an unset ${RELAY}
-		{"-relay", ":2268", "-vote"},                        // no host, which ManagedConn reads as no relay
-		{"-relay", "69.25.95.128:", "-vote"},                // empty port
-		{"-relay", "69.25.95.128:0", "-vote"},               // port 0
-		{"-relay", "69.25.95.128:x", "-vote"},               // not a port
-		{"-relay", "[::1]:2268", "-vote"},                   // not IPv4
-		{"-relay", "1.1.1.1", "-relay", "2.2.2.2", "-vote"}, // two relays
+		{"-nonvote", "-relay"},                                 // no value
+		{"-relay=", "-nonvote"},                                // an unset ${RELAY}
+		{"-relay", ":2268", "-nonvote"},                        // no host, which ManagedConn reads as no relay
+		{"-relay", "69.25.95.128:", "-nonvote"},                // empty port
+		{"-relay", "69.25.95.128:0", "-nonvote"},               // port 0
+		{"-relay", "69.25.95.128:x", "-nonvote"},               // not a port
+		{"-relay", "[::1]:2268", "-nonvote"},                   // not IPv4
+		{"-relay", "1.1.1.1", "-relay", "2.2.2.2", "-nonvote"}, // two relays
 	} {
 		if c, err := parseArgs(args...); err == nil {
 			t.Errorf("parse(%q) accepted, relay %v", args, c.relay)
@@ -71,8 +71,12 @@ func TestRelayFlag(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		want = "-relay"
 	}
-	if _, err := parseArgs("-vote"); err == nil || !strings.Contains(err.Error(), want) {
-		t.Errorf("parse(-vote) = %v; without -relay it must ask for %s", err, want)
+	if _, err := parseArgs("-nonvote"); err == nil || !strings.Contains(err.Error(), want) {
+		t.Errorf("parse(-nonvote) = %v; without -relay it must ask for %s", err, want)
+	}
+	// The vote group 232.0.3.2 is retired (BLO-22812): -vote selects nothing.
+	if _, err := parseArgs("-relay", "69.25.95.128", "-vote"); err == nil {
+		t.Error("-vote accepted")
 	}
 	// The relay example in the docs names jupiter-v6; plain jupiter is not a
 	// default program.
@@ -85,7 +89,7 @@ func TestRelayFlag(t *testing.T) {
 // the native-first ManagedConn, and none through the native-only join.
 func TestRelayRoutesEveryGroup(t *testing.T) {
 	jup := txfeed.DefaultPrograms[5]
-	c, err := parseArgs("-relay", "69.25.95.128", "-vote", "-nonvote", "-named", jup.Name,
+	c, err := parseArgs("-relay", "69.25.95.128", "-nonvote", "-named", jup.Name,
 		"-program", jup.ID.String(), "-ssm", "69.25.95.57@232.0.3.200:5003")
 	if err != nil {
 		t.Fatal(err)
@@ -104,7 +108,7 @@ func TestRelayRoutesEveryGroup(t *testing.T) {
 		}
 	}
 
-	want := []string{"232.0.3.2:5003", "232.0.3.1:5003", "232.0.3.21:5003",
+	want := []string{"232.0.3.1:5003", "232.0.3.21:5003",
 		fmt.Sprintf("232.0.3.%d:5003", txfeed.PartBucketBase+txfeed.Bucket(jup.ID)), "232.0.3.200:5003"}
 	if len(opened) != len(want) {
 		t.Fatalf("opened %d relayed joins, want %d", len(opened), len(want))
@@ -131,7 +135,7 @@ func TestNoRelayStaysNative(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("native joins are Linux-only")
 	}
-	c, err := parseArgs("-iface-ip", "127.0.0.1", "-vote")
+	c, err := parseArgs("-iface-ip", "127.0.0.1", "-nonvote")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +151,7 @@ func TestNoRelayStaysNative(t *testing.T) {
 	if _, _, err := c.open(c.subs[0]); !errors.Is(err, stop) {
 		t.Fatalf("open = %v", err)
 	}
-	if want := "69.25.95.57 232.0.3.2 5003 127.0.0.1 4194304"; got != want {
+	if want := "69.25.95.57 232.0.3.1 5003 127.0.0.1 4194304"; got != want {
 		t.Errorf("native join (S G port iface rcvbuf) = %s, want %s", got, want)
 	}
 }

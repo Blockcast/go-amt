@@ -11,7 +11,13 @@ import (
 // A partition is an offset from a group base: partition p is carried on the
 // group whose last byte is p.
 const (
-	PartNonVote    = 1
+	PartNonVote = 1
+	// PartVote is retired and reserved (BLO-22812). Consensus votes left
+	// blocks at Alpenglow (mainnet slot 459,653,000) and are BLS messages
+	// between validators. The simple-vote test still matches rare
+	// one-instruction vote-account transactions, such as Withdraw, and
+	// Partitions gives those no partition. No other partition may take this
+	// offset, so a subscriber still joined to it gets silence, not another feed.
 	PartVote       = 2
 	PartNamedBase  = 16 // NumNamed named programs at most, offsets 16..31
 	NumNamed       = 16
@@ -53,15 +59,15 @@ func Bucket(p Pubkey) int {
 	return int(h.Sum32() % NumBuckets)
 }
 
-// Partitions returns the partitions tx is carried on, ascending. A vote goes
-// to PartVote only. Any other transaction goes to PartNonVote, to
-// PartNamedBase+i for each named[i] it invokes, and to the bucket of each
-// program it invokes except the compute budget program, which nearly every
-// transaction invokes. Only the first NumNamed of named have partitions: past
-// them, offsets would run into the buckets.
+// Partitions returns the partitions tx is carried on, ascending: none for a
+// simple vote, as PartVote is retired. Any other transaction goes to
+// PartNonVote, to PartNamedBase+i for each named[i] it invokes, and to the
+// bucket of each program it invokes except the compute budget program, which
+// nearly every transaction invokes. Only the first NumNamed of named have
+// partitions: past them, offsets would run into the buckets.
 func Partitions(tx Tx, named []Pubkey) []int {
 	if tx.Vote {
-		return []int{PartVote}
+		return nil
 	}
 	parts := []int{PartNonVote}
 	for i, p := range named[:min(len(named), NumNamed)] {
