@@ -72,10 +72,10 @@ func ParseChannel(s string) (Channel, error) {
 	return c, nil
 }
 
-// RefusedKeys can have no channel, of either kind: nearly every transaction
-// carries them, so the channel would be the whole feed. Every simple vote
-// invokes the vote program, and nearly every other transaction the compute
-// budget program.
+// RefusedKeys can have no channel, of either kind. Nearly every transaction
+// invokes the compute budget program, so its channel would be the whole feed.
+// The vote program stays refused so that no channel stands in for the retired
+// vote group (BLO-22812).
 var RefusedKeys = []Named{
 	{"vote", VoteProgram},
 	{"compute-budget", ComputeBudgetProgram},
