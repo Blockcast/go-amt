@@ -54,14 +54,14 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
-// fixtureFrames returns the 900 txframes of a receive-only SSM capture of
-// shred-txfeed (69.25.95.57) on 2026-10-13 at 22:26Z, as the kernel
-// reassembled them: 300 from the jupiter-v6 group 232.0.3.21:5003, then 600
-// from the non-vote group 232.0.3.1:5003. Each is u16 LE length, then the
-// frame.
-func fixtureFrames(t testing.TB) [][]byte {
+// fixtureFrames returns the n frames of testdata/name, each stored as u16 LE
+// length, then the frame. txframes-2026-10-13.bin.gz is the 900 txframes of a
+// receive-only SSM capture of shred-txfeed (69.25.95.57) on 2026-10-13 at
+// 22:26Z, as the kernel reassembled them: 300 from the jupiter-v6 group
+// 232.0.3.21:5003, then 600 from the non-vote group 232.0.3.1:5003.
+func fixtureFrames(t testing.TB, name string, n int) [][]byte {
 	t.Helper()
-	f, err := os.Open("testdata/txframes-2026-10-13.bin.gz")
+	f, err := os.Open("testdata/" + name)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,11 +76,11 @@ func fixtureFrames(t testing.TB) [][]byte {
 	}
 	var frames [][]byte
 	for len(b) >= 2 {
-		n := 2 + int(binary.LittleEndian.Uint16(b))
-		frames, b = append(frames, b[2:n]), b[n:]
+		end := 2 + int(binary.LittleEndian.Uint16(b))
+		frames, b = append(frames, b[2:end]), b[end:]
 	}
-	if len(frames) != 900 || len(b) != 0 {
-		t.Fatalf("fixture: %d frames and %d bytes left over; want 900 and 0", len(frames), len(b))
+	if len(frames) != n || len(b) != 0 {
+		t.Fatalf("fixture %s: %d frames and %d bytes left over; want %d and 0", name, len(frames), len(b), n)
 	}
 	return frames
 }
@@ -92,7 +92,7 @@ func fixtureFrames(t testing.TB) [][]byte {
 func TestDatagramsSplitsTheLiveFeed(t *testing.T) {
 	t0 := time.Unix(1792000000, 0)
 	var fragmented, split int
-	for i, b := range fixtureFrames(t) {
+	for i, b := range fixtureFrames(t, "txframes-2026-10-13.bin.gz", 900) {
 		if len(b) > 1500-20-8 {
 			fragmented++ // IPv4 fragmented it on a 1500-byte link
 		}
@@ -214,7 +214,7 @@ func parseFrameV1(b []byte) (Frame, error) {
 // transaction.
 func TestV1DecoderRejectsChunks(t *testing.T) {
 	var whole, chunks int
-	for _, b := range fixtureFrames(t) {
+	for _, b := range fixtureFrames(t, "txframes-2026-10-13.bin.gz", 900) {
 		f, _ := ParseFrame(b)
 		for _, d := range Datagrams(f) {
 			g, err := parseFrameV1(d)
