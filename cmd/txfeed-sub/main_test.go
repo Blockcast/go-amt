@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -298,5 +299,79 @@ func TestChannelCheck(t *testing.T) {
 	}
 	if c.channel = nil; !c.matches(txfeed.Tx{}) {
 		t.Error("without -channel every transaction must pass")
+	}
+}
+
+// -footers takes the shred union from -ssm or -listen, this host's clock as
+// -clock-source and -clock-offset, and no selector or check made for
+// transactions.
+func TestFootersFlag(t *testing.T) {
+	for _, args := range []string{
+		"-footers -ssm 69.25.95.57@232.0.0.2:5001 -relay 69.25.95.128 -clock-source chrony -clock-offset=0s",
+		"-footers -listen 127.0.0.1:15001 -clock-source systemd-timesyncd -clock-offset=190us",
+	} {
+		if c, err := parseArgs(strings.Fields(args)...); err != nil || !c.footers {
+			t.Errorf("parse(%q): %v", args, err)
+		}
+	}
+	c, err := parseArgs("-footers", "-listen", "127.0.0.1:15001", "-clock-source", "systemd-timesyncd 162.159.200.1", "-clock-offset=190us")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.clockSource != "systemd-timesyncd 162.159.200.1" || c.clockOffset != 190*time.Microsecond {
+		t.Errorf("clock %q %v; want the source and offset as given", c.clockSource, c.clockOffset)
+	}
+	jup := txfeed.DefaultPrograms[5]
+	for _, args := range [][]string{
+		{"-footers", "-relay", "69.25.95.128", "-nonvote"},
+		{"-footers", "-relay", "69.25.95.128", "-named", jup.Name},
+		{"-footers", "-relay", "69.25.95.128", "-program", jup.ID.String()},
+		{"-footers", "-listen", "127.0.0.1:15001", "-channel", "program:" + jup.ID.String()},
+		{"-footers", "-listen", "127.0.0.1:15001", "-verify"},
+	} {
+		if _, err := parseArgs(append(args, "-clock-source", "chrony", "-clock-offset=0s")...); err == nil {
+			t.Errorf("parse(%q) accepted", args)
+		}
+	}
+	// Unset, the clock would read as a measured zero offset.
+	for _, args := range [][]string{
+		{"-footers", "-listen", "127.0.0.1:15001"},
+		{"-footers", "-listen", "127.0.0.1:15001", "-clock-offset=190us"},
+		{"-footers", "-listen", "127.0.0.1:15001", "-clock-source", "chrony"},
+		{"-footers", "-listen", "127.0.0.1:15001", "-clock-source=", "-clock-offset=190us"},
+		{"-footers", "-listen", "127.0.0.1:15001", "-clock-source", " \t", "-clock-offset=190us"}, // blank: names no source
+	} {
+		if _, err := parseArgs(args...); err == nil {
+			t.Errorf("parse(%q) accepted", args)
+		}
+	}
+}
+
+// A footer's line: latency_ms from the nanosecond clocks, this host's clock as
+// given, under the names the lines are read by.
+func TestFooterLine(t *testing.T) {
+	c, err := parseArgs("-footers", "-listen", "127.0.0.1:15001", "-clock-source", "systemd-timesyncd time.cloudflare.com", "-clock-offset=190us")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Slot 460191482's footer in the 10-22 capture of txfeed's tests, read from
+	// its own data shred, whose send_ts_us is ShredTs, and received here
+	// 1.253567ms after that.
+	hash, err := txfeed.ParsePubkey("2BLWnrUPqLvMHp3oqq9Y8xBpobR4tFqTwR41rb8DLzh4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ft := txfeed.FooterTime{Slot: 460191482, BankHash: hash, UserAgent: "agave/4.3.2 (src:013a4306; feat:c9ad34d2, client:JitoLabs)",
+		ProducerTimeNanos: 1792705262401095514, At: time.Unix(0, 1792705262496234567), ShredTs: 1792705262494981}
+	b, err := json.Marshal(c.footerLine(ft))
+	want := `{"slot":460191482,"bank_hash":"2BLWnrUPqLvMHp3oqq9Y8xBpobR4tFqTwR41rb8DLzh4",` +
+		`"agent":"agave/4.3.2 (src:013a4306; feat:c9ad34d2, client:JitoLabs)","producer_ns":1792705262401095514,` +
+		`"recv_ns":1792705262496234567,"latency_ms":95.139053,"recovered":false,"send_ts_us":1792705262494981,` +
+		`"clock_source":"systemd-timesyncd time.cloudflare.com","clock_offset_us":190}`
+	if err != nil || string(b) != want {
+		t.Errorf("line %s, %v; want %s", b, err, want)
+	}
+	if ft.Recovered = true; !c.footerLine(ft).Recovered {
+		t.Error("a recovered footer's line reads recovered false")
 	}
 }

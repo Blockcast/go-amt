@@ -35,6 +35,21 @@
 //	txfeed-sub -listen 127.0.0.1:15003 -channel program:JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4 -json &
 //	amt-verify --family v6 --relay 2602:f74d:1::128 --source 2602:f74d:1:5::57 \
 //		--group ff3e:0:5931:b9e6:ea21:cfec:b94a:e197 --forward 127.0.0.1:15003
+//
+// -footers times Alpenglow block footers on the shred union instead
+// (txfeed.FooterTimes, BLO-49345): join the union with -ssm, natively or
+// through -relay, or read it from -listen. It prints a JSON line a block: the
+// footer's producer time, its receive time, and latency_ms between them with no
+// clock correction. It requires -clock-source, this host's time source, and
+// -clock-offset, this host's clock minus that source's, and records both on
+// each line: latency_ms minus clock_offset_us/1000 is corrected for this host's
+// clock, not the leader's. timedatectl timesync-status prints the opposite
+// sign, so its Offset of -190us is -clock-offset=190us. The exit summary's
+// percentiles take the latency at index n*p/100, rounded down: up to 100
+// footers, p99 is the slowest. On sfo12:
+//
+//	txfeed-sub -footers -ssm 69.25.95.57@232.0.0.2:5001 -iface-ip 69.25.95.32 -duration 10m \
+//		-clock-source 'systemd-timesyncd time.cloudflare.com' -clock-offset=190us
 package main
 
 import (
@@ -129,6 +144,28 @@ func percentile(sorted []float64, p int) float64 {
 	return sorted[min(len(sorted)-1, len(sorted)*p/100)]
 }
 
+// footerLine is one timed block footer (-footers).
+type footerLine struct {
+	Slot          uint64  `json:"slot"`
+	BankHash      string  `json:"bank_hash"`
+	Agent         string  `json:"agent"`
+	ProducerNs    uint64  `json:"producer_ns"`
+	RecvNs        int64   `json:"recv_ns"`
+	LatencyMs     float64 `json:"latency_ms"` // recv_ns minus producer_ns
+	Recovered     bool    `json:"recovered"`
+	SendTsUs      uint64  `json:"send_ts_us"` // of the frame that completed the footer
+	ClockSource   string  `json:"clock_source"`
+	ClockOffsetUs float64 `json:"clock_offset_us"` // this host's clock minus clock_source's
+}
+
+// footerLine is ft's line, with this host's clock as -clock-source and
+// -clock-offset give it.
+func (c *config) footerLine(ft txfeed.FooterTime) footerLine {
+	return footerLine{Slot: ft.Slot, BankHash: txfeed.Base58Encode(ft.BankHash[:]), Agent: ft.UserAgent,
+		ProducerNs: ft.ProducerTimeNanos, RecvNs: ft.At.UnixNano(), LatencyMs: float64(ft.Latency()) / 1e6,
+		Recovered: ft.Recovered, SendTsUs: ft.ShredTs, ClockSource: c.clockSource, ClockOffsetUs: float64(c.clockOffset) / 1e3}
+}
+
 // line is one printed transaction.
 type line struct {
 	Slot      uint64   `json:"slot"`
@@ -163,6 +200,9 @@ type config struct {
 	verify, asJSON bool
 	limit          uint64
 	duration       time.Duration
+	footers        bool          // -footers: time block footers instead of printing transactions
+	clockSource    string        // -clock-source, recorded on each footer line
+	clockOffset    time.Duration // -clock-offset, this host's clock minus clockSource's: recorded on each footer line, not applied
 
 	mu       sync.Mutex
 	conns    []*amt.ManagedConn // relayed joins, left at exit
@@ -220,8 +260,14 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 		nonvote  = fs.Bool("nonvote", false, "subscribe to non-vote transactions")
 		verify   = fs.Bool("verify", false, "verify each transaction's ed25519 signatures")
 		asJSON   = fs.Bool("json", false, "print JSON lines")
-		limit    = fs.Uint64("n", 0, "exit after this many transactions; 0 for no limit")
+		limit    = fs.Uint64("n", 0, "exit after this many transactions, or footers with -footers; 0 for no limit")
 		duration = fs.Duration("duration", 0, "exit after this long; 0 for no limit")
+		footers  = fs.Bool("footers", false, "time Alpenglow block footers on the shred union, joined with -ssm or read from -listen, "+
+			"and print a JSON line a block instead of transactions")
+		clockSrc = fs.String("clock-source", "", "required with -footers: this host's time source, such as 'systemd-timesyncd time.cloudflare.com'; "+
+			"recorded on each line")
+		clockOff = fs.Duration("clock-offset", 0, "required with -footers: this host's clock minus -clock-source's, positive when this host is ahead: "+
+			"timedatectl timesync-status's Offset negated, so its -190us is 190us. Recorded on each line as clock_offset_us, not applied")
 	)
 	fs.Usage = func() {
 		fmt.Fprint(fs.Output(), `Usage of txfeed-sub:
@@ -229,6 +275,8 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
   txfeed-sub -iface-ip 10.0.0.5 -nonvote                  native joins: Linux, on a network carrying the feed
   txfeed-sub -relay 69.25.95.128 -named jupiter-v6 -json  anywhere: native first, else through the AMT relay
   txfeed-sub -listen 127.0.0.1:15003 -channel program:B58  frames handed off by amt-verify --forward 127.0.0.1:15003
+  txfeed-sub -footers -relay 69.25.95.128 -ssm 69.25.95.57@232.0.0.2:5001 -clock-source SRC -clock-offset D
+                                                          block footer latency on the shred union
 
 `)
 		fs.PrintDefaults()
@@ -237,6 +285,15 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 		return nil, err
 	}
 	c.verify, c.asJSON, c.limit, c.duration = *verify, *asJSON, *limit, *duration
+	c.footers, c.clockSource, c.clockOffset = *footers, *clockSrc, *clockOff
+	if c.footers && (*nonvote || len(named)+len(programs) > 0 || c.channel != nil || c.verify) {
+		return nil, errors.New("-footers reads the shred union from -ssm or -listen: give no -nonvote, -named, -program, -channel or -verify with it")
+	}
+	offset := false // -clock-offset given: a zero then is measured, not a default
+	fs.Visit(func(f *flag.Flag) { offset = offset || f.Name == "clock-offset" })
+	if c.footers && (strings.TrimSpace(c.clockSource) == "" || !offset) {
+		return nil, errors.New("-footers needs -clock-source and -clock-offset, so that no line reads as a measured zero offset")
+	}
 
 	if c.listen.IsValid() {
 		if c.relay != nil || *ifaceIP != "" || *nonvote || len(named)+len(programs)+len(raw) > 0 {
@@ -437,6 +494,10 @@ func main() {
 		}
 	}
 
+	var footers *txfeed.FooterTimes
+	if cfg.footers {
+		footers = txfeed.NewFooterTimes()
+	}
 	var printed, dups, filtered, bad, verOK, verBad uint64
 	var lat []float64 // ponytail: keeps every latency for the percentiles; a histogram if runs get long
 	type slotSeen struct {
@@ -458,6 +519,12 @@ func main() {
 		slices.Sort(lat)
 		for _, s := range cfg.subs {
 			log.Printf("group %s %s: frames=%d", s.label, s.group, s.frames)
+		}
+		if footers != nil {
+			s := footers.Stats()
+			log.Printf("footers=%d frames=%d dups=%d bad=%d sets_recovered=%d latency_ms p50=%.1f p95=%.1f p99=%.1f",
+				printed, s.Frames, s.Dups, s.Bad, s.SetsRecovered, percentile(lat, 50), percentile(lat, 95), percentile(lat, 99))
+			return
 		}
 		log.Printf("printed=%d dups=%d filtered=%d bad=%d verify_ok=%d verify_bad=%d latency_ms p50=%.1f p90=%.1f p99=%.1f",
 			printed, dups, filtered, bad, verOK, verBad, percentile(lat, 50), percentile(lat, 90), percentile(lat, 99))
@@ -487,6 +554,18 @@ func main() {
 			return
 		}
 		p.s.frames++
+		if footers != nil {
+			for _, ft := range footers.Add(p.b, p.at) {
+				if printed == cfg.limit && cfg.limit > 0 {
+					break // -n: one frame can complete two footers
+				}
+				l := cfg.footerLine(ft)
+				lat = append(lat, l.LatencyMs)
+				printed++
+				_ = enc.Encode(l)
+			}
+			continue
+		}
 		f, whole, err := p.s.frame(p.b, p.at)
 		if err != nil {
 			bad++
