@@ -189,6 +189,8 @@ permissions:
 # removed, V6-only log, false PASS for the v4 name.
 jobs:
   test:
+    # The shared-port veth guard below requires a privileged host network and
+    # a Linux 6.9+ kernel; keep this job on the hosted Ubuntu environment.
     runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
@@ -316,7 +318,7 @@ jobs:
           exit $rc
 
   race:
-    runs-on: ubuntu-latest
+    runs-on: default
     env:
       CGO_ENABLED: "1"
     steps:
@@ -427,7 +429,7 @@ jobs:
   # tree via `#cgo CFLAGS: -I${SRCDIR}`, not from the submodule, so no header
   # generation step is needed.
   cgo-test:
-    runs-on: ubuntu-latest
+    runs-on: default
     env:
       CGO_ENABLED: "1"
       CGO_LDFLAGS: -L${{ github.workspace }}/amt-protocol/target/release
@@ -949,7 +951,7 @@ jobs:
   # Two things stay unchecked, and neither exists today: a test file tagged ios
   # alone (go build skips tests), and an ios-only file outside the root package.
   mobile-typecheck:
-    runs-on: ubuntu-latest
+    runs-on: default
     env:
       CGO_ENABLED: "0"
     steps:
@@ -975,7 +977,7 @@ jobs:
   # tested on linux through setXNUBufferAtLeast (sockbuf_test.go); no job here
   # runs a test on macOS.
   cross-build:
-    runs-on: ubuntu-latest
+    runs-on: default
     env:
       CGO_ENABLED: "0"
     steps:
@@ -996,7 +998,7 @@ jobs:
   # The iwa-amt-gateway output-server unit suites are the only tests for that
   # JavaScript; without this job no CI run executes them.
   iwa-unit:
-    runs-on: ubuntu-latest
+    runs-on: default
     defaults:
       run:
         working-directory: iwa-amt-gateway
