@@ -11,6 +11,7 @@ jobs:
   # The load-bearing job: builds the static binary exactly as shipped and runs
   # the same smoke test an operator runs after installing it.
   smoke:
+    timeout-minutes: 15
     runs-on: default
     steps:
       - uses: actions/checkout@v4
@@ -186,6 +187,7 @@ jobs:
           done
 
   goreleaser:
+    timeout-minutes: 15
     runs-on: default
     steps:
       - uses: actions/checkout@v4
