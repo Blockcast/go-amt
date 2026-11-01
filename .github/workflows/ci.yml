@@ -231,7 +231,7 @@ jobs:
           echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
           rc=0
           for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go gro_abi_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the CGO_ENABLED=0 test selection; the ManagedConn guards in it are not running in this lane"
               rc=1
             }
@@ -239,7 +239,7 @@ jobs:
           # The cgo-only half must NOT be here. If it were, it would run against
           # conn_nocgo.go's stub, whose Open returns errNoCGO unconditionally —
           # so it could only pass by asserting nothing.
-          if printf '%s\n' "$tst" | grep -qxF fakerelay_switchover_test.go; then
+          if grep -qxF fakerelay_switchover_test.go <<<"$tst"; then
             echo "::error::fakerelay_switchover_test.go is selected under CGO_ENABLED=0; it needs the real MulticastConn, not the stub"
             rc=1
           fi
@@ -374,7 +374,7 @@ jobs:
           echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
           rc=0
           for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go gro_abi_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the -tags purego test selection; the ManagedConn guards in it are not running in the race lane"
               rc=1
             }
@@ -383,7 +383,7 @@ jobs:
           # here either: it would run against conn_nocgo.go's stub, whose Open
           # returns errNoCGO unconditionally, and could only pass by asserting
           # nothing.
-          if printf '%s\n' "$tst" | grep -qxF fakerelay_switchover_test.go; then
+          if grep -qxF fakerelay_switchover_test.go <<<"$tst"; then
             echo "::error::fakerelay_switchover_test.go is selected under -tags purego; it needs the real MulticastConn, not the stub"
             rc=1
           fi
@@ -484,13 +484,13 @@ jobs:
           echo "selected sources: $(printf '%s\n' "$sel" | tr '\n' ' ')"
           rc=0
           for f in conn.go gateway.go protocol_cgo.go; do
-            printf '%s\n' "$sel" | grep -qxF "$f" || {
+            grep -qxF "$f" <<<"$sel" || {
               echo "::error::$f is not in the build selection; the cgo tests would pass vacuously"
               rc=1
             }
           done
           for t in gateway_timeout_test.go gateway_logging_test.go gateway_advertisement_length_test.go gateway_retransmit_test.go gateway_abort_join_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the test selection; the Gateway.Open guards are not running"
               rc=1
             }
@@ -502,7 +502,7 @@ jobs:
           # fakerelay_switchover_test.go is deselected here it is deselected
           # everywhere, which is exactly how BLO-28640 shipped.
           for t in fakenative_test.go fakenative_flows_test.go fakerelay_switchover_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the cgo test selection; the MulticastConn switchover tests are not running anywhere"
               rc=1
             }
@@ -521,7 +521,7 @@ jobs:
           # truncates Dst off every v6 datagram in the consumer that sizes its
           # OOB buffer from those constants.
           for t in conn_close_during_open_test.go control_flags_conn_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the cgo test selection; the MulticastConn guards in it are not running anywhere"
               rc=1
             }
@@ -537,7 +537,7 @@ jobs:
           # only reason falling back to per-datagram writes cannot duplicate
           # traffic on a live group.
           for t in gso_linux_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the cgo test selection; the UDP GSO send and its zero-frame refusal are not asserted anywhere"
               rc=1
             }
