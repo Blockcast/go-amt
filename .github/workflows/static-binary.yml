@@ -2,6 +2,7 @@ name: static binary
 on: [push, pull_request]
 jobs:
   build:
+    timeout-minutes: 20
     runs-on: default
     steps:
       - uses: actions/checkout@v4
