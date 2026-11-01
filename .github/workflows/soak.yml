@@ -42,7 +42,7 @@ permissions:
 
 jobs:
   soak:
-    runs-on: default
+    runs-on: ubuntu-latest
     # 10 minutes of soak plus build and checkout. Generous, but a hang here
     # should fail rather than burn the default 6h.
     timeout-minutes: 30

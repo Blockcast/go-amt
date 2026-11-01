@@ -319,7 +319,7 @@ jobs:
 
   race:
     timeout-minutes: 20
-    runs-on: default
+    runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "1"
     steps:
@@ -431,7 +431,7 @@ jobs:
   # generation step is needed.
   cgo-test:
     timeout-minutes: 45
-    runs-on: default
+    runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "1"
       CGO_LDFLAGS: -L${{ github.workspace }}/amt-protocol/target/release
@@ -451,7 +451,7 @@ jobs:
         working-directory: amt-protocol
         run: |
           set -euo pipefail
-          # Rust is preinstalled on the ARC image. Assert it
+          # Rust is preinstalled on the GitHub-hosted image. Assert it
           # rather than letting `make ffi` fail with a bare "cargo: not found".
           command -v cargo >/dev/null || {
             echo "::error::cargo not found; this job needs a Rust toolchain to build libamt_protocol"
@@ -954,7 +954,7 @@ jobs:
   # alone (go build skips tests), and an ios-only file outside the root package.
   mobile-typecheck:
     timeout-minutes: 20
-    runs-on: default
+    runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
     steps:
@@ -981,7 +981,7 @@ jobs:
   # runs a test on macOS.
   cross-build:
     timeout-minutes: 25
-    runs-on: default
+    runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
     steps:
@@ -1003,7 +1003,7 @@ jobs:
   # JavaScript; without this job no CI run executes them.
   iwa-unit:
     timeout-minutes: 15
-    runs-on: default
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: iwa-amt-gateway

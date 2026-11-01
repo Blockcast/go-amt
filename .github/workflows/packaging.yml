@@ -12,7 +12,7 @@ jobs:
   # the same smoke test an operator runs after installing it.
   smoke:
     timeout-minutes: 15
-    runs-on: default
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -188,7 +188,7 @@ jobs:
 
   goreleaser:
     timeout-minutes: 15
-    runs-on: default
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
