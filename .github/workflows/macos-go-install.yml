@@ -9,8 +9,7 @@ on:
     tags: ['v*']
 jobs:
   go-install:
-    runs-on:
-      group: macos
+    runs-on: macos-latest
     timeout-minutes: 15
     env:
       # ponytail: PRs pin the current release; bump when a newer one ships.

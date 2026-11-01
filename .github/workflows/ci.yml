@@ -28,7 +28,7 @@ name: CI
 # across 26 branches, 22 push runs across exactly ONE branch (main), and zero
 # push runs on any feature branch.
 #
-# Cost of the overlap is negligible here — all four jobs are on ARC and
+# Cost of the overlap is negligible here — all four jobs are short and
 # the whole workflow finishes in about a minute.
 on:
   pull_request:
@@ -190,8 +190,8 @@ permissions:
 jobs:
   test:
     # The shared-port veth guard below requires a privileged host network and
-    # a Linux 6.9+ kernel; the default ARC pool provides that environment.
-    runs-on: default
+    # a Linux 6.9+ kernel; keep this job on the hosted Ubuntu environment.
+    runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
     steps:
