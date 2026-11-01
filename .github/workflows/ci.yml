@@ -318,6 +318,7 @@ jobs:
           exit $rc
 
   race:
+    timeout-minutes: 20
     runs-on: default
     env:
       CGO_ENABLED: "1"
@@ -429,6 +430,7 @@ jobs:
   # tree via `#cgo CFLAGS: -I${SRCDIR}`, not from the submodule, so no header
   # generation step is needed.
   cgo-test:
+    timeout-minutes: 45
     runs-on: default
     env:
       CGO_ENABLED: "1"
@@ -951,6 +953,7 @@ jobs:
   # Two things stay unchecked, and neither exists today: a test file tagged ios
   # alone (go build skips tests), and an ios-only file outside the root package.
   mobile-typecheck:
+    timeout-minutes: 20
     runs-on: default
     env:
       CGO_ENABLED: "0"
@@ -977,6 +980,7 @@ jobs:
   # tested on linux through setXNUBufferAtLeast (sockbuf_test.go); no job here
   # runs a test on macOS.
   cross-build:
+    timeout-minutes: 25
     runs-on: default
     env:
       CGO_ENABLED: "0"
@@ -998,6 +1002,7 @@ jobs:
   # The iwa-amt-gateway output-server unit suites are the only tests for that
   # JavaScript; without this job no CI run executes them.
   iwa-unit:
+    timeout-minutes: 15
     runs-on: default
     defaults:
       run:
