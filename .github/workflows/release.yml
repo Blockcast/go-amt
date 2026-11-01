@@ -27,7 +27,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: default
     steps:
       - uses: actions/checkout@v4
         with:
@@ -76,7 +76,7 @@ jobs:
             "blockcast-shreds_${GITHUB_REF_NAME#v}_linux_amd64.tar.gz" \
             checksums.txt checksums.txt.sig checksums.txt.pem
           do
-            printf '%s\n' "${assets}" | grep -qx -- "${want}" \
+            grep -qx -- "${want}" <<<"${assets}" \
               || { echo "::error::release ${GITHUB_REF_NAME} is missing asset ${want}"; exit 1; }
           done
 

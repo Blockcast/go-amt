@@ -28,7 +28,7 @@ name: CI
 # across 26 branches, 22 push runs across exactly ONE branch (main), and zero
 # push runs on any feature branch.
 #
-# Cost of the overlap is negligible here — all four jobs are ubuntu-latest and
+# Cost of the overlap is negligible here — all four jobs are short and
 # the whole workflow finishes in about a minute.
 on:
   pull_request:
@@ -57,7 +57,7 @@ permissions:
 #   mobile-typecheck | 0           | -      | NO (conn_mobile.go instead)| no
 #
 # mobile-typecheck is the fourth selection, not a variant of the first three:
-# GOOS=android picks conn_mobile.go, which none of the ubuntu-only jobs above
+# GOOS=android picks conn_mobile.go, which none of the Linux jobs above
 # compiles at all. That is how it came to be missing a field the other variants
 # carry (BLO-28640). It supersedes an earlier cgo-typecheck job, whose whole
 # purpose — type-checking the cgo selection nothing else compiled — is now done
@@ -231,7 +231,7 @@ jobs:
           echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
           rc=0
           for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go gro_abi_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the CGO_ENABLED=0 test selection; the ManagedConn guards in it are not running in this lane"
               rc=1
             }
@@ -239,7 +239,7 @@ jobs:
           # The cgo-only half must NOT be here. If it were, it would run against
           # conn_nocgo.go's stub, whose Open returns errNoCGO unconditionally —
           # so it could only pass by asserting nothing.
-          if printf '%s\n' "$tst" | grep -qxF fakerelay_switchover_test.go; then
+          if grep -qxF fakerelay_switchover_test.go <<<"$tst"; then
             echo "::error::fakerelay_switchover_test.go is selected under CGO_ENABLED=0; it needs the real MulticastConn, not the stub"
             rc=1
           fi
@@ -374,7 +374,7 @@ jobs:
           echo "selected test files: $(printf '%s\n' "$tst" | tr '\n' ' ')"
           rc=0
           for t in fakenative_test.go fakenative_flows_test.go control_flags_managed_test.go gro_abi_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the -tags purego test selection; the ManagedConn guards in it are not running in the race lane"
               rc=1
             }
@@ -383,7 +383,7 @@ jobs:
           # here either: it would run against conn_nocgo.go's stub, whose Open
           # returns errNoCGO unconditionally, and could only pass by asserting
           # nothing.
-          if printf '%s\n' "$tst" | grep -qxF fakerelay_switchover_test.go; then
+          if grep -qxF fakerelay_switchover_test.go <<<"$tst"; then
             echo "::error::fakerelay_switchover_test.go is selected under -tags purego; it needs the real MulticastConn, not the stub"
             rc=1
           fi
@@ -451,7 +451,7 @@ jobs:
         working-directory: amt-protocol
         run: |
           set -euo pipefail
-          # Rust is preinstalled on GitHub-hosted ubuntu runners. Assert it
+          # Rust is preinstalled on the ARC image. Assert it
           # rather than letting `make ffi` fail with a bare "cargo: not found".
           command -v cargo >/dev/null || {
             echo "::error::cargo not found; this job needs a Rust toolchain to build libamt_protocol"
@@ -484,13 +484,13 @@ jobs:
           echo "selected sources: $(printf '%s\n' "$sel" | tr '\n' ' ')"
           rc=0
           for f in conn.go gateway.go protocol_cgo.go; do
-            printf '%s\n' "$sel" | grep -qxF "$f" || {
+            grep -qxF "$f" <<<"$sel" || {
               echo "::error::$f is not in the build selection; the cgo tests would pass vacuously"
               rc=1
             }
           done
           for t in gateway_timeout_test.go gateway_logging_test.go gateway_advertisement_length_test.go gateway_retransmit_test.go gateway_abort_join_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the test selection; the Gateway.Open guards are not running"
               rc=1
             }
@@ -502,7 +502,7 @@ jobs:
           # fakerelay_switchover_test.go is deselected here it is deselected
           # everywhere, which is exactly how BLO-28640 shipped.
           for t in fakenative_test.go fakenative_flows_test.go fakerelay_switchover_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the cgo test selection; the MulticastConn switchover tests are not running anywhere"
               rc=1
             }
@@ -521,7 +521,7 @@ jobs:
           # truncates Dst off every v6 datagram in the consumer that sizes its
           # OOB buffer from those constants.
           for t in conn_close_during_open_test.go control_flags_conn_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the cgo test selection; the MulticastConn guards in it are not running anywhere"
               rc=1
             }
@@ -537,7 +537,7 @@ jobs:
           # only reason falling back to per-datagram writes cannot duplicate
           # traffic on a live group.
           for t in gso_linux_test.go; do
-            printf '%s\n' "$tst" | grep -qxF "$t" || {
+            grep -qxF "$t" <<<"$tst" || {
               echo "::error::$t is not in the cgo test selection; the UDP GSO send and its zero-frame refusal are not asserted anywhere"
               rc=1
             }
@@ -930,7 +930,7 @@ jobs:
 
   # MulticastConn is defined three times under mutually exclusive build tags
   # (conn.go for cgo, conn_nocgo.go, conn_mobile.go for android/ios). Nothing in
-  # the ubuntu-only jobs above compiles the mobile variant, which is how it came
+  # the Linux jobs above compiles the mobile variant, which is how it came
   # to be missing the Mode field that conn_nocgo.go documents as settable "under
   # any build configuration" (BLO-28640, Ally review on go-amt#49).
   #
@@ -941,7 +941,7 @@ jobs:
   #
   # vet runs for android only. conn_mobile.go is tagged `android || ios`, so
   # vetting android type-checks the mobile files ios shares; and GOOS=ios
-  # cannot be vetted on ubuntu at all — the toolchain refuses with "ios/arm64
+  # cannot be vetted on Linux at all — the toolchain refuses with "ios/arm64
   # requires external (cgo) linking" under CGO_ENABLED=0 and wants clang
   # under =1. That is a pre-existing toolchain limit, not something this job
   # introduced.
