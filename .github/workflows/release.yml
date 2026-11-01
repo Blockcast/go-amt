@@ -27,6 +27,7 @@ permissions:
 
 jobs:
   release:
+    timeout-minutes: 60  # no recent run history
     runs-on: default
     steps:
       - uses: actions/checkout@v4
