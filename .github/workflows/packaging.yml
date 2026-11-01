@@ -45,9 +45,8 @@ jobs:
         run: packaging/smoke-test.sh ./blockcast-shreds
 
   docker:
-    # Docker/buildx and registry publishing require the hosted Docker setup;
-    # keep this explicit exception separate from the ARC-compatible jobs.
-    runs-on: ubuntu-latest
+    # Docker/buildx and registry publishing use the ARC Docker pool.
+    runs-on: arc-e2e
     # Serialise per ref so two quick merges cannot push `:main` out of order: a
     # slower build of the OLDER commit finishing last would leave the floating
     # tag on the older image, silently (`sha-*` tags are immutable and safe).

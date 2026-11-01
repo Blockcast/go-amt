@@ -9,7 +9,9 @@ on:
     tags: ['v*']
 jobs:
   go-install:
-    runs-on: macos-latest
+    runs-on:
+      group: macos
+    timeout-minutes: 15
     env:
       # ponytail: PRs pin the current release; bump when a newer one ships.
       TAG: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v0.3.0' }}

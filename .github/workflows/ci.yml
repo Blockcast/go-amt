@@ -28,7 +28,7 @@ name: CI
 # across 26 branches, 22 push runs across exactly ONE branch (main), and zero
 # push runs on any feature branch.
 #
-# Cost of the overlap is negligible here — all four jobs are ubuntu-latest and
+# Cost of the overlap is negligible here — all four jobs are on ARC and
 # the whole workflow finishes in about a minute.
 on:
   pull_request:
@@ -57,7 +57,7 @@ permissions:
 #   mobile-typecheck | 0           | -      | NO (conn_mobile.go instead)| no
 #
 # mobile-typecheck is the fourth selection, not a variant of the first three:
-# GOOS=android picks conn_mobile.go, which none of the ubuntu-only jobs above
+# GOOS=android picks conn_mobile.go, which none of the Linux jobs above
 # compiles at all. That is how it came to be missing a field the other variants
 # carry (BLO-28640). It supersedes an earlier cgo-typecheck job, whose whole
 # purpose — type-checking the cgo selection nothing else compiled — is now done
@@ -190,8 +190,8 @@ permissions:
 jobs:
   test:
     # The shared-port veth guard below requires a privileged host network and
-    # a Linux 6.9+ kernel; keep this job on the hosted Ubuntu environment.
-    runs-on: ubuntu-latest
+    # a Linux 6.9+ kernel; the default ARC pool provides that environment.
+    runs-on: default
     env:
       CGO_ENABLED: "0"
     steps:
@@ -449,7 +449,7 @@ jobs:
         working-directory: amt-protocol
         run: |
           set -euo pipefail
-          # Rust is preinstalled on GitHub-hosted ubuntu runners. Assert it
+          # Rust is preinstalled on the ARC image. Assert it
           # rather than letting `make ffi` fail with a bare "cargo: not found".
           command -v cargo >/dev/null || {
             echo "::error::cargo not found; this job needs a Rust toolchain to build libamt_protocol"
@@ -928,7 +928,7 @@ jobs:
 
   # MulticastConn is defined three times under mutually exclusive build tags
   # (conn.go for cgo, conn_nocgo.go, conn_mobile.go for android/ios). Nothing in
-  # the ubuntu-only jobs above compiles the mobile variant, which is how it came
+  # the Linux jobs above compiles the mobile variant, which is how it came
   # to be missing the Mode field that conn_nocgo.go documents as settable "under
   # any build configuration" (BLO-28640, Ally review on go-amt#49).
   #
@@ -939,7 +939,7 @@ jobs:
   #
   # vet runs for android only. conn_mobile.go is tagged `android || ios`, so
   # vetting android type-checks the mobile files ios shares; and GOOS=ios
-  # cannot be vetted on ubuntu at all — the toolchain refuses with "ios/arm64
+  # cannot be vetted on Linux at all — the toolchain refuses with "ios/arm64
   # requires external (cgo) linking" under CGO_ENABLED=0 and wants clang
   # under =1. That is a pre-existing toolchain limit, not something this job
   # introduced.
