@@ -42,7 +42,10 @@ permissions:
 
 jobs:
   soak:
-    runs-on: ubuntu-latest
+    # A dispatch can select any branch; only run checked-in soak code from main
+    # on the shared ARC pool.
+    if: github.ref == 'refs/heads/main'
+    runs-on: default
     # 10 minutes of soak plus build and checkout. Generous, but a hang here
     # should fail rather than burn the default 6h.
     timeout-minutes: 30

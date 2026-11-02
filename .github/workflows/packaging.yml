@@ -11,8 +11,11 @@ jobs:
   # The load-bearing job: builds the static binary exactly as shipped and runs
   # the same smoke test an operator runs after installing it.
   smoke:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
-    runs-on: ubuntu-latest
+    runs-on: default
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -46,9 +49,12 @@ jobs:
         run: packaging/smoke-test.sh ./blockcast-shreds
 
   docker:
-    # Docker/buildx and registry publishing require the hosted Docker setup;
-    # keep this explicit exception separate from the ARC-compatible jobs.
-    runs-on: ubuntu-latest
+    # The ARC Docker pool provides the daemon/buildx setup this lane needs.
+    # Fork PRs do not execute checked-out code on the shared self-hosted pool.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: arc-e2e
     # Serialise per ref so two quick merges cannot push `:main` out of order: a
     # slower build of the OLDER commit finishing last would leave the floating
     # tag on the older image, silently (`sha-*` tags are immutable and safe).
@@ -187,8 +193,11 @@ jobs:
           done
 
   goreleaser:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
-    runs-on: ubuntu-latest
+    runs-on: default
     steps:
       - uses: actions/checkout@v4
         with:
