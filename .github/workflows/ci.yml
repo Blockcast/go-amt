@@ -189,9 +189,13 @@ permissions:
 # removed, V6-only log, false PASS for the v4 name.
 jobs:
   test:
+    # Never execute fork PR code on the shared ARC pool.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     # The shared-port veth guard below requires a privileged host network and
-    # a Linux 6.9+ kernel; keep this job on the hosted Ubuntu environment.
-    runs-on: ubuntu-latest
+    # a Linux 6.9+ kernel; use the dedicated multicast-capable ARC pool.
+    runs-on: arc-multicast-integ
     env:
       CGO_ENABLED: "0"
     steps:
@@ -318,6 +322,9 @@ jobs:
           exit $rc
 
   race:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 20
     runs-on: default
     env:
@@ -430,6 +437,9 @@ jobs:
   # tree via `#cgo CFLAGS: -I${SRCDIR}`, not from the submodule, so no header
   # generation step is needed.
   cgo-test:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 45
     runs-on: default
     env:
@@ -451,7 +461,7 @@ jobs:
         working-directory: amt-protocol
         run: |
           set -euo pipefail
-          # Rust is preinstalled on the GitHub-hosted image. Assert it
+          # Rust is preinstalled on the ARC runner image. Assert it
           # rather than letting `make ffi` fail with a bare "cargo: not found".
           command -v cargo >/dev/null || {
             echo "::error::cargo not found; this job needs a Rust toolchain to build libamt_protocol"
@@ -953,6 +963,9 @@ jobs:
   # Two things stay unchecked, and neither exists today: a test file tagged ios
   # alone (go build skips tests), and an ios-only file outside the root package.
   mobile-typecheck:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 20
     runs-on: default
     env:
@@ -980,6 +993,9 @@ jobs:
   # tested on linux through setXNUBufferAtLeast (sockbuf_test.go); no job here
   # runs a test on macOS.
   cross-build:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 25
     runs-on: default
     env:
@@ -1002,6 +1018,9 @@ jobs:
   # The iwa-amt-gateway output-server unit suites are the only tests for that
   # JavaScript; without this job no CI run executes them.
   iwa-unit:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 15
     runs-on: default
     defaults:

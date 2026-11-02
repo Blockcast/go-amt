@@ -9,6 +9,9 @@ on:
     tags: ['v*']
 jobs:
   go-install:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: default
     timeout-minutes: 15
     env:
@@ -22,5 +25,6 @@ jobs:
       - run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go install "github.com/blockcast/go-amt/cmd/blockcast-shreds@${TAG}"
       - name: Assert the install target is a macOS binary
         run: |
-          file "$(go env GOPATH)/bin/blockcast-shreds"
-          file "$(go env GOPATH)/bin/blockcast-shreds" | grep -q 'Mach-O'
+          binary="$(go env GOPATH)/bin/darwin_arm64/blockcast-shreds"
+          file "$binary"
+          file "$binary" | grep -q 'Mach-O'

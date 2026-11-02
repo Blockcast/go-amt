@@ -27,7 +27,9 @@ permissions:
 
 jobs:
   release:
-    runs-on: default
+    # Tag pushes are trusted release refs. Keep signing isolated from the
+    # shared build pool while staying on ARC.
+    runs-on: arc-deploy
     steps:
       - uses: actions/checkout@v4
         with:
