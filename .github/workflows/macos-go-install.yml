@@ -1,6 +1,6 @@
-# Proves the documented Mac install path on a real macOS runner (BLO-45892 AC 5).
-# The module is fetched from the proxy at the tag, so the result does not
-# depend on the PR diff. Tag pushes check the tag just cut.
+# Proves the documented Mac install path by cross-compiling on ARC
+# (BLO-45892 AC 5). The module is fetched from the proxy at the tag, so the
+# result does not depend on the PR diff. Tag pushes check the tag just cut.
 name: macos go install
 on:
   pull_request:
@@ -9,7 +9,7 @@ on:
     tags: ['v*']
 jobs:
   go-install:
-    runs-on: macos-latest
+    runs-on: default
     timeout-minutes: 15
     env:
       # ponytail: PRs pin the current release; bump when a newer one ships.
@@ -19,8 +19,8 @@ jobs:
       - uses: actions/setup-go@v5
         with: {go-version-file: go.mod, cache: false}
       - run: uname -sm
-      - run: CGO_ENABLED=0 go install "github.com/blockcast/go-amt/cmd/blockcast-shreds@${TAG}"
-      # Recorded, not asserted: go install applies no ldflags, so this prints
-      # broker.version's default "dev-unstamped". Release binaries are stamped
-      # by goreleaser and checked in packaging.yml.
-      - run: '"$(go env GOPATH)/bin/blockcast-shreds" --version'
+      - run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go install "github.com/blockcast/go-amt/cmd/blockcast-shreds@${TAG}"
+      - name: Assert the install target is a macOS binary
+        run: |
+          file "$(go env GOPATH)/bin/blockcast-shreds"
+          file "$(go env GOPATH)/bin/blockcast-shreds" | grep -q 'Mach-O'

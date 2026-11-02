@@ -319,7 +319,7 @@ jobs:
 
   race:
     timeout-minutes: 20
-    runs-on: ubuntu-latest
+    runs-on: default
     env:
       CGO_ENABLED: "1"
     steps:
@@ -431,7 +431,7 @@ jobs:
   # generation step is needed.
   cgo-test:
     timeout-minutes: 45
-    runs-on: ubuntu-latest
+    runs-on: default
     env:
       CGO_ENABLED: "1"
       CGO_LDFLAGS: -L${{ github.workspace }}/amt-protocol/target/release
@@ -954,7 +954,7 @@ jobs:
   # alone (go build skips tests), and an ios-only file outside the root package.
   mobile-typecheck:
     timeout-minutes: 20
-    runs-on: ubuntu-latest
+    runs-on: default
     env:
       CGO_ENABLED: "0"
     steps:
@@ -981,7 +981,7 @@ jobs:
   # runs a test on macOS.
   cross-build:
     timeout-minutes: 25
-    runs-on: ubuntu-latest
+    runs-on: default
     env:
       CGO_ENABLED: "0"
     steps:
@@ -1003,7 +1003,7 @@ jobs:
   # JavaScript; without this job no CI run executes them.
   iwa-unit:
     timeout-minutes: 15
-    runs-on: ubuntu-latest
+    runs-on: default
     defaults:
       run:
         working-directory: iwa-amt-gateway
