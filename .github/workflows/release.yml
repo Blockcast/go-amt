@@ -27,6 +27,7 @@ permissions:
 
 jobs:
   release:
+    timeout-minutes: 60  # BLO-44648: bound self-hosted ARC job
     # Tag pushes are trusted release refs. Keep signing isolated from the
     # shared build pool while staying on ARC.
     runs-on: arc-deploy
