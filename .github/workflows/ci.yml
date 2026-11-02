@@ -189,6 +189,7 @@ permissions:
 # removed, V6-only log, false PASS for the v4 name.
 jobs:
   test:
+    timeout-minutes: 30  # BLO-44648: bound self-hosted ARC job
     # Never execute fork PR code on the shared ARC pool.
     if: >-
       github.event_name != 'pull_request' ||

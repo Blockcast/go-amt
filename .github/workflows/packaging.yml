@@ -49,6 +49,7 @@ jobs:
         run: packaging/smoke-test.sh ./blockcast-shreds
 
   docker:
+    timeout-minutes: 45  # BLO-44648: bound self-hosted ARC job
     # The ARC Docker pool provides the daemon/buildx setup this lane needs.
     # Fork PRs do not execute checked-out code on the shared self-hosted pool.
     if: >-
