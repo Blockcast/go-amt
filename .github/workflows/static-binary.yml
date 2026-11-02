@@ -2,8 +2,11 @@ name: static binary
 on: [push, pull_request]
 jobs:
   build:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     timeout-minutes: 20
-    runs-on: ubuntu-latest
+    runs-on: default
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
