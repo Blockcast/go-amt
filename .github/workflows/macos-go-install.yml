@@ -1,6 +1,7 @@
-# Proves the documented Mac install path by cross-compiling on ARC
-# (BLO-45892 AC 5). The module is fetched from the proxy at the tag, so the
-# result does not depend on the PR diff. Tag pushes check the tag just cut.
+# Checks that the tagged module cross-compiles to a darwin/arm64 Mach-O on ARC;
+# it does not execute on macOS (BLO-45892 AC 5). The module is fetched from the
+# proxy at the tag, so the result does not depend on the PR diff. Tag pushes
+# check the tag just cut.
 name: macos go install
 on:
   pull_request:
