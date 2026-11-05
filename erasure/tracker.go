@@ -180,14 +180,47 @@ type Stats struct {
 	FrontierResyncs uint64
 }
 
+// setKey names one FEC set within a slot. version separates two blocks a
+// leader produced for the same slot (a duplicate block, or the 13:54Z Alpenglow
+// switch): without it their shreds share (fec_set_index, local_index) and can
+// complete a set neither version delivered. It is the first eight bytes of the
+// leader's signature over the set's Merkle root, the same key go-amt
+// cmd/shred-merger dedups on, and zero where the framing does not carry it.
 type setKey struct {
 	fecSetIndex uint32
+	version     uint64
 }
 
 type slotState struct {
 	sets     map[setKey]uint64
 	boundary time.Time
 	scored   bool
+}
+
+// resolve maps an arriving key onto the set it belongs to. Version 0 is a
+// wildcard, as in cmd/shred-merger: a wire-version-3 frame carries no
+// signature, and a merger whose inputs are on different wire versions emits a
+// per-shred mix of both, so a set must not split on that alone. A versioned
+// shred adopts an unversioned set of its index; an unversioned shred joins any
+// set of its index. Only two signed versions are kept apart.
+func (s *slotState) resolve(key setKey) setKey {
+	if _, ok := s.sets[key]; ok {
+		return key
+	}
+	if key.version != 0 {
+		wild := setKey{fecSetIndex: key.fecSetIndex}
+		if bits, ok := s.sets[wild]; ok {
+			delete(s.sets, wild)
+			s.sets[key] = bits
+		}
+		return key
+	}
+	for existing := range s.sets {
+		if existing.fecSetIndex == key.fecSetIndex {
+			return existing
+		}
+	}
+	return key
 }
 
 type scoreEvent struct {
@@ -341,6 +374,13 @@ func NewTracker(grace time.Duration, windowStart time.Time) (*Tracker, error) {
 // It returns false for duplicate, stale, invalid, or already-scored
 // observations.
 func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
+	return t.ObserveVersion(header, 0, receivedAt)
+}
+
+// ObserveVersion is Observe with the set keyed by version as well, see setKey.
+// It is what makes one tracker shared across a node's layers a correct union:
+// shreds of one set arriving on different layers land in the same bitmap.
+func (t *Tracker) ObserveVersion(header shred.Header, version uint64, receivedAt time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -362,7 +402,7 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 			}
 			// Sustained AND self-consistent: the feed moved. Resync rather
 			// than stay blacked out.
-			return t.resyncFrontier(header, receivedAt)
+			return t.resyncFrontier(header, version, receivedAt)
 		}
 		t.clearRuns()
 		for slot, state := range t.slots {
@@ -381,7 +421,7 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 		// A sustained, self-consistent run of traffic behind the frontier is
 		// evidence the FRONTIER is wrong, not the traffic. Adopt it; this is
 		// the only exit from a frontier poisoned by a forged advance.
-		return t.resyncFrontier(header, receivedAt)
+		return t.resyncFrontier(header, version, receivedAt)
 	} else {
 		// A plausible in-window observation is evidence the frontier is still
 		// real, so a lone poisoned datagram cannot accumulate toward a resync.
@@ -406,7 +446,7 @@ func (t *Tracker) Observe(header shred.Header, receivedAt time.Time) bool {
 		return false
 	}
 
-	key := setKey{fecSetIndex: header.FECSetIndex}
+	key := state.resolve(setKey{fecSetIndex: header.FECSetIndex, version: version})
 	bit := uint64(1) << header.IndexWithinSet
 	if state.sets[key]&bit != 0 {
 		return false
@@ -656,7 +696,7 @@ func (t *Tracker) clearRuns() {
 // a slot range that no longer exists either way, so it is dropped rather than
 // scored -- scoring it would charge sets to an erasure figure they never had a
 // chance to complete under.
-func (t *Tracker) resyncFrontier(header shred.Header, receivedAt time.Time) bool {
+func (t *Tracker) resyncFrontier(header shred.Header, version uint64, receivedAt time.Time) bool {
 	t.frontierResyncs++
 	t.clearRuns()
 	t.slots = make(map[uint64]*slotState)
@@ -667,7 +707,7 @@ func (t *Tracker) resyncFrontier(header shred.Header, receivedAt time.Time) bool
 	t.reclaimOldSlots()
 	state := &slotState{sets: make(map[setKey]uint64), boundary: receivedAt}
 	t.slots[header.Slot] = state
-	state.sets[setKey{fecSetIndex: header.FECSetIndex}] |= 1 << header.IndexWithinSet
+	state.sets[setKey{fecSetIndex: header.FECSetIndex, version: version}] |= 1 << header.IndexWithinSet
 	// A resync accepts this observation, so it must be folded into delivery
 	// exactly like the ordinary accept path in Observe. Dropping scoring state
 	// must not drop the arrival: delivery and erasure are independent surfaces,

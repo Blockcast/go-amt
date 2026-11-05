@@ -60,8 +60,14 @@ type ReceiverMetrics struct {
 	// mutated, which is why Describe, Collect and PublishGuard read it without
 	// holding mu. Adding a setter would make those reads a data race.
 	reportsWindows bool
-	feeds          map[string]feedMetrics
-	windows        map[string]erasure.Window
+	// unionID, when set, names the ONE delivery window this receiver reports:
+	// an erasure tracker shared by every feed, i.e. the union of a node's
+	// layers. Windows, guards and the heartbeat are then keyed on it alone, and
+	// the per-feed packet counters stay local. Immutable after construction,
+	// like reportsWindows. See NewUnionReceiverMetrics.
+	unionID string
+	feeds   map[string]feedMetrics
+	windows map[string]erasure.Window
 	// liveness holds the per-feed ingress activity the broker heartbeat
 	// reports. It is kept here, beside the prometheus counters and written on
 	// the same call, because the heartbeat's packet count and
@@ -110,6 +116,17 @@ type feedMetrics struct {
 // the fan-out, not by a drain, so they stay honest in every mode and remain the
 // liveness signal a consumer pairs against.
 func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, reporting WindowReporting) (*ReceiverMetrics, error) {
+	return NewUnionReceiverMetrics(registerer, feedIDs, reporting, "")
+}
+
+// NewUnionReceiverMetrics is NewReceiverMetrics for a receiver whose feeds are
+// layers of one stream scored as a union (BLO-53098). unionID is the only ID
+// PublishWindow and PublishGuard accept, the only erasure series /metrics
+// exports, and the single entry Snapshot returns, carrying the summed liveness
+// of every feed. A per-layer window would be false SLA evidence: a coding
+// layer carries at most 16 shreds of a set and scores erased on every one.
+// An empty unionID is NewReceiverMetrics.
+func NewUnionReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, reporting WindowReporting, unionID string) (*ReceiverMetrics, error) {
 	if registerer == nil {
 		return nil, errors.New("receiver metrics registerer is nil")
 	}
@@ -127,8 +144,13 @@ func NewReceiverMetrics(registerer prometheus.Registerer, feedIDs []string, repo
 		configured[feedID] = struct{}{}
 	}
 
+	if _, exists := configured[unionID]; exists && unionID != "" {
+		return nil, fmt.Errorf("receiver metrics union %q collides with a feed ID", unionID)
+	}
+
 	metrics := &ReceiverMetrics{
 		reportsWindows: bool(reporting),
+		unionID:        unionID,
 
 		feedIDs:  append([]string(nil), feedIDs...),
 		feeds:    make(map[string]feedMetrics, len(feedIDs)),
@@ -263,7 +285,7 @@ func (m *ReceiverMetrics) Collect(ch chan<- prometheus.Metric) {
 
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for _, feedID := range m.feedIDs {
+	for _, feedID := range m.windowIDs() {
 		window := m.windows[feedID]
 		ch <- prometheus.MustNewConstMetric(m.rateDesc, prometheus.GaugeValue, window.RMean, feedID, "mean")
 		ch <- prometheus.MustNewConstMetric(m.rateDesc, prometheus.GaugeValue, window.RPeak100MS, feedID, "peak_100ms")
@@ -401,7 +423,7 @@ func (m *ReceiverMetrics) IncUndeliverable(feedID string) error {
 // that path does not depend on the /metrics gate. See PublishGuard for why the
 // two methods answer differently.
 func (m *ReceiverMetrics) PublishWindow(feedID string, window erasure.Window) error {
-	if _, err := m.feed(feedID); err != nil {
+	if err := m.windowFeed(feedID); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -417,7 +439,7 @@ func (m *ReceiverMetrics) PublishWindow(feedID string, window erasure.Window) er
 // series, and an operator needs to see it as one rather than have it reset to
 // zero with the next window.
 func (m *ReceiverMetrics) PublishGuard(feedID string, stats erasure.Stats) error {
-	if _, err := m.feed(feedID); err != nil {
+	if err := m.windowFeed(feedID); err != nil {
 		return err
 	}
 	// Refused rather than stored: with NoWindowReporting guards reach no
@@ -449,6 +471,26 @@ func (m *ReceiverMetrics) PublishGuard(feedID string, stats erasure.Stats) error
 	m.mu.Lock()
 	m.guards[feedID] = stats
 	m.mu.Unlock()
+	return nil
+}
+
+// windowIDs are the IDs that carry a delivery window: the union alone when one
+// is configured, otherwise every feed.
+func (m *ReceiverMetrics) windowIDs() []string {
+	if m.unionID != "" {
+		return []string{m.unionID}
+	}
+	return m.feedIDs
+}
+
+func (m *ReceiverMetrics) windowFeed(feedID string) error {
+	if m.unionID == "" {
+		_, err := m.feed(feedID)
+		return err
+	}
+	if feedID != m.unionID {
+		return fmt.Errorf("%w: %q (windows are reported for union %q)", ErrUnknownFeed, feedID, m.unionID)
+	}
 	return nil
 }
 
@@ -500,6 +542,24 @@ type FeedSnapshot struct {
 func (m *ReceiverMetrics) Snapshot() []FeedSnapshot {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
+	if m.unionID != "" {
+		// One entry: the union's window, with liveness summed over its
+		// layers. FirstAt/LastAt bound traffic on ANY layer, which keeps the
+		// heartbeat's packets/timestamps pairing intact.
+		union := FeedSnapshot{FeedID: m.unionID, Window: m.windows[m.unionID]}
+		for _, feedID := range m.feedIDs {
+			l := m.liveness[feedID]
+			union.Liveness.Packets += l.Packets
+			union.Liveness.Bytes += l.Bytes
+			if !l.FirstAt.IsZero() && (union.Liveness.FirstAt.IsZero() || l.FirstAt.Before(union.Liveness.FirstAt)) {
+				union.Liveness.FirstAt = l.FirstAt
+			}
+			if l.LastAt.After(union.Liveness.LastAt) {
+				union.Liveness.LastAt = l.LastAt
+			}
+		}
+		return []FeedSnapshot{union}
+	}
 	snapshot := make([]FeedSnapshot, 0, len(m.feedIDs))
 	for _, feedID := range m.feedIDs {
 		snapshot = append(snapshot, FeedSnapshot{
