@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -384,7 +385,16 @@ func erasureGrace(graceMS, graceSlots int, slotTime time.Duration, set map[strin
 	if slotTime == 0 {
 		return 0, errors.New("--erasure-grace-slots requires --slot-time")
 	}
-	return time.Duration(graceSlots) * slotTime, nil
+	if slotTime > time.Duration(math.MaxInt64)/time.Duration(graceSlots) {
+		return 0, errors.New("--erasure-grace-slots x --slot-time overflows a duration")
+	}
+	grace := time.Duration(graceSlots) * slotTime
+	// The heartbeat and metrics publish the grace in whole milliseconds; a
+	// fraction would be scored at one value and reported at another.
+	if grace%time.Millisecond != 0 {
+		return 0, fmt.Errorf("--erasure-grace-slots x --slot-time = %v is not a whole number of milliseconds", grace)
+	}
+	return grace, nil
 }
 
 // billing holds the delivery-session record configuration. A zero value
@@ -906,6 +916,11 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	}
 	unionID := ""
 	if mode.union {
+		// One feed is not a union, and under broker mode its delivery targets
+		// would be read for names[0] while the heartbeat reports union:NAME.
+		if len(names) < 2 {
+			return errors.New("--erasure-union needs at least two --feed layers")
+		}
 		unionID = unionFeedID(names)
 		if len(unionID) > broker.MaxFeedIDBytes {
 			return fmt.Errorf("--erasure-union feed ID %q is %d bytes, over the heartbeat's %d; shorten the --feed names",

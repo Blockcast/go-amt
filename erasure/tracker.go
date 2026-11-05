@@ -215,12 +215,21 @@ func (s *slotState) resolve(key setKey) setKey {
 		}
 		return key
 	}
-	for existing := range s.sets {
-		if existing.fecSetIndex == key.fecSetIndex {
-			return existing
+	// Two signed versions of one index can both be open, and map order is
+	// random, so the pick must be a function of the sets alone or the same
+	// capture scores differently run to run: join the fullest, then the
+	// lowest version.
+	best, found := key, false
+	for existing, bits := range s.sets {
+		if existing.fecSetIndex != key.fecSetIndex {
+			continue
+		}
+		if !found || bitsSet(bits) > bitsSet(s.sets[best]) ||
+			(bitsSet(bits) == bitsSet(s.sets[best]) && existing.version < best.version) {
+			best, found = existing, true
 		}
 	}
-	return key
+	return best
 }
 
 type scoreEvent struct {
