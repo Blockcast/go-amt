@@ -45,7 +45,14 @@ type Tx struct {
 	Raw      []byte // exact serialized VersionedTransaction (sub-slice of the batch)
 	NumSigs  int
 	Sig      []byte   // the first signature, the transaction's id (sub-slice of Raw)
+	Required int      // header.num_required_signatures; NumSigs can differ, which VerifyTx refuses
+	Signed   []byte   // the message, the bytes the signatures sign (sub-slice of Raw)
 	Programs []Pubkey // distinct top-level program ids, first-use order
+	// Version is the message version as the wire states it: 0 or 1, or -1 for
+	// a legacy message, which has no version byte. -1 rather than 0 keeps a
+	// legacy message from reading as version 0, as solana-transaction's
+	// TransactionVersion splits Legacy from Number(u8).
+	Version int
 	// Keys are the message's static account keys, 32 bytes each (sub-slice of
 	// Raw). The accounts a version-0 message loads from address lookup tables
 	// are not among them, since only on-chain state resolves them, and nor are
@@ -133,7 +140,7 @@ func (r *reader) skipVec(size int) {
 	r.bytes(r.shortVec() * size)
 }
 
-// message is what ParseTx learns beyond Tx, for VerifyTx.
+// message is what VerifyTx reads of a parsed transaction.
 type message struct {
 	signed   []byte // the bytes the signatures sign
 	sigs     []byte // the signatures, 64 bytes each
@@ -150,12 +157,11 @@ func parseTx(b []byte) (Tx, message, error) {
 	sigs := r.bytes(64 * numSigs)
 	m := message{sigs: sigs}
 	start := r.off
-	v0 := false
+	version := -1 // legacy
 	if r.err == nil && r.off < len(b) && b[r.off]&0x80 != 0 {
-		if version := r.u8() & 0x7f; version != 0 {
+		if version = int(r.u8() & 0x7f); version != 0 {
 			return Tx{}, m, fmt.Errorf("unsupported message version %d", version)
 		}
-		v0 = true
 	}
 	m.required = int(r.u8())
 	if r.err == nil && m.required == 0 {
@@ -185,7 +191,7 @@ func parseTx(b []byte) (Tx, message, error) {
 			programs = append(programs, p)
 		}
 	}
-	if v0 {
+	if version == 0 {
 		for range r.shortVec() {
 			r.bytes(32)  // account_key
 			r.skipVec(1) // writable_indexes
@@ -198,14 +204,17 @@ func parseTx(b []byte) (Tx, message, error) {
 	if r.err != nil {
 		return Tx{}, m, r.err
 	}
-	m.signed = b[start:r.off]
+	m.signed = b[start:r.off:r.off]
 	return Tx{
 		Raw:      b[:r.off:r.off],
 		NumSigs:  numSigs,
 		Sig:      firstSig(sigs),
+		Required: m.required,
+		Signed:   m.signed,
 		Programs: programs,
+		Version:  version,
 		Keys:     slices.Clip(m.keys),
-		Vote:     !v0 && numSigs < 3 && n == 1 && programs[0] == VoteProgram,
+		Vote:     version < 0 && numSigs < 3 && n == 1 && programs[0] == VoteProgram,
 	}, m, nil
 }
 
@@ -274,12 +283,15 @@ func parseTxV1(b []byte) (Tx, message, error) {
 	if r.err != nil {
 		return Tx{}, m, r.err
 	}
-	m.signed = b[:signed]
+	m.signed = b[:signed:signed]
 	return Tx{
 		Raw:      b[:r.off:r.off],
 		NumSigs:  m.required,
 		Sig:      firstSig(m.sigs),
+		Required: m.required,
+		Signed:   m.signed,
 		Programs: programs, // never a simple vote: Agave requires a legacy message
+		Version:  1,
 		Keys:     slices.Clip(m.keys),
 	}, m, nil
 }
