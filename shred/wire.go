@@ -145,3 +145,18 @@ func TVUPayload(packet []byte) (payload []byte, ok bool) {
 	}
 	return packet[WireHeaderSize:], true
 }
+
+// SetVersion returns the first eight bytes of the leader's signature over the
+// FEC set's Merkle root, which tells two versions of one slot apart. Only a
+// version-4 forwarder frame carries it, as the first bytes of its body; every
+// other packet returns 0, which erasure scoring treats as "any version". It is
+// the same value cmd/shred-merger dedups on.
+func SetVersion(packet []byte) uint64 {
+	if len(packet) < WireHeaderSize+signatureSize || packet[0] != 4 {
+		return 0
+	}
+	if _, err := ParseWireHeader(packet); err != nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(packet[WireHeaderSize:])
+}

@@ -10,12 +10,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -214,6 +216,10 @@ func run(args []string) error {
 	flags.DurationVar(&healthMaxAge, "health-max-age", 30*time.Second, "/healthz ingress freshness window; readiness-shaped, see README")
 	graceMS := flags.Int("erasure-grace-ms", int(config.DefaultErasureGrace/time.Millisecond),
 		"receiver-observed FEC-set scoring grace in milliseconds; a set still below 32 of 64 shreds at slot_boundary plus this grace scores erased")
+	graceSlots := flags.Int("erasure-grace-slots", 0,
+		"scoring grace in slots instead of milliseconds: the grace is this many --slot-time; replaces --erasure-grace-ms")
+	slotTime := flags.Duration("slot-time", 0,
+		"the cluster's slot duration, which --erasure-grace-slots multiplies; measure it, Solana mainnet has run near 212ms since epoch 1053")
 	reportInterval := flags.Duration("report-interval", defaultReportInterval,
 		"how often the delivery window is drained into /metrics; matches the broker heartbeat cadence")
 	retention := flags.Duration("retain", shred.DefaultRetention, "how far behind the newest arrival to keep per-shred scoring state; see README")
@@ -255,6 +261,12 @@ func run(args []string) error {
 	if *graceMS <= 0 {
 		return errors.New("--erasure-grace-ms must be positive")
 	}
+	set := map[string]bool{}
+	flags.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	grace, err := erasureGrace(*graceMS, *graceSlots, *slotTime, set)
+	if err != nil {
+		return err
+	}
 	if *reportInterval <= 0 {
 		return errors.New("--report-interval must be positive")
 	}
@@ -278,16 +290,11 @@ func run(args []string) error {
 	// also drives billDestinations and the broker delivery-target reconcile in
 	// the reporter goroutine, both of which run in generic mode.
 	if score.generic() {
-		var setGrace bool
-		flags.Visit(func(f *flag.Flag) {
-			if f.Name == "erasure-grace-ms" {
-				setGrace = true
+		for _, name := range []string{"erasure-grace-ms", "erasure-grace-slots", "slot-time"} {
+			if set[name] {
+				return fmt.Errorf("--%s requires --mode shred: generic mode does no erasure "+
+					"scoring, so the grace would be accepted and silently ignored", name)
 			}
-		})
-		if setGrace {
-			return errors.New(
-				"--erasure-grace-ms requires --mode shred: generic mode does no erasure " +
-					"scoring, so the grace would be accepted and silently ignored")
 		}
 	}
 	configured := []feed{{name: "default", address: listen, rcvbuf: *rcvbuf}}
@@ -350,7 +357,44 @@ func run(args []string) error {
 		return err
 	}
 	return listenAndScore(configured, forwardTo, httpAddress, healthMaxAge, *asJSON,
-		time.Duration(*graceMS)*time.Millisecond, *reportInterval, *retention, nil, *score, bill, beat)
+		grace, *reportInterval, *retention, nil, *score, bill, beat)
+}
+
+// erasureGrace resolves the scoring grace from either --erasure-grace-ms or
+// --erasure-grace-slots x --slot-time. The millisecond default (400ms, the v1
+// scoring spec) was two slots at 200ms-and-up slot times and is about two
+// slots again at mainnet's ~212ms only by coincidence; stating it in slots
+// keeps the meaning when the slot time moves (BLO-53098). set holds the flags
+// the caller actually passed.
+func erasureGrace(graceMS, graceSlots int, slotTime time.Duration, set map[string]bool) (time.Duration, error) {
+	if graceSlots < 0 {
+		return 0, errors.New("--erasure-grace-slots must not be negative")
+	}
+	if slotTime < 0 {
+		return 0, errors.New("--slot-time must not be negative")
+	}
+	if graceSlots == 0 {
+		if set["slot-time"] {
+			return 0, errors.New("--slot-time only scales --erasure-grace-slots, which is not set")
+		}
+		return time.Duration(graceMS) * time.Millisecond, nil
+	}
+	if set["erasure-grace-ms"] {
+		return 0, errors.New("--erasure-grace-ms and --erasure-grace-slots both set the grace; pass one")
+	}
+	if slotTime == 0 {
+		return 0, errors.New("--erasure-grace-slots requires --slot-time")
+	}
+	if slotTime > time.Duration(math.MaxInt64)/time.Duration(graceSlots) {
+		return 0, errors.New("--erasure-grace-slots x --slot-time overflows a duration")
+	}
+	grace := time.Duration(graceSlots) * slotTime
+	// The heartbeat and metrics publish the grace in whole milliseconds; a
+	// fraction would be scored at one value and reported at another.
+	if grace%time.Millisecond != 0 {
+		return 0, fmt.Errorf("--erasure-grace-slots x --slot-time = %v is not a whole number of milliseconds", grace)
+	}
+	return grace, nil
 }
 
 // billing holds the delivery-session record configuration. A zero value
@@ -758,6 +802,13 @@ type scoring struct {
 	mode        scoringMode
 	sourceLabel scoringSource
 	rightsBasis scoringRights
+
+	// union scores every feed's shreds in ONE erasure tracker and reports
+	// that single window, under unionFeedID, instead of one per feed. It is
+	// for feeds that are layers of one stream (data, coding-even,
+	// coding-odd): a coding layer carries at most 16 shreds of a set, so on
+	// its own it scores every set erased (BLO-53098).
+	union bool
 }
 
 // The three fields carry DISTINCT defined types rather than three plain
@@ -804,6 +855,8 @@ func scoringFlags(flags *flag.FlagSet) *scoring {
 	flags.Var(stringFlag[scoringMode]{&score.mode}, "mode", "scoring mode: shred or generic")
 	flags.Var(stringFlag[scoringSource]{&score.sourceLabel}, "source-label", "generic mode: provenance of the input, e.g. synthetic")
 	flags.Var(stringFlag[scoringRights]{&score.rightsBasis}, "rights-basis", "generic mode: recorded rights basis for the input")
+	flags.BoolVar(&score.union, "erasure-union", false,
+		"score all feeds as layers of one stream: one erasure window over their union, reported as feed union:NAME+NAME...")
 	return score
 }
 
@@ -816,6 +869,9 @@ func (s scoring) validate() error {
 			return errors.New("--source-label and --rights-basis apply to --mode generic only")
 		}
 	case "generic":
+		if s.union {
+			return errors.New("--erasure-union requires --mode shred: generic mode does no erasure scoring")
+		}
 		// Both labels are mandatory rather than defaulted. A generic receipt
 		// whose input provenance is unstated is the artifact the rights
 		// guardrail exists to prevent, and defaulting to "synthetic" would let
@@ -858,13 +914,28 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	if mode.generic() {
 		windowReporting = receiver.NoWindowReporting
 	}
-	metrics, err := receiver.NewReceiverMetrics(registry, names, windowReporting)
+	unionID := ""
+	if mode.union {
+		// One feed is not a union, and under broker mode its delivery targets
+		// would be read for names[0] while the heartbeat reports union:NAME.
+		if len(names) < 2 {
+			return errors.New("--erasure-union needs at least two --feed layers")
+		}
+		unionID = unionFeedID(names)
+		if len(unionID) > broker.MaxFeedIDBytes {
+			return fmt.Errorf("--erasure-union feed ID %q is %d bytes, over the heartbeat's %d; shorten the --feed names",
+				unionID, len(unionID), broker.MaxFeedIDBytes)
+		}
+	}
+	metrics, err := receiver.NewUnionReceiverMetrics(registry, names, windowReporting, unionID)
 	if err != nil {
 		return err
 	}
 
 	// One tracker per feed. The delivery SLA is per feed, and a shared tracker
-	// would let a healthy feed mask an erased one behind a pooled fraction.
+	// would let a healthy feed mask an erased one behind a pooled fraction --
+	// unless the feeds are layers of ONE stream (--erasure-union), where only
+	// the union describes what the validator can reconstruct.
 	windowStart := time.Now()
 	// Erasure scoring is shred-only. Generic mode does no erasure coding, so a
 	// tracker there would never be fed -- shred.Parse rejects a generic record
@@ -873,14 +944,14 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 	// exact confusion the drain-failure path below refuses to create. Leaving
 	// the map empty makes trackers[feed] nil, which processPacket treats as
 	// "erasure scoring disabled" without touching delivery.
-	trackers := make(map[string]*erasure.Tracker, len(names))
+	//
+	// trackers is keyed by the ID a window is REPORTED under; byFeed by the
+	// feed a packet arrived on. They differ only under --erasure-union, where
+	// every feed shares the one tracker reported as unionID.
+	var trackers, byFeed map[string]*erasure.Tracker
 	if !mode.generic() {
-		for _, name := range names {
-			tracker, err := erasure.NewTracker(grace, windowStart)
-			if err != nil {
-				return fmt.Errorf("erasure tracker for feed %q: %w", name, err)
-			}
-			trackers[name] = tracker
+		if trackers, byFeed, err = newErasureTrackers(names, unionID, grace, windowStart); err != nil {
+			return err
 		}
 	}
 	var brokerClient *http.Client
@@ -1171,7 +1242,7 @@ func listenAndScore(feeds []feed, destinations []string, httpAddress string, hea
 				mu.Lock()
 				health.MarkReceived(receivedAt)
 				_ = metrics.ObserveIngress(feedName, n, receivedAt)
-				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics, trackers[feedName])
+				processPacket(feedName, packet[:n], receivedAt, scorer, fanout, metrics, byFeed[feedName])
 				mu.Unlock()
 			}
 		}(f)
@@ -1514,7 +1585,42 @@ func processPacket(feedName string, packet []byte, receivedAt time.Time, scorer 
 	if err != nil {
 		return
 	}
-	tracker.Observe(header, receivedAt)
+	tracker.ObserveVersion(header, shred.SetVersion(packet), receivedAt)
+}
+
+// newErasureTrackers builds the erasure trackers for names. reported is keyed by
+// the ID a window is REPORTED under, byFeed by the feed a packet arrives on.
+// They differ only when unionID is set: then every feed shares one tracker,
+// reported as unionID, and a set completes on shreds from any of its layers.
+func newErasureTrackers(names []string, unionID string, grace time.Duration, windowStart time.Time) (reported, byFeed map[string]*erasure.Tracker, err error) {
+	reported = make(map[string]*erasure.Tracker, len(names))
+	byFeed = make(map[string]*erasure.Tracker, len(names))
+	var union *erasure.Tracker
+	if unionID != "" {
+		if union, err = erasure.NewTracker(grace, windowStart); err != nil {
+			return nil, nil, fmt.Errorf("erasure tracker for %q: %w", unionID, err)
+		}
+		reported[unionID] = union
+	}
+	for _, name := range names {
+		tracker := union
+		if tracker == nil {
+			if tracker, err = erasure.NewTracker(grace, windowStart); err != nil {
+				return nil, nil, fmt.Errorf("erasure tracker for feed %q: %w", name, err)
+			}
+			reported[name] = tracker
+		}
+		byFeed[name] = tracker
+	}
+	return reported, byFeed, nil
+}
+
+// unionFeedID names the --erasure-union window after the layers it covers, in
+// sorted order so the ID does not depend on --feed order.
+func unionFeedID(names []string) string {
+	sorted := slices.Clone(names)
+	slices.Sort(sorted)
+	return "union:" + strings.Join(sorted, "+")
 }
 
 func startHTTP(address string, registry *prometheus.Registry, health http.Handler) (*http.Server, error) {

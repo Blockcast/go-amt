@@ -164,10 +164,13 @@ func TestDocumentedFlagsAreAccepted(t *testing.T) {
 		// supplied a real path would parse, fall through to listenAndScore and
 		// hang the package on the test timeout -- the trap TestUndefinedFlagIsRejected
 		// documents below.
-		"delivery-wal":     {"--delivery-wal"},
-		"delivery-records": {"--delivery-records"},
-		"erasure-grace-ms": {"--erasure-grace-ms"},
-		"report-interval":  {"--report-interval"},
+		"delivery-wal":        {"--delivery-wal"},
+		"delivery-records":    {"--delivery-records"},
+		"erasure-grace-ms":    {"--erasure-grace-ms"},
+		"erasure-grace-slots": {"--erasure-grace-slots"},
+		"slot-time":           {"--slot-time"},
+		"erasure-union":       {"--erasure-union=not-a-bool"},
+		"report-interval":     {"--report-interval"},
 		// The collector flag set, probed with no value for the same reason: a
 		// probe supplying real values would parse, and --delivery-collector's
 		// own validation runs after the parser.
