@@ -301,6 +301,28 @@ jobs:
           done
           exit $rc
 
+      # By name, for the same reason. These are the only end-to-end guards for
+      # IPv6 (S,G) joins: the tunnel through a relay on [::1], the native join
+      # through the v6 seam, and the probe that picks between them. Each
+      # t.Skips on a host with no IPv6 loopback, which goes red here.
+      - name: Prove the IPv6 join guards ran
+        run: |
+          set -euo pipefail
+          names='TestRelayManagerJoinsIPv6GroupOverIPv6
+          TestManagedConnJoinsIPv6GroupNatively
+          TestManagedConnProbesIPv6Group'
+          rc=0
+          # Anchored selection; see the prove-it-ran note above `jobs:`.
+          go test -v -count=1 -run "^($(echo $names | tr ' ' '|'))$" . 2>&1 | tee /tmp/ipv6-join.log || rc=$?
+          for t in $names; do
+            # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
+            grep -qF -- "--- PASS: $t " /tmp/ipv6-join.log || {
+              echo "::error::$t did not report a PASS line; it was skipped, deselected or failed"
+              rc=1
+            }
+          done
+          exit $rc
+
       # BLO-47285: sockets sharing a port must each get only their own group
       # over a real link. It needs a veth pair, so it runs in its own user and
       # network namespace, and as root because Ubuntu's AppArmor withholds
@@ -417,6 +439,24 @@ jobs:
           for t in $names; do
             # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
             grep -qF -- "--- PASS: $t " /tmp/native-harness-race.log || {
+              echo "::error::$t did not report a PASS line under -race; it was skipped, deselected or failed"
+              rc=1
+            }
+          done
+          exit $rc
+
+      - name: Prove the IPv6 join guards ran under -race
+        run: |
+          set -euo pipefail
+          names='TestRelayManagerJoinsIPv6GroupOverIPv6
+          TestManagedConnJoinsIPv6GroupNatively
+          TestManagedConnProbesIPv6Group'
+          rc=0
+          # Anchored selection; see the prove-it-ran note above `jobs:`.
+          go test -race -tags purego -v -count=1 -run "^($(echo $names | tr ' ' '|'))$" . 2>&1 | tee /tmp/ipv6-join-race.log || rc=$?
+          for t in $names; do
+            # Trailing-space anchored; see the prove-it-ran note above `jobs:`.
+            grep -qF -- "--- PASS: $t " /tmp/ipv6-join-race.log || {
               echo "::error::$t did not report a PASS line under -race; it was skipped, deselected or failed"
               rc=1
             }

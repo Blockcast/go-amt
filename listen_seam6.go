@@ -16,5 +16,5 @@ package amt
 // narrower: listen_multicast6_linux.go is `linux && !android` and
 // listen_multicast6_darwin.go is `darwin && !ios`, and there is no v6
 // counterpart to listen_multicast_mobile.go. That union is a superset of
-// conn.go's tag, which is the only caller.
+// conn.go's tag, and is managed_conn_native6.go's tag: those are the callers.
 var listenMulticastUDP6 = ListenMulticastUDP6

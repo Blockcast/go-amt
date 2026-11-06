@@ -200,15 +200,17 @@ func TestTeardownRacingDeliveryDoesNotPanic(t *testing.T) {
 	}
 }
 
-func TestManagedConnOpenRejectsNonIPv4Subscription(t *testing.T) {
+func TestManagedConnOpenRejectsMixedFamilySubscription(t *testing.T) {
 	tests := []struct {
 		name    string
 		source  netip.Addr
 		group   netip.Addr
 		wantErr string
 	}{
-		{name: "IPv6 source", source: netip.MustParseAddr("2001:db8::1"), group: netip.MustParseAddr("239.0.0.1"), wantErr: "source address must be IPv4"},
-		{name: "IPv6 group", source: netip.MustParseAddr("192.0.2.1"), group: netip.MustParseAddr("ff3e::1"), wantErr: "group address must be IPv4"},
+		{name: "IPv6 source", source: netip.MustParseAddr("2001:db8::1"), group: netip.MustParseAddr("239.0.0.1"), wantErr: "one family"},
+		{name: "IPv6 group", source: netip.MustParseAddr("192.0.2.1"), group: netip.MustParseAddr("ff3e::1"), wantErr: "one family"},
+		{name: "v4-mapped group", source: netip.MustParseAddr("2001:db8::1"), group: netip.MustParseAddr("::ffff:239.0.0.1"), wantErr: "one family"},
+		{name: "v4-mapped source", source: netip.MustParseAddr("::ffff:192.0.2.1"), group: netip.MustParseAddr("ff3e::1"), wantErr: "one family"},
 	}
 
 	for _, tt := range tests {
@@ -222,7 +224,7 @@ func TestManagedConnOpenRejectsNonIPv4Subscription(t *testing.T) {
 			}
 			err := mc.Open()
 			if err == nil {
-				t.Fatal("Open() succeeded for a non-IPv4 AMT subscription")
+				t.Fatal("Open() succeeded for a mixed-family AMT subscription")
 			}
 			if !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("Open() error = %q, want error containing %q", err, tt.wantErr)

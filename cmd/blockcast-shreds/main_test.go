@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -905,6 +906,86 @@ func TestSSMFeedAddress(t *testing.T) {
 	} {
 		if _, err := ssmFeed(bad, 0); err == nil {
 			t.Errorf("ssmFeed(%q) accepted", bad)
+		}
+	}
+}
+
+// TestSSMFeedAddressIPv6 is the IPv6 half of TestSSMFeedAddress: the
+// ssm://[S]@[G]:PORT form groups.py prints, with and without an IPv6 relay. It
+// fails if the bracketed source is handed to url.Parse (which refuses it), if
+// the source loses everything after its first colon, or if a feed mixing the
+// families, a bracketed IPv4 source or an unbracketed IPv6 one is accepted.
+func TestSSMFeedAddressIPv6(t *testing.T) {
+	for _, tc := range []struct{ address, relay string }{
+		{"ssm://[2001:db8:1:5::57]@[ff3e::232:201]:5001", ""},
+		{"ssm://[2001:db8:1:5::57]@[ff3e::232:201]:5001?relay=2001:db8:1::128", "[2001:db8:1::128]:2268"},
+		{"ssm://[2001:db8:1:5::57]@[ff3e::232:201]:5001?relay=[2001:db8:1::128]:2269", "[2001:db8:1::128]:2269"},
+	} {
+		conn, err := ssmFeed(tc.address, 0)
+		if err != nil {
+			t.Errorf("ssmFeed(%q): %v", tc.address, err)
+			continue
+		}
+		if conn.SrcAddr.String() != "2001:db8:1:5::57" || conn.GroupAddr.String() != "ff3e::232:201" || conn.GroupPort != 5001 {
+			t.Errorf("ssmFeed(%q) parsed (S,G):port = (%s,%s):%d", tc.address, conn.SrcAddr, conn.GroupAddr, conn.GroupPort)
+		}
+		if tc.relay == "" && (conn.Mode != amt.AMTModeNative || len(conn.RelayAddr.IP) != 0) {
+			t.Errorf("ssmFeed(%q): mode %v relay %v, want native with no relay", tc.address, conn.Mode, &conn.RelayAddr)
+		}
+		if tc.relay != "" && (conn.Mode != amt.AMTModeAuto || conn.RelayAddr.String() != tc.relay) {
+			t.Errorf("ssmFeed(%q): mode %v relay %v, want auto via %s", tc.address, conn.Mode, &conn.RelayAddr, tc.relay)
+		}
+	}
+
+	for _, bad := range []string{
+		"ssm://2001:db8:1:5::57@[ff3e::232:201]:5001",            // IPv6 source without brackets
+		"ssm://[2001:db8:1:5::57]@232.0.0.1:5001",                // IPv6 source, IPv4 group
+		"ssm://198.51.100.57@[ff3e::232:201]:5001",                  // IPv4 source, IPv6 group
+		"ssm://[198.51.100.57]@232.0.0.1:5001",                      // bracketed IPv4 source
+		"ssm://[::ffff:198.51.100.57]@[::ffff:232.0.0.1]:5001",      // v4-mapped pair
+		"ssm://[::ffff:198.51.100.57]@[ff3e::232:201]:5001",         // v4-mapped source, IPv6 group
+		"ssm://[2001:db8:1:5::57]@[::ffff:232.0.0.1]:5001",       // IPv6 source, v4-mapped group
+		"ssm://[fe80::57%25eth0]@[ff3e::232:201]:5001",            // zoned source, %-escaped
+		"ssm://[fe80::57%eth0]@[ff3e::232:201]:5001",              // zoned source
+		"ssm://[2001:db8:1:5::57]@[ff3e::232:201%25eth0]:5001",   // zoned group
+		"ssm://[2001:db8:1:5::57]@junk@[ff3e::232:201]:5001",     // junk between ]@ and the group
+		"ssm://[2001:db8:1:5::57]@v6:pw@[ff3e::232:201]:5001",    // a password beside the placeholder
+		"ssm://[2001:db8:1:5::57]@[2001:db8:1:5::1]:5001",       // group is not multicast
+		"ssm://[2001:db8:1:5::57]@[ff3e::232:201]",               // no port
+		"ssm://[2001:db8:1:5::57]@ff3e::232:201:5001",            // unbracketed group
+		"ssm://[2001:db8:1:5::57]:5001@[ff3e::232:201]:5001",     // source with a port
+		"ssm://[2001:db8:1:5::57@[ff3e::232:201]:5001",           // unclosed bracket
+		"ssm://[2001:db8:1:5::57]@[ff3e::232:201]:5001/x",        // stray path
+		"ssm://[2001:db8:1:5::57]@[ff3e::232:201]:5001?relay=",   // unset ${RELAY}
+		"ssm://[2001:db8:1:5::57]@[ff3e::232:201]:5001?relayy=1", // misspelt relay
+		// A relay tunnels a group only in the group's family: these would
+		// join and then deliver nothing.
+		"ssm://[2001:db8:1:5::57]@[ff3e::232:201]:5001?relay=203.0.113.128",
+		"ssm://198.51.100.57@232.0.0.1:5001?relay=[2001:db8:1::128]",
+		"ssm://198.51.100.57@232.0.0.1:5001?relay=2001:db8:1::128",
+	} {
+		if _, err := ssmFeed(bad, 0); err == nil {
+			t.Errorf("ssmFeed(%q) accepted", bad)
+		}
+	}
+
+	// localhost resolves to both families; each group takes the relay
+	// address of its own, where resolving as "udp" would take 127.0.0.1 for
+	// both.
+	if v6, err := (&net.Resolver{}).LookupNetIP(context.Background(), "ip6", "localhost"); err != nil || len(v6) == 0 {
+		t.Skipf("localhost has no IPv6 address here (%v)", err)
+	}
+	for address, want := range map[string]string{
+		"ssm://[2001:db8:1:5::57]@[ff3e::232:201]:5001?relay=localhost": "[::1]:2268",
+		"ssm://198.51.100.57@232.0.0.1:5001?relay=localhost":               "127.0.0.1:2268",
+	} {
+		conn, err := ssmFeed(address, 0)
+		if err != nil {
+			t.Errorf("ssmFeed(%q): %v", address, err)
+			continue
+		}
+		if conn.RelayAddr.String() != want {
+			t.Errorf("ssmFeed(%q): relay %v, want %s", address, &conn.RelayAddr, want)
 		}
 	}
 }

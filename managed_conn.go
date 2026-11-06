@@ -9,6 +9,7 @@ import (
 
 	m "github.com/blockcast/go-amt/messages"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 )
 
 // Ensure ManagedConn implements net.PacketConn
@@ -74,8 +75,10 @@ type ManagedConn struct {
 	usingTunnel bool
 	localAddr   net.Addr
 
-	// For native multicast fallback
-	nativeConn *ipv4.PacketConn
+	// For native multicast fallback: nativeConn for an IPv4 group, nativeConn6
+	// for an IPv6 one. At most one is set, and only by Open.
+	nativeConn  *ipv4.PacketConn
+	nativeConn6 *ipv6.PacketConn
 
 	// pending holds the datagram a successful native probe consumed, so the
 	// caller's first read gets it instead of waiting a whole signalling interval
@@ -141,11 +144,12 @@ func (mc *ManagedConn) Open() error {
 	mc.mu.Unlock()
 	defer close(openDone)
 
-	if !mc.SrcAddr.Is4() {
-		return fmt.Errorf("AMT source address must be IPv4: %s", mc.SrcAddr)
-	}
-	if !mc.GroupAddr.Is4() {
-		return fmt.Errorf("AMT group address must be IPv4: %s", mc.GroupAddr)
+	// An IPv4 (S,G) joins with IGMPv3 and an IPv6 one with MLDv2. A pair that
+	// mixes the families is neither, and a v4-mapped address would take the
+	// IPv6 native join with an IPv4 group in it.
+	if !mc.SrcAddr.IsValid() || !mc.GroupAddr.IsValid() || mc.SrcAddr.Is4() != mc.GroupAddr.Is4() ||
+		mc.SrcAddr.Is4In6() || mc.GroupAddr.Is4In6() {
+		return fmt.Errorf("AMT source and group must be addresses of one family: (%s,%s)", mc.SrcAddr, mc.GroupAddr)
 	}
 
 	hasRelay := len(mc.RelayAddr.IP) > 0
@@ -162,7 +166,18 @@ func (mc *ManagedConn) Open() error {
 		// Runs outside mc.mu: this is the multi-second call. dialNativeMulticast
 		// returns the socket rather than installing it, so the only thing that
 		// needs the lock is the handful of assignments below.
-		conn, pkt, err := mc.dialNativeMulticast(plan.Probe)
+		var conn4 *ipv4.PacketConn
+		var conn6 *ipv6.PacketConn
+		var conn nativeConn
+		var pkt *pendingPacket
+		var err error
+		if mc.GroupAddr.Is6() {
+			if conn6, pkt, err = mc.dialNativeMulticast6(plan.Probe); err == nil {
+				conn = conn6
+			}
+		} else if conn4, pkt, err = mc.dialNativeMulticast(plan.Probe); err == nil {
+			conn = conn4
+		}
 		if err == nil {
 			mc.mu.Lock()
 			if mc.closed {
@@ -173,7 +188,7 @@ func (mc *ManagedConn) Open() error {
 				conn.Close()
 				return fmt.Errorf("connection closed while opening")
 			}
-			mc.nativeConn = conn
+			mc.nativeConn, mc.nativeConn6 = conn4, conn6
 			mc.localAddr = conn.LocalAddr()
 			mc.usingTunnel = false
 			mc.mu.Unlock()
@@ -306,6 +321,20 @@ func (mc *ManagedConn) IsUsingTunnel() bool {
 	return mc.usingTunnel
 }
 
+// native returns the native socket in use, of either family, or nil while
+// tunnelling or before Open has installed one. The caller holds mu.
+func (mc *ManagedConn) native() nativeConn {
+	switch {
+	case mc.usingTunnel:
+		return nil
+	case mc.nativeConn6 != nil:
+		return mc.nativeConn6
+	case mc.nativeConn != nil:
+		return mc.nativeConn
+	}
+	return nil
+}
+
 // waitOpen blocks until an in-flight Open has reached a final state, so a
 // data-plane call that races Open resumes against the finished connection
 // rather than a half-built one.
@@ -357,7 +386,7 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		return 0, nil, fmt.Errorf("connection closed")
 	}
 	usingTunnel := mc.usingTunnel
-	nativeConn := mc.nativeConn
+	nativeConn, nativeConn6 := mc.nativeConn, mc.nativeConn6
 	readBuffer := mc.readBuffer
 	done := mc.done
 	// Drained inside the read lock, so the closed check above is exact rather
@@ -372,6 +401,10 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		return copy(p, pending.buf), pending.src, nil
 	}
 
+	if !usingTunnel && nativeConn6 != nil {
+		n, _, src, err := nativeConn6.ReadFrom(p)
+		return n, src, err
+	}
 	if !usingTunnel && nativeConn != nil {
 		n, _, src, err := nativeConn.ReadFrom(p)
 		return n, src, err
@@ -398,7 +431,9 @@ func (mc *ManagedConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 // consuming the queued packet. A non-zero buffer that is shorter than the
 // packet follows net.PacketConn semantics: the packet is consumed and its
 // payload is truncated to fit. The native path delegates to the underlying
-// connection and retains its standard-library behavior.
+// connection and retains its standard-library behavior. An IPv6 group returns
+// a nil control message, as the tunnel does: its control message is an
+// ipv6.ControlMessage.
 func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.ControlMessage, src net.Addr, err error) {
 	mc.waitOpen()
 	mc.mu.RLock()
@@ -407,7 +442,7 @@ func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.C
 		return 0, nil, nil, fmt.Errorf("connection closed")
 	}
 	usingTunnel := mc.usingTunnel
-	nativeConn := mc.nativeConn
+	nativeConn, nativeConn6 := mc.nativeConn, mc.nativeConn6
 	readBuffer := mc.readBuffer
 	done := mc.done
 	// See ReadFrom: taken inside the read lock so the closed check is exact.
@@ -418,6 +453,10 @@ func (mc *ManagedConn) ReadFromWithControlMessage(buf []byte) (n int, cm *ipv4.C
 		return copy(buf, pending.buf), pending.cm, pending.src, nil
 	}
 
+	if !usingTunnel && nativeConn6 != nil {
+		n, _, src, err = nativeConn6.ReadFrom(buf)
+		return n, nil, src, err
+	}
 	if !usingTunnel && nativeConn != nil {
 		return nativeConn.ReadFrom(buf)
 	}
@@ -456,7 +495,7 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 		return 0, fmt.Errorf("connection closed")
 	}
 	usingTunnel := mc.usingTunnel
-	nativeConn := mc.nativeConn
+	nativeConn, nativeConn6 := mc.nativeConn, mc.nativeConn6
 	readBuffer := mc.readBuffer
 	done := mc.done
 	// See ReadFrom for why the store is touched inside the read lock. Room is
@@ -489,6 +528,10 @@ func (mc *ManagedConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
 		return 1, nil
 	}
 
+	if !usingTunnel && nativeConn6 != nil {
+		// ipv6.Message and ipv4.Message are both aliases for socket.Message.
+		return nativeConn6.ReadBatch(ms, flags)
+	}
 	if !usingTunnel && nativeConn != nil {
 		return nativeConn.ReadBatch(ms, flags)
 	}
@@ -561,6 +604,9 @@ func (mc *ManagedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		return 0, fmt.Errorf("connection closed")
 	}
 
+	if !mc.usingTunnel && mc.nativeConn6 != nil {
+		return mc.nativeConn6.WriteTo(p, nil, addr)
+	}
 	if !mc.usingTunnel && mc.nativeConn != nil {
 		cm := new(ipv4.ControlMessage)
 		return mc.nativeConn.WriteTo(p, cm, addr)
@@ -569,7 +615,8 @@ func (mc *ManagedConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	return 0, fmt.Errorf("write not supported for AMT tunnel")
 }
 
-// WriteToWithControlMessage writes a packet with an IPv4 control message.
+// WriteToWithControlMessage writes a packet with an IPv4 control message. On
+// an IPv6 group's socket the control message does not apply and is not sent.
 func (mc *ManagedConn) WriteToWithControlMessage(p []byte, cm *ipv4.ControlMessage, addr net.Addr) (n int, err error) {
 	mc.waitOpen()
 	mc.mu.RLock()
@@ -577,6 +624,10 @@ func (mc *ManagedConn) WriteToWithControlMessage(p []byte, cm *ipv4.ControlMessa
 
 	if mc.closed {
 		return 0, fmt.Errorf("connection closed")
+	}
+
+	if !mc.usingTunnel && mc.nativeConn6 != nil {
+		return mc.nativeConn6.WriteTo(p, nil, addr)
 	}
 
 	if !mc.usingTunnel && mc.nativeConn != nil {
@@ -596,6 +647,9 @@ func (mc *ManagedConn) WriteBatch(msg []ipv4.Message, flags int) (int, error) {
 		return 0, fmt.Errorf("connection closed")
 	}
 
+	if !mc.usingTunnel && mc.nativeConn6 != nil {
+		return mc.nativeConn6.WriteBatch(msg, flags)
+	}
 	if !mc.usingTunnel && mc.nativeConn != nil {
 		return mc.nativeConn.WriteBatch(msg, flags)
 	}
@@ -614,14 +668,13 @@ func (mc *ManagedConn) Close() error {
 	if mc.done != nil {
 		close(mc.done)
 	}
-	usingTunnel := mc.usingTunnel
-	nativeConn := mc.nativeConn
+	native := mc.native()
 	rm := mc.rm
 	sub := mc.sub
 	mc.mu.Unlock()
 
-	if !usingTunnel && nativeConn != nil {
-		return nativeConn.Close()
+	if native != nil {
+		return native.Close()
 	}
 
 	// Unsubscribe from RelayManager
@@ -637,8 +690,8 @@ func (mc *ManagedConn) LocalAddr() net.Addr {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
-	if !mc.usingTunnel && mc.nativeConn != nil {
-		return mc.nativeConn.LocalAddr()
+	if native := mc.native(); native != nil {
+		return native.LocalAddr()
 	}
 
 	return mc.localAddr
@@ -654,8 +707,8 @@ func (mc *ManagedConn) SetDeadline(t time.Time) error {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
-	if !mc.usingTunnel && mc.nativeConn != nil {
-		return mc.nativeConn.SetDeadline(t)
+	if native := mc.native(); native != nil {
+		return native.SetDeadline(t)
 	}
 
 	// Deadline handling for AMT would require more complex implementation
@@ -669,8 +722,8 @@ func (mc *ManagedConn) SetReadDeadline(t time.Time) error {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
-	if !mc.usingTunnel && mc.nativeConn != nil {
-		return mc.nativeConn.SetReadDeadline(t)
+	if native := mc.native(); native != nil {
+		return native.SetReadDeadline(t)
 	}
 
 	return nil
@@ -683,8 +736,8 @@ func (mc *ManagedConn) SetWriteDeadline(t time.Time) error {
 	mc.mu.RLock()
 	defer mc.mu.RUnlock()
 
-	if !mc.usingTunnel && mc.nativeConn != nil {
-		return mc.nativeConn.SetWriteDeadline(t)
+	if native := mc.native(); native != nil {
+		return native.SetWriteDeadline(t)
 	}
 
 	return nil

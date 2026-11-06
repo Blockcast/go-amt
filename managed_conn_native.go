@@ -45,27 +45,38 @@ func (mc *ManagedConn) dialNativeMulticast(plan probePlan) (*ipv4.PacketConn, *p
 	}
 
 	if plan.Probe {
-		mtu := 1500
-		if mc.IFace != nil {
-			mtu = mc.IFace.MTU
-		}
 		var cm *ipv4.ControlMessage
 		var src net.Addr
-		pkt, native, err := probeNativeTraffic(conn, plan.Window, mtu, func(b []byte) (int, error) {
+		pkt, err := mc.probeJoin(conn, plan, func(b []byte) (int, error) {
 			n, c, s, err := conn.ReadFrom(b)
 			cm, src = c, s
 			return n, err
 		})
 		if err != nil {
-			conn.Close()
 			return nil, nil, err
-		}
-		if !native {
-			conn.Close()
-			return nil, nil, errNativeProbeTimedOut
 		}
 		return conn, &pendingPacket{buf: pkt, cm: cm, src: src}, nil
 	}
 
 	return conn, nil, nil
+}
+
+// probeJoin waits plan.Window for the native join conn to deliver, through
+// read, and returns the datagram that proved it. When nothing arrives, or the
+// read fails, it closes conn and says why. Shared by both families' dials.
+func (mc *ManagedConn) probeJoin(conn nativeConn, plan probePlan, read func([]byte) (int, error)) ([]byte, error) {
+	mtu := 1500
+	if mc.IFace != nil {
+		mtu = mc.IFace.MTU
+	}
+	pkt, native, err := probeNativeTraffic(conn, plan.Window, mtu, read)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	if !native {
+		conn.Close()
+		return nil, errNativeProbeTimedOut
+	}
+	return pkt, nil
 }

@@ -374,6 +374,61 @@ func buildIGMPIPHeader(payload []byte) []byte {
 	return header
 }
 
+// mldReportsGroup is ff02::16, the all-MLDv2-capable-routers address every
+// Version 2 Multicast Listener Report is sent to (RFC 3810 §5.2.14).
+var mldReportsGroup = netip.MustParseAddr("ff02::16")
+
+// mldHopByHop is the Hop-by-Hop Options header an MLD message carries: next
+// header ICMPv6 (58), length 0 (8 bytes), the Router Alert option with value 0,
+// MLD (RFC 2711), and a PadN to fill the 8 bytes. RFC 3810 §5 requires the
+// option, and the relay's ipv6_mc_check_mld drops a report without the header.
+var mldHopByHop = [8]byte{58, 0, 0x05, 0x02, 0x00, 0x00, 0x01, 0x00}
+
+// buildMLDReport builds an MLDv2 Multicast Listener Report (RFC 3810 §5.2)
+// with one record of recordType per group, each naming source, the IPv6
+// counterpart of the IGMPv3 reports above. MLDv2 numbers its record types as
+// IGMPv3 does (§5.2.12), so the m.IGMPv3* constants are the record types.
+//
+// The envelope is the one amt-protocol's amt-verify joins through the relay
+// with: an IPv6 header from :: to ff02::16 with hop limit 1, mldHopByHop, then
+// the report, whose ICMPv6 checksum covers the IPv6 pseudo-header (RFC 8200
+// §8.1). The (S,G) is in the records; the relay reads the header only to
+// validate the framing.
+func buildMLDReport(recordType byte, source netip.Addr, groups []netip.Addr) ([]byte, error) {
+	if !source.Is6() || source.Is4In6() {
+		return nil, fmt.Errorf("source address must be IPv6: %s", source)
+	}
+	mld := make([]byte, 8, 8+36*len(groups))
+	mld[0] = 143 // Version 2 Multicast Listener Report
+	binary.BigEndian.PutUint16(mld[6:8], uint16(len(groups)))
+	s := source.As16()
+	for _, g := range groups {
+		if !g.Is6() || g.Is4In6() {
+			return nil, fmt.Errorf("group address must be IPv6: %s", g)
+		}
+		g16 := g.As16()
+		mld = append(mld, recordType, 0, 0, 1) // type, aux data len, one source
+		mld = append(mld, g16[:]...)
+		mld = append(mld, s[:]...)
+	}
+
+	dst := mldReportsGroup.As16()
+	pseudo := make([]byte, 40, 40+len(mld))
+	copy(pseudo[16:32], dst[:]) // pseudo[0:16], the source ::, stays zero
+	binary.BigEndian.PutUint32(pseudo[32:36], uint32(len(mld)))
+	pseudo[39] = 58 // ICMPv6
+	binary.BigEndian.PutUint16(mld[2:4], ipChecksum(append(pseudo, mld...)))
+
+	ip := make([]byte, 40, 40+len(mldHopByHop)+len(mld))
+	ip[0] = 0x60 // version 6, traffic class and flow label 0
+	binary.BigEndian.PutUint16(ip[4:6], uint16(len(mldHopByHop)+len(mld)))
+	ip[6] = 0 // Hop-by-Hop Options
+	ip[7] = 1 // hop limit
+	copy(ip[24:40], dst[:])
+	ip = append(ip, mldHopByHop[:]...)
+	return append(ip, mld...), nil
+}
+
 // ipChecksum is the standard RFC 1071 one's-complement checksum over header.
 func ipChecksum(header []byte) uint16 {
 	var sum uint32
