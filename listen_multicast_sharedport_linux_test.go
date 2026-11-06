@@ -18,8 +18,8 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// netnsChildEnv marks the re-executed test binary running inside its own user
-// and network namespace.
+// netnsChildEnv marks the re-executed test binary running inside its own
+// network namespace.
 const netnsChildEnv = "GOAMT_NETNS_CHILD"
 
 // TestListenMulticastUDP4SharedPortOverVeth pins BLO-47285. Five listeners
@@ -132,18 +132,22 @@ func anyAddrListener(t *testing.T, ifi *net.Interface, group net.IP, port, multi
 	return fd
 }
 
-// runInNetns re-executes the test binary for one test inside a new user and
-// network namespace, where it may create a veth pair. It skips where the
-// sandbox forbids unprivileged user namespaces.
+// runInNetns re-executes the test binary for one test inside a new network
+// namespace, where it may create a veth pair. Run as root, the namespace needs
+// nothing more; otherwise a new user namespace owns it. That matters where the
+// host allows no user namespaces at all (clone fails with ENOSPC when
+// user.max_user_namespaces is 0), which would otherwise skip the test even
+// under sudo. It skips where neither namespace can be entered.
 func runInNetns(t *testing.T, run string) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run="+run, "-test.v")
 	cmd.Env = append(os.Environ(), netnsChildEnv+"=1")
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags:                 syscall.CLONE_NEWUSER | syscall.CLONE_NEWNET,
-		UidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}},
-		GidMappings:                []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}},
-		GidMappingsEnableSetgroups: false,
+	cmd.SysProcAttr = &syscall.SysProcAttr{Cloneflags: syscall.CLONE_NEWNET}
+	if os.Getuid() != 0 {
+		cmd.SysProcAttr.Cloneflags |= syscall.CLONE_NEWUSER
+		cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getuid(), Size: 1}}
+		cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{{ContainerID: 0, HostID: os.Getgid(), Size: 1}}
+		cmd.SysProcAttr.GidMappingsEnableSetgroups = false
 	}
 	out, err := cmd.CombinedOutput()
 	var ee *exec.ExitError
