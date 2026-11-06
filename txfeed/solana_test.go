@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/binary"
+	"maps"
 	"slices"
 	"testing"
 )
@@ -213,6 +214,87 @@ func TestParseTx(t *testing.T) {
 		// A sub-slice of Raw, not a copy, with no room to append into the batch.
 		if off := bytes.Index(tx.Raw, tx.Keys); off < 0 || &tx.Raw[off] != &tx.Keys[0] || cap(tx.Keys) != len(tx.Keys) {
 			t.Errorf("%s: Keys is not a clipped sub-slice of Raw", c.name)
+		}
+	}
+}
+
+// TestParseTxMessage checks Version, Required and Signed against the wire: the
+// version byte, the header's first byte, and the bytes every signature
+// verifies over, as VerifyTx checks them.
+func TestParseTxMessage(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		tx      testTx
+		version int
+	}{
+		{"legacy", legacyTx, -1},
+		{"v0", v0Tx, 0},
+		{"v1", v1Tx, 1},
+	} {
+		b := append(c.tx.build(), 0xff, 0xff) // what follows is not read
+		raw, n := b[:len(b)-2], len(c.tx.signers)
+		sigs, msg := raw[1:1+64*n], raw[1+64*n:]
+		if c.tx.v1 { // the signatures are last
+			sigs, msg = raw[len(raw)-64*n:], raw[:len(raw)-64*n]
+		}
+		required := msg[0] // num_required_signatures, after any version byte
+		if c.tx.v0 || c.tx.v1 {
+			required = msg[1]
+		}
+		tx, _, err := ParseTx(b)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if tx.Version != c.version || tx.Required != int(required) || tx.Required != n {
+			t.Errorf("%s: Version %d, Required %d; want %d, %d", c.name, tx.Version, tx.Required, c.version, required)
+		}
+		// A sub-slice of Raw, not a copy, with no room to append over what
+		// follows it.
+		if !bytes.Equal(tx.Signed, msg) || &tx.Signed[0] != &msg[0] || cap(tx.Signed) != len(tx.Signed) {
+			t.Errorf("%s: Signed is not the message as a clipped sub-slice of Raw", c.name)
+		}
+		for i, k := range c.tx.signers {
+			if !ed25519.Verify(k.Public().(ed25519.PublicKey), tx.Signed, sigs[64*i:64*i+64]) {
+				t.Errorf("%s: signature %d does not verify over Signed", c.name, i)
+			}
+		}
+	}
+
+	// The captured mainnet transactions hold all three versions.
+	versions := map[int]int{}
+	for i, b := range fixtureFrames(t, "txframes-2026-10-13.bin.gz", 900) {
+		f, _ := ParseFrame(b)
+		tx, _, err := ParseTx(f.Tx)
+		if err != nil || tx.Required != tx.NumSigs || !ed25519.Verify(tx.Keys[:32], tx.Signed, tx.Sig) {
+			t.Fatalf("captured transaction %d: %v, %d signatures, %d required, or the first does not verify over Signed",
+				i, err, tx.NumSigs, tx.Required)
+		}
+		versions[tx.Version]++
+	}
+	if want := map[int]int{-1: 153, 0: 431, 1: 316}; !maps.Equal(versions, want) {
+		t.Errorf("captured transactions by version: %v, want %v", versions, want)
+	}
+}
+
+// TestParseTxSignatureCount parses transactions whose signature count is not
+// num_required_signatures: ParseTx reports both, and VerifyTx refuses them.
+func TestParseTxSignatureCount(t *testing.T) {
+	raw := legacyTx.build() // two signatures, two required
+	msg := raw[1+2*64:]
+	for _, n := range []int{0, 1, 3} {
+		b := appendShortVec(nil, n)
+		for i := range n {
+			b = append(b, raw[1+64*(i%2):][:64]...)
+		}
+		b = append(b, msg...)
+		tx, _, err := ParseTx(b)
+		if err != nil || tx.NumSigs != n || tx.Required != 2 || tx.Version != -1 || !bytes.Equal(tx.Signed, msg) {
+			t.Errorf("%d signatures: ParseTx = %d sigs, %d required, version %d, %v; want %d, 2, -1",
+				n, tx.NumSigs, tx.Required, tx.Version, err, n)
+		}
+		if _, err := VerifyTx(b); err == nil {
+			t.Errorf("VerifyTx accepted %d signatures where 2 are required", n)
 		}
 	}
 }
