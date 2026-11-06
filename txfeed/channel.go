@@ -100,6 +100,21 @@ func ChannelGroup(kind ChannelKind, key Pubkey) netip.Addr {
 	return netip.AddrFrom16(g)
 }
 
+// shredLayerDomain prefixes a shred layer's name in its group key.
+const shredLayerDomain = "blockcast/shreds/v1/"
+
+// ShredLayerGroup returns the IPv6 SSM group of a shred layer (data,
+// coding-even or coding-odd, as shred-merger names them): the ChannelGroup of
+// kind 0xff, which no filter channel has, and key
+//
+//	SHA-256(shredLayerDomain || layer),
+//
+// which is the registry's channel_group(0xff, key). The rpc-node kit's
+// test_groups.py pins the same three groups as TestShredLayerGroups.
+func ShredLayerGroup(layer string) netip.Addr {
+	return ChannelGroup(0xff, sha256.Sum256([]byte(shredLayerDomain+layer)))
+}
+
 // MatchChannels returns the channels in active that tx matches, each once: the
 // program channels of the programs it invokes, in first-use order, then the
 // account channels of its static account keys, in message order. A vote

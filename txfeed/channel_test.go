@@ -56,6 +56,28 @@ func TestChannelVectors(t *testing.T) {
 	}
 }
 
+// TestShredLayerGroups pins ShredLayerGroup to the three groups the rpc-node
+// kit's test_groups.py pins, and ChannelGroup to a channel of the registry's
+// own client vectors (channel-registry tests/client-vectors.json, pdas).
+func TestShredLayerGroups(t *testing.T) {
+	for layer, want := range map[string]string{
+		"data":        "ff3e:0:cf0b:c164:2fac:b52a:ae31:48a",
+		"coding-even": "ff3e:0:2e60:73b5:4c6a:39b9:2b24:35cd",
+		"coding-odd":  "ff3e:0:8502:b0d9:9568:6968:3c07:88ae",
+	} {
+		if g := ShredLayerGroup(layer); g.String() != want {
+			t.Errorf("ShredLayerGroup(%q) = %s, want %s", layer, g, want)
+		}
+	}
+	c, err := ParseChannel("program:QWmroo4YnnMqYW3cnxWkFdaTxGD3P7vMSzwMHGbUzwF")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g := ChannelGroup(c.Kind, c.Key); hex.EncodeToString(g.AsSlice()) != "ff3e0000f54514c15452584a05a4a78a" {
+		t.Errorf("ChannelGroup(%s) = %s, want the registry's ff3e0000f54514c15452584a05a4a78a", c, g)
+	}
+}
+
 // pub is the public key of key(seed).
 func pub(seed byte) Pubkey { return Pubkey(key(seed).Public().(ed25519.PublicKey)) }
 
