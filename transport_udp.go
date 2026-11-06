@@ -53,6 +53,9 @@ func (t *UDPTransport) Open(ctx context.Context) error {
 		}
 	}
 
+	// An ipv4.PacketConn on an AF_INET6 socket too: t.cm is empty, so no IPv4
+	// control message is ever sent or asked for, and plain reads and writes are
+	// family-blind.
 	t.conn = ipv4.NewPacketConn(conn)
 
 	// Set read deadline for context cancellation

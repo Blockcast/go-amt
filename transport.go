@@ -78,6 +78,14 @@ type TransportConfig struct {
 	SndBufBytes int
 }
 
+// outerIPv6 reports whether the tunnel's outer transport is IPv6: the relay is
+// an IPv6 address. A relay serves its IPv6 groups only through its IPv6 tunnel
+// device, so a gateway that joins one reaches the relay over IPv6. An unset
+// relay keeps the IPv4 socket every transport opened before.
+func (cfg TransportConfig) outerIPv6() bool {
+	return len(cfg.RelayAddr.IP) == net.IPv6len && cfg.RelayAddr.IP.To4() == nil
+}
+
 // DefaultTransportConfig returns a config with sensible defaults
 func DefaultTransportConfig(relayAddr net.UDPAddr) TransportConfig {
 	return TransportConfig{
@@ -140,8 +148,8 @@ func (e *TransportError) Unwrap() error {
 //
 //   - absent or unspecified;
 //   - a different address family from the one we reached the relay on. Our
-//     sockets are AF_INET, so a 24-byte advertisement carrying a global IPv6
-//     address is unsendable however routable it looks;
+//     socket is opened in the discovery address's family, so an advertisement
+//     in the other one is unsendable however routable it looks;
 //   - private or link-local from a relay we reached at a global address -- a
 //     relay behind NAT advertising its inside address.
 //

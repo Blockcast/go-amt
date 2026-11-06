@@ -89,10 +89,13 @@ the extra feeds rescued. It measures this run only — it cannot tell whether
 the inputs are independently operated or share one tap.
 
 A feed of the form NAME=ssm://SOURCE@GROUP:PORT joins that source-specific
-multicast group natively instead of binding a unicast port. Adding
-?relay=IP[:PORT] (default port 2268) falls back to an AMT tunnel through that
-relay when no native traffic arrives within the probe window; ?iface=NAME pins
-the join to one interface.
+multicast group natively instead of binding a unicast port. An IPv6 source and
+group go in brackets: NAME=ssm://[SOURCE]@[GROUP]:PORT. Adding
+?relay=IP[:PORT] (default port 2268; an IPv6 relay with a port is [IP]:PORT)
+falls back to an AMT tunnel through that relay when no native traffic arrives
+within the probe window; ?iface=NAME pins the join to one interface. The
+relay must be of the group's family, reached over that family, and a relay
+host name resolves to an address of it.
 
 --rcvbuf sets every feed socket's receive buffer (default 8 MiB). With
 CAP_NET_ADMIN the receiver forces it; without, the kernel caps it at
@@ -207,7 +210,7 @@ func run(args []string) error {
 	var configuredFeeds feeds
 	var listen, destinations, httpAddress string
 	var healthMaxAge time.Duration
-	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed, or NAME=ssm://SOURCE@GROUP:PORT[?relay=IP[:PORT]&iface=NAME] multicast feed")
+	flags.Var(&configuredFeeds, "feed", "repeatable NAME=IP:PORT unicast feed, or NAME=ssm://SOURCE@GROUP:PORT[?relay=IP[:PORT]&iface=NAME] multicast feed; IPv6 is ssm://[SOURCE]@[GROUP]:PORT")
 	flags.StringVar(&listen, "listen", "0.0.0.0:20000", "unicast UDP listen address")
 	flags.StringVar(&destinations, "dest-ip-ports", "", "comma-separated validator TVU IP:PORT destinations")
 	asJSON := flags.Bool("json", false, "emit the receipt as JSON instead of the human table")
@@ -1366,21 +1369,47 @@ func setFeedReceiveBuffer(conn *net.UDPConn, f feed) error {
 // ssmFeed parses an ssm:// feed address into an unopened ManagedConn that asks
 // for rcvbuf bytes of receive buffer on whichever socket Open lands on: the
 // native join and the AMT tunnel both apply it and warn on a clamp.
+//
+// An IPv6 feed is ssm://[SOURCE]@[GROUP]:PORT. url.Parse refuses the brackets
+// in the userinfo (RFC 3986 allows none there), and an unbracketed IPv6 source
+// splits at its first colon into a user and a password, so the bracketed source
+// is cut out by hand and the rest goes to url.Parse with a placeholder user.
 func ssmFeed(address string, rcvbuf int) (*amt.ManagedConn, error) {
-	u, err := url.Parse(address)
+	usage := fmt.Errorf("%q must be ssm://SOURCE@GROUP:PORT or ssm://[SOURCE]@[GROUP]:PORT, then [?relay=IP[:PORT]&iface=NAME]", address)
+	parsed, bracketed := address, ""
+	if rest, ok := strings.CutPrefix(address, "ssm://["); ok {
+		var tail string
+		if bracketed, tail, ok = strings.Cut(rest, "]@"); !ok {
+			return nil, usage
+		}
+		parsed = "ssm://v6@" + tail
+	}
+	u, err := url.Parse(parsed)
 	if err != nil {
 		return nil, fmt.Errorf("parse %q: %w", address, err)
 	}
-	usage := fmt.Errorf("%q must be ssm://SOURCE@GROUP:PORT[?relay=IP[:PORT]&iface=NAME]", address)
 	if u.User == nil || u.Path != "" {
 		return nil, usage
 	}
 	source, err := netip.ParseAddr(u.User.Username())
-	if err != nil || !source.Is4() {
+	if bracketed != "" {
+		// url.Parse splits the authority at its last '@', so anything between
+		// "]@" and the group would be left in the userinfo beside the
+		// placeholder: ssm://[S]@junk@[G]:P must not parse as ssm://[S]@[G]:P.
+		if u.User.String() != "v6" {
+			return nil, usage
+		}
+		source, err = netip.ParseAddr(bracketed)
+	}
+	// Brackets hold an IPv6 source and only an IPv6 one, and the group is of
+	// the source's family, so the two forms cannot be mixed. A zone would
+	// never match the zoneless source of a tunnelled packet.
+	if err != nil || source.Is4In6() || source.Is6() != (bracketed != "") || source.Zone() != "" {
 		return nil, usage
 	}
 	group, err := netip.ParseAddrPort(u.Host)
-	if err != nil || !group.Addr().Is4() || !group.Addr().IsMulticast() || group.Port() == 0 {
+	if err != nil || group.Addr().Is6() != source.Is6() || group.Addr().Is4In6() || group.Addr().Zone() != "" ||
+		!group.Addr().IsMulticast() || group.Port() == 0 {
 		return nil, usage
 	}
 	conn := &amt.ManagedConn{SrcAddr: source, GroupAddr: group.Addr(), GroupPort: group.Port(), Mode: amt.AMTModeNative, RcvBufBytes: rcvbuf}
@@ -1401,12 +1430,18 @@ func ssmFeed(address string, rcvbuf int) (*amt.ManagedConn, error) {
 		}
 	}
 	if relay := query.Get("relay"); relay != "" {
-		relayAddress, err := amtrelay.Parse(relay)
+		// A relay forwards a group only through a tunnel of the group's family,
+		// so a relay of the other family would join and then deliver nothing.
+		family, network := "IPv4", "udp4"
+		if group.Addr().Is6() {
+			family, network = "IPv6", "udp6"
+		}
+		relayAddress, err := amtrelay.Parse(relay, network)
 		if errors.Is(err, amtrelay.ErrPortZero) {
 			return nil, fmt.Errorf("%w: relay port 0", usage)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("%q relay: %w", address, err)
+			return nil, fmt.Errorf("%q relay, which must be %s like the group: %w", address, family, err)
 		}
 		conn.RelayAddr, conn.Mode = relayAddress, amt.AMTModeAuto
 	}

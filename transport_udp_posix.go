@@ -11,7 +11,11 @@ import (
 // openUDPConn keeps the raw-socket setup used by the platforms that expose
 // the socket options and descriptor types used by the AMT native path.
 func openUDPConn(cfg TransportConfig) (net.PacketConn, error) {
-	sock, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
+	family := syscall.AF_INET
+	if cfg.outerIPv6() {
+		family = syscall.AF_INET6
+	}
+	sock, err := syscall.Socket(family, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
 	if err != nil {
 		return nil, err
 	}

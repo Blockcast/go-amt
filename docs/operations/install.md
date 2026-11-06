@@ -217,7 +217,7 @@ remaining checks and reports the delivery assertion as `UNVERIFIED`.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--listen` | `0.0.0.0:20000` | Unicast UDP ingress address. |
-| `--feed NAME=IP:PORT` | — | Repeatable. Enables multi-feed first-arrival-wins scoring. Replaces `--listen` when given. `NAME=ssm://SOURCE@GROUP:PORT` joins that source-specific multicast group natively instead; add `?relay=IP[:PORT]` to fall back to an AMT tunnel when native multicast is silent, `?iface=NAME` to pin the join's interface. |
+| `--feed NAME=IP:PORT` | — | Repeatable. Enables multi-feed first-arrival-wins scoring. Replaces `--listen` when given. `NAME=ssm://SOURCE@GROUP:PORT` joins that source-specific multicast group natively instead; an IPv6 source and group go in brackets, `NAME=ssm://[SOURCE]@[GROUP]:PORT`. Add `?relay=IP[:PORT]` to fall back to an AMT tunnel when native multicast is silent (an IPv6 relay with a port is `[IP]:PORT`; the relay must be of the group's family, with egress to it in that family), `?iface=NAME` to pin the join's interface. |
 | `--dest-ip-ports` | *(none)* | Comma-separated validator TVU targets; each receives canonical shreds (see the delivery table above). Empty means score-only, no forwarding. |
 | `--http-addr` | `127.0.0.1:8080` | `/metrics` and `/healthz`. Empty disables HTTP. |
 | `--json` | off | Emit the shutdown receipt as JSON instead of a table. |

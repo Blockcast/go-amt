@@ -470,11 +470,13 @@ func TestReconnectRunsOneLoopPairPerGeneration(t *testing.T) {
 	}
 }
 
-// TestSubscribeRejectsNonIPv4Synchronously pins defect 7. The IGMPv3 report
+// TestSubscribeRejectsMixedFamilySynchronously pins defect 7. The IGMPv3 report
 // builder calls netip.Addr.As4, which panics on a v6 address, and it runs from
 // a time.AfterFunc goroutine where no recover() can catch it -- so the
-// rejection has to happen synchronously, in the caller's own goroutine.
-func TestSubscribeRejectsNonIPv4Synchronously(t *testing.T) {
+// rejection has to happen synchronously, in the caller's own goroutine. An
+// IPv6 (S,G) is joined with MLDv2 instead; a pair that mixes the families
+// reaches neither builder and is what is refused here.
+func TestSubscribeRejectsMixedFamilySynchronously(t *testing.T) {
 	fr := newFakeRelay(t)
 	rm := newTestManager(t, fr)
 
@@ -512,12 +514,18 @@ func TestSubscribeRejectsNonIPv4Synchronously(t *testing.T) {
 				Port:   testHarnessPort,
 			},
 		},
+		{
+			// Both zero is one family to the family check, so only the
+			// validity check refuses it before the join fails off-goroutine.
+			name: "zero source and group",
+			key:  SubscriptionKey{Port: testHarnessPort},
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if _, err := rm.Subscribe(tc.key, SubscriptionCallbacks{}); err == nil {
-				t.Fatal("Subscribe accepted a non-IPv4 subscription; the report builder will panic off-goroutine")
+				t.Fatal("Subscribe accepted an (S,G) no report can join; the report builder will panic off-goroutine")
 			}
 		})
 	}

@@ -536,24 +536,25 @@ func (rm *RelayManager) Close() error {
 // builders require strictly Is4(); storing the mapped form lets a subscription
 // join successfully and then fail to build its leave report, which strands the
 // membership on the relay. Normalising at the boundary keeps one representation
-// in the maps so every downstream Is4() holds.
+// in the maps so every downstream Is4() holds. Unmap leaves an IPv6 address as
+// it is, but its zone goes: a tunnelled packet's addresses carry none, so a
+// zoned key would join and then match no packet.
 func canonicalSubscriptionKey(key SubscriptionKey) SubscriptionKey {
-	key.Source = key.Source.Unmap()
-	key.Group = key.Group.Unmap()
+	key.Source = key.Source.Unmap().WithZone("")
+	key.Group = key.Group.Unmap().WithZone("")
 	return key
 }
 
 func (rm *RelayManager) Subscribe(key SubscriptionKey, callbacks SubscriptionCallbacks) (*Subscription, error) {
-	// Reject non-IPv4 (S,G) synchronously. The IGMPv3 report builder converts
-	// these with netip.Addr.As4, which panics, and it runs from the batched
-	// membership time.AfterFunc goroutine where no recover() can catch it.
-	if !key.Source.IsValid() || (!key.Source.Is4() && !key.Source.Is4In6()) {
-		return nil, fmt.Errorf("subscription source address must be IPv4: %s", key.Source)
-	}
-	if !key.Group.IsValid() || (!key.Group.Is4() && !key.Group.Is4In6()) {
-		return nil, fmt.Errorf("subscription group address must be IPv4: %s", key.Group)
-	}
+	// Reject an (S,G) no report can join, synchronously. An IPv4 pair is
+	// joined with IGMPv3 and an IPv6 one with MLDv2, from the batched
+	// membership time.AfterFunc goroutine where no caller sees the error and no
+	// recover() catches the panic netip.Addr.As4 raises on a v6 address. A pair
+	// that mixes the families is neither.
 	key = canonicalSubscriptionKey(key)
+	if !key.Source.IsValid() || !key.Group.IsValid() || key.Source.Is4() != key.Group.Is4() {
+		return nil, fmt.Errorf("subscription source and group must be addresses of one family: (%s,%s)", key.Source, key.Group)
+	}
 
 	rm.mu.RLock()
 	state := rm.State()
@@ -631,7 +632,11 @@ func (rm *RelayManager) Unsubscribe(key SubscriptionKey) error {
 			// and discards a record with no source, so that form left it
 			// streaming to an exited gateway until its 3-minute liveness sweep
 			// (BLO-45606).
-			if sourceLeaver, ok := rm.protocol.(SourceSpecificLeaveReporter); ok {
+			if key.Source.Is6() {
+				// MLDv2 spells the source-specific leave the same way
+				// (RFC 3810 §6.1).
+				report, err = buildMLDReport(m.IGMPv3BlockOldSources, key.Source, []netip.Addr{key.Group})
+			} else if sourceLeaver, ok := rm.protocol.(SourceSpecificLeaveReporter); ok {
 				report, err = sourceLeaver.CreateIGMPSourceLeaveReport(key.Source, key.Group)
 			} else {
 				// A group-wide leave is safer than reporting an error after
@@ -1002,14 +1007,24 @@ func (rm *RelayManager) sendBatchedMembershipUpdate() error {
 		return nil
 	}
 
-	// Create and send IGMP reports for each source
+	// Create and send a report for each source: IGMPv3 for an IPv4 source,
+	// MLDv2 for an IPv6 one. Subscribe keeps every group in its source's family.
+	// The relay dispatches an Update's report on its IP version (linux-amt
+	// amt_update_handler), not on the Query family the Request asked for, so
+	// the IGMP Query the handshake asks for refreshes both.
 	for source, groups := range sourceGroups {
-		igmpReport, err := rm.protocol.CreateIGMPJoinReportMulti(source, groups)
+		var report []byte
+		var err error
+		if source.Is6() {
+			report, err = buildMLDReport(m.IGMPv3AllowNewSources, source, groups)
+		} else {
+			report, err = rm.protocol.CreateIGMPJoinReportMulti(source, groups)
+		}
 		if err != nil {
-			return fmt.Errorf("failed to create IGMP report: %w", err)
+			return fmt.Errorf("failed to create membership report: %w", err)
 		}
 
-		update, err := rm.protocol.CreateMembershipUpdate(igmpReport)
+		update, err := rm.protocol.CreateMembershipUpdate(report)
 		if err != nil {
 			return fmt.Errorf("failed to create membership update: %w", err)
 		}

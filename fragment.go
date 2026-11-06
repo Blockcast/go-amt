@@ -13,8 +13,8 @@ import (
 // an AMT data message larger than the path MTU as IP fragments, and the kernel
 // hands the reassembled UDP datagram over whole: W5.6 saw such datagrams over
 // 1,500 B from Tokyo and London. The largest UDP payload an IPv4 datagram can
-// carry is 65,507 B, so a 64 KiB buffer holds any of them and a read can never
-// be truncated.
+// carry is 65,507 B, and an IPv6 one 65,527 B, so a 64 KiB buffer holds any of
+// them over either outer family and a read can never be truncated.
 const tunnelReadBuffer = 64 << 10
 
 // Inner IPv4 reassembly bounds (RFC 791 §3.2, with a shorter timer than its 15
@@ -42,16 +42,17 @@ type DecapStats struct {
 	// inconsistent or oversized fragments.
 	ReassemblyInvalid uint64
 	// Truncated is the inner packets cut short of, or inconsistent with, the
-	// lengths their IPv4 and UDP headers give. None is delivered.
+	// lengths their IP and UDP headers give. None is delivered.
 	Truncated uint64
-	// Unsupported is the inner packets that are not IPv4 UDP. Subscriptions
-	// are IPv4-only, so an IPv6 packet, fragmented or not, is counted here
-	// rather than parsed.
+	// Unsupported is the inner packets that are not UDP, and the IPv6 ones
+	// with an extension header between the fixed header and UDP. A Fragment
+	// header is one of those, so an IPv6 fragment is counted here rather than
+	// reassembled.
 	Unsupported uint64
 }
 
-// udp4 is one whole UDP datagram from the inner packet of a data message.
-type udp4 struct {
+// datagram is one whole UDP datagram from the inner packet of a data message.
+type datagram struct {
 	src, dst     netip.Addr
 	sport, dport uint16
 	payload      []byte // aliases the read buffer unless it was reassembled
@@ -100,17 +101,20 @@ func (d *decapsulator) stats() DecapStats {
 }
 
 // decap parses ip, the inner packet of a data message, received at now. It
-// returns the UDP datagram ip carries or, for a fragment, the datagram it
+// returns the UDP datagram ip carries or, for an IPv4 fragment, the datagram it
 // completes. A fragment that completes nothing, and a packet that is not a
-// whole IPv4 UDP datagram, return false.
-func (d *decapsulator) decap(ip []byte, now time.Time) (udp4, bool) {
+// whole UDP datagram, return false.
+func (d *decapsulator) decap(ip []byte, now time.Time) (datagram, bool) {
+	if len(ip) > 0 && ip[0]>>4 == 6 {
+		return d.decap6(ip)
+	}
 	if len(ip) == 0 || ip[0]>>4 != 4 {
 		d.unsupported.Add(1)
-		return udp4{}, false
+		return datagram{}, false
 	}
 	if len(ip) < 20 {
 		d.truncated.Add(1)
-		return udp4{}, false
+		return datagram{}, false
 	}
 	hlen, total := int(ip[0]&0x0f)*4, int(binary.BigEndian.Uint16(ip[2:4]))
 	if hlen < 20 || total < hlen || total > len(ip) {
@@ -118,11 +122,11 @@ func (d *decapsulator) decap(ip []byte, now time.Time) (udp4, bool) {
 		// read buffer was sized for the largest one, this is how a datagram
 		// over 1,500 B arrived, and its payload was delivered truncated.
 		d.truncated.Add(1)
-		return udp4{}, false
+		return datagram{}, false
 	}
 	if ip[9] != 17 { // UDP
 		d.unsupported.Add(1)
-		return udp4{}, false
+		return datagram{}, false
 	}
 	ip = ip[:total] // drop any trailing padding
 	src, dst := netip.AddrFrom4([4]byte(ip[12:16])), netip.AddrFrom4([4]byte(ip[16:20]))
@@ -131,20 +135,46 @@ func (d *decapsulator) decap(ip []byte, now time.Time) (udp4, bool) {
 		d.fragments.Add(1)
 		k := fragKey{src: src, dst: dst, id: binary.BigEndian.Uint16(ip[4:6])}
 		if payload = d.reassemble(k, int(ff&0x1fff)*8, ff&0x2000 != 0, payload, now); payload == nil {
-			return udp4{}, false
+			return datagram{}, false
 		}
 		d.reassembled.Add(1)
 	}
+	return d.udp(src, dst, payload)
+}
+
+// decap6 parses ip, an inner IPv6 packet. Only UDP straight after the fixed
+// header is delivered: the source sends no extension headers, and an IPv6
+// router never fragments, so the inner packets the relay forwards have none.
+func (d *decapsulator) decap6(ip []byte) (datagram, bool) {
+	if len(ip) < 40 {
+		d.truncated.Add(1)
+		return datagram{}, false
+	}
+	total := 40 + int(binary.BigEndian.Uint16(ip[4:6]))
+	if total > len(ip) {
+		d.truncated.Add(1)
+		return datagram{}, false
+	}
+	if ip[6] != 17 { // UDP
+		d.unsupported.Add(1)
+		return datagram{}, false
+	}
+	return d.udp(netip.AddrFrom16([16]byte(ip[8:24])), netip.AddrFrom16([16]byte(ip[24:40])), ip[40:total])
+}
+
+// udp returns the datagram in payload, a whole UDP header and data from src
+// to dst.
+func (d *decapsulator) udp(src, dst netip.Addr, payload []byte) (datagram, bool) {
 	if len(payload) < 8 {
 		d.truncated.Add(1)
-		return udp4{}, false
+		return datagram{}, false
 	}
 	ulen := int(binary.BigEndian.Uint16(payload[4:6]))
 	if ulen < 8 || ulen > len(payload) {
 		d.truncated.Add(1)
-		return udp4{}, false
+		return datagram{}, false
 	}
-	return udp4{
+	return datagram{
 		src: src, dst: dst,
 		sport:   binary.BigEndian.Uint16(payload[0:2]),
 		dport:   binary.BigEndian.Uint16(payload[2:4]),

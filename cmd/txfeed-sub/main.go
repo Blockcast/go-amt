@@ -215,12 +215,13 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 	fs.Var(&named, "named", "NAME of a default named program to subscribe to; repeatable")
 	fs.Var(&programs, "program", "BASE58 program to subscribe to, through its bucket group; repeatable")
 	fs.Var(&raw, "ssm", "SOURCE@GROUP:PORT to join unfiltered; repeatable")
-	fs.Func("relay", "AMT relay IP[:PORT], port 2268 by default: join each group natively first, then through an AMT tunnel to the relay "+
+	fs.Func("relay", "AMT relay IP[:PORT] or [IPv6]:PORT, port 2268 by default, of the groups' family: join each group natively first, then through an AMT tunnel to the relay "+
 		"if no native traffic arrives within the probe window ("+amt.MinUsefulProbeWindow.String()+"); makes -iface-ip optional", func(s string) error {
 		if c.relay != nil {
 			return errors.New("given twice")
 		}
-		a, err := amtrelay.Parse(s)
+		// The groups are not known yet; parse checks the family once they are.
+		a, err := amtrelay.Parse(s, "udp")
 		if err != nil {
 			return err
 		}
@@ -364,6 +365,13 @@ func parse(fs *flag.FlagSet, args []string) (*config, error) {
 	}
 	if len(c.subs) == 0 {
 		return nil, errors.New("nothing to subscribe to: give -nonvote, -named, -program, -ssm or -listen")
+	}
+	// A relay tunnels a group only in the group's family: an IPv6 group through
+	// an IPv4 relay, or the reverse, would join and then receive nothing.
+	for _, s := range c.subs {
+		if c.relay != nil && (c.relay.IP.To4() == nil) != s.group.Addr().Is6() {
+			return nil, fmt.Errorf("-relay %v cannot tunnel group %v: give a relay of the group's family", c.relay, s.group.Addr())
+		}
 	}
 	return c, nil
 }

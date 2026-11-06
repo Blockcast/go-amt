@@ -38,6 +38,8 @@ func TestRelayFlag(t *testing.T) {
 	for args, want := range map[string]string{
 		"-relay 69.25.95.128 -nonvote":      "69.25.95.128:2268",
 		"-relay 69.25.95.128:4000 -nonvote": "69.25.95.128:4000",
+		// The shared relay parser takes IPv6, for IPv6 groups.
+		"-relay [::1]:2268 -ssm 2001:db8::57@[ff3e::8000:57]:5003": "[::1]:2268",
 	} {
 		c, err := parseArgs(strings.Fields(args)...)
 		if err != nil || c.relay == nil || c.relay.String() != want {
@@ -60,8 +62,11 @@ func TestRelayFlag(t *testing.T) {
 		{"-relay", "69.25.95.128:", "-nonvote"},                // empty port
 		{"-relay", "69.25.95.128:0", "-nonvote"},               // port 0
 		{"-relay", "69.25.95.128:x", "-nonvote"},               // not a port
-		{"-relay", "[::1]:2268", "-nonvote"},                   // not IPv4
 		{"-relay", "1.1.1.1", "-relay", "2.2.2.2", "-nonvote"}, // two relays
+		// A relay tunnels only groups of its own family.
+		{"-relay", "[::1]:2268", "-nonvote"},                                              // IPv6 relay, IPv4 group base
+		{"-relay", "203.0.113.128", "-ssm", "2001:db8::57@[ff3e::8000:57]:5003"},           // IPv4 relay, IPv6 group
+		{"-relay", "[::1]:2268", "-ssm", "2001:db8::57@[ff3e::8000:57]:5003", "-nonvote"}, // one group of each family
 	} {
 		if c, err := parseArgs(args...); err == nil {
 			t.Errorf("parse(%q) accepted, relay %v", args, c.relay)

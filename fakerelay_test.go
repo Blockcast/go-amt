@@ -77,6 +77,9 @@ type fakeRelay struct {
 	// Immutable once serve starts; set it through withAdvertisedAddress.
 	advertisedAddr net.IP
 
+	// ipv6 serves the relay on [::1] rather than 127.0.0.1; see withIPv6.
+	ipv6 bool
+
 	updateCh chan []byte
 	done     chan struct{}
 	wg       sync.WaitGroup
@@ -109,6 +112,16 @@ func withAdvertisedAddress(ip net.IP) fakeRelayOption {
 			return
 		}
 		fr.advertisedAddr = ip.To16()
+	}
+}
+
+// withIPv6 serves the relay on [::1], so the gateway reaches it over an IPv6
+// outer transport, and advertises ::1 in the 24-byte advertisement. A test
+// using it is skipped on a host with no IPv6 loopback.
+func withIPv6() fakeRelayOption {
+	return func(fr *fakeRelay) {
+		fr.ipv6 = true
+		fr.advertisedAddr = net.IPv6loopback
 	}
 }
 
@@ -155,14 +168,8 @@ func (fr *fakeRelay) sendAfter(d time.Duration, b []byte, addr *net.UDPAddr) {
 func newFakeRelay(t *testing.T, opts ...fakeRelayOption) *fakeRelay {
 	t.Helper()
 
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatalf("fake relay listen: %v", err)
-	}
-
 	fr := &fakeRelay{
 		t:                 t,
-		conn:              conn,
 		queryResp:         100 * time.Millisecond,
 		queryIntervalCode: 0x0a,
 		advertisedAddr:    net.IPv4(127, 0, 0, 1).To4(),
@@ -176,6 +183,19 @@ func newFakeRelay(t *testing.T, opts ...fakeRelayOption) *fakeRelay {
 		opt(fr)
 	}
 
+	network := "udp4"
+	if fr.ipv6 {
+		network = "udp6"
+	}
+	conn, err := net.ListenUDP(network, &net.UDPAddr{IP: fr.loopback()})
+	if err != nil && fr.ipv6 {
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	if err != nil {
+		t.Fatalf("fake relay listen: %v", err)
+	}
+	fr.conn = conn
+
 	fr.wg.Add(1)
 	go fr.serve()
 
@@ -186,7 +206,15 @@ func newFakeRelay(t *testing.T, opts ...fakeRelayOption) *fakeRelay {
 // Addr is the address a RelayManager should be pointed at.
 func (fr *fakeRelay) Addr() net.UDPAddr {
 	a := fr.conn.LocalAddr().(*net.UDPAddr)
-	return net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: a.Port}
+	return net.UDPAddr{IP: fr.loopback(), Port: a.Port}
+}
+
+// loopback is the address the relay listens on.
+func (fr *fakeRelay) loopback() net.IP {
+	if fr.ipv6 {
+		return net.IPv6loopback
+	}
+	return net.IPv4(127, 0, 0, 1)
 }
 
 func (fr *fakeRelay) Close() {
@@ -404,13 +432,25 @@ func (fr *fakeRelay) SendData(src, group netip.Addr, sport, dport uint16, payloa
 			"mean the handshake is complete when it passes — see the note above")
 	}
 
-	ip := &layers.IPv4{
+	var ip interface {
+		gopacket.NetworkLayer
+		gopacket.SerializableLayer
+	} = &layers.IPv4{
 		Version:  4,
 		IHL:      5,
 		TTL:      64,
 		Protocol: layers.IPProtocolUDP,
 		SrcIP:    net.IP(src.AsSlice()),
 		DstIP:    net.IP(group.AsSlice()),
+	}
+	if src.Is6() {
+		ip = &layers.IPv6{
+			Version:    6,
+			HopLimit:   64,
+			NextHeader: layers.IPProtocolUDP,
+			SrcIP:      net.IP(src.AsSlice()),
+			DstIP:      net.IP(group.AsSlice()),
+		}
 	}
 	udp := &layers.UDP{
 		SrcPort: layers.UDPPort(sport),
