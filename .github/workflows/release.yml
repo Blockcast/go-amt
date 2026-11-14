@@ -27,10 +27,12 @@ permissions:
 
 jobs:
   release:
-    timeout-minutes: 60  # BLO-44648: bound self-hosted ARC job
-    # Tag pushes are trusted release refs. Keep signing isolated from the
-    # shared build pool while staying on ARC.
-    runs-on: arc-deploy
+    timeout-minutes: 60
+    # GitHub-hosted (BLO-56666): org groups 1/21 stop admitting public repos
+    # (BLO-40782), and a tag ref (`refs/tags/v*`) can never match a group-26
+    # `@refs/heads/<default>` pin. Nothing here needs cluster reach, and a fresh
+    # hosted VM is better signing isolation than a shared pool.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
