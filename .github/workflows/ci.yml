@@ -189,14 +189,15 @@ permissions:
 # removed, V6-only log, false PASS for the v4 name.
 jobs:
   test:
-    timeout-minutes: 30  # BLO-44648: bound self-hosted ARC job
-    # Never execute fork PR code on the shared ARC pool.
+    timeout-minutes: 30  # BLO-44648
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    # The shared-port veth guard below requires a privileged host network and
-    # a Linux 6.9+ kernel; use the dedicated multicast-capable ARC pool.
-    runs-on: arc-multicast-integ
+    # The shared-port veth guard below needs root (sudo) and a Linux 6.9+
+    # kernel; a hosted VM provides both. BLO-56666: PR-triggered, and the
+    # public repo leaves org group 1. Fallback if multicast fails here is
+    # default-ref-only on a group-26 twin of arc-multicast-integ.
+    runs-on: ubuntu-latest
     env:
       CGO_ENABLED: "0"
     steps:
