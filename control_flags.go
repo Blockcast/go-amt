@@ -30,7 +30,7 @@ import (
 // otherwise be pushed straight back to a local copy.
 const (
 	ControlFlags4 ipv4.ControlFlags = ipv4.FlagDst | ipv4.FlagInterface | ipv4.FlagTTL
-	ControlFlags6 ipv6.ControlFlags = ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit
+	ControlFlags6 ipv6.ControlFlags = ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit | ipv6.FlagTrafficClass
 )
 
 // TimestampControlMessageLen is the OOB space the one timestamp control message

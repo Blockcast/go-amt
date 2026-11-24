@@ -35,7 +35,7 @@ func TestControlFlagsAreTheDocumentedSets(t *testing.T) {
 			"the destination cmsg, so a group filter discards all traffic with no error",
 			ControlFlags4, want)
 	}
-	if want := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit; ControlFlags6 != want {
+	if want := ipv6.FlagDst | ipv6.FlagInterface | ipv6.FlagHopLimit | ipv6.FlagTrafficClass; ControlFlags6 != want {
 		t.Errorf("ControlFlags6 = %v, want %v: same silent loss as v4, on the family "+
 			"multicast's receiver has no headroom on", ControlFlags6, want)
 	}
