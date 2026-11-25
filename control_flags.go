@@ -114,4 +114,4 @@ func ControlMessageOOBLen() int { return controlMessageOOBLen }
 var controlMessageOOBLen = max(
 	len(ipv4.NewControlMessage(ControlFlags4)),
 	len(ipv6.NewControlMessage(ControlFlags6)),
-) + TimestampControlMessageLen + GROControlMessageLen
+) + TimestampControlMessageLen + GROControlMessageLen + ECNControlMessageLen

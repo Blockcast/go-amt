@@ -88,6 +88,12 @@ func ListenMulticastUDP4(network string, ifi *net.Interface, saddr netip.Addr, g
 		}
 	}
 
+	// ECN read (BLO-58854). A refusal still opens the channel; ParseECN then
+	// finds no cmsg and the caller sees "unavailable".
+	if err := enableRecvTOS(sock); err != nil {
+		slog.Warn("amt: IP_RECVTOS refused, ECN reads report unavailable", "err", err)
+	}
+
 	// Bind the group, not 0.0.0.0. With IP_MULTICAST_ALL cleared, UDP early
 	// demux finds the one socket whose filter admits the group, and since
 	// Linux 6.9 marks it prefetched (sock_pfree), so inet_steal_sock re-picks

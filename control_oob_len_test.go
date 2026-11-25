@@ -277,6 +277,10 @@ var sockoptsWithoutCmsg = map[string]bool{
 // sendmsg(2), not with setsockopt, so it never appears here and never puts
 // anything in a RECEIVE buffer. If it is ever set as a socket option it needs
 // classifying on its own merits rather than inheriting this entry.
+var sockoptsCoveredByECNLen = map[string]bool{
+	"IP_RECVTOS": true, // IP_TOS cmsg, ECNControlMessageLen
+}
+
 var sockoptsCoveredByGROLen = map[string]bool{
 	"UDP_GRO": true,
 }
@@ -351,7 +355,7 @@ func TestRawSockoptsAreAllClassified(t *testing.T) {
 				return true
 			}
 			switch {
-			case sockoptsWithoutCmsg[name], timestampSockoptsCoveredBy32[name], sockoptsCoveredByGROLen[name]:
+			case sockoptsWithoutCmsg[name], timestampSockoptsCoveredBy32[name], sockoptsCoveredByGROLen[name], sockoptsCoveredByECNLen[name]:
 			case sockbufOptParams[name] && strings.HasPrefix(path, "sockbuf_"):
 			default:
 				t.Errorf("%s sets socket option %q, which is not classified against "+
