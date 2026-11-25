@@ -4,12 +4,15 @@ package main
 
 import (
 	"bytes"
+	"fmt"
+	"os"
 	"encoding/binary"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +84,33 @@ func checkIDs(t *testing.T, d *dedup) {
 // A slot can come in two versions, as at the Alpenglow switch. Each version of
 // a shred is emitted once, so the union carries every shred of each version it
 // received, and a TVU fed from it is not left with a set mixing the two.
+// The vector file is shared with libmmt's shred_dedup tests. Merger versions
+// are 1-based because ver 0 is the v3 wildcard.
+func TestDedupSharedVectors(t *testing.T) {
+	// Byte-identical copy of libmmt/vectors/shred-dedup-00/first-arrival.txt; re-copy on change.
+	raw, err := os.ReadFile("testdata/libmmt-shred-dedup-first-arrival.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := newDedup(25 * time.Second)
+	for _, line := range strings.Split(string(raw), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 0 || strings.HasPrefix(f[0], "#") {
+			continue
+		}
+		slot, _ := strconv.ParseUint(f[0], 10, 64)
+		idx, _ := strconv.ParseUint(f[1], 10, 32)
+		ver, _ := strconv.ParseUint(f[2], 10, 64)
+		got := "duplicate"
+		if v := d.observe(t0, slot, 0, uint32(idx), ver); v == emit || v == emitOther {
+			got = "first"
+		}
+		if got != f[3] {
+			t.Errorf("%s: %s", line, fmt.Sprint("got ", got))
+		}
+	}
+}
+
 func TestDedupKeepsEachVersionOfAShred(t *testing.T) {
 	d := newDedup(25 * time.Second)
 	for _, step := range []struct {

@@ -1,0 +1,20 @@
+# Shared shred first-arrival dedup vectors (BLO-15080). One step per line:
+#   <slot> <shred_index> <version> <first|duplicate>
+# Steps run in order against ONE fresh deduper. `version` is a small integer
+# naming a distinct leader-signed Merkle root of the same shred. Consumers:
+#   libmmt  shred-forwarder/src/shred_dedup.rs (tests::shared_first_arrival_vectors)
+#   go-amt  cmd/shred-merger/main_test.go     (TestDedupSharedVectors)
+# Out of scope (consumer-specific, not shared): v3 unsigned wildcard, retention.
+100 5 1 first
+100 5 1 duplicate
+# reorder: higher index first, lower later, each its own shred
+100 9 1 first
+100 2 1 first
+100 9 1 duplicate
+# next slot with the same index is a different shred
+101 5 1 first
+# version conflict: a second signed root of one shred is a distinct first copy
+100 5 2 first
+100 5 2 duplicate
+100 5 1 duplicate
+100 5 3 first
